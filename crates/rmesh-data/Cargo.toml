@@ -1,0 +1,13 @@
+[package]
+name = "rmesh-data"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytemuck = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+half = { workspace = true }
+image = { workspace = true }
+flate2 = { workspace = true }

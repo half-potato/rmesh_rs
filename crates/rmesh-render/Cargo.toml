@@ -1,0 +1,13 @@
+[package]
+name = "rmesh-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-shaders = { path = "../rmesh-shaders" }
+rmesh-data = { path = "../rmesh-data" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

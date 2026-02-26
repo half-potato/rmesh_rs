@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rmesh-shaders",
+    "crates/rmesh-render",
+    "crates/rmesh-backward",
+    "crates/rmesh-data",
+    "crates/rmesh-train",
+    "crates/rmesh-viewer",
+]
+
+[workspace.dependencies]
+wgpu = "24"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+glam = { version = "0.32", features = ["bytemuck"] }
+winit = "0.30"
+image = "0.25"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+half = { version = "2", features = ["bytemuck"] }
+flate2 = "1"

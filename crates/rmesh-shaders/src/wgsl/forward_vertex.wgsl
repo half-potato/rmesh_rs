@@ -1,0 +1,134 @@
+// Forward vertex shader: per-tet face rasterization setup.
+//
+// Each tet is drawn as 4 triangles (12 vertices) via instanced draw.
+// The vertex shader computes ray-plane intersection parameters for the fragment shader.
+
+struct Uniforms {
+    vp_col0: vec4<f32>,
+    vp_col1: vec4<f32>,
+    vp_col2: vec4<f32>,
+    vp_col3: vec4<f32>,
+    inv_vp_col0: vec4<f32>,
+    inv_vp_col1: vec4<f32>,
+    inv_vp_col2: vec4<f32>,
+    inv_vp_col3: vec4<f32>,
+    cam_pos_pad: vec4<f32>,
+    screen_width: f32,
+    screen_height: f32,
+    tet_count: u32,
+    sh_degree: u32,
+    step: u32,
+    _pad1: vec3<u32>,
+};
+
+struct VertexOutput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) @interpolate(flat) tet_density: f32,
+    @location(1) @interpolate(flat) base_color: vec3<f32>,
+    @location(2) plane_numerators: vec4<f32>,
+    @location(3) plane_denominators: vec4<f32>,
+    @location(4) ray_dir: vec3<f32>,
+    @location(5) @interpolate(flat) dc_dt: f32,
+};
+
+@group(0) @binding(0) var<storage, read> uniforms: Uniforms;
+@group(0) @binding(1) var<storage, read> vertices: array<f32>;
+@group(0) @binding(2) var<storage, read> indices: array<u32>;
+@group(0) @binding(3) var<storage, read> colors: array<f32>;
+@group(0) @binding(4) var<storage, read> densities: array<f32>;
+@group(0) @binding(5) var<storage, read> color_grads: array<f32>;
+@group(0) @binding(6) var<storage, read> sorted_indices: array<u32>;
+
+// Face winding: 4 faces × 3 vertex indices each
+const TET_FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
+    vec3<u32>(0u, 2u, 1u),
+    vec3<u32>(1u, 2u, 3u),
+    vec3<u32>(0u, 3u, 2u),
+    vec3<u32>(3u, 0u, 1u),
+);
+
+// 12 entries: face index for each of the 12 vertices (4 faces × 3 verts)
+const FACE_VERTEX_MAP: array<vec2<u32>, 12> = array<vec2<u32>, 12>(
+    vec2<u32>(0u, 0u), vec2<u32>(0u, 1u), vec2<u32>(0u, 2u), // face 0
+    vec2<u32>(1u, 0u), vec2<u32>(1u, 1u), vec2<u32>(1u, 2u), // face 1
+    vec2<u32>(2u, 0u), vec2<u32>(2u, 1u), vec2<u32>(2u, 2u), // face 2
+    vec2<u32>(3u, 0u), vec2<u32>(3u, 1u), vec2<u32>(3u, 2u), // face 3
+);
+
+fn load_f32x3(buf_base: u32) -> vec3<f32> {
+    return vec3<f32>(vertices[buf_base], vertices[buf_base + 1u], vertices[buf_base + 2u]);
+}
+
+fn load_color(idx: u32) -> vec3<f32> {
+    return vec3<f32>(colors[idx * 3u], colors[idx * 3u + 1u], colors[idx * 3u + 2u]);
+}
+
+fn load_grad(idx: u32) -> vec3<f32> {
+    return vec3<f32>(color_grads[idx * 3u], color_grads[idx * 3u + 1u], color_grads[idx * 3u + 2u]);
+}
+
+@vertex
+fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_idx: u32) -> VertexOutput {
+    var out: VertexOutput;
+
+    let tet_id = sorted_indices[instance_idx];
+
+    // Load 4 vertex indices
+    let i0 = indices[tet_id * 4u];
+    let i1 = indices[tet_id * 4u + 1u];
+    let i2 = indices[tet_id * 4u + 2u];
+    let i3 = indices[tet_id * 4u + 3u];
+
+    // Load vertex positions
+    var verts: array<vec3<f32>, 4>;
+    verts[0] = load_f32x3(i0 * 3u);
+    verts[1] = load_f32x3(i1 * 3u);
+    verts[2] = load_f32x3(i2 * 3u);
+    verts[3] = load_f32x3(i3 * 3u);
+
+    // Which face and which vertex within that face?
+    let fv = FACE_VERTEX_MAP[vert_idx];
+    let face = TET_FACES[fv.x];
+    let face_vert_idx = face[fv.y];
+    let world_pos = verts[face_vert_idx];
+
+    let cam = uniforms.cam_pos_pad.xyz;
+    let ray_dir = normalize(world_pos - cam);
+
+    // Density
+    out.tet_density = densities[tet_id];
+
+    // Color gradient → dc/dt along ray
+    let grad = load_grad(tet_id);
+    out.dc_dt = dot(grad, ray_dir);
+
+    // Base color at ray origin
+    let color = load_color(tet_id);
+    let offset = dot(grad, cam - verts[0]);
+    out.base_color = color + vec3<f32>(offset);
+
+    // Ray-plane intersection parameters for all 4 faces
+    var numerators = vec4<f32>(0.0);
+    var denominators = vec4<f32>(0.0);
+
+    for (var i = 0u; i < 4u; i++) {
+        let f = TET_FACES[i];
+        let va = verts[f[0]];
+        let vb = verts[f[1]];
+        let vc = verts[f[2]];
+        let n = cross(vc - va, vb - va);
+
+        numerators[i] = dot(n, va - cam);
+        denominators[i] = dot(n, ray_dir);
+    }
+
+    out.plane_numerators = numerators;
+    out.plane_denominators = denominators;
+    out.ray_dir = ray_dir;
+
+    // Project to clip space
+    let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
+    out.position = vp * vec4<f32>(world_pos, 1.0);
+
+    return out;
+}
