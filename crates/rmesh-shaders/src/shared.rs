@@ -133,6 +133,22 @@ pub const C3_4: f32 = -0.4570457994644658;
 pub const C3_5: f32 = 1.445305721320277;
 pub const C3_6: f32 = -0.5900435899266435;
 
+/// Tile-based backward pass uniforms.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct TileUniforms {
+    pub screen_width: u32,
+    pub screen_height: u32,
+    pub tile_size: u32,
+    pub tiles_x: u32,
+    pub tiles_y: u32,
+    pub num_tiles: u32,
+    pub visible_tet_count: u32,
+    pub max_pairs: u32,
+    pub max_pairs_pow2: u32,
+    pub _pad: [u32; 3],
+}
+
 // Safe math constants (from safe_math.slang)
 pub const SAFE_MIN: f32 = -1e20;
 pub const SAFE_MAX: f32 = 1e20;

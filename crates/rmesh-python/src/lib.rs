@@ -13,8 +13,11 @@ use pyo3::types::PyDict;
 
 use glam::{Mat4, Vec3, Vec4};
 use rmesh_backward::{
-    create_adam_bind_group, create_backward_bind_groups, create_loss_bind_group, AdamState,
-    AdamUniforms, BackwardPipelines, GradientBuffers, LossBuffers, LossUniforms,
+    create_adam_bind_group, create_backward_bind_groups, create_backward_tiled_bind_groups,
+    create_loss_bind_group, create_tile_fill_bind_group, create_tile_gen_bind_group,
+    create_tile_ranges_bind_group_with_keys, AdamState, AdamUniforms, BackwardPipelines,
+    GradientBuffers, LossBuffers, LossUniforms, RadixSortPipelines, RadixSortState,
+    TileBuffers, TilePipelines, TileUniforms,
 };
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group, make_uniforms, record_forward_pass,
@@ -112,12 +115,26 @@ struct RMeshRenderer {
     grad_buffers: GradientBuffers,
     loss_buffers: LossBuffers,
     _adam_state: AdamState,
+    // Tiled backward infrastructure
+    tile_pipelines: TilePipelines,
+    tile_buffers: TileBuffers,
+    radix_pipelines: RadixSortPipelines,
+    radix_state: RadixSortState,
+    _tile_fill_bg: wgpu::BindGroup,
+    tile_gen_bg: wgpu::BindGroup,
+    // A-buffer bind groups (sort result in primary buffers)
+    tile_ranges_bg: wgpu::BindGroup,
+    bwd_tiled_bg0: wgpu::BindGroup,
+    bwd_tiled_bg1: wgpu::BindGroup,
+    // B-buffer bind groups (sort result in alternate buffers)
+    tile_ranges_bg_b: wgpu::BindGroup,
+    bwd_tiled_bg0_b: wgpu::BindGroup,
     // Bind groups
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
     loss_bg: wgpu::BindGroup,
-    bwd_bg0: wgpu::BindGroup,
-    bwd_bg1: wgpu::BindGroup,
+    _bwd_bg0: wgpu::BindGroup,
+    _bwd_bg1: wgpu::BindGroup,
     adam_bgs: Vec<wgpu::BindGroup>,
     adam_uniforms_buf: wgpu::Buffer,
     // Scene metadata
@@ -321,6 +338,67 @@ impl RMeshRenderer {
             tet_count * 3,
         ];
 
+        // Tiled backward infrastructure
+        let tile_size = 16u32;
+        let tile_pipelines = TilePipelines::new(&device);
+        let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
+
+        // Radix sort (replaces bitonic TileSortState)
+        let sorting_bits = 32u32; // full 32-bit key sort
+        let radix_pipelines = RadixSortPipelines::new(&device);
+        let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs, sorting_bits);
+        radix_state.upload_configs(&queue);
+
+        let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+        let tile_gen_bg = create_tile_gen_bind_group(
+            &device,
+            &tile_pipelines,
+            &tile_buffers,
+            &scene_buffers,
+        );
+
+        // A-buffer bind groups (sort result in primary tile_sort_keys/values)
+        let tile_ranges_bg = create_tile_ranges_bind_group_with_keys(
+            &device,
+            &tile_pipelines,
+            &tile_buffers.tile_sort_keys,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+            &tile_buffers.tile_pair_count,
+        );
+        let (bwd_tiled_bg0, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
+            &device,
+            &tile_pipelines,
+            &scene_buffers,
+            &loss_buffers,
+            &grad_buffers,
+            &ttb.rendered_image,
+            &tile_buffers.tile_sort_values,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+
+        // B-buffer bind groups (sort result in radix_state.keys_b/values_b)
+        let tile_ranges_bg_b = create_tile_ranges_bind_group_with_keys(
+            &device,
+            &tile_pipelines,
+            &radix_state.keys_b,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+            &tile_buffers.tile_pair_count,
+        );
+        let (bwd_tiled_bg0_b, _) = create_backward_tiled_bind_groups(
+            &device,
+            &tile_pipelines,
+            &scene_buffers,
+            &loss_buffers,
+            &grad_buffers,
+            &ttb.rendered_image,
+            &radix_state.values_b,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+
         Ok(Self {
             device,
             queue,
@@ -333,11 +411,22 @@ impl RMeshRenderer {
             grad_buffers,
             loss_buffers,
             _adam_state: adam_state,
+            tile_pipelines,
+            tile_buffers,
+            radix_pipelines,
+            radix_state,
+            _tile_fill_bg: tile_fill_bg,
+            tile_gen_bg,
+            tile_ranges_bg,
+            bwd_tiled_bg0,
+            bwd_tiled_bg1,
+            tile_ranges_bg_b,
+            bwd_tiled_bg0_b,
             compute_bg,
             render_bg,
             loss_bg,
-            bwd_bg0,
-            bwd_bg1,
+            _bwd_bg0: bwd_bg0,
+            _bwd_bg1: bwd_bg1,
             adam_bgs,
             adam_uniforms_buf,
             tet_count,
@@ -532,7 +621,38 @@ impl RMeshRenderer {
             bytemuck::cast_slice(dl_data),
         );
 
-        // Clear gradient buffers
+        // Read visible tet count for tile gen
+        let raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.indirect_args);
+        let u32s: &[u32] = bytemuck::cast_slice(&raw);
+        let visible_tet_count = u32s[1];
+
+        // Upload tile uniforms
+        let tile_uni = TileUniforms {
+            screen_width: self.width,
+            screen_height: self.height,
+            tile_size: 16,
+            tiles_x: self.tile_buffers.tiles_x,
+            tiles_y: self.tile_buffers.tiles_y,
+            num_tiles: self.tile_buffers.num_tiles,
+            visible_tet_count,
+            max_pairs: self.tile_buffers.max_pairs,
+            max_pairs_pow2: self.tile_buffers.max_pairs_pow2,
+            _pad: [0; 3],
+        };
+        self.queue.write_buffer(
+            &self.tile_buffers.tile_uniforms,
+            0,
+            bytemuck::bytes_of(&tile_uni),
+        );
+
+        // Upload num_keys for radix sort
+        self.queue.write_buffer(
+            &self.radix_state.num_keys_buf,
+            0,
+            bytemuck::bytes_of(&self.tile_buffers.max_pairs),
+        );
+
+        // Clear gradient buffers + tile pair count + tile ranges
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -542,21 +662,29 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_color_grads, 0, None);
+        encoder.clear_buffer(&self.tile_buffers.tile_pair_count, 0, None);
+        encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
         self.queue.submit(std::iter::once(encoder.finish()));
 
-        // Backward pass
+        // Tiled backward pass (with radix sort)
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("backward"),
+                label: Some("backward_tiled"),
             });
-        rmesh_backward::record_backward_pass(
+        rmesh_backward::record_tiled_backward(
             &mut encoder,
-            &self.bwd_pipelines,
-            &self.bwd_bg0,
-            &self.bwd_bg1,
-            self.width,
-            self.height,
+            &self.device,
+            &self.tile_pipelines,
+            &self.radix_pipelines,
+            &self.radix_state,
+            &self.tile_gen_bg,
+            &self.tile_ranges_bg,
+            &self.bwd_tiled_bg0,
+            &self.bwd_tiled_bg1,
+            &self.tile_buffers,
+            &self.tile_ranges_bg_b,
+            &self.bwd_tiled_bg0_b,
         );
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -659,7 +787,7 @@ impl RMeshRenderer {
             bytemuck::bytes_of(&loss_uni),
         );
 
-        // Clear gradient buffers + loss value
+        // Clear gradient buffers + loss value + tile buffers
         {
             let mut encoder = self
                 .device
@@ -671,6 +799,8 @@ impl RMeshRenderer {
             encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
             encoder.clear_buffer(&self.grad_buffers.d_color_grads, 0, None);
             encoder.clear_buffer(&self.loss_buffers.loss_value, 0, None);
+            encoder.clear_buffer(&self.tile_buffers.tile_pair_count, 0, None);
+            encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
@@ -696,6 +826,39 @@ impl RMeshRenderer {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
+        // Read visible tet count for tile gen
+        let visible_tet_count = {
+            let raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.indirect_args);
+            let u32s: &[u32] = bytemuck::cast_slice(&raw);
+            u32s[1]
+        };
+
+        // Upload tile uniforms + radix num_keys
+        {
+            let tile_uni = TileUniforms {
+                screen_width: self.width,
+                screen_height: self.height,
+                tile_size: 16,
+                tiles_x: self.tile_buffers.tiles_x,
+                tiles_y: self.tile_buffers.tiles_y,
+                num_tiles: self.tile_buffers.num_tiles,
+                visible_tet_count,
+                max_pairs: self.tile_buffers.max_pairs,
+                max_pairs_pow2: self.tile_buffers.max_pairs_pow2,
+                _pad: [0; 3],
+            };
+            self.queue.write_buffer(
+                &self.tile_buffers.tile_uniforms,
+                0,
+                bytemuck::bytes_of(&tile_uni),
+            );
+            self.queue.write_buffer(
+                &self.radix_state.num_keys_buf,
+                0,
+                bytemuck::bytes_of(&self.tile_buffers.max_pairs),
+            );
+        }
+
         // Loss pass
         {
             let mut encoder = self
@@ -713,20 +876,26 @@ impl RMeshRenderer {
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
-        // Backward pass
+        // Tiled backward pass (with radix sort)
         {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("backward"),
+                    label: Some("backward_tiled"),
                 });
-            rmesh_backward::record_backward_pass(
+            rmesh_backward::record_tiled_backward(
                 &mut encoder,
-                &self.bwd_pipelines,
-                &self.bwd_bg0,
-                &self.bwd_bg1,
-                self.width,
-                self.height,
+                &self.device,
+                &self.tile_pipelines,
+                &self.radix_pipelines,
+                &self.radix_state,
+                &self.tile_gen_bg,
+                &self.tile_ranges_bg,
+                &self.bwd_tiled_bg0,
+                &self.bwd_tiled_bg1,
+                &self.tile_buffers,
+                &self.tile_ranges_bg_b,
+                &self.bwd_tiled_bg0_b,
             );
             self.queue.submit(std::iter::once(encoder.finish()));
         }

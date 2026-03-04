@@ -797,6 +797,94 @@ impl SortState {
 }
 
 // ---------------------------------------------------------------------------
+// TileSortState — bitonic sort for tile-tet pairs
+// ---------------------------------------------------------------------------
+
+/// Bitonic sort state for tile-tet pair sorting.
+///
+/// Same pattern as `SortState` but operates on separately-sized buffers.
+/// The sort pipeline itself is shared with the forward sort (ForwardPipelines).
+pub struct TileSortState {
+    pub uniform_buffer: wgpu::Buffer,
+    pub bind_groups: Vec<wgpu::BindGroup>,
+    pub step_count: usize,
+    pub dispatch_x: u32,
+}
+
+impl TileSortState {
+    /// Build the tile sort state for the given max_pairs_pow2 count.
+    ///
+    /// Reuses the sort pipeline and bind group layout from ForwardPipelines.
+    pub fn new(
+        device: &wgpu::Device,
+        pipelines: &ForwardPipelines,
+        tile_sort_keys: &wgpu::Buffer,
+        tile_sort_values: &wgpu::Buffer,
+        max_pairs_pow2: u32,
+    ) -> Self {
+        let n_pow2 = max_pairs_pow2;
+        let mut pairs: Vec<SortUniforms> = Vec::new();
+
+        let mut k = 2u32;
+        while k <= n_pow2 {
+            let stage = (k as f32).log2() as u32 - 1;
+            let mut j = k >> 1;
+            while j > 0 {
+                let step_bit = (j as f32).log2() as u32;
+                pairs.push(SortUniforms {
+                    count: n_pow2,
+                    stage,
+                    step_size: step_bit,
+                    _pad: 0,
+                });
+                j >>= 1;
+            }
+            k <<= 1;
+        }
+
+        let step_count = pairs.len();
+
+        let buf_size = step_count as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
+        let mut data = vec![0u8; buf_size as usize];
+        let uniform_bytes = std::mem::size_of::<SortUniforms>();
+
+        for (i, su) in pairs.iter().enumerate() {
+            let offset = i as usize * SORT_UNIFORM_ALIGNMENT as usize;
+            data[offset..offset + uniform_bytes].copy_from_slice(bytemuck::bytes_of(su));
+        }
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tile_sort_uniforms"),
+            contents: &data,
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        let bind_groups: Vec<wgpu::BindGroup> = (0..step_count)
+            .map(|i| {
+                let offset = i as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
+                create_sort_bind_group(
+                    device,
+                    pipelines,
+                    &uniform_buffer,
+                    tile_sort_keys,
+                    tile_sort_values,
+                    offset,
+                )
+            })
+            .collect();
+
+        let dispatch_x = (n_pow2 + 255) / 256;
+
+        Self {
+            uniform_buffer,
+            bind_groups,
+            step_count,
+            dispatch_x,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Command Recording
 // ---------------------------------------------------------------------------
 
