@@ -202,7 +202,12 @@ impl RMeshRenderer {
             &wgpu::DeviceDescriptor {
                 label: Some("rmesh_renderer"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits {
+                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffer_binding_size: 1 << 30, // 1 GiB
+                    max_buffer_size: 1 << 30,
+                    ..wgpu::Limits::default()
+                },
                 memory_hints: wgpu::MemoryHints::Performance,
             },
             None,
@@ -419,6 +424,90 @@ impl RMeshRenderer {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         Ok(array.into_pyarray(py))
+    }
+
+    /// Read back the auxiliary buffer from the last forward pass.
+    ///
+    /// Returns:
+    ///     numpy array [H, W, 4] f32 with (t_min, t_max, optical_depth, dist)
+    ///     for the last fragment rendered at each pixel.
+    fn read_aux<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let bytes_per_pixel: u32 = 16; // Rgba32Float = 4 × f32
+        let unpadded_bpr = self.width * bytes_per_pixel;
+        let aligned_bpr = (unpadded_bpr + 255) & !255;
+        let buf_size = (aligned_bpr * self.height) as u64;
+
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("aux_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("aux_copy"),
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.targets.aux0_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(aligned_bpr),
+                    rows_per_image: Some(self.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.width,
+                height: self.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        receiver
+            .recv()
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Map recv: {e}")))?
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Map error: {e}")))?;
+
+        let data = slice.get_mapped_range();
+        let mut result = Vec::with_capacity((self.width * self.height * 4) as usize);
+        for row in 0..self.height {
+            let start = (row * aligned_bpr) as usize;
+            let end = start + (self.width * bytes_per_pixel) as usize;
+            let row_f32: &[f32] = bytemuck::cast_slice(&data[start..end]);
+            result.extend_from_slice(row_f32);
+        }
+        drop(data);
+        staging.unmap();
+
+        let array = Array3::from_shape_vec(
+            (self.height as usize, self.width as usize, 4),
+            result,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        Ok(array.into_pyarray(py))
+    }
+
+    /// Read back the instance_count from the indirect draw args buffer.
+    /// This is the number of tets that passed frustum culling in the compute shader.
+    fn read_instance_count(&self) -> PyResult<u32> {
+        let raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.indirect_args);
+        // DrawIndirectCommand: [vertex_count, instance_count, first_vertex, first_instance]
+        let u32s: &[u32] = bytemuck::cast_slice(&raw);
+        Ok(u32s[1])
     }
 
     /// Run the backward pass given upstream gradients.
@@ -763,7 +852,7 @@ impl RMeshRenderer {
 
 /// Native module — re-exported as rmesh_wgpu._native by the Python package.
 #[pymodule]
-fn rmesh_wgpu(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RMeshRenderer>()?;
     Ok(())
 }

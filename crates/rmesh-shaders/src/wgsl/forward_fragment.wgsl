@@ -13,7 +13,7 @@ struct FragmentInput {
     @location(2) plane_numerators: vec4<f32>,
     @location(3) plane_denominators: vec4<f32>,
     @location(4) ray_dir: vec3<f32>,
-    @location(5) @interpolate(flat) dc_dt: f32,
+    @location(5) dc_dt: f32,
 };
 
 struct FragmentOutput {

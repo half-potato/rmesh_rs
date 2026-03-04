@@ -115,7 +115,14 @@ fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
-    if (tet_id >= uniforms.tet_count) { return; }
+    // Padding threads (beyond tet_count): initialize sort buffers for bitonic sort.
+    if (tet_id >= uniforms.tet_count) {
+        if (tet_id < arrayLength(&sort_keys)) {
+            sort_keys[tet_id] = 0xFFFFFFFFu;
+            sort_values[tet_id] = tet_id;
+        }
+        return;
+    }
 
     // --- 1. Load geometry ---
     let i0 = indices[tet_id * 4u];
@@ -135,20 +142,26 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let p2 = project_to_ndc(v2, vp);
     let p3 = project_to_ndc(v3, vp);
 
-    let min_x = min(min(p0.x, p1.x), min(p2.x, p3.x));
-    let max_x = max(max(p0.x, p1.x), max(p2.x, p3.x));
-    let min_y = min(min(p0.y, p1.y), min(p2.y, p3.y));
-    let max_y = max(max(p0.y, p1.y), max(p2.y, p3.y));
-    let min_z = min(min(p0.z, p1.z), min(p2.z, p3.z));
+    // If any vertex is behind the camera (clip.w <= 0), NDC coords are unreliable.
+    // Mark as visible and let the hardware rasterizer handle near-plane clipping.
+    let any_behind = (p0.w <= 0.0) || (p1.w <= 0.0) || (p2.w <= 0.0) || (p3.w <= 0.0);
 
     var visible = true;
-    if (max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 || min_z > 1.0) {
-        visible = false;
-    }
-    let ext_x = (max_x - min_x) * uniforms.screen_width;
-    let ext_y = (max_y - min_y) * uniforms.screen_height;
-    if (ext_x * ext_y < 1.0) {
-        visible = false;
+    if (!any_behind) {
+        let min_x = min(min(p0.x, p1.x), min(p2.x, p3.x));
+        let max_x = max(max(p0.x, p1.x), max(p2.x, p3.x));
+        let min_y = min(min(p0.y, p1.y), min(p2.y, p3.y));
+        let max_y = max(max(p0.y, p1.y), max(p2.y, p3.y));
+        let min_z = min(min(p0.z, p1.z), min(p2.z, p3.z));
+
+        if (max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 || min_z > 1.0) {
+            visible = false;
+        }
+        let ext_x = (max_x - min_x) * uniforms.screen_width;
+        let ext_y = (max_y - min_y) * uniforms.screen_height;
+        if (ext_x * ext_y < 1.0) {
+            visible = false;
+        }
     }
 
     if (!visible) {

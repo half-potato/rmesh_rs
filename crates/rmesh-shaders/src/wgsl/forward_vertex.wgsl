@@ -28,7 +28,7 @@ struct VertexOutput {
     @location(2) plane_numerators: vec4<f32>,
     @location(3) plane_denominators: vec4<f32>,
     @location(4) ray_dir: vec3<f32>,
-    @location(5) @interpolate(flat) dc_dt: f32,
+    @location(5) dc_dt: f32,
 };
 
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
@@ -93,7 +93,12 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
     let world_pos = verts[face_vert_idx];
 
     let cam = uniforms.cam_pos_pad.xyz;
-    let ray_dir = normalize(world_pos - cam);
+    // IMPORTANT: Do NOT normalize here. Perspective interpolation of unnormalized
+    // (world_pos - cam) gives exact (p - cam) at each fragment, so the fragment
+    // shader's division by d = length(ray_dir) yields the true normalized direction.
+    // Normalizing here would introduce interpolation error (weighted sum of unit
+    // vectors ≠ unit vector in the correct direction).
+    let ray_dir = world_pos - cam;
 
     // Density
     out.tet_density = densities[tet_id];

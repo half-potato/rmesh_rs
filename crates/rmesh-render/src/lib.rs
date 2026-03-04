@@ -90,6 +90,7 @@ impl SceneBuffers {
         });
 
         let m = scene.tet_count as u64;
+        let n_pow2 = (scene.tet_count as u64).next_power_of_two();
 
         let colors = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("colors"),
@@ -98,16 +99,17 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        // Sort buffers padded to next power of 2 for correct bitonic sort.
         let sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_keys"),
-            size: m * 4,
+            size: n_pow2 * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
 
         let sort_values = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_values"),
-            size: m * 4,
+            size: n_pow2 * 4,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -117,7 +119,8 @@ impl SceneBuffers {
             size: 16, // DrawIndirectCommand = 4 x u32
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::INDIRECT
-                | wgpu::BufferUsages::COPY_DST,
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -280,7 +283,7 @@ impl ForwardPipelines {
                     topology: wgpu::PrimitiveTopology::TriangleList,
                     strip_index_format: None,
                     front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None, // Tet faces face both ways
+                    cull_mode: Some(wgpu::Face::Back), // Only front-facing → 1 fragment per pixel
                     unclipped_depth: false,
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
@@ -735,8 +738,9 @@ impl SortState {
             let mut j = k >> 1;
             while j > 0 {
                 let step_bit = (j as f32).log2() as u32;
+                // Use n_pow2 as count so ALL comparisons happen in valid memory.
                 pairs.push(SortUniforms {
-                    count: tet_count,
+                    count: n_pow2,
                     stage,
                     step_size: step_bit,
                     _pad: 0,
@@ -780,7 +784,8 @@ impl SortState {
             })
             .collect();
 
-        let dispatch_x = (tet_count + 255) / 256;
+        // Dispatch for n_pow2 elements (padded buffers).
+        let dispatch_x = (n_pow2 + 255) / 256;
 
         Self {
             uniform_buffer,
@@ -835,8 +840,11 @@ pub fn record_forward_pass(
         cpass.set_pipeline(&pipelines.compute_pipeline);
         cpass.set_bind_group(0, compute_bg, &[]);
 
+        // Dispatch for n_pow2 threads: tet_count threads do real work,
+        // padding threads (tet_count..n_pow2-1) initialize sort buffers.
         let workgroup_size = 64u32;
-        let total_workgroups = (tet_count + workgroup_size - 1) / workgroup_size;
+        let n_pow2 = tet_count.next_power_of_two();
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
         let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;

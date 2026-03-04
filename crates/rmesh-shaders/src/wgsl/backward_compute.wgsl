@@ -100,18 +100,8 @@ fn load_f32x3_g(idx: u32) -> vec3<f32> {
     return vec3<f32>(color_grads_buf[idx * 3u], color_grads_buf[idx * 3u + 1u], color_grads_buf[idx * 3u + 2u]);
 }
 
-// Atomic float add via compare-and-swap
-fn atomic_add_f32(dst: ptr<storage, atomic<u32>, read_write>, val: f32) {
-    var old_bits = atomicLoad(dst);
-    loop {
-        let old_val = bitcast<f32>(old_bits);
-        let new_val = old_val + val;
-        let new_bits = bitcast<u32>(new_val);
-        let result = atomicCompareExchangeWeak(dst, old_bits, new_bits);
-        if (result.exchanged) { break; }
-        old_bits = result.old_value;
-    }
-}
+// Atomic float add via compare-and-swap — inlined at call sites
+// (naga does not allow ptr<storage, atomic<u32>, read_write> as function arguments)
 
 fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
     let x = dir.x; let y = dir.y; let z = dir.z;
@@ -175,7 +165,14 @@ fn scatter_sh_grads(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, sh_b
     for (var c = 0u; c < 3u; c++) {
         for (var k = 0u; k < n_basis; k++) {
             let idx = sh_base + c * nc + k;
-            atomic_add_f32(&d_sh_coeffs[idx], d_channels[c] * basis[k]);
+            let add_val = d_channels[c] * basis[k];
+            var ob = atomicLoad(&d_sh_coeffs[idx]);
+            loop {
+                let nv = bitcast<u32>(bitcast<f32>(ob) + add_val);
+                let r = atomicCompareExchangeWeak(&d_sh_coeffs[idx], ob, nv);
+                if (r.exchanged) { break; }
+                ob = r.old_value;
+            }
         }
     }
 }
@@ -211,7 +208,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // 3. Compute ray from pixel coordinates via inverse VP
     let ndc_x = (2.0 * (f32(px) + 0.5) / uniforms.screen_width) - 1.0;
-    let ndc_y = (2.0 * (f32(py) + 0.5) / uniforms.screen_height) - 1.0;
+    // wgpu framebuffer y=0 is top, but NDC y=+1 is top → flip
+    let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / uniforms.screen_height);
 
     let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
     let near_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
@@ -429,15 +427,42 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let vert_indices = array<u32, 4>(ti0, ti1, ti2, ti3);
         for (var vi = 0u; vi < 4u; vi++) {
             let vidx = vert_indices[vi];
-            atomic_add_f32(&d_vertices[vidx * 3u], d_vert_i[vi].x);
-            atomic_add_f32(&d_vertices[vidx * 3u + 1u], d_vert_i[vi].y);
-            atomic_add_f32(&d_vertices[vidx * 3u + 2u], d_vert_i[vi].z);
+            let dv = d_vert_i[vi];
+            for (var ax = 0u; ax < 3u; ax++) {
+                let comp = select(select(dv.z, dv.y, ax == 1u), dv.x, ax == 0u);
+                let gi = vidx * 3u + ax;
+                var ob_v = atomicLoad(&d_vertices[gi]);
+                loop {
+                    let nv_v = bitcast<u32>(bitcast<f32>(ob_v) + comp);
+                    let r_v = atomicCompareExchangeWeak(&d_vertices[gi], ob_v, nv_v);
+                    if (r_v.exchanged) { break; }
+                    ob_v = r_v.old_value;
+                }
+            }
         }
 
-        atomic_add_f32(&d_densities[tet_id], d_density_local);
-        atomic_add_f32(&d_color_grads[tet_id * 3u], d_grad.x);
-        atomic_add_f32(&d_color_grads[tet_id * 3u + 1u], d_grad.y);
-        atomic_add_f32(&d_color_grads[tet_id * 3u + 2u], d_grad.z);
+        {
+            var ob_d = atomicLoad(&d_densities[tet_id]);
+            loop {
+                let nv_d = bitcast<u32>(bitcast<f32>(ob_d) + d_density_local);
+                let r_d = atomicCompareExchangeWeak(&d_densities[tet_id], ob_d, nv_d);
+                if (r_d.exchanged) { break; }
+                ob_d = r_d.old_value;
+            }
+        }
+
+        let dg = d_grad;
+        for (var gi2 = 0u; gi2 < 3u; gi2++) {
+            let gc = select(select(dg.z, dg.y, gi2 == 1u), dg.x, gi2 == 0u);
+            let gidx = tet_id * 3u + gi2;
+            var ob_g = atomicLoad(&d_color_grads[gidx]);
+            loop {
+                let nv_g = bitcast<u32>(bitcast<f32>(ob_g) + gc);
+                let r_g = atomicCompareExchangeWeak(&d_color_grads[gidx], ob_g, nv_g);
+                if (r_g.exchanged) { break; }
+                ob_g = r_g.old_value;
+            }
+        }
 
         // 4n. Update pixel state for next iteration
         color = prev_color;
