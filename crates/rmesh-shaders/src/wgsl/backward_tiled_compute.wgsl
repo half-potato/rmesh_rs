@@ -1,8 +1,17 @@
-// Tiled backward compute shader: gradient computation using tile-sorted tet lists.
+// Forward-order tiled backward compute shader with shared-memory gradient accumulation.
+//
+// Phase 1: Iterates nearest -> furthest (forward compositing order).
+//   Uses closed-form d_log_t = d_log_t_final + dot(d_color, color_final - color_after),
+//   eliminating sequential d_log_t state tracking and the "undo" step.
+//
+// Phase 2: Per-batch shared-memory gradient accumulators.
+//   Each batch of BATCH_SIZE tets accumulates gradients in workgroup memory,
+//   then flushes to global with one atomic add per entry per tile.
+//   Reduces global atomic operations by ~Nx (N = avg pixel hits per tet per tile).
 //
 // One workgroup per tile (16x16 pixels). Each thread = one pixel.
-// Tets are processed in batches of BATCH_SIZE with shared memory cooperative loading.
-// Iterates furthest → nearest (same as non-tiled backward), then undoes pixel state.
+// Sort order: range_start = furthest, range_end = nearest.
+// Forward compositing: nearest first = range_end-1 down to range_start.
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -59,7 +68,16 @@ struct TileUniforms {
 @group(1) @binding(5) var<storage, read> tile_uniforms: TileUniforms;
 
 const TINY_VAL: f32 = 1e-20;
-const BATCH_SIZE: u32 = 256u;
+const BATCH_SIZE: u32 = 32u;
+const MAX_GRAD_PER_TET: u32 = 64u;
+const GRAD_BUF_SIZE: u32 = 2048u; // BATCH_SIZE * MAX_GRAD_PER_TET
+const WG_SIZE: u32 = 256u;
+
+// Gradient layout per tet (within MAX_GRAD_PER_TET block):
+//   [0]:       density
+//   [1..12]:   vertex gradients (4 verts x 3 axes)
+//   [13..15]:  color gradient gradients (3 axes)
+//   [16..63]:  SH coefficient gradients (up to 3 channels x 16 basis)
 
 // SH Constants
 const C0: f32 = 0.28209479177387814;
@@ -97,7 +115,8 @@ struct TetData {
     grad_z: f32,
 };
 
-var<workgroup> shared_tets: array<TetData, 256>;
+var<workgroup> shared_tets: array<TetData, 32>;
+var<workgroup> wg_grads: array<atomic<u32>, 2048>;
 
 fn phi(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
@@ -152,7 +171,19 @@ fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
     return val;
 }
 
-fn scatter_sh_grads(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, sh_base: u32, nc: u32) {
+// Atomic f32 add on workgroup memory
+fn wg_add_f32(idx: u32, val: f32) {
+    var ob = atomicLoad(&wg_grads[idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&wg_grads[idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
+    }
+}
+
+// Scatter SH gradients to workgroup shared memory
+fn scatter_sh_grads_wg(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, bi: u32, nc: u32) {
     let x = dir.x; let y = dir.y; let z = dir.z;
     var basis: array<f32, 16>;
     basis[0] = C0;
@@ -183,17 +214,49 @@ fn scatter_sh_grads(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, sh_b
         }
     }
     let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
+    let base_offset = bi * MAX_GRAD_PER_TET + 16u;
     for (var c = 0u; c < 3u; c++) {
         for (var k = 0u; k < n_basis; k++) {
-            let idx = sh_base + c * nc + k;
             let add_val = d_channels[c] * basis[k];
-            var ob = atomicLoad(&d_sh_coeffs[idx]);
-            loop {
-                let nv = bitcast<u32>(bitcast<f32>(ob) + add_val);
-                let r = atomicCompareExchangeWeak(&d_sh_coeffs[idx], ob, nv);
-                if (r.exchanged) { break; }
-                ob = r.old_value;
-            }
+            wg_add_f32(base_offset + c * nc + k, add_val);
+        }
+    }
+}
+
+// Atomic f32 add on global storage buffer (generic CAS pattern)
+fn global_cas_add(buf_idx: u32, val: f32, buf_type: u32) {
+    // buf_type: 0=d_densities, 1=d_vertices, 2=d_color_grads, 3=d_sh_coeffs
+    if (buf_type == 0u) {
+        var ob = atomicLoad(&d_densities[buf_idx]);
+        loop {
+            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+            let r = atomicCompareExchangeWeak(&d_densities[buf_idx], ob, nv);
+            if (r.exchanged) { break; }
+            ob = r.old_value;
+        }
+    } else if (buf_type == 1u) {
+        var ob = atomicLoad(&d_vertices[buf_idx]);
+        loop {
+            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+            let r = atomicCompareExchangeWeak(&d_vertices[buf_idx], ob, nv);
+            if (r.exchanged) { break; }
+            ob = r.old_value;
+        }
+    } else if (buf_type == 2u) {
+        var ob = atomicLoad(&d_color_grads[buf_idx]);
+        loop {
+            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+            let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
+            if (r.exchanged) { break; }
+            ob = r.old_value;
+        }
+    } else {
+        var ob = atomicLoad(&d_sh_coeffs[buf_idx]);
+        loop {
+            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+            let r = atomicCompareExchangeWeak(&d_sh_coeffs[buf_idx], ob, nv);
+            if (r.exchanged) { break; }
+            ob = r.old_value;
         }
     }
 }
@@ -226,31 +289,30 @@ fn main(
 
     let valid_pixel = (px < w) && (py < h);
 
-    // Load final pixel state
+    // Load per-pixel constants (invariant across all tets)
     let pixel_idx = py * w + px;
 
-    var color = vec3<f32>(0.0);
-    var log_t = 0.0;
     var d_color = vec3<f32>(0.0);
-    var d_log_t: f32 = 0.0;
+    var d_log_t_final: f32 = 0.0;
+    var color_final = vec3<f32>(0.0);
 
     if (valid_pixel) {
-        let final_r = rendered_image[pixel_idx * 4u];
-        let final_g = rendered_image[pixel_idx * 4u + 1u];
-        let final_b = rendered_image[pixel_idx * 4u + 2u];
-        let final_a = rendered_image[pixel_idx * 4u + 3u];
-
-        color = vec3<f32>(final_r, final_g, final_b);
-        let transmittance = max(1.0 - final_a, TINY_VAL);
-        log_t = log(transmittance);
-
         d_color = vec3<f32>(
             dl_d_image[pixel_idx * 4u],
             dl_d_image[pixel_idx * 4u + 1u],
             dl_d_image[pixel_idx * 4u + 2u],
         );
-        d_log_t = dl_d_image[pixel_idx * 4u + 3u];
+        d_log_t_final = dl_d_image[pixel_idx * 4u + 3u];
+        color_final = vec3<f32>(
+            rendered_image[pixel_idx * 4u],
+            rendered_image[pixel_idx * 4u + 1u],
+            rendered_image[pixel_idx * 4u + 2u],
+        );
     }
+
+    // Forward state: starts at initial (no compositing yet)
+    var color_accum = vec3<f32>(0.0);
+    var log_t: f32 = 0.0;
 
     // Compute ray from pixel coordinates via inverse VP
     let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
@@ -269,17 +331,24 @@ fn main(
     let sh_stride = num_coeffs * 3u;
     let nc = num_coeffs;
 
-    let tet_count_in_tile = range_end - range_start;
+    // Process batches: nearest -> furthest (forward compositing order)
+    // Sort order: range_start = furthest, range_end-1 = nearest
+    // We iterate from the end backward, taking batches from the nearest side first.
+    var cursor = range_end;
 
-    // Process tets in batches: furthest → nearest (same order as non-tiled)
-    var batch_start = range_start;
-    while (batch_start < range_end) {
-        let batch_end = min(batch_start + BATCH_SIZE, range_end);
-        let batch_count = batch_end - batch_start;
+    while (cursor > range_start) {
+        let remaining = cursor - range_start;
+        let batch_count = min(remaining, BATCH_SIZE);
+        let batch_begin = cursor - batch_count;
 
-        // Cooperative load: each of 256 threads loads one tet's metadata
+        // === Zero shared gradients + cooperative load ===
+        // Zero wg_grads: 2048 entries, 256 threads -> 8 per thread
+        for (var z = local_idx; z < GRAD_BUF_SIZE; z += WG_SIZE) {
+            atomicStore(&wg_grads[z], 0u);
+        }
+        // Cooperative load: each of first batch_count threads loads one tet
         if (local_idx < batch_count) {
-            let sort_idx = batch_start + local_idx;
+            let sort_idx = batch_begin + local_idx;
             let tet_id = tile_sort_values[sort_idx];
 
             shared_tets[local_idx].tet_id = tet_id;
@@ -294,9 +363,13 @@ fn main(
 
         workgroupBarrier();
 
-        // Per-pixel loop over batch
+        // === Per-pixel processing (nearest to furthest within batch) ===
+        // shared_tets[0] = furthest in batch, shared_tets[batch_count-1] = nearest
+        // Iterate from batch_count-1 down to 0 for front-to-back compositing order
         if (valid_pixel) {
-            for (var bi = 0u; bi < batch_count; bi++) {
+            for (var bi_rev = 0u; bi_rev < batch_count; bi_rev++) {
+                let bi = batch_count - 1u - bi_rev;
+
                 let tet_id = shared_tets[bi].tet_id;
                 let density_raw = shared_tets[bi].density_raw;
                 let colors_tet = vec3<f32>(shared_tets[bi].color_r, shared_tets[bi].color_g, shared_tets[bi].color_b);
@@ -366,18 +439,21 @@ fn main(
                 let w1 = 1.0 - phi_val;
                 let c_premul = c_end * w0 + c_start * w1;
 
-                // Undo pixel state
-                let prev_log_t = log_t + od;
-                let t_prev = exp(prev_log_t);
-                let prev_color = color - c_premul * t_prev;
+                // Forward state: transmittance at this tet's position
+                let T_j = exp(log_t);
 
-                // Backward: pixel state
-                let d_c_premul = d_color * t_prev;
-                let d_od_state = -d_log_t;
-                let d_old_color = d_color;
-                let d_old_log_t = d_log_t + dot(d_color, c_premul) * t_prev;
+                // Forward state update
+                let color_after = color_accum + c_premul * T_j;
+                let log_t_after = log_t - od;
 
-                // Backward: compute_integral
+                // Closed-form d_log_t: no sequential state tracking needed
+                let d_log_t_j = d_log_t_final + dot(d_color, color_final - color_after);
+
+                // Gradient computation (same math as original, using closed-form d_log_t_j)
+                let d_c_premul = d_color * T_j;
+                let d_od_state = -d_log_t_j;
+
+                // Backward through compute_integral
                 let dphi_val = dphi_dx(od);
                 let dw0_dod = dphi_val + alpha_t;
                 let dw1_dod = -dphi_val;
@@ -394,7 +470,7 @@ fn main(
                 var d_t_min = -d_dist;
                 var d_t_max = d_dist;
 
-                // Backward: color chain
+                // Backward: color chain (through ReLU clamp)
                 let d_c_start_raw = vec3<f32>(
                     select(0.0, d_c_start_integral.x, c_start_raw.x > 0.0),
                     select(0.0, d_c_start_integral.y, c_start_raw.y > 0.0),
@@ -447,8 +523,8 @@ fn main(
                 let d_v0_from_offset = grad * d_offset_scalar * 0.75;
                 let d_vother_from_offset = -grad * d_offset_scalar * 0.25;
 
-                // SH gradients
-                scatter_sh_grads(sh_dir, uniforms.sh_degree, d_sh_result, sh_base, nc);
+                // SH gradients -> shared memory
+                scatter_sh_grads_wg(sh_dir, uniforms.sh_degree, d_sh_result, bi, nc);
 
                 // Intersection gradients
                 var d_vert_i: array<vec3<f32>, 4>;
@@ -487,61 +563,80 @@ fn main(
                     d_vert_i[f[2]] += dt_dvc * d_t_max;
                 }
 
-                // Combine vertex gradients and scatter
+                // Combine vertex gradients
                 d_vert_i[0] += d_v0_from_base + d_v0_from_offset;
                 d_vert_i[1] += d_vother_from_offset;
                 d_vert_i[2] += d_vother_from_offset;
                 d_vert_i[3] += d_vother_from_offset;
 
-                let vert_indices = array<u32, 4>(ti0, ti1, ti2, ti3);
+                // Scatter all gradients to shared memory
+                let grad_base = bi * MAX_GRAD_PER_TET;
+
+                // Density
+                wg_add_f32(grad_base, d_density_local);
+
+                // Vertices (4 verts x 3 axes)
                 for (var vi = 0u; vi < 4u; vi++) {
-                    let vidx = vert_indices[vi];
                     let dv = d_vert_i[vi];
-                    for (var ax = 0u; ax < 3u; ax++) {
-                        let comp = select(select(dv.z, dv.y, ax == 1u), dv.x, ax == 0u);
-                        let gi = vidx * 3u + ax;
-                        var ob_v = atomicLoad(&d_vertices[gi]);
-                        loop {
-                            let nv_v = bitcast<u32>(bitcast<f32>(ob_v) + comp);
-                            let r_v = atomicCompareExchangeWeak(&d_vertices[gi], ob_v, nv_v);
-                            if (r_v.exchanged) { break; }
-                            ob_v = r_v.old_value;
-                        }
-                    }
+                    wg_add_f32(grad_base + 1u + vi * 3u, dv.x);
+                    wg_add_f32(grad_base + 1u + vi * 3u + 1u, dv.y);
+                    wg_add_f32(grad_base + 1u + vi * 3u + 2u, dv.z);
                 }
 
-                {
-                    var ob_d = atomicLoad(&d_densities[tet_id]);
-                    loop {
-                        let nv_d = bitcast<u32>(bitcast<f32>(ob_d) + d_density_local);
-                        let r_d = atomicCompareExchangeWeak(&d_densities[tet_id], ob_d, nv_d);
-                        if (r_d.exchanged) { break; }
-                        ob_d = r_d.old_value;
-                    }
-                }
+                // Color gradients (3 axes)
+                wg_add_f32(grad_base + 13u, d_grad.x);
+                wg_add_f32(grad_base + 14u, d_grad.y);
+                wg_add_f32(grad_base + 15u, d_grad.z);
 
-                let dg = d_grad;
-                for (var gi2 = 0u; gi2 < 3u; gi2++) {
-                    let gc = select(select(dg.z, dg.y, gi2 == 1u), dg.x, gi2 == 0u);
-                    let gidx = tet_id * 3u + gi2;
-                    var ob_g = atomicLoad(&d_color_grads[gidx]);
-                    loop {
-                        let nv_g = bitcast<u32>(bitcast<f32>(ob_g) + gc);
-                        let r_g = atomicCompareExchangeWeak(&d_color_grads[gidx], ob_g, nv_g);
-                        if (r_g.exchanged) { break; }
-                        ob_g = r_g.old_value;
-                    }
-                }
-
-                // Update pixel state for next iteration
-                color = prev_color;
-                log_t = prev_log_t;
-                d_color = d_old_color;
-                d_log_t = d_old_log_t;
+                // Update forward state
+                color_accum = color_after;
+                log_t = log_t_after;
             } // end per-tet loop
         } // end valid_pixel
 
         workgroupBarrier();
-        batch_start = batch_end;
+
+        // === Flush shared gradients to global buffers ===
+        // Distribute flush work across all 256 threads
+        let num_entries_per_tet = 16u + sh_stride;
+        let total_flush_entries = batch_count * num_entries_per_tet;
+
+        for (var flush_idx = local_idx; flush_idx < total_flush_entries; flush_idx += WG_SIZE) {
+            let bi = flush_idx / num_entries_per_tet;
+            let entry = flush_idx % num_entries_per_tet;
+            let tet_id_flush = shared_tets[bi].tet_id;
+
+            // Map entry index to wg_grads offset
+            let wg_offset = bi * MAX_GRAD_PER_TET + entry;
+            let val = bitcast<f32>(atomicLoad(&wg_grads[wg_offset]));
+
+            // Skip zero entries (common for missed ray-tet intersections)
+            if (val == 0.0) { continue; }
+
+            if (entry == 0u) {
+                // Density gradient
+                global_cas_add(tet_id_flush, val, 0u);
+            } else if (entry < 13u) {
+                // Vertex gradients: entry 1..12 -> vi = (entry-1)/3, ax = (entry-1)%3
+                let vi = (entry - 1u) / 3u;
+                let ax = (entry - 1u) % 3u;
+                let vidx = indices[tet_id_flush * 4u + vi];
+                let gi = vidx * 3u + ax;
+                global_cas_add(gi, val, 1u);
+            } else if (entry < 16u) {
+                // Color gradient gradients: entry 13..15 -> c = entry - 13
+                let c = entry - 13u;
+                let gidx = tet_id_flush * 3u + c;
+                global_cas_add(gidx, val, 2u);
+            } else {
+                // SH coefficient gradients: entry 16.. -> sh_offset = entry - 16
+                let sh_offset = entry - 16u;
+                let sh_global_idx = tet_id_flush * sh_stride + sh_offset;
+                global_cas_add(sh_global_idx, val, 3u);
+            }
+        }
+
+        workgroupBarrier();
+        cursor = batch_begin;
     } // end batch loop
 }
