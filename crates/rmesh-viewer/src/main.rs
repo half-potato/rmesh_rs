@@ -156,11 +156,10 @@ impl App {
                 .request_device(
                     &wgpu::DeviceDescriptor {
                         label: Some("rmesh device"),
-                        required_features: wgpu::Features::empty(),
+                        required_features: wgpu::Features::SUBGROUP,
                         required_limits: wgpu::Limits::default(),
                         ..Default::default()
                     },
-                    None,
                 )
                 .await
                 .expect("Failed to create device");
@@ -307,6 +306,7 @@ impl App {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 ..Default::default()

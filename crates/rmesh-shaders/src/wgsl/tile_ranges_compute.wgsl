@@ -38,14 +38,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         return;
     }
 
-    let tile_id = key >> 17u;
+    let tile_id = key >> 15u;
 
     // Check if this is the start of a new tile
     if (idx == 0u) {
         tile_ranges[tile_id * 2u] = idx;
     } else {
         let prev_key = tile_sort_keys[idx - 1u];
-        let prev_tile = prev_key >> 17u;
+        let prev_tile = prev_key >> 15u;
         if (tile_id != prev_tile) {
             // Start of new tile
             tile_ranges[tile_id * 2u] = idx;

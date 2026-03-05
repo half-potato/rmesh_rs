@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.dependencies]
-wgpu = "24"
+wgpu = "28"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.32", features = ["bytemuck"] }

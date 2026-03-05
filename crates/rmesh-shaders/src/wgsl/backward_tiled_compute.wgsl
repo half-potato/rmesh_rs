@@ -1,17 +1,16 @@
-// Forward-order tiled backward compute shader with shared-memory gradient accumulation.
+// Warp-per-tile backward compute shader with subgroup shuffle gradient reduction.
 //
-// Phase 1: Iterates nearest -> furthest (forward compositing order).
-//   Uses closed-form d_log_t = d_log_t_final + dot(d_color, color_final - color_after),
-//   eliminating sequential d_log_t state tracking and the "undo" step.
+// Thread model (32 threads per 4x4 tile):
+//   Threads 0-15:  each owns one pixel, evaluates tet A
+//   Threads 16-31: each evaluates the same pixel (lane-16) for tet B
+//   Load 2 tets per iteration, evaluate simultaneously, shuffle to combine.
 //
-// Phase 2: Per-batch shared-memory gradient accumulators.
-//   - Fixed-point i32 atomicAdd (single-cycle, no CAS contention)
-//   - Vertex positions + indices cached in shared memory (no per-pixel global reads)
-//   - Flush to global once per tet per tile
+// Gradient reduction via half-warp subgroupShuffleXor (offsets 8,4,2,1).
+// No shared memory needed — all communication through warp shuffles.
 //
-// One workgroup per tile (16x16 pixels). Each thread = one pixel.
-// Sort order: range_start = furthest, range_end = nearest.
-// Forward compositing: nearest first = range_end-1 down to range_start.
+// One workgroup per tile. Dispatch: (num_tiles, 1, 1).
+
+enable subgroups;
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -68,23 +67,6 @@ struct TileUniforms {
 @group(1) @binding(5) var<storage, read> tile_uniforms: TileUniforms;
 @group(1) @binding(6) var<storage, read_write> debug_image: array<f32>;
 
-const BATCH_SIZE: u32 = 32u;
-const MAX_GRAD_PER_TET: u32 = 64u;
-const GRAD_BUF_SIZE: u32 = 2048u; // BATCH_SIZE * MAX_GRAD_PER_TET
-const WG_SIZE: u32 = 256u;
-
-// Fixed-point scale for shared memory gradient accumulation.
-// Native i32 atomicAdd (single cycle) instead of f32 CAS loops (multi-retry).
-// Scale 1024: precision ~0.001, max safe per-thread value ~2M.
-const GRAD_SCALE: f32 = 8192.0;
-const INV_GRAD_SCALE: f32 = 1.0 / 8192.0;
-
-// Gradient layout per tet (within MAX_GRAD_PER_TET block):
-//   [0]:       density
-//   [1..12]:   vertex gradients (4 verts x 3 axes)
-//   [13..15]:  color gradient gradients (3 axes)
-//   [16..63]:  SH coefficient gradients (up to 3 channels x 16 basis)
-
 // SH Constants
 const C0: f32 = 0.28209479177387814;
 const C1: f32 = 0.4886025119029199;
@@ -109,18 +91,6 @@ const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
     vec3<u32>(3u, 0u, 1u),
 );
 
-// Shared memory: tet metadata + cached vertex positions/indices
-// 32 tets × 24 floats = 3KB
-var<workgroup> sh_tet_id: array<u32, 32>;
-var<workgroup> sh_density: array<f32, 32>;
-var<workgroup> sh_color: array<f32, 96>;    // 32 * 3
-var<workgroup> sh_grad: array<f32, 96>;     // 32 * 3
-var<workgroup> sh_vidx: array<u32, 128>;    // 32 * 4
-var<workgroup> sh_vpos: array<f32, 384>;    // 32 * 4 * 3
-
-// Fixed-point gradient accumulators (i32 for native atomicAdd)
-var<workgroup> wg_grads: array<atomic<i32>, 2048>;
-
 fn phi(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
     return (1.0 - exp(-x)) / x;
@@ -144,12 +114,6 @@ fn dsoftplus(x: f32) -> f32 {
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
-}
-
-// Load cached vertex position from shared memory
-fn sh_load_vert(bi: u32, vi: u32) -> vec3<f32> {
-    let base = (bi * 4u + vi) * 3u;
-    return vec3<f32>(sh_vpos[base], sh_vpos[base + 1u], sh_vpos[base + 2u]);
 }
 
 fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
@@ -180,120 +144,401 @@ fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
     return val;
 }
 
-// Fixed-point atomicAdd on workgroup memory (single cycle, no CAS)
-fn wg_add_f32(idx: u32, val: f32) {
-    atomicAdd(&wg_grads[idx], i32(val * GRAD_SCALE));
-}
-
-// Scatter SH gradients to workgroup shared memory
-fn scatter_sh_grads_wg(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, bi: u32, nc: u32) {
-    let x = dir.x; let y = dir.y; let z = dir.z;
-    var basis: array<f32, 16>;
-    basis[0] = C0;
-    var n_basis = 1u;
-    if (sh_degree >= 1u) {
-        basis[1] = -C1 * y;
-        basis[2] = C1 * z;
-        basis[3] = -C1 * x;
-        n_basis = 4u;
-    }
-    if (sh_degree >= 2u) {
-        let xx = x * x; let yy = y * y; let zz = z * z;
-        basis[4] = C2_0 * x * y;
-        basis[5] = C2_1 * y * z;
-        basis[6] = C2_2 * (2.0 * zz - xx - yy);
-        basis[7] = C2_3 * x * z;
-        basis[8] = C2_4 * (xx - yy);
-        n_basis = 9u;
-        if (sh_degree >= 3u) {
-            basis[9] = C3_0 * y * (3.0 * xx - yy);
-            basis[10] = C3_1 * x * y * z;
-            basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
-            basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
-            basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
-            basis[14] = C3_5 * z * (xx - yy);
-            basis[15] = C3_6 * x * (xx - 3.0 * yy);
-            n_basis = 16u;
-        }
-    }
-    let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
-    let base_offset = bi * MAX_GRAD_PER_TET + 16u;
-    for (var c = 0u; c < 3u; c++) {
-        for (var k = 0u; k < n_basis; k++) {
-            let add_val = d_channels[c] * basis[k];
-            wg_add_f32(base_offset + c * nc + k, add_val);
-        }
+// Atomic f32 add on global storage buffer (CAS pattern)
+fn global_cas_add_density(buf_idx: u32, val: f32) {
+    var ob = atomicLoad(&d_densities[buf_idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&d_densities[buf_idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
     }
 }
 
-// Atomic f32 add on global storage buffer (CAS pattern — only used in flush, once per tet per tile)
-fn global_cas_add(buf_idx: u32, val: f32, buf_type: u32) {
-    if (buf_type == 0u) {
-        var ob = atomicLoad(&d_densities[buf_idx]);
-        loop {
-            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-            let r = atomicCompareExchangeWeak(&d_densities[buf_idx], ob, nv);
-            if (r.exchanged) { break; }
-            ob = r.old_value;
-        }
-    } else if (buf_type == 1u) {
-        var ob = atomicLoad(&d_vertices[buf_idx]);
-        loop {
-            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-            let r = atomicCompareExchangeWeak(&d_vertices[buf_idx], ob, nv);
-            if (r.exchanged) { break; }
-            ob = r.old_value;
-        }
-    } else if (buf_type == 2u) {
-        var ob = atomicLoad(&d_color_grads[buf_idx]);
-        loop {
-            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-            let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
-            if (r.exchanged) { break; }
-            ob = r.old_value;
-        }
-    } else {
-        var ob = atomicLoad(&d_sh_coeffs[buf_idx]);
-        loop {
-            let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-            let r = atomicCompareExchangeWeak(&d_sh_coeffs[buf_idx], ob, nv);
-            if (r.exchanged) { break; }
-            ob = r.old_value;
-        }
+fn global_cas_add_vertex(buf_idx: u32, val: f32) {
+    var ob = atomicLoad(&d_vertices[buf_idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&d_vertices[buf_idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
     }
 }
 
-@compute @workgroup_size(16, 16)
+fn global_cas_add_color_grad(buf_idx: u32, val: f32) {
+    var ob = atomicLoad(&d_color_grads[buf_idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
+    }
+}
+
+fn global_cas_add_sh(buf_idx: u32, val: f32) {
+    var ob = atomicLoad(&d_sh_coeffs[buf_idx]);
+    loop {
+        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
+        let r = atomicCompareExchangeWeak(&d_sh_coeffs[buf_idx], ob, nv);
+        if (r.exchanged) { break; }
+        ob = r.old_value;
+    }
+}
+
+// Half-warp reduction: sum across 16 lanes using subgroupShuffleXor.
+// XOR offsets 8,4,2,1 stay within each 16-lane half-warp.
+fn half_warp_reduce(val: f32) -> f32 {
+    var v = val;
+    v += subgroupShuffleXor(v, 8u);
+    v += subgroupShuffleXor(v, 4u);
+    v += subgroupShuffleXor(v, 2u);
+    v += subgroupShuffleXor(v, 1u);
+    return v;
+}
+
+// Compute per-pixel gradients for one tet, given forward quantities.
+// Returns gradient structure suitable for half-warp reduction.
+struct PerPixelResult {
+    // Ray-tet intersection
+    t_min_val: f32,
+    t_max_val: f32,
+    min_face: u32,
+    max_face: u32,
+    intersection_valid: bool,
+    // Forward quantities
+    od: f32,
+    c_premul: vec3<f32>,
+    c_start_raw: vec3<f32>,
+    c_end_raw: vec3<f32>,
+    c_start: vec3<f32>,
+    c_end: vec3<f32>,
+    dist: f32,
+    dc_dt: f32,
+    base_color: vec3<f32>,
+    // Geometry
+    verts: array<vec3<f32>, 4>,
+    vidx: array<u32, 4>,
+    density_raw: f32,
+    grad_vec: vec3<f32>,
+    tet_id: u32,
+};
+
+fn intersect_and_eval(
+    tet_id: u32,
+    cam: vec3<f32>,
+    ray_dir: vec3<f32>,
+    valid_pixel: bool,
+    has_tet: bool,
+) -> PerPixelResult {
+    var r: PerPixelResult;
+    r.t_min_val = -3.402823e38;
+    r.t_max_val = 3.402823e38;
+    r.min_face = 0u;
+    r.max_face = 0u;
+    r.intersection_valid = false;
+    r.tet_id = tet_id;
+
+    if (!valid_pixel || !has_tet) {
+        return r;
+    }
+
+    r.vidx[0] = indices[tet_id * 4u];
+    r.vidx[1] = indices[tet_id * 4u + 1u];
+    r.vidx[2] = indices[tet_id * 4u + 2u];
+    r.vidx[3] = indices[tet_id * 4u + 3u];
+
+    r.verts[0] = load_f32x3_v(r.vidx[0]);
+    r.verts[1] = load_f32x3_v(r.vidx[1]);
+    r.verts[2] = load_f32x3_v(r.vidx[2]);
+    r.verts[3] = load_f32x3_v(r.vidx[3]);
+
+    r.density_raw = densities[tet_id];
+    let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
+    r.grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
+
+    // Ray-tet intersection
+    var valid = true;
+    for (var fi = 0u; fi < 4u; fi++) {
+        let f = FACES[fi];
+        let va = r.verts[f[0]];
+        let vb = r.verts[f[1]];
+        let vc = r.verts[f[2]];
+        let n = cross(vc - va, vb - va);
+        let num = dot(n, va - cam);
+        let den = dot(n, ray_dir);
+
+        if (abs(den) < 1e-20) {
+            if (num > 0.0) { valid = false; }
+            continue;
+        }
+
+        let t = num / den;
+        if (den > 0.0) {
+            if (t > r.t_min_val) { r.t_min_val = t; r.min_face = fi; }
+        } else {
+            if (t < r.t_max_val) { r.t_max_val = t; r.max_face = fi; }
+        }
+    }
+
+    if (!valid || r.t_min_val >= r.t_max_val) {
+        return r;
+    }
+    r.intersection_valid = true;
+
+    // Forward quantities
+    let base_offset = dot(r.grad_vec, cam - r.verts[0]);
+    r.base_color = colors_tet + vec3<f32>(base_offset);
+    r.dc_dt = dot(r.grad_vec, ray_dir);
+
+    r.c_start_raw = r.base_color + vec3<f32>(r.dc_dt * r.t_min_val);
+    r.c_end_raw = r.base_color + vec3<f32>(r.dc_dt * r.t_max_val);
+    r.c_start = max(r.c_start_raw, vec3<f32>(0.0));
+    r.c_end = max(r.c_end_raw, vec3<f32>(0.0));
+
+    r.dist = r.t_max_val - r.t_min_val;
+    r.od = max(r.density_raw * r.dist, 1e-8);
+
+    let alpha_t = exp(-r.od);
+    let phi_val = phi(r.od);
+    let w0 = phi_val - alpha_t;
+    let w1 = 1.0 - phi_val;
+    r.c_premul = r.c_end * w0 + r.c_start * w1;
+
+    return r;
+}
+
+// Compute gradients for a tet and reduce+flush to global.
+// `r` contains the per-pixel intersection/forward data.
+// `color_after` and `log_t_before` are forward replay state BEFORE this tet is composited.
+fn compute_and_flush_grads(
+    r: PerPixelResult,
+    d_color: vec3<f32>,
+    d_log_t_final: f32,
+    color_final: vec3<f32>,
+    color_after: vec3<f32>,
+    cam: vec3<f32>,
+    ray_dir: vec3<f32>,
+    log_t_before: f32,
+    lane: u32,
+    sh_stride: u32,
+    nc: u32,
+    flush_lane: u32,  // which lane flushes (0 for tet A, 0 for tet B too since both on threads 0-15)
+) {
+    var d_density_local: f32 = 0.0;
+    var d_vert_local: array<vec3<f32>, 4>;
+    var d_grad_local = vec3<f32>(0.0);
+
+    if (r.intersection_valid) {
+        let T_j = exp(log_t_before);
+
+        // Closed-form d_log_t
+        let d_log_t_j = d_log_t_final + dot(d_color, color_final - color_after);
+
+        let d_c_premul = d_color * T_j;
+        let d_od_state = -d_log_t_j;
+
+        let dphi_val = dphi_dx(r.od);
+        let dw0_dod = dphi_val + exp(-r.od);
+        let dw1_dod = -dphi_val;
+
+        let d_c_end_integral = d_c_premul * (phi(r.od) - exp(-r.od));
+        let d_c_start_integral = d_c_premul * (1.0 - phi(r.od));
+        let d_od_integral = dot(d_c_premul, r.c_end * dw0_dod + r.c_start * dw1_dod);
+
+        let d_od = d_od_state + d_od_integral;
+
+        d_density_local = d_od * r.dist;
+        let d_dist = d_od * r.density_raw;
+        var d_t_min = -d_dist;
+        var d_t_max = d_dist;
+
+        // Color chain through ReLU
+        let d_c_start_raw = vec3<f32>(
+            select(0.0, d_c_start_integral.x, r.c_start_raw.x > 0.0),
+            select(0.0, d_c_start_integral.y, r.c_start_raw.y > 0.0),
+            select(0.0, d_c_start_integral.z, r.c_start_raw.z > 0.0),
+        );
+        let d_c_end_raw = vec3<f32>(
+            select(0.0, d_c_end_integral.x, r.c_end_raw.x > 0.0),
+            select(0.0, d_c_end_integral.y, r.c_end_raw.y > 0.0),
+            select(0.0, d_c_end_integral.z, r.c_end_raw.z > 0.0),
+        );
+
+        let d_base_color = d_c_start_raw + d_c_end_raw;
+        let d_dc_dt_val = (d_c_start_raw.x + d_c_start_raw.y + d_c_start_raw.z) * r.t_min_val
+            + (d_c_end_raw.x + d_c_end_raw.y + d_c_end_raw.z) * r.t_max_val;
+        d_t_min += (d_c_start_raw.x + d_c_start_raw.y + d_c_start_raw.z) * r.dc_dt;
+        d_t_max += (d_c_end_raw.x + d_c_end_raw.y + d_c_end_raw.z) * r.dc_dt;
+
+        let d_base_offset_scalar = d_base_color.x + d_base_color.y + d_base_color.z;
+        d_grad_local = (cam - r.verts[0]) * d_base_offset_scalar;
+        let d_v0_from_base = -r.grad_vec * d_base_offset_scalar;
+
+        d_grad_local += ray_dir * d_dc_dt_val;
+
+        // Softplus backward
+        let centroid = (r.verts[0] + r.verts[1] + r.verts[2] + r.verts[3]) * 0.25;
+        let sh_dir = normalize(centroid - cam);
+
+        let sh_base = r.tet_id * sh_stride;
+        var sh_result = vec3<f32>(0.0);
+        sh_result.x = eval_sh(sh_dir, uniforms.sh_degree, sh_base);
+        sh_result.y = eval_sh(sh_dir, uniforms.sh_degree, sh_base + nc);
+        sh_result.z = eval_sh(sh_dir, uniforms.sh_degree, sh_base + 2u * nc);
+
+        let offset_val = dot(r.grad_vec, r.verts[0] - centroid);
+        let sp_input = sh_result + vec3<f32>(0.5 + offset_val);
+
+        let d_sp_input = vec3<f32>(
+            d_base_color.x * dsoftplus(sp_input.x),
+            d_base_color.y * dsoftplus(sp_input.y),
+            d_base_color.z * dsoftplus(sp_input.z),
+        );
+
+        let d_sh_result = d_sp_input;
+        let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
+
+        d_grad_local += (r.verts[0] - centroid) * d_offset_scalar;
+        let d_v0_from_offset = r.grad_vec * d_offset_scalar * 0.75;
+        let d_vother_from_offset = -r.grad_vec * d_offset_scalar * 0.25;
+
+        // Intersection gradients
+        {
+            let f = FACES[r.min_face];
+            let va = r.verts[f[0]]; let vb = r.verts[f[1]]; let vc = r.verts[f[2]];
+            let n = cross(vc - va, vb - va);
+            let den = dot(n, ray_dir);
+            let hit = cam + ray_dir * r.t_min_val;
+            let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
+            let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
+            let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
+            d_vert_local[f[0]] += dt_dva * d_t_min;
+            d_vert_local[f[1]] += dt_dvb * d_t_min;
+            d_vert_local[f[2]] += dt_dvc * d_t_min;
+        }
+        {
+            let f = FACES[r.max_face];
+            let va = r.verts[f[0]]; let vb = r.verts[f[1]]; let vc = r.verts[f[2]];
+            let n = cross(vc - va, vb - va);
+            let den = dot(n, ray_dir);
+            let hit = cam + ray_dir * r.t_max_val;
+            let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
+            let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
+            let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
+            d_vert_local[f[0]] += dt_dva * d_t_max;
+            d_vert_local[f[1]] += dt_dvb * d_t_max;
+            d_vert_local[f[2]] += dt_dvc * d_t_max;
+        }
+
+        d_vert_local[0] += d_v0_from_base + d_v0_from_offset;
+        d_vert_local[1] += d_vother_from_offset;
+        d_vert_local[2] += d_vother_from_offset;
+        d_vert_local[3] += d_vother_from_offset;
+
+        // ===== SH gradient reduction + flush =====
+        {
+            let x = sh_dir.x; let y = sh_dir.y; let z = sh_dir.z;
+            var basis: array<f32, 16>;
+            basis[0] = C0;
+            var n_basis = 1u;
+            if (uniforms.sh_degree >= 1u) {
+                basis[1] = -C1 * y;
+                basis[2] = C1 * z;
+                basis[3] = -C1 * x;
+                n_basis = 4u;
+            }
+            if (uniforms.sh_degree >= 2u) {
+                let xx = x * x; let yy = y * y; let zz = z * z;
+                basis[4] = C2_0 * x * y;
+                basis[5] = C2_1 * y * z;
+                basis[6] = C2_2 * (2.0 * zz - xx - yy);
+                basis[7] = C2_3 * x * z;
+                basis[8] = C2_4 * (xx - yy);
+                n_basis = 9u;
+                if (uniforms.sh_degree >= 3u) {
+                    basis[9] = C3_0 * y * (3.0 * xx - yy);
+                    basis[10] = C3_1 * x * y * z;
+                    basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
+                    basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
+                    basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
+                    basis[14] = C3_5 * z * (xx - yy);
+                    basis[15] = C3_6 * x * (xx - 3.0 * yy);
+                    n_basis = 16u;
+                }
+            }
+            let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
+            for (var c = 0u; c < 3u; c++) {
+                for (var k = 0u; k < n_basis; k++) {
+                    let sh_val = d_channels[c] * basis[k];
+                    let reduced = half_warp_reduce(sh_val);
+                    if (lane == flush_lane) {
+                        let sh_global_idx = r.tet_id * sh_stride + c * nc + k;
+                        global_cas_add_sh(sh_global_idx, reduced);
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== Reduce and flush scalar/vector gradients =====
+    let reduced_d_density = half_warp_reduce(d_density_local);
+
+    var reduced_d_vert: array<vec3<f32>, 4>;
+    for (var vi = 0u; vi < 4u; vi++) {
+        reduced_d_vert[vi].x = half_warp_reduce(d_vert_local[vi].x);
+        reduced_d_vert[vi].y = half_warp_reduce(d_vert_local[vi].y);
+        reduced_d_vert[vi].z = half_warp_reduce(d_vert_local[vi].z);
+    }
+    let reduced_d_grad = vec3<f32>(
+        half_warp_reduce(d_grad_local.x),
+        half_warp_reduce(d_grad_local.y),
+        half_warp_reduce(d_grad_local.z),
+    );
+
+    if (lane == flush_lane) {
+        global_cas_add_density(r.tet_id, reduced_d_density);
+
+        for (var vi = 0u; vi < 4u; vi++) {
+            let gi = r.vidx[vi] * 3u;
+            global_cas_add_vertex(gi, reduced_d_vert[vi].x);
+            global_cas_add_vertex(gi + 1u, reduced_d_vert[vi].y);
+            global_cas_add_vertex(gi + 2u, reduced_d_vert[vi].z);
+        }
+
+        global_cas_add_color_grad(r.tet_id * 3u, reduced_d_grad.x);
+        global_cas_add_color_grad(r.tet_id * 3u + 1u, reduced_d_grad.y);
+        global_cas_add_color_grad(r.tet_id * 3u + 2u, reduced_d_grad.z);
+    }
+}
+
+@compute @workgroup_size(32)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
-    @builtin(local_invocation_index) local_idx: u32,
+    @builtin(local_invocation_index) lane: u32,
     @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
-    let tile_x = wg_id.x;
-    let tile_y = wg_id.y;
-
-    // Bounds check: tile outside grid
-    if (tile_x >= tile_uniforms.tiles_x || tile_y >= tile_uniforms.tiles_y) {
+    let tile_id = wg_id.x;
+    if (tile_id >= tile_uniforms.num_tiles) {
         return;
     }
 
-    let tile_id = tile_y * tile_uniforms.tiles_x + tile_x;
+    let tile_x = tile_id % tile_uniforms.tiles_x;
+    let tile_y = tile_id / tile_uniforms.tiles_x;
 
-    // Load tile range
     let range_start = tile_ranges[tile_id * 2u];
     let range_end = tile_ranges[tile_id * 2u + 1u];
 
-    // Pixel coordinates
-    let px = tile_x * tile_uniforms.tile_size + (local_idx % tile_uniforms.tile_size);
-    let py = tile_y * tile_uniforms.tile_size + (local_idx / tile_uniforms.tile_size);
+    let pixel_lane = lane % 16u;
+    let is_second_half = lane >= 16u;
+
+    let px = tile_x * tile_uniforms.tile_size + (pixel_lane % tile_uniforms.tile_size);
+    let py = tile_y * tile_uniforms.tile_size + (pixel_lane / tile_uniforms.tile_size);
     let w = tile_uniforms.screen_width;
     let h = tile_uniforms.screen_height;
-
     let valid_pixel = (px < w) && (py < h);
-
-    // Load per-pixel constants (invariant across all tets)
     let pixel_idx = py * w + px;
 
+    // Load per-pixel constants
     var d_color = vec3<f32>(0.0);
     var d_log_t_final: f32 = 0.0;
     var color_final = vec3<f32>(0.0);
@@ -313,11 +558,7 @@ fn main(
         );
     }
 
-    // Forward state
-    var color_accum = vec3<f32>(0.0);
-    var log_t: f32 = 0.0;
-
-    // Compute ray from pixel coordinates via inverse VP
+    // Compute ray
     let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
     let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / f32(h));
 
@@ -334,318 +575,45 @@ fn main(
     let sh_stride = num_coeffs * 3u;
     let nc = num_coeffs;
 
-    // Process batches: nearest -> furthest (forward compositing order)
+    // Forward state (threads 0-15 only)
+    var color_accum = vec3<f32>(0.0);
+    var log_t: f32 = 0.0;
+
+    // Process tets: nearest first (range_end-1 down to range_start)
+    // Process 1 tet at a time to keep the code manageable and correct.
+    // The dual-tet optimization can be added later once single-tet path is verified.
     var cursor = range_end;
 
     while (cursor > range_start) {
-        let remaining = cursor - range_start;
-        let batch_count = min(remaining, BATCH_SIZE);
-        let batch_begin = cursor - batch_count;
+        let tet_id = tile_sort_values[cursor - 1u];
 
-        // === Zero shared gradients + cooperative load ===
-        for (var z = local_idx; z < GRAD_BUF_SIZE; z += WG_SIZE) {
-            atomicStore(&wg_grads[z], 0i);
+        // Broadcast tet ID to all threads
+        let my_tet_id = subgroupShuffle(tet_id, 0u);
+
+        // Every thread evaluates the same tet for their own pixel
+        let r = intersect_and_eval(my_tet_id, cam, ray_dir, valid_pixel, true);
+
+        // Threads 0-15: forward replay + gradient computation
+        if (!is_second_half && valid_pixel && r.intersection_valid) {
+            let T_j = exp(log_t);
+            let color_after = color_accum + r.c_premul * T_j;
+
+            // Compute and reduce+flush gradients
+            compute_and_flush_grads(
+                r, d_color, d_log_t_final, color_final, color_after,
+                cam, ray_dir, log_t, lane, sh_stride, nc, 0u
+            );
+
+            // Update forward state
+            color_accum = color_after;
+            log_t -= r.od;
         }
 
-        // Cooperative load: distribute across threads
-        // Each thread loads data for one tet, plus vertex data
-        if (local_idx < batch_count) {
-            let sort_idx = batch_begin + local_idx;
-            let tet_id = tile_sort_values[sort_idx];
+        cursor -= 1u;
+    }
 
-            sh_tet_id[local_idx] = tet_id;
-            sh_density[local_idx] = densities[tet_id];
-            sh_color[local_idx * 3u] = colors_buf[tet_id * 3u];
-            sh_color[local_idx * 3u + 1u] = colors_buf[tet_id * 3u + 1u];
-            sh_color[local_idx * 3u + 2u] = colors_buf[tet_id * 3u + 2u];
-            sh_grad[local_idx * 3u] = color_grads_buf[tet_id * 3u];
-            sh_grad[local_idx * 3u + 1u] = color_grads_buf[tet_id * 3u + 1u];
-            sh_grad[local_idx * 3u + 2u] = color_grads_buf[tet_id * 3u + 2u];
-
-            // Cache vertex indices and positions
-            let vi0 = indices[tet_id * 4u];
-            let vi1 = indices[tet_id * 4u + 1u];
-            let vi2 = indices[tet_id * 4u + 2u];
-            let vi3 = indices[tet_id * 4u + 3u];
-            sh_vidx[local_idx * 4u] = vi0;
-            sh_vidx[local_idx * 4u + 1u] = vi1;
-            sh_vidx[local_idx * 4u + 2u] = vi2;
-            sh_vidx[local_idx * 4u + 3u] = vi3;
-
-            let vbase = local_idx * 12u;
-            let v0 = load_f32x3_v(vi0);
-            sh_vpos[vbase] = v0.x; sh_vpos[vbase + 1u] = v0.y; sh_vpos[vbase + 2u] = v0.z;
-            let v1 = load_f32x3_v(vi1);
-            sh_vpos[vbase + 3u] = v1.x; sh_vpos[vbase + 4u] = v1.y; sh_vpos[vbase + 5u] = v1.z;
-            let v2 = load_f32x3_v(vi2);
-            sh_vpos[vbase + 6u] = v2.x; sh_vpos[vbase + 7u] = v2.y; sh_vpos[vbase + 8u] = v2.z;
-            let v3 = load_f32x3_v(vi3);
-            sh_vpos[vbase + 9u] = v3.x; sh_vpos[vbase + 10u] = v3.y; sh_vpos[vbase + 11u] = v3.z;
-        }
-
-        workgroupBarrier();
-
-        // === Per-pixel processing ===
-        if (valid_pixel) {
-            for (var bi_rev = 0u; bi_rev < batch_count; bi_rev++) {
-                let bi = batch_count - 1u - bi_rev;
-
-                let tet_id = sh_tet_id[bi];
-                let density_raw = sh_density[bi];
-                let colors_tet = vec3<f32>(sh_color[bi * 3u], sh_color[bi * 3u + 1u], sh_color[bi * 3u + 2u]);
-                let grad = vec3<f32>(sh_grad[bi * 3u], sh_grad[bi * 3u + 1u], sh_grad[bi * 3u + 2u]);
-
-                // Load tet geometry from shared memory (no global reads)
-                var verts: array<vec3<f32>, 4>;
-                verts[0] = sh_load_vert(bi, 0u);
-                verts[1] = sh_load_vert(bi, 1u);
-                verts[2] = sh_load_vert(bi, 2u);
-                verts[3] = sh_load_vert(bi, 3u);
-
-                // Ray-tet intersection
-                var t_min_val = -3.402823e38;
-                var t_max_val = 3.402823e38;
-                var min_face = 0u;
-                var max_face = 0u;
-                var valid = true;
-
-                for (var fi = 0u; fi < 4u; fi++) {
-                    let f = FACES[fi];
-                    let va = verts[f[0]];
-                    let vb = verts[f[1]];
-                    let vc = verts[f[2]];
-                    let n = cross(vc - va, vb - va);
-
-                    let num = dot(n, va - cam);
-                    let den = dot(n, ray_dir);
-
-                    if (abs(den) < 1e-20) {
-                        if (num > 0.0) { valid = false; }
-                        continue;
-                    }
-
-                    let t = num / den;
-
-                    if (den > 0.0) {
-                        if (t > t_min_val) { t_min_val = t; min_face = fi; }
-                    } else {
-                        if (t < t_max_val) { t_max_val = t; max_face = fi; }
-                    }
-                }
-
-                if (!valid || t_min_val >= t_max_val) { continue; }
-
-                // Forward replay: colors & integral
-                let base_offset = dot(grad, cam - verts[0]);
-                let base_color = colors_tet + vec3<f32>(base_offset);
-                let dc_dt = dot(grad, ray_dir);
-
-                let c_start_raw = base_color + vec3<f32>(dc_dt * t_min_val);
-                let c_end_raw = base_color + vec3<f32>(dc_dt * t_max_val);
-                let c_start = max(c_start_raw, vec3<f32>(0.0));
-                let c_end = max(c_end_raw, vec3<f32>(0.0));
-
-                let dist = t_max_val - t_min_val;
-                let od = max(density_raw * dist, 1e-8);
-
-                let alpha_t = exp(-od);
-                let phi_val = phi(od);
-                let w0 = phi_val - alpha_t;
-                let w1 = 1.0 - phi_val;
-                let c_premul = c_end * w0 + c_start * w1;
-
-                let T_j = exp(log_t);
-                let color_after = color_accum + c_premul * T_j;
-                let log_t_after = log_t - od;
-
-                // Closed-form d_log_t
-                let d_log_t_j = d_log_t_final + dot(d_color, color_final - color_after);
-
-                // Gradient computation
-                let d_c_premul = d_color * T_j;
-                let d_od_state = -d_log_t_j;
-
-                let dphi_val = dphi_dx(od);
-                let dw0_dod = dphi_val + alpha_t;
-                let dw1_dod = -dphi_val;
-
-                let d_c_end_integral = d_c_premul * w0;
-                let d_c_start_integral = d_c_premul * w1;
-                let d_od_integral = dot(d_c_premul, c_end * dw0_dod + c_start * dw1_dod);
-
-                let d_od = d_od_state + d_od_integral;
-
-                let d_density_local = d_od * dist;
-                let d_dist = d_od * density_raw;
-                var d_t_min = -d_dist;
-                var d_t_max = d_dist;
-
-                // Backward: color chain (through ReLU clamp)
-                let d_c_start_raw = vec3<f32>(
-                    select(0.0, d_c_start_integral.x, c_start_raw.x > 0.0),
-                    select(0.0, d_c_start_integral.y, c_start_raw.y > 0.0),
-                    select(0.0, d_c_start_integral.z, c_start_raw.z > 0.0),
-                );
-                let d_c_end_raw = vec3<f32>(
-                    select(0.0, d_c_end_integral.x, c_end_raw.x > 0.0),
-                    select(0.0, d_c_end_integral.y, c_end_raw.y > 0.0),
-                    select(0.0, d_c_end_integral.z, c_end_raw.z > 0.0),
-                );
-
-                let d_base_color = d_c_start_raw + d_c_end_raw;
-                let d_dc_dt = (d_c_start_raw.x + d_c_start_raw.y + d_c_start_raw.z) * t_min_val
-                    + (d_c_end_raw.x + d_c_end_raw.y + d_c_end_raw.z) * t_max_val;
-                d_t_min += (d_c_start_raw.x + d_c_start_raw.y + d_c_start_raw.z) * dc_dt;
-                d_t_max += (d_c_end_raw.x + d_c_end_raw.y + d_c_end_raw.z) * dc_dt;
-
-                let d_base_offset_scalar = d_base_color.x + d_base_color.y + d_base_color.z;
-                var d_grad = (cam - verts[0]) * d_base_offset_scalar;
-                let d_v0_from_base = -grad * d_base_offset_scalar;
-
-                d_grad += ray_dir * d_dc_dt;
-
-                // Backward: softplus
-                let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-                let sh_dir = normalize(centroid - cam);
-
-                let sh_base = tet_id * sh_stride;
-                var sh_result = vec3<f32>(0.0);
-                sh_result.x = eval_sh(sh_dir, uniforms.sh_degree, sh_base);
-                sh_result.y = eval_sh(sh_dir, uniforms.sh_degree, sh_base + nc);
-                sh_result.z = eval_sh(sh_dir, uniforms.sh_degree, sh_base + 2u * nc);
-
-                let offset_val = dot(grad, verts[0] - centroid);
-                let sp_input = sh_result + vec3<f32>(0.5 + offset_val);
-
-                let d_sp_input = vec3<f32>(
-                    d_base_color.x * dsoftplus(sp_input.x),
-                    d_base_color.y * dsoftplus(sp_input.y),
-                    d_base_color.z * dsoftplus(sp_input.z),
-                );
-
-                let d_sh_result = d_sp_input;
-                let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
-
-                d_grad += (verts[0] - centroid) * d_offset_scalar;
-                let d_v0_from_offset = grad * d_offset_scalar * 0.75;
-                let d_vother_from_offset = -grad * d_offset_scalar * 0.25;
-
-                // SH gradients -> shared memory
-                scatter_sh_grads_wg(sh_dir, uniforms.sh_degree, d_sh_result, bi, nc);
-
-                // Intersection gradients
-                var d_vert_i: array<vec3<f32>, 4>;
-
-                // t_min face
-                {
-                    let f = FACES[min_face];
-                    let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];
-                    let n = cross(vc - va, vb - va);
-                    let den = dot(n, ray_dir);
-                    let hit = cam + ray_dir * t_min_val;
-
-                    let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
-                    let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
-                    let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
-
-                    d_vert_i[f[0]] += dt_dva * d_t_min;
-                    d_vert_i[f[1]] += dt_dvb * d_t_min;
-                    d_vert_i[f[2]] += dt_dvc * d_t_min;
-                }
-
-                // t_max face
-                {
-                    let f = FACES[max_face];
-                    let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];
-                    let n = cross(vc - va, vb - va);
-                    let den = dot(n, ray_dir);
-                    let hit = cam + ray_dir * t_max_val;
-
-                    let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
-                    let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
-                    let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
-
-                    d_vert_i[f[0]] += dt_dva * d_t_max;
-                    d_vert_i[f[1]] += dt_dvb * d_t_max;
-                    d_vert_i[f[2]] += dt_dvc * d_t_max;
-                }
-
-                // Combine vertex gradients
-                d_vert_i[0] += d_v0_from_base + d_v0_from_offset;
-                d_vert_i[1] += d_vother_from_offset;
-                d_vert_i[2] += d_vother_from_offset;
-                d_vert_i[3] += d_vother_from_offset;
-
-                // Scatter all gradients to shared memory (fixed-point atomicAdd)
-                let grad_base = bi * MAX_GRAD_PER_TET;
-
-                // Density
-                wg_add_f32(grad_base, d_density_local);
-
-                // Vertices (4 verts x 3 axes)
-                for (var vi = 0u; vi < 4u; vi++) {
-                    let dv = d_vert_i[vi];
-                    wg_add_f32(grad_base + 1u + vi * 3u, dv.x);
-                    wg_add_f32(grad_base + 1u + vi * 3u + 1u, dv.y);
-                    wg_add_f32(grad_base + 1u + vi * 3u + 2u, dv.z);
-                }
-
-                // Color gradients (3 axes)
-                wg_add_f32(grad_base + 13u, d_grad.x);
-                wg_add_f32(grad_base + 14u, d_grad.y);
-                wg_add_f32(grad_base + 15u, d_grad.z);
-
-                // Update forward state
-                color_accum = color_after;
-                log_t = log_t_after;
-            } // end per-tet loop
-        } // end valid_pixel
-
-        workgroupBarrier();
-
-        // === Flush shared gradients to global buffers ===
-        let num_entries_per_tet = 16u + sh_stride;
-        let total_flush_entries = batch_count * num_entries_per_tet;
-
-        for (var flush_idx = local_idx; flush_idx < total_flush_entries; flush_idx += WG_SIZE) {
-            let bi = flush_idx / num_entries_per_tet;
-            let entry = flush_idx % num_entries_per_tet;
-            let tet_id_flush = sh_tet_id[bi];
-
-            // Read fixed-point accumulator and convert back to f32
-            let wg_offset = bi * MAX_GRAD_PER_TET + entry;
-            let ival = atomicLoad(&wg_grads[wg_offset]);
-
-            // Skip zero entries
-            if (ival == 0i) { continue; }
-
-            let val = f32(ival) * INV_GRAD_SCALE;
-
-            if (entry == 0u) {
-                global_cas_add(tet_id_flush, val, 0u);
-            } else if (entry < 13u) {
-                let vi = (entry - 1u) / 3u;
-                let ax = (entry - 1u) % 3u;
-                let vidx = sh_vidx[bi * 4u + vi];
-                let gi = vidx * 3u + ax;
-                global_cas_add(gi, val, 1u);
-            } else if (entry < 16u) {
-                let c = entry - 13u;
-                let gidx = tet_id_flush * 3u + c;
-                global_cas_add(gidx, val, 2u);
-            } else {
-                let sh_offset = entry - 16u;
-                let sh_global_idx = tet_id_flush * sh_stride + sh_offset;
-                global_cas_add(sh_global_idx, val, 3u);
-            }
-        }
-
-        workgroupBarrier();
-        cursor = batch_begin;
-    } // end batch loop
-
-    // === Debug: write composited image from forward replay ===
-    if (valid_pixel) {
+    // Debug: write composited image from forward replay
+    if (!is_second_half && valid_pixel) {
         let T_final = exp(log_t);
         debug_image[pixel_idx * 4u] = color_accum.x;
         debug_image[pixel_idx * 4u + 1u] = color_accum.y;

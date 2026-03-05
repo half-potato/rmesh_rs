@@ -20,8 +20,9 @@ use rmesh_backward::{
     TileBuffers, TilePipelines, TileUniforms,
 };
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group, make_uniforms, record_forward_pass,
-    record_tex_to_buffer, ForwardPipelines, RenderTargets, SceneBuffers, SortState,
+    create_compute_bind_group, create_forward_tiled_bind_group, create_render_bind_group,
+    make_uniforms, record_forward_pass, record_forward_tiled, record_tex_to_buffer,
+    ForwardPipelines, ForwardTiledPipeline, RenderTargets, SceneBuffers, SortState,
     TexToBufferPipeline,
 };
 
@@ -46,7 +47,7 @@ fn read_buffer_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Bu
     slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).unwrap();
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
 
     let data = slice.get_mapped_range();
@@ -81,7 +82,7 @@ fn read_buffer_raw(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         tx.send(result).unwrap();
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
 
     let data = slice.get_mapped_range();
@@ -129,6 +130,10 @@ struct RMeshRenderer {
     // B-buffer bind groups (sort result in alternate buffers)
     tile_ranges_bg_b: wgpu::BindGroup,
     bwd_tiled_bg0_b: wgpu::BindGroup,
+    // Forward tiled compute pipeline (subgroup-based, 4x4 tiles)
+    fwd_tiled: ForwardTiledPipeline,
+    fwd_tiled_bg: wgpu::BindGroup,
+    fwd_tiled_bg_b: wgpu::BindGroup,
     // Debug image buffer for backward forward-replay verification
     debug_image: wgpu::Buffer,
     // Bind groups
@@ -213,14 +218,14 @@ impl RMeshRenderer {
             force_fallback_adapter: false,
             compatible_surface: None,
         }))
-        .ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Failed to find a suitable GPU adapter")
+        .map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to find a suitable GPU adapter: {e}"))
         })?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("rmesh_renderer"),
-                required_features: wgpu::Features::empty(),
+                required_features: wgpu::Features::SUBGROUP,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 16,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GiB
@@ -228,8 +233,8 @@ impl RMeshRenderer {
                     ..wgpu::Limits::default()
                 },
                 memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
             },
-            None,
         ))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Device error: {e}")))?;
 
@@ -341,7 +346,7 @@ impl RMeshRenderer {
         ];
 
         // Tiled backward infrastructure
-        let tile_size = 16u32;
+        let tile_size = 4u32;
         let tile_pipelines = TilePipelines::new(&device);
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
@@ -367,6 +372,9 @@ impl RMeshRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
+
+        // Forward tiled compute pipeline (4x4 tiles with subgroups)
+        let fwd_tiled = ForwardTiledPipeline::new(&device, width, height);
 
         // A-buffer bind groups (sort result in primary tile_sort_keys/values)
         let tile_ranges_bg = create_tile_ranges_bind_group_with_keys(
@@ -412,6 +420,24 @@ impl RMeshRenderer {
             &debug_image,
         );
 
+        // Forward tiled bind groups (A and B buffer variants)
+        let fwd_tiled_bg = create_forward_tiled_bind_group(
+            &device,
+            &fwd_tiled,
+            &scene_buffers,
+            &tile_buffers.tile_sort_values,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+        let fwd_tiled_bg_b = create_forward_tiled_bind_group(
+            &device,
+            &fwd_tiled,
+            &scene_buffers,
+            &radix_state.values_b,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+
         Ok(Self {
             device,
             queue,
@@ -435,6 +461,9 @@ impl RMeshRenderer {
             bwd_tiled_bg1,
             tile_ranges_bg_b,
             bwd_tiled_bg0_b,
+            fwd_tiled,
+            fwd_tiled_bg,
+            fwd_tiled_bg_b,
             debug_image,
             compute_bg,
             render_bg,
@@ -529,6 +558,210 @@ impl RMeshRenderer {
         Ok(array.into_pyarray(py))
     }
 
+    /// Run the compute-based tiled forward rendering pipeline.
+    ///
+    /// Uses 4x4 tiles with subgroup shuffles (no hardware rasterization).
+    /// Includes tile generation, radix sort, tile ranges, and compute forward.
+    ///
+    /// Args:
+    ///     cam_pos: [3] f32 camera position
+    ///     vp: [16] f32 column-major view-projection matrix
+    ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///
+    /// Returns:
+    ///     numpy array [H, W, 4] f32 (RGBA)
+    fn forward_tiled<'py>(
+        &mut self,
+        py: Python<'py>,
+        cam_pos: PyReadonlyArray1<f32>,
+        vp: PyReadonlyArray1<f32>,
+        inv_vp: PyReadonlyArray1<f32>,
+    ) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let cam_pos_slice = cam_pos.as_slice()?;
+        let vp_slice = vp.as_slice()?;
+        let inv_vp_slice = inv_vp.as_slice()?;
+
+        let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
+        let vp_mat = mat4_from_flat(vp_slice);
+        let inv_vp_mat = mat4_from_flat(inv_vp_slice);
+
+        let uniforms = make_uniforms(
+            vp_mat,
+            inv_vp_mat,
+            cam,
+            self.width as f32,
+            self.height as f32,
+            self.tet_count,
+            self.sh_degree,
+            self.step,
+        );
+
+        // Upload uniforms
+        self.queue.write_buffer(
+            &self.scene_buffers.uniforms,
+            0,
+            bytemuck::bytes_of(&uniforms),
+        );
+
+        // Step 1: Forward compute (SH eval + cull + depth sort) — same as hardware path
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("forward_compute"),
+            });
+        record_forward_pass(
+            &mut encoder,
+            &self.fwd_pipelines,
+            &self.scene_buffers,
+            &self.targets,
+            &self.compute_bg,
+            &self.render_bg,
+            &self.sort_state,
+            self.tet_count,
+            &self.queue,
+        );
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Step 2: Read visible tet count
+        let visible_tet_count = {
+            let raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.indirect_args);
+            let u32s: &[u32] = bytemuck::cast_slice(&raw);
+            u32s[1]
+        };
+
+        // Step 3: Upload tile uniforms
+        let tile_uni = TileUniforms {
+            screen_width: self.width,
+            screen_height: self.height,
+            tile_size: 4,
+            tiles_x: self.tile_buffers.tiles_x,
+            tiles_y: self.tile_buffers.tiles_y,
+            num_tiles: self.tile_buffers.num_tiles,
+            visible_tet_count,
+            max_pairs: self.tile_buffers.max_pairs,
+            max_pairs_pow2: self.tile_buffers.max_pairs_pow2,
+            _pad: [0; 3],
+        };
+        self.queue.write_buffer(
+            &self.tile_buffers.tile_uniforms,
+            0,
+            bytemuck::bytes_of(&tile_uni),
+        );
+        self.queue.write_buffer(
+            &self.radix_state.num_keys_buf,
+            0,
+            bytemuck::bytes_of(&self.tile_buffers.max_pairs),
+        );
+
+        // Step 4: Clear tile buffers + forward output
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("clear_tile"),
+                });
+            encoder.clear_buffer(&self.tile_buffers.tile_pair_count, 0, None);
+            encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
+            encoder.clear_buffer(&self.fwd_tiled.rendered_image, 0, None);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Step 5: Tile fill + gen + sort + ranges + forward tiled
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("forward_tiled"),
+                });
+
+            // Tile fill (sentinel keys)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tile_fill"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tile_pipelines.fill_pipeline);
+                pass.set_bind_group(0, &self.tile_fill_bg, &[]);
+                let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+                if total <= 65535 {
+                    pass.dispatch_workgroups(total, 1, 1);
+                } else {
+                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                }
+            }
+
+            // Tile gen (hull-based)
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tile_gen"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tile_pipelines.tile_gen_pipeline);
+                pass.set_bind_group(0, &self.tile_gen_bg, &[]);
+                let tet_count_upper = self.tile_buffers.max_pairs / 16;
+                let total = (tet_count_upper + 63) / 64;
+                if total <= 65535 {
+                    pass.dispatch_workgroups(total, 1, 1);
+                } else {
+                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                }
+            }
+
+            // Radix sort
+            let result_in_b = rmesh_backward::record_radix_sort(
+                &mut encoder,
+                &self.device,
+                &self.radix_pipelines,
+                &self.radix_state,
+                &self.tile_buffers.tile_sort_keys,
+                &self.tile_buffers.tile_sort_values,
+            );
+
+            let (ranges_bg, fwd_bg) = if result_in_b {
+                (&self.tile_ranges_bg_b, &self.fwd_tiled_bg_b)
+            } else {
+                (&self.tile_ranges_bg, &self.fwd_tiled_bg)
+            };
+
+            // Tile ranges
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tile_ranges"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
+                pass.set_bind_group(0, ranges_bg, &[]);
+                let total = (self.tile_buffers.max_pairs + 255) / 256;
+                if total <= 65535 {
+                    pass.dispatch_workgroups(total, 1, 1);
+                } else {
+                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                }
+            }
+
+            // Forward tiled compute
+            record_forward_tiled(
+                &mut encoder,
+                &self.fwd_tiled,
+                fwd_bg,
+                self.tile_buffers.num_tiles,
+            );
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back rendered image
+        let data = read_buffer_f32(&self.device, &self.queue, &self.fwd_tiled.rendered_image);
+
+        let array = Array3::from_shape_vec(
+            (self.height as usize, self.width as usize, 4),
+            data,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        Ok(array.into_pyarray(py))
+    }
+
     /// Read back the auxiliary buffer from the last forward pass.
     ///
     /// Returns:
@@ -578,7 +811,7 @@ impl RMeshRenderer {
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        self.device.poll(wgpu::Maintain::Wait);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         receiver
             .recv()
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Map recv: {e}")))?
@@ -644,7 +877,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 16,
+            tile_size: 4,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -868,7 +1101,7 @@ impl RMeshRenderer {
             let tile_uni = TileUniforms {
                 screen_width: self.width,
                 screen_height: self.height,
-                tile_size: 16,
+                tile_size: 4,
                 tiles_x: self.tile_buffers.tiles_x,
                 tiles_y: self.tile_buffers.tiles_y,
                 num_tiles: self.tile_buffers.num_tiles,

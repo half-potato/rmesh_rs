@@ -434,18 +434,19 @@ async fn gpu_render_scene_async(
             compatible_surface: None,
             force_fallback_adapter: false,
         })
-        .await?;
+        .await
+        .ok()?;
 
     let (device, queue) = adapter
         .request_device(
             &wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SUBGROUP,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 11,
                     ..wgpu::Limits::downlevel_defaults()
                 },
                 ..Default::default()
             },
-            None,
         )
         .await
         .ok()?;
@@ -525,7 +526,7 @@ async fn gpu_render_scene_async(
     slice.map_async(wgpu::MapMode::Read, move |result| {
         sender.send(result).unwrap();
     });
-    device.poll(wgpu::Maintain::Wait);
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().unwrap().ok()?;
 
     let data = slice.get_mapped_range();

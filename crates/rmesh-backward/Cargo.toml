@@ -10,3 +10,10 @@ wgpu = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+pollster = { workspace = true }
+glam = { workspace = true }
+rand = "0.9"
+rand_chacha = "0.9"
+rmesh-data = { path = "../rmesh-data" }

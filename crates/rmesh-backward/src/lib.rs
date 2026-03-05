@@ -231,7 +231,7 @@ impl BackwardPipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("loss_pipeline_layout"),
                 bind_group_layouts: &[&loss_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let loss_pipeline =
@@ -288,7 +288,7 @@ impl BackwardPipelines {
                     &backward_bind_group_layout_0,
                     &backward_bind_group_layout_1,
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let backward_pipeline =
@@ -328,7 +328,7 @@ impl BackwardPipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("adam_pipeline_layout"),
                 bind_group_layouts: &[&adam_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let adam_pipeline =
@@ -738,7 +738,7 @@ impl TilePipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("tile_fill_pl"),
                 bind_group_layouts: &[&fill_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let fill_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -750,10 +750,10 @@ impl TilePipelines {
                 cache: None,
             });
 
-        // ----- Tile gen pipeline (9 bindings) -----
+        // ----- Tile gen pipeline (9 bindings) — uses convex hull overlap test -----
         let tile_gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tile_gen_compute"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TILE_GEN_WGSL.into()),
+            label: Some("tile_gen_hull_compute"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TILE_GEN_HULL_WGSL.into()),
         });
         let tile_gen_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -774,7 +774,7 @@ impl TilePipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("tile_gen_pl"),
                 bind_group_layouts: &[&tile_gen_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let tile_gen_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -805,7 +805,7 @@ impl TilePipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("tile_ranges_pl"),
                 bind_group_layouts: &[&tile_ranges_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let tile_ranges_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -861,7 +861,7 @@ impl TilePipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("backward_tiled_pl"),
                 bind_group_layouts: &[&backward_tiled_bg_layout_0, &backward_tiled_bg_layout_1],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
 
         let backward_tiled_pipeline =
@@ -1442,7 +1442,7 @@ pub fn record_tiled_backward(
         pass.dispatch_workgroups(rx, ry, 1);
     }
 
-    // 4. Tiled backward pass
+    // 4. Tiled backward pass (one workgroup per tile, @workgroup_size(32))
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("backward_tiled"),
@@ -1451,7 +1451,14 @@ pub fn record_tiled_backward(
         pass.set_pipeline(&tile_pipelines.backward_tiled_pipeline);
         pass.set_bind_group(0, bwd_bg0, &[]);
         pass.set_bind_group(1, bwd_tiled_bg1, &[]);
-        pass.dispatch_workgroups(tile_buffers.tiles_x, tile_buffers.tiles_y, 1);
+        let num_tiles = tile_buffers.num_tiles;
+        if num_tiles <= 65535 {
+            pass.dispatch_workgroups(num_tiles, 1, 1);
+        } else {
+            let x = 65535u32;
+            let y = (num_tiles + x - 1) / x;
+            pass.dispatch_workgroups(x, y, 1);
+        }
     }
 }
 
@@ -1465,7 +1472,7 @@ fn make_compute_pipeline(
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(&format!("{label}_pl")),
         bind_group_layouts: bgls,
-        push_constant_ranges: &[],
+        immediate_size: 0,
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(&format!("{label}_pipeline")),

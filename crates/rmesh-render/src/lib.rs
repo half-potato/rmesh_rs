@@ -210,7 +210,7 @@ impl ForwardPipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute_pipeline_layout"),
                 bind_group_layouts: &[&compute_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_compute.wgsl"),
@@ -244,7 +244,7 @@ impl ForwardPipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("render_pipeline_layout"),
                 bind_group_layouts: &[&render_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_vertex.wgsl"),
@@ -309,7 +309,7 @@ impl ForwardPipelines {
                     ],
                     compilation_options: Default::default(),
                 }),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -332,7 +332,7 @@ impl ForwardPipelines {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("sort_pipeline_layout"),
                 bind_group_layouts: &[&sort_bind_group_layout],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
         let sort_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort.wgsl"),
@@ -507,7 +507,7 @@ impl TexToBufferPipeline {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("tex_to_buffer_pipeline_layout"),
             bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -563,6 +563,143 @@ impl TexToBufferPipeline {
             width,
             height,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forward Tiled Compute Pipeline (4x4 tiles, subgroup-based)
+// ---------------------------------------------------------------------------
+
+/// Compute-based forward renderer using 4x4 tiles with warp-per-tile.
+///
+/// Requires `wgpu::Features::SUBGROUPS` on the device.
+/// Renders directly to an f32 storage buffer (no texture intermediate).
+pub struct ForwardTiledPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// The output storage buffer: [W x H x 4] f32
+    pub rendered_image: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ForwardTiledPipeline {
+    /// Create the forward tiled pipeline and allocate the rendered_image buffer.
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_tiled_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::FORWARD_TILED_WGSL.into()),
+        });
+
+        // 10 bindings: uniforms, vertices, indices, colors, densities, color_grads,
+        //              tile_sort_values, tile_ranges, tile_uniforms, rendered_image
+        let read_only = [true, true, true, true, true, true, true, true, true, false];
+        let entries = storage_entries(10, wgpu::ShaderStages::COMPUTE, &read_only);
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("forward_tiled_bgl"),
+                entries: &entries,
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("forward_tiled_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("forward_tiled_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fwd_tiled_rendered_image"),
+            size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            rendered_image,
+            width,
+            height,
+        }
+    }
+
+    /// Get the bind group layout (for creating bind groups externally).
+    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bind_group_layout
+    }
+
+    /// Get the pipeline (for recording dispatches).
+    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.pipeline
+    }
+}
+
+/// Create the forward tiled bind group.
+///
+/// Binding order matches `forward_tiled_compute.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: colors,
+///   4: densities, 5: color_grads, 6: tile_sort_values,
+///   7: tile_ranges, 8: tile_uniforms, 9: rendered_image
+pub fn create_forward_tiled_bind_group(
+    device: &wgpu::Device,
+    fwd_tiled: &ForwardTiledPipeline,
+    scene_buffers: &SceneBuffers,
+    tile_sort_values: &wgpu::Buffer,
+    tile_ranges: &wgpu::Buffer,
+    tile_uniforms: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("forward_tiled_bg"),
+        layout: fwd_tiled.bind_group_layout(),
+        entries: &[
+            buf_entry(0, &scene_buffers.uniforms),
+            buf_entry(1, &scene_buffers.vertices),
+            buf_entry(2, &scene_buffers.indices),
+            buf_entry(3, &scene_buffers.colors),
+            buf_entry(4, &scene_buffers.densities),
+            buf_entry(5, &scene_buffers.color_grads),
+            buf_entry(6, tile_sort_values),
+            buf_entry(7, tile_ranges),
+            buf_entry(8, tile_uniforms),
+            buf_entry(9, &fwd_tiled.rendered_image),
+        ],
+    })
+}
+
+/// Record the forward tiled compute pass dispatch.
+///
+/// Dispatches one workgroup per tile (32 threads each).
+pub fn record_forward_tiled(
+    encoder: &mut wgpu::CommandEncoder,
+    fwd_tiled: &ForwardTiledPipeline,
+    bind_group: &wgpu::BindGroup,
+    num_tiles: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("forward_tiled"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(fwd_tiled.pipeline());
+    pass.set_bind_group(0, bind_group, &[]);
+    // Use 2D dispatch if num_tiles exceeds 65535
+    if num_tiles <= 65535 {
+        pass.dispatch_workgroups(num_tiles, 1, 1);
+    } else {
+        let x = 65535u32;
+        let y = (num_tiles + x - 1) / x;
+        pass.dispatch_workgroups(x, y, 1);
     }
 }
 
@@ -973,6 +1110,7 @@ pub fn record_forward_pass(
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 }),
                 // Attachment 1: auxiliary (no blending, overwrite)
                 Some(wgpu::RenderPassColorAttachment {
@@ -987,11 +1125,13 @@ pub fn record_forward_pass(
                         }),
                         store: wgpu::StoreOp::Store,
                     },
+                    depth_slice: None,
                 }),
             ],
             depth_stencil_attachment: None,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
 
         rpass.set_viewport(
