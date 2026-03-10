@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 rmesh-shaders = { path = "../rmesh-shaders" }
 rmesh-render = { path = "../rmesh-render" }
+rmesh-sort = { path = "../rmesh-sort" }
+rmesh-tile = { path = "../rmesh-tile" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true }
@@ -17,3 +19,4 @@ glam = { workspace = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rmesh-data = { path = "../rmesh-data" }
+rmesh-train = { path = "../rmesh-train" }

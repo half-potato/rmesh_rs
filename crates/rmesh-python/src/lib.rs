@@ -13,11 +13,11 @@ use pyo3::types::PyDict;
 
 use glam::{Mat4, Vec3, Vec4};
 use rmesh_backward::{
-    create_adam_bind_group, create_backward_bind_groups, create_backward_tiled_bind_groups,
-    create_loss_bind_group, create_prepare_dispatch_bind_group, create_rts_bind_group,
+    create_backward_bind_groups, create_backward_tiled_bind_groups,
+    create_prepare_dispatch_bind_group, create_rts_bind_group,
     create_tile_fill_bind_group, create_tile_gen_scan_bind_group,
-    create_tile_ranges_bind_group_with_keys, AdamState, AdamUniforms, BackwardPipelines,
-    GradientBuffers, LossBuffers, LossUniforms, RadixSortPipelines, RadixSortState,
+    create_tile_ranges_bind_group_with_keys, BackwardPipelines,
+    BackwardTiledPipelines, GradientBuffers, RadixSortPipelines, RadixSortState,
     ScanBuffers, ScanPipelines, TileBuffers, TilePipelines, TileUniforms,
 };
 use rmesh_render::{
@@ -28,6 +28,11 @@ use rmesh_render::{
     ForwardTiledPipeline, RayTraceBuffers, RayTracePipeline, RenderTargets, SceneBuffers,
     SortState, TexToBufferPipeline,
 };
+use rmesh_train::{
+    create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,
+    LossPipeline,
+};
+use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
 
 /// Helper: read back a GPU buffer to a Vec<f32>.
 fn read_buffer_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<f32> {
@@ -116,8 +121,11 @@ struct RMeshRenderer {
     ttb: TexToBufferPipeline,
     // Backward infrastructure
     bwd_pipelines: BackwardPipelines,
+    bwd_tiled_pipelines: BackwardTiledPipelines,
     grad_buffers: GradientBuffers,
     loss_buffers: LossBuffers,
+    loss_pipeline: LossPipeline,
+    adam_pipeline: AdamPipeline,
     _adam_state: AdamState,
     // Tiled backward infrastructure
     tile_pipelines: TilePipelines,
@@ -264,6 +272,9 @@ impl RMeshRenderer {
         // Create pipelines
         let fwd_pipelines = ForwardPipelines::new(&device, color_format, aux_format);
         let bwd_pipelines = BackwardPipelines::new(&device);
+        let bwd_tiled_pipelines = BackwardTiledPipelines::new(&device);
+        let loss_pipeline = LossPipeline::new(&device);
+        let adam_pipeline = AdamPipeline::new(&device);
 
         // Upload scene
         let scene_buffers = SceneBuffers::upload(&device, &queue, &scene);
@@ -274,7 +285,7 @@ impl RMeshRenderer {
         // Sort state
         let sort_state = SortState::new(
             &device,
-            &fwd_pipelines,
+            &fwd_pipelines.bitonic_sort,
             &scene_buffers.sort_keys,
             &scene_buffers.sort_values,
             tet_count,
@@ -298,7 +309,7 @@ impl RMeshRenderer {
         // Backward bind groups
         let loss_bg = create_loss_bind_group(
             &device,
-            &bwd_pipelines,
+            &loss_pipeline,
             &loss_buffers,
             &ttb.rendered_image,
         );
@@ -306,7 +317,7 @@ impl RMeshRenderer {
             &device,
             &bwd_pipelines,
             &scene_buffers,
-            &loss_buffers,
+            &loss_buffers.dl_d_image,
             &grad_buffers,
             &ttb.rendered_image,
         );
@@ -326,7 +337,7 @@ impl RMeshRenderer {
         let adam_bgs = vec![
             create_adam_bind_group(
                 &device,
-                &bwd_pipelines,
+                &adam_pipeline,
                 &adam_uniforms_bufs[0],
                 &scene_buffers.sh_coeffs,
                 &grad_buffers.d_sh_coeffs,
@@ -335,7 +346,7 @@ impl RMeshRenderer {
             ),
             create_adam_bind_group(
                 &device,
-                &bwd_pipelines,
+                &adam_pipeline,
                 &adam_uniforms_bufs[1],
                 &scene_buffers.vertices,
                 &grad_buffers.d_vertices,
@@ -344,7 +355,7 @@ impl RMeshRenderer {
             ),
             create_adam_bind_group(
                 &device,
-                &bwd_pipelines,
+                &adam_pipeline,
                 &adam_uniforms_bufs[2],
                 &scene_buffers.densities,
                 &grad_buffers.d_densities,
@@ -353,7 +364,7 @@ impl RMeshRenderer {
             ),
             create_adam_bind_group(
                 &device,
-                &bwd_pipelines,
+                &adam_pipeline,
                 &adam_uniforms_bufs[3],
                 &scene_buffers.color_grads,
                 &grad_buffers.d_color_grads,
@@ -405,12 +416,22 @@ impl RMeshRenderer {
         );
         let (bwd_tiled_bg0, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
             &device,
-            &tile_pipelines,
-            &scene_buffers,
-            &loss_buffers,
-            &grad_buffers,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
             &ttb.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.sh_coeffs,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
+            &scene_buffers.circumdata,
+            &scene_buffers.colors,
             &tile_buffers.tile_sort_values,
+            &grad_buffers.d_sh_coeffs,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -427,12 +448,22 @@ impl RMeshRenderer {
         );
         let (bwd_tiled_bg0_b, _) = create_backward_tiled_bind_groups(
             &device,
-            &tile_pipelines,
-            &scene_buffers,
-            &loss_buffers,
-            &grad_buffers,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
             &ttb.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.sh_coeffs,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
+            &scene_buffers.circumdata,
+            &scene_buffers.colors,
             &radix_state.values_b,
+            &grad_buffers.d_sh_coeffs,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -442,7 +473,12 @@ impl RMeshRenderer {
         let fwd_tiled_bg = create_forward_tiled_bind_group(
             &device,
             &fwd_tiled,
-            &scene_buffers,
+            &scene_buffers.uniforms,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.colors,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
             &tile_buffers.tile_sort_values,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
@@ -450,7 +486,12 @@ impl RMeshRenderer {
         let fwd_tiled_bg_b = create_forward_tiled_bind_group(
             &device,
             &fwd_tiled,
-            &scene_buffers,
+            &scene_buffers.uniforms,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.colors,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
             &radix_state.values_b,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
@@ -459,7 +500,7 @@ impl RMeshRenderer {
         // Loss bind group using fwd_tiled.rendered_image (for train_step tiled path)
         let loss_bg_tiled = create_loss_bind_group(
             &device,
-            &bwd_pipelines,
+            &loss_pipeline,
             &loss_buffers,
             &fwd_tiled.rendered_image,
         );
@@ -467,24 +508,44 @@ impl RMeshRenderer {
         // Backward tiled bind groups using fwd_tiled.rendered_image (for train_step)
         let (bwd_tiled_bg0_tiled, _) = create_backward_tiled_bind_groups(
             &device,
-            &tile_pipelines,
-            &scene_buffers,
-            &loss_buffers,
-            &grad_buffers,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
             &fwd_tiled.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.sh_coeffs,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
+            &scene_buffers.circumdata,
+            &scene_buffers.colors,
             &tile_buffers.tile_sort_values,
+            &grad_buffers.d_sh_coeffs,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
         );
         let (bwd_tiled_bg0_tiled_b, _) = create_backward_tiled_bind_groups(
             &device,
-            &tile_pipelines,
-            &scene_buffers,
-            &loss_buffers,
-            &grad_buffers,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
             &fwd_tiled.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.sh_coeffs,
+            &scene_buffers.densities,
+            &scene_buffers.color_grads,
+            &scene_buffers.circumdata,
+            &scene_buffers.colors,
             &radix_state.values_b,
+            &grad_buffers.d_sh_coeffs,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &debug_image,
@@ -509,7 +570,12 @@ impl RMeshRenderer {
             &device,
             &scan_pipelines,
             &tile_buffers,
-            &scene_buffers,
+            &scene_buffers.uniforms,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.compact_tet_ids,
+            &scene_buffers.circumdata,
+            &scene_buffers.tiles_touched,
             &scan_buffers,
             &radix_state.num_keys_buf,
         );
@@ -530,8 +596,11 @@ impl RMeshRenderer {
             sort_state,
             ttb,
             bwd_pipelines,
+            bwd_tiled_pipelines,
             grad_buffers,
             loss_buffers,
+            loss_pipeline,
+            adam_pipeline,
             _adam_state: adam_state,
             tile_pipelines,
             tile_buffers,
@@ -1093,7 +1162,7 @@ impl RMeshRenderer {
                 label: Some("backward_tiled"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.tile_pipelines.backward_tiled_pipeline);
+            pass.set_pipeline(&self.bwd_tiled_pipelines.pipeline);
             pass.set_bind_group(0, bwd_bg0, &[]);
             pass.set_bind_group(1, &self.bwd_tiled_bg1, &[]);
             let num_tiles = self.tile_buffers.num_tiles;
@@ -1319,9 +1388,9 @@ impl RMeshRenderer {
         );
 
         // Loss compute (reads from fwd_tiled.rendered_image via loss_bg_tiled)
-        rmesh_backward::record_loss_pass(
+        rmesh_train::record_loss_pass(
             &mut encoder,
-            &self.bwd_pipelines,
+            &self.loss_pipeline,
             &self.loss_bg_tiled,
             self.width,
             self.height,
@@ -1333,7 +1402,7 @@ impl RMeshRenderer {
                 label: Some("backward_tiled"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.tile_pipelines.backward_tiled_pipeline);
+            pass.set_pipeline(&self.bwd_tiled_pipelines.pipeline);
             pass.set_bind_group(0, bwd_bg0, &[]);
             pass.set_bind_group(1, &self.bwd_tiled_bg1, &[]);
             let num_tiles = self.tile_buffers.num_tiles;
@@ -1374,7 +1443,7 @@ impl RMeshRenderer {
                 label: Some("adam"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.bwd_pipelines.adam_pipeline);
+            pass.set_pipeline(&self.adam_pipeline.pipeline);
             pass.set_bind_group(0, bg, &[]);
             let wg_count = (count + 255) / 256;
             if wg_count <= 65535 {

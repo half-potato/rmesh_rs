@@ -195,7 +195,7 @@ impl App {
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
         let sort_state = SortState::new(
             &device,
-            &pipelines,
+            &pipelines.bitonic_sort,
             &buffers.sort_keys,
             &buffers.sort_values,
             self.scene_data.tet_count,

@@ -226,7 +226,7 @@ fn test_bitonic_sort_kernel() {
         wgpu::TextureFormat::Rgba32Float,
     );
     let sort_state =
-        rmesh_render::SortState::new(&device, &pipelines, &sort_keys, &sort_values, n);
+        rmesh_render::SortState::new(&device, &pipelines.bitonic_sort, &sort_keys, &sort_values, n);
 
     // Dispatch sort
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -235,7 +235,7 @@ fn test_bitonic_sort_kernel() {
             label: Some("bitonic_sort"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipelines.sort_pipeline);
+        pass.set_pipeline(&pipelines.bitonic_sort.pipeline);
         for i in 0..sort_state.step_count {
             pass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
             pass.dispatch_workgroups(sort_state.dispatch_x, 1, 1);

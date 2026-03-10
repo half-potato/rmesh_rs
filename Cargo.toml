@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/rmesh-shaders",
+    "crates/rmesh-sort",
+    "crates/rmesh-tile",
     "crates/rmesh-render",
     "crates/rmesh-backward",
     "crates/rmesh-data",

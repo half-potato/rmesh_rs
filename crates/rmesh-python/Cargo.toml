@@ -8,10 +8,11 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-rmesh-shaders = { path = "../rmesh-shaders" }
 rmesh-render = { path = "../rmesh-render" }
 rmesh-backward = { path = "../rmesh-backward" }
 rmesh-data = { path = "../rmesh-data" }
+rmesh-shaders = { path = "../rmesh-shaders" }
+rmesh-train = { path = "../rmesh-train" }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 bytemuck = { workspace = true }

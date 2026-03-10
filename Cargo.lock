@@ -2238,6 +2238,9 @@ dependencies = [
  "rmesh-data",
  "rmesh-render",
  "rmesh-shaders",
+ "rmesh-sort",
+ "rmesh-tile",
+ "rmesh-train",
  "wgpu",
 ]
 
@@ -2269,6 +2272,7 @@ dependencies = [
  "rmesh-data",
  "rmesh-render",
  "rmesh-shaders",
+ "rmesh-train",
  "wgpu",
 ]
 
@@ -2286,6 +2290,8 @@ dependencies = [
  "rand_chacha",
  "rmesh-data",
  "rmesh-shaders",
+ "rmesh-sort",
+ "rmesh-tile",
  "wgpu",
 ]
 
@@ -2295,6 +2301,24 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+]
+
+[[package]]
+name = "rmesh-sort"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rmesh-shaders",
+ "wgpu",
+]
+
+[[package]]
+name = "rmesh-tile"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "rmesh-shaders",
+ "wgpu",
 ]
 
 [[package]]
@@ -2326,7 +2350,6 @@ dependencies = [
  "pollster",
  "rmesh-data",
  "rmesh-render",
- "rmesh-shaders",
  "wgpu",
  "winit",
 ]

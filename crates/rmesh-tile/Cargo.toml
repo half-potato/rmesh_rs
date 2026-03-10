@@ -1,0 +1,9 @@
+[package]
+name = "rmesh-tile"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-shaders = { path = "../rmesh-shaders" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }

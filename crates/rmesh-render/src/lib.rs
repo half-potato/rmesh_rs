@@ -15,6 +15,32 @@ use wgpu::util::DeviceExt;
 // Re-export shared types for CPU-side use.
 pub use rmesh_shaders::shared::{BVHNode, DrawIndirectCommand, SortUniforms, Uniforms};
 
+// Re-export sort types (moved to rmesh-sort crate).
+pub use rmesh_sort::{
+    BitonicSortPipeline, SortState, TileSortState,
+    create_sort_bind_group, SORT_UNIFORM_ALIGNMENT,
+};
+
+// Re-export tile types (moved to rmesh-tile crate).
+pub use rmesh_tile::{
+    TileBuffers, TilePipelines,
+    ScanPipelines, ScanBuffers,
+    create_tile_fill_bind_group,
+    create_tile_ranges_bind_group, create_tile_ranges_bind_group_with_keys,
+    create_prepare_dispatch_bind_group, create_rts_bind_group,
+    create_tile_gen_scan_bind_group,
+    record_scan_tile_pipeline,
+    dispatch_2d,
+};
+
+// WGSL shader sources, embedded from crate-local files.
+const FORWARD_COMPUTE_WGSL: &str = include_str!("wgsl/forward_compute.wgsl");
+const FORWARD_VERTEX_WGSL: &str = include_str!("wgsl/forward_vertex.wgsl");
+const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
+const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
+const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
+const FORWARD_TILED_WGSL: &str = include_str!("wgsl/forward_tiled_compute.wgsl");
+
 // ---------------------------------------------------------------------------
 // GPU Buffers
 // ---------------------------------------------------------------------------
@@ -179,8 +205,7 @@ pub struct ForwardPipelines {
     pub compute_bind_group_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
     pub render_bind_group_layout: wgpu::BindGroupLayout,
-    pub sort_pipeline: wgpu::ComputePipeline,
-    pub sort_bind_group_layout: wgpu::BindGroupLayout,
+    pub bitonic_sort: BitonicSortPipeline,
 }
 
 /// Helper: create N storage buffer layout entries for the given visibility.
@@ -237,7 +262,7 @@ impl ForwardPipelines {
             });
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::FORWARD_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_COMPUTE_WGSL.into()),
         });
         let compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -271,11 +296,11 @@ impl ForwardPipelines {
             });
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_vertex.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::FORWARD_VERTEX_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_WGSL.into()),
         });
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::FORWARD_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.into()),
         });
 
         // Premultiplied alpha blend for color attachment 0
@@ -336,48 +361,15 @@ impl ForwardPipelines {
                 cache: None,
             });
 
-        // ----- Sort pipeline (3 bindings) -----
-        // Binding 0: SortUniforms (read-only storage)
-        // Binding 1: keys (read-write)
-        // Binding 2: values (read-write)
-        let sort_read_only = [true, false, false];
-        let sort_entries = storage_entries(
-            3,
-            wgpu::ShaderStages::COMPUTE,
-            &sort_read_only,
-        );
-        let sort_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("sort_bind_group_layout"),
-                entries: &sort_entries,
-            });
-        let sort_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("sort_pipeline_layout"),
-                bind_group_layouts: &[&sort_bind_group_layout],
-                immediate_size: 0,
-            });
-        let sort_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("radix_sort.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::RADIX_SORT_WGSL.into()),
-        });
-        let sort_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("sort_pipeline"),
-                layout: Some(&sort_pipeline_layout),
-                module: &sort_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        // ----- Bitonic sort pipeline -----
+        let bitonic_sort = BitonicSortPipeline::new(device);
 
         Self {
             compute_pipeline,
             compute_bind_group_layout,
             render_pipeline,
             render_bind_group_layout,
-            sort_pipeline,
-            sort_bind_group_layout,
+            bitonic_sort,
         }
     }
 }
@@ -484,7 +476,7 @@ impl TexToBufferPipeline {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tex_to_buffer.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TEX_TO_BUFFER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TEX_TO_BUFFER_WGSL.into()),
         });
 
         let bind_group_layout =
@@ -589,143 +581,6 @@ impl TexToBufferPipeline {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Forward Tiled Compute Pipeline (4x4 tiles, subgroup-based)
-// ---------------------------------------------------------------------------
-
-/// Compute-based forward renderer using 4x4 tiles with warp-per-tile.
-///
-/// Requires `wgpu::Features::SUBGROUPS` on the device.
-/// Renders directly to an f32 storage buffer (no texture intermediate).
-pub struct ForwardTiledPipeline {
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    /// The output storage buffer: [W x H x 4] f32
-    pub rendered_image: wgpu::Buffer,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl ForwardTiledPipeline {
-    /// Create the forward tiled pipeline and allocate the rendered_image buffer.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("forward_tiled_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::FORWARD_TILED_WGSL.into()),
-        });
-
-        // 10 bindings: uniforms, vertices, indices, colors, densities, color_grads,
-        //              tile_sort_values, tile_ranges, tile_uniforms, rendered_image
-        let read_only = [true, true, true, true, true, true, true, true, true, false];
-        let entries = storage_entries(10, wgpu::ShaderStages::COMPUTE, &read_only);
-
-        let bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("forward_tiled_bgl"),
-                entries: &entries,
-            });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("forward_tiled_pl"),
-            bind_group_layouts: &[&bind_group_layout],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("forward_tiled_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("fwd_tiled_rendered_image"),
-            size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        Self {
-            pipeline,
-            bind_group_layout,
-            rendered_image,
-            width,
-            height,
-        }
-    }
-
-    /// Get the bind group layout (for creating bind groups externally).
-    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.bind_group_layout
-    }
-
-    /// Get the pipeline (for recording dispatches).
-    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
-        &self.pipeline
-    }
-}
-
-/// Create the forward tiled bind group.
-///
-/// Binding order matches `forward_tiled_compute.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: colors,
-///   4: densities, 5: color_grads, 6: tile_sort_values,
-///   7: tile_ranges, 8: tile_uniforms, 9: rendered_image
-pub fn create_forward_tiled_bind_group(
-    device: &wgpu::Device,
-    fwd_tiled: &ForwardTiledPipeline,
-    scene_buffers: &SceneBuffers,
-    tile_sort_values: &wgpu::Buffer,
-    tile_ranges: &wgpu::Buffer,
-    tile_uniforms: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("forward_tiled_bg"),
-        layout: fwd_tiled.bind_group_layout(),
-        entries: &[
-            buf_entry(0, &scene_buffers.uniforms),
-            buf_entry(1, &scene_buffers.vertices),
-            buf_entry(2, &scene_buffers.indices),
-            buf_entry(3, &scene_buffers.colors),
-            buf_entry(4, &scene_buffers.densities),
-            buf_entry(5, &scene_buffers.color_grads),
-            buf_entry(6, tile_sort_values),
-            buf_entry(7, tile_ranges),
-            buf_entry(8, tile_uniforms),
-            buf_entry(9, &fwd_tiled.rendered_image),
-        ],
-    })
-}
-
-/// Record the forward tiled compute pass dispatch.
-///
-/// Dispatches one workgroup per tile (32 threads each).
-pub fn record_forward_tiled(
-    encoder: &mut wgpu::CommandEncoder,
-    fwd_tiled: &ForwardTiledPipeline,
-    bind_group: &wgpu::BindGroup,
-    num_tiles: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("forward_tiled"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(fwd_tiled.pipeline());
-    pass.set_bind_group(0, bind_group, &[]);
-    // Use 2D dispatch if num_tiles exceeds 65535
-    if num_tiles <= 65535 {
-        pass.dispatch_workgroups(num_tiles, 1, 1);
-    } else {
-        let x = 65535u32;
-        let y = (num_tiles + x - 1) / x;
-        pass.dispatch_workgroups(x, y, 1);
-    }
-}
-
 /// Record the tex-to-buffer conversion dispatch.
 ///
 /// Should be called after the render pass finishes, within the same command encoder.
@@ -808,242 +663,11 @@ pub fn create_render_bind_group(
     })
 }
 
-/// Create a sort bind group for a specific offset within the sort uniform buffer.
-///
-/// Binding order matches `radix_sort.wgsl`:
-///   0: sort_uniforms (at given offset, SortUniforms size),
-///   1: keys, 2: values
-pub fn create_sort_bind_group(
-    device: &wgpu::Device,
-    pipelines: &ForwardPipelines,
-    sort_uniform_buffer: &wgpu::Buffer,
-    sort_keys: &wgpu::Buffer,
-    sort_values: &wgpu::Buffer,
-    offset: wgpu::BufferAddress,
-) -> wgpu::BindGroup {
-    let uniform_size = std::mem::size_of::<SortUniforms>() as wgpu::BufferAddress;
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("sort_bind_group"),
-        layout: &pipelines.sort_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: sort_uniform_buffer,
-                    offset,
-                    size: wgpu::BufferSize::new(uniform_size),
-                }),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: sort_keys.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: sort_values.as_entire_binding(),
-            },
-        ],
-    })
-}
-
 /// Shorthand for a full-buffer bind group entry.
 fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sort State
-// ---------------------------------------------------------------------------
-
-/// Pre-computed bitonic sort state.
-///
-/// Contains a single GPU buffer with all (stage, step_size) uniform pairs
-/// at 256-byte aligned offsets, and one bind group per sort dispatch.
-pub struct SortState {
-    /// Buffer holding all padded SortUniforms entries.
-    pub uniform_buffer: wgpu::Buffer,
-    /// One bind group per sort dispatch step (references uniform_buffer at the
-    /// appropriate offset, plus the sort_keys and sort_values buffers).
-    pub bind_groups: Vec<wgpu::BindGroup>,
-    /// Number of sort dispatches. Same as `bind_groups.len()`.
-    pub step_count: usize,
-    /// Workgroup count per sort dispatch: ceil(tet_count / 256).
-    pub dispatch_x: u32,
-}
-
-/// Minimum alignment for storage buffer offsets. The wgpu spec requires
-/// `minStorageBufferOffsetAlignment`, which is at most 256 on all backends.
-const SORT_UNIFORM_ALIGNMENT: wgpu::BufferAddress = 256;
-
-impl SortState {
-    /// Build the sort state for a given tet count.
-    ///
-    /// Pre-computes all bitonic sort (stage, step_size) pairs, writes them into
-    /// a single padded buffer, and creates one bind group per pair.
-    pub fn new(
-        device: &wgpu::Device,
-        pipelines: &ForwardPipelines,
-        sort_keys: &wgpu::Buffer,
-        sort_values: &wgpu::Buffer,
-        tet_count: u32,
-    ) -> Self {
-        // Enumerate all (stage, step_size) pairs for the full bitonic network.
-        let n_pow2 = tet_count.next_power_of_two();
-        let mut pairs: Vec<SortUniforms> = Vec::new();
-
-        let mut k = 2u32;
-        while k <= n_pow2 {
-            // stage = log2(k) - 1
-            let stage = (k as f32).log2() as u32 - 1;
-            let mut j = k >> 1;
-            while j > 0 {
-                let step_bit = (j as f32).log2() as u32;
-                // Use n_pow2 as count so ALL comparisons happen in valid memory.
-                pairs.push(SortUniforms {
-                    count: n_pow2,
-                    stage,
-                    step_size: step_bit,
-                    _pad: 0,
-                });
-                j >>= 1;
-            }
-            k <<= 1;
-        }
-
-        let step_count = pairs.len();
-
-        // Write all SortUniforms into a single buffer with SORT_UNIFORM_ALIGNMENT padding.
-        let buf_size = step_count as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
-        let mut data = vec![0u8; buf_size as usize];
-        let uniform_bytes = std::mem::size_of::<SortUniforms>();
-
-        for (i, su) in pairs.iter().enumerate() {
-            let offset = i as usize * SORT_UNIFORM_ALIGNMENT as usize;
-            data[offset..offset + uniform_bytes].copy_from_slice(bytemuck::bytes_of(su));
-        }
-
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sort_uniforms"),
-            contents: &data,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Create one bind group per pair, each pointing at the appropriate
-        // offset within the uniform buffer.
-        let bind_groups: Vec<wgpu::BindGroup> = (0..step_count)
-            .map(|i| {
-                let offset = i as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
-                create_sort_bind_group(
-                    device,
-                    pipelines,
-                    &uniform_buffer,
-                    sort_keys,
-                    sort_values,
-                    offset,
-                )
-            })
-            .collect();
-
-        // Dispatch for n_pow2 elements (padded buffers).
-        let dispatch_x = (n_pow2 + 255) / 256;
-
-        Self {
-            uniform_buffer,
-            bind_groups,
-            step_count,
-            dispatch_x,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TileSortState — bitonic sort for tile-tet pairs
-// ---------------------------------------------------------------------------
-
-/// Bitonic sort state for tile-tet pair sorting.
-///
-/// Same pattern as `SortState` but operates on separately-sized buffers.
-/// The sort pipeline itself is shared with the forward sort (ForwardPipelines).
-pub struct TileSortState {
-    pub uniform_buffer: wgpu::Buffer,
-    pub bind_groups: Vec<wgpu::BindGroup>,
-    pub step_count: usize,
-    pub dispatch_x: u32,
-}
-
-impl TileSortState {
-    /// Build the tile sort state for the given max_pairs_pow2 count.
-    ///
-    /// Reuses the sort pipeline and bind group layout from ForwardPipelines.
-    pub fn new(
-        device: &wgpu::Device,
-        pipelines: &ForwardPipelines,
-        tile_sort_keys: &wgpu::Buffer,
-        tile_sort_values: &wgpu::Buffer,
-        max_pairs_pow2: u32,
-    ) -> Self {
-        let n_pow2 = max_pairs_pow2;
-        let mut pairs: Vec<SortUniforms> = Vec::new();
-
-        let mut k = 2u32;
-        while k <= n_pow2 {
-            let stage = (k as f32).log2() as u32 - 1;
-            let mut j = k >> 1;
-            while j > 0 {
-                let step_bit = (j as f32).log2() as u32;
-                pairs.push(SortUniforms {
-                    count: n_pow2,
-                    stage,
-                    step_size: step_bit,
-                    _pad: 0,
-                });
-                j >>= 1;
-            }
-            k <<= 1;
-        }
-
-        let step_count = pairs.len();
-
-        let buf_size = step_count as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
-        let mut data = vec![0u8; buf_size as usize];
-        let uniform_bytes = std::mem::size_of::<SortUniforms>();
-
-        for (i, su) in pairs.iter().enumerate() {
-            let offset = i as usize * SORT_UNIFORM_ALIGNMENT as usize;
-            data[offset..offset + uniform_bytes].copy_from_slice(bytemuck::bytes_of(su));
-        }
-
-        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tile_sort_uniforms"),
-            contents: &data,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        let bind_groups: Vec<wgpu::BindGroup> = (0..step_count)
-            .map(|i| {
-                let offset = i as wgpu::BufferAddress * SORT_UNIFORM_ALIGNMENT;
-                create_sort_bind_group(
-                    device,
-                    pipelines,
-                    &uniform_buffer,
-                    tile_sort_keys,
-                    tile_sort_values,
-                    offset,
-                )
-            })
-            .collect();
-
-        let dispatch_x = (n_pow2 + 255) / 256;
-
-        Self {
-            uniform_buffer,
-            bind_groups,
-            step_count,
-            dispatch_x,
-        }
     }
 }
 
@@ -1147,7 +771,7 @@ pub fn record_forward_compute_and_sort(
             label: Some("bitonic_sort"),
             timestamp_writes: None,
         });
-        spass.set_pipeline(&pipelines.sort_pipeline);
+        spass.set_pipeline(&pipelines.bitonic_sort.pipeline);
 
         for i in 0..sort_state.step_count {
             spass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
@@ -1215,7 +839,7 @@ pub fn record_forward_pass(
             label: Some("bitonic_sort"),
             timestamp_writes: None,
         });
-        spass.set_pipeline(&pipelines.sort_pipeline);
+        spass.set_pipeline(&pipelines.bitonic_sort.pipeline);
 
         for i in 0..sort_state.step_count {
             spass.set_bind_group(0, &sort_state.bind_groups[i], &[]);
@@ -1314,7 +938,7 @@ pub fn setup_forward(
     let render_bg = create_render_bind_group(device, &pipelines, &buffers);
     let sort_state = SortState::new(
         device,
-        &pipelines,
+        &pipelines.bitonic_sort,
         &buffers.sort_keys,
         &buffers.sort_values,
         scene.tet_count,
@@ -1612,7 +1236,7 @@ impl RayTracePipeline {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raytrace_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::RAYTRACE_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(RAYTRACE_COMPUTE_WGSL.into()),
         });
 
         let read_only = [true, true, true, true, true, true, true, false, true, true, true];
@@ -1745,4 +1369,144 @@ pub fn record_raytrace(
     pass.set_pipeline(rt_pipeline.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
     pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
+}
+
+// ===========================================================================
+// Forward tiled pipeline
+// ===========================================================================
+
+/// Compute-based forward renderer using tiles with warp-per-tile.
+///
+/// Requires `wgpu::Features::SUBGROUPS` on the device.
+/// Renders directly to an f32 storage buffer (no texture intermediate).
+pub struct ForwardTiledPipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+    /// The output storage buffer: [W x H x 4] f32
+    pub rendered_image: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl ForwardTiledPipeline {
+    /// Create the forward tiled pipeline and allocate the rendered_image buffer.
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("forward_tiled_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_TILED_WGSL.into()),
+        });
+
+        // 10 bindings: uniforms, vertices, indices, colors, densities, color_grads,
+        //              tile_sort_values, tile_ranges, tile_uniforms, rendered_image
+        let read_only = [true, true, true, true, true, true, true, true, true, false];
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
+            .iter()
+            .enumerate()
+            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
+            .collect();
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("forward_tiled_bgl"),
+                entries: &entries,
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("forward_tiled_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("forward_tiled_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fwd_tiled_rendered_image"),
+            size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        Self {
+            pipeline,
+            bind_group_layout,
+            rendered_image,
+            width,
+            height,
+        }
+    }
+
+    /// Get the bind group layout (for creating bind groups externally).
+    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bind_group_layout
+    }
+
+    /// Get the pipeline (for recording dispatches).
+    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.pipeline
+    }
+}
+
+/// Create the forward tiled bind group.
+///
+/// Binding order matches `forward_tiled_compute.wgsl`:
+///   0: uniforms, 1: vertices, 2: indices, 3: colors,
+///   4: densities, 5: color_grads, 6: tile_sort_values,
+///   7: tile_ranges, 8: tile_uniforms, 9: rendered_image
+pub fn create_forward_tiled_bind_group(
+    device: &wgpu::Device,
+    fwd_tiled: &ForwardTiledPipeline,
+    uniforms: &wgpu::Buffer,
+    vertices: &wgpu::Buffer,
+    indices: &wgpu::Buffer,
+    colors: &wgpu::Buffer,
+    densities: &wgpu::Buffer,
+    color_grads: &wgpu::Buffer,
+    tile_sort_values: &wgpu::Buffer,
+    tile_ranges: &wgpu::Buffer,
+    tile_uniforms: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("forward_tiled_bg"),
+        layout: fwd_tiled.bind_group_layout(),
+        entries: &[
+            buf_entry(0, uniforms),
+            buf_entry(1, vertices),
+            buf_entry(2, indices),
+            buf_entry(3, colors),
+            buf_entry(4, densities),
+            buf_entry(5, color_grads),
+            buf_entry(6, tile_sort_values),
+            buf_entry(7, tile_ranges),
+            buf_entry(8, tile_uniforms),
+            buf_entry(9, &fwd_tiled.rendered_image),
+        ],
+    })
+}
+
+/// Record the forward tiled compute pass dispatch.
+///
+/// Dispatches one workgroup per tile (32 threads each).
+pub fn record_forward_tiled(
+    encoder: &mut wgpu::CommandEncoder,
+    fwd_tiled: &ForwardTiledPipeline,
+    bind_group: &wgpu::BindGroup,
+    num_tiles: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("forward_tiled"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(fwd_tiled.pipeline());
+    pass.set_bind_group(0, bind_group, &[]);
+    let (x, y) = dispatch_2d(num_tiles);
+    pass.dispatch_workgroups(x, y, 1);
 }

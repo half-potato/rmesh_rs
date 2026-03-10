@@ -11,8 +11,7 @@
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
-    create_adam_bind_group, create_backward_bind_groups, create_loss_bind_group, AdamState,
-    BackwardPipelines, GradientBuffers, LossBuffers,
+    create_backward_bind_groups, BackwardPipelines, GradientBuffers,
 };
 use rmesh_data::SceneData;
 use rmesh_render::{
@@ -20,6 +19,328 @@ use rmesh_render::{
     ForwardPipelines, RenderTargets, SceneBuffers, SortState, TexToBufferPipeline, Uniforms,
 };
 use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
+
+// Re-export these types so downstream crates (rmesh-python) can use them.
+pub use rmesh_shaders::shared::AdamUniforms as AdamUniformsType;
+pub use rmesh_shaders::shared::LossUniforms as LossUniformsType;
+
+// WGSL shader sources.
+const LOSS_COMPUTE_WGSL: &str = include_str!("wgsl/loss_compute.wgsl");
+const ADAM_COMPUTE_WGSL: &str = include_str!("wgsl/adam_compute.wgsl");
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn dispatch_2d(total_workgroups: u32) -> (u32, u32) {
+    if total_workgroups <= 65535 {
+        (total_workgroups, 1)
+    } else {
+        let x = 65535u32;
+        let y = (total_workgroups + x - 1) / x;
+        (x, y)
+    }
+}
+
+fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    })
+}
+
+// ===========================================================================
+// Loss buffers and pipeline
+// ===========================================================================
+
+/// Buffers for loss computation.
+pub struct LossBuffers {
+    /// Per-pixel gradient dL/d(pixel): [H x W x 4] f32
+    pub dl_d_image: wgpu::Buffer,
+    /// Ground truth image: [H x W x 3] f32
+    pub ground_truth: wgpu::Buffer,
+    /// Scalar loss value: [1] f32
+    pub loss_value: wgpu::Buffer,
+    /// Loss uniforms
+    pub loss_uniforms: wgpu::Buffer,
+}
+
+impl LossBuffers {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        let n_pixels = (width as u64) * (height as u64);
+        Self {
+            dl_d_image: create_storage_buffer(device, "dl_d_image", n_pixels * 4 * 4),
+            ground_truth: create_storage_buffer(device, "ground_truth", n_pixels * 3 * 4),
+            loss_value: create_storage_buffer(device, "loss_value", 4),
+            loss_uniforms: create_storage_buffer(
+                device,
+                "loss_uniforms",
+                std::mem::size_of::<LossUniforms>() as u64,
+            ),
+        }
+    }
+}
+
+/// Loss compute pipeline.
+pub struct LossPipeline {
+    pub pipeline: wgpu::ComputePipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl LossPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let loss_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("loss_compute"),
+            source: wgpu::ShaderSource::Wgsl(LOSS_COMPUTE_WGSL.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("loss_bind_group_layout"),
+                entries: &[
+                    storage_entry(0, true),  // uniforms
+                    storage_entry(1, true),  // rendered
+                    storage_entry(2, true),  // ground_truth
+                    storage_entry(3, false), // dl_d_image
+                    storage_entry(4, false), // loss_value
+                ],
+            });
+
+        let pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("loss_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                immediate_size: 0,
+            });
+
+        let pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("loss_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &loss_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+/// Create the bind group for the loss compute pass.
+pub fn create_loss_bind_group(
+    device: &wgpu::Device,
+    pipeline: &LossPipeline,
+    loss_buffers: &LossBuffers,
+    rendered_buf: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("loss_bind_group"),
+        layout: &pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: loss_buffers.loss_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: rendered_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: loss_buffers.ground_truth.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: loss_buffers.dl_d_image.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: loss_buffers.loss_value.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+/// Record the loss computation pass.
+pub fn record_loss_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &LossPipeline,
+    loss_bg: &wgpu::BindGroup,
+    width: u32,
+    height: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("loss_pass"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&pipeline.pipeline);
+    pass.set_bind_group(0, loss_bg, &[]);
+    pass.dispatch_workgroups((width + 15) / 16, (height + 15) / 16, 1);
+}
+
+// ===========================================================================
+// Adam optimizer
+// ===========================================================================
+
+/// Adam optimizer state -- first and second moments per parameter group.
+pub struct AdamState {
+    pub m_sh: wgpu::Buffer,
+    pub v_sh: wgpu::Buffer,
+    pub m_vertices: wgpu::Buffer,
+    pub v_vertices: wgpu::Buffer,
+    pub m_densities: wgpu::Buffer,
+    pub v_densities: wgpu::Buffer,
+    pub m_color_grads: wgpu::Buffer,
+    pub v_color_grads: wgpu::Buffer,
+}
+
+impl AdamState {
+    pub fn new(
+        device: &wgpu::Device,
+        vertex_count: u32,
+        tet_count: u32,
+        sh_stride: u32,
+    ) -> Self {
+        let sh_size = (tet_count as u64) * (sh_stride as u64) * 4;
+        let vert_size = (vertex_count as u64) * 3 * 4;
+        let density_size = (tet_count as u64) * 4;
+        let grad_size = (tet_count as u64) * 3 * 4;
+
+        Self {
+            m_sh: create_storage_buffer(device, "adam_m_sh", sh_size),
+            v_sh: create_storage_buffer(device, "adam_v_sh", sh_size),
+            m_vertices: create_storage_buffer(device, "adam_m_vertices", vert_size),
+            v_vertices: create_storage_buffer(device, "adam_v_vertices", vert_size),
+            m_densities: create_storage_buffer(device, "adam_m_densities", density_size),
+            v_densities: create_storage_buffer(device, "adam_v_densities", density_size),
+            m_color_grads: create_storage_buffer(device, "adam_m_color_grads", grad_size),
+            v_color_grads: create_storage_buffer(device, "adam_v_color_grads", grad_size),
+        }
+    }
+}
+
+/// Adam optimizer pipeline.
+pub struct AdamPipeline {
+    pub pipeline: wgpu::ComputePipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl AdamPipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let adam_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("adam_compute"),
+            source: wgpu::ShaderSource::Wgsl(ADAM_COMPUTE_WGSL.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("adam_bind_group_layout"),
+                entries: &[
+                    storage_entry(0, true),  // uniforms
+                    storage_entry(1, false), // params
+                    storage_entry(2, true),  // grads
+                    storage_entry(3, false), // m
+                    storage_entry(4, false), // v
+                ],
+            });
+
+        let pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("adam_pipeline_layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                immediate_size: 0,
+            });
+
+        let pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("adam_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &adam_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+        Self { pipeline, bind_group_layout }
+    }
+}
+
+/// Create a bind group for a single Adam optimizer parameter group.
+pub fn create_adam_bind_group(
+    device: &wgpu::Device,
+    pipeline: &AdamPipeline,
+    uniforms_buf: &wgpu::Buffer,
+    params: &wgpu::Buffer,
+    grads: &wgpu::Buffer,
+    m: &wgpu::Buffer,
+    v: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("adam_bind_group"),
+        layout: &pipeline.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: grads.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: m.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: v.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+/// Record Adam optimizer updates for all parameter groups.
+pub fn record_adam_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &AdamPipeline,
+    adam_bgs: &[wgpu::BindGroup],
+    param_counts: &[u32],
+) {
+    for (bg, &count) in adam_bgs.iter().zip(param_counts) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("adam_pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline.pipeline);
+        pass.set_bind_group(0, bg, &[]);
+        let (ax, ay) = dispatch_2d((count + 255) / 256);
+        pass.dispatch_workgroups(ax, ay, 1);
+    }
+}
+
+// ===========================================================================
+// Training configuration and loop
+// ===========================================================================
 
 /// Training configuration.
 pub struct TrainConfig {
@@ -87,6 +408,8 @@ pub fn train(
     // Create pipelines
     let fwd_pipelines = ForwardPipelines::new(device, color_format, aux_format);
     let bwd_pipelines = BackwardPipelines::new(device);
+    let loss_pipeline = LossPipeline::new(device);
+    let adam_pipeline = AdamPipeline::new(device);
 
     // Upload scene data
     let buffers = SceneBuffers::upload(device, queue, scene);
@@ -102,7 +425,7 @@ pub fn train(
     // Create sort state
     let sort_state = SortState::new(
         device,
-        &fwd_pipelines,
+        &fwd_pipelines.bitonic_sort,
         &buffers.sort_keys,
         &buffers.sort_values,
         scene.tet_count,
@@ -125,12 +448,11 @@ pub fn train(
     );
 
     // Create bind groups for backward pass
-    let loss_bg = create_loss_bind_group(device, &bwd_pipelines, &loss_buffers, &ttb.rendered_image);
+    let loss_bg = create_loss_bind_group(device, &loss_pipeline, &loss_buffers, &ttb.rendered_image);
     let (bwd_bg0, bwd_bg1) =
-        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &loss_buffers, &grads, &ttb.rendered_image);
+        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &loss_buffers.dl_d_image, &grads, &ttb.rendered_image);
 
     // Adam bind groups — one per parameter group
-    // Each group: (uniforms_buf, params, grads, m, v)
     let adam_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("adam_uniforms"),
         size: std::mem::size_of::<AdamUniforms>() as u64,
@@ -138,11 +460,10 @@ pub fn train(
         mapped_at_creation: false,
     });
 
-    // Parameter groups: SH, vertices, densities, color_grads
     let adam_bgs = [
         create_adam_bind_group(
             device,
-            &bwd_pipelines,
+            &adam_pipeline,
             &adam_uniforms_buf,
             &buffers.sh_coeffs,
             &grads.d_sh_coeffs,
@@ -151,7 +472,7 @@ pub fn train(
         ),
         create_adam_bind_group(
             device,
-            &bwd_pipelines,
+            &adam_pipeline,
             &adam_uniforms_buf,
             &buffers.vertices,
             &grads.d_vertices,
@@ -160,7 +481,7 @@ pub fn train(
         ),
         create_adam_bind_group(
             device,
-            &bwd_pipelines,
+            &adam_pipeline,
             &adam_uniforms_buf,
             &buffers.densities,
             &grads.d_densities,
@@ -169,7 +490,7 @@ pub fn train(
         ),
         create_adam_bind_group(
             device,
-            &bwd_pipelines,
+            &adam_pipeline,
             &adam_uniforms_buf,
             &buffers.color_grads,
             &grads.d_color_grads,
@@ -294,9 +615,9 @@ pub fn train(
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("loss"),
                 });
-            rmesh_backward::record_loss_pass(
+            record_loss_pass(
                 &mut encoder,
-                &bwd_pipelines,
+                &loss_pipeline,
                 &loss_bg,
                 view.width,
                 view.height,
@@ -336,9 +657,9 @@ pub fn train(
                     device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                         label: Some("adam"),
                     });
-                rmesh_backward::record_adam_pass(
+                record_adam_pass(
                     &mut encoder,
-                    &bwd_pipelines,
+                    &adam_pipeline,
                     std::slice::from_ref(bg),
                     &[count],
                 );

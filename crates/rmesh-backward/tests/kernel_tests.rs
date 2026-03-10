@@ -19,6 +19,12 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rmesh_data::SceneData;
+use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
+use rmesh_train::{
+    AdamPipeline, AdamState, LossBuffers, LossPipeline,
+    create_adam_bind_group, create_loss_bind_group,
+    record_adam_pass, record_loss_pass,
+};
 use wgpu::util::DeviceExt;
 
 const SEED: u64 = 42424242;
@@ -338,14 +344,14 @@ fn test_loss_compute_kernel() {
     let loss_uniforms_buf = create_rw_buffer(
         &device,
         "loss_uniforms",
-        std::mem::size_of::<rmesh_backward::LossUniforms>() as u64,
+        std::mem::size_of::<LossUniforms>() as u64,
     );
 
     // Clear loss_value
     queue.write_buffer(&loss_value, 0, &[0u8; 4]);
 
     // Write loss uniforms (L1)
-    let loss_uni = rmesh_backward::LossUniforms {
+    let loss_uni = LossUniforms {
         width: W,
         height: H,
         loss_type: 0, // L1
@@ -354,21 +360,21 @@ fn test_loss_compute_kernel() {
     queue.write_buffer(&loss_uniforms_buf, 0, bytemuck::bytes_of(&loss_uni));
 
     // Create pipeline and bind group
-    let pipelines = rmesh_backward::BackwardPipelines::new(&device);
+    let loss_pipeline = LossPipeline::new(&device);
 
     // Manually create loss buffers struct for bind group
-    let loss_buffers = rmesh_backward::LossBuffers {
+    let loss_buffers = LossBuffers {
         dl_d_image,
         ground_truth: gt_buf,
         loss_value,
         loss_uniforms: loss_uniforms_buf,
     };
     let loss_bg =
-        rmesh_backward::create_loss_bind_group(&device, &pipelines, &loss_buffers, &rendered_buf);
+        create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &rendered_buf);
 
     // Dispatch
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_backward::record_loss_pass(&mut encoder, &pipelines, &loss_bg, W, H);
+    record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
     queue.submit(std::iter::once(encoder.finish()));
 
     // Read back dl_d_image
@@ -452,14 +458,14 @@ fn test_adam_kernel() {
     let adam_uniforms_buf = create_rw_buffer(
         &device,
         "adam_uniforms",
-        std::mem::size_of::<rmesh_backward::AdamUniforms>() as u64,
+        std::mem::size_of::<AdamUniforms>() as u64,
     );
 
     queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&params_data));
     queue.write_buffer(&m_buf, 0, bytemuck::cast_slice(&zeros));
     queue.write_buffer(&v_buf, 0, bytemuck::cast_slice(&zeros));
 
-    let adam_uni = rmesh_backward::AdamUniforms {
+    let adam_uni = AdamUniforms {
         param_count,
         step: 1,
         lr: 0.01,
@@ -470,10 +476,10 @@ fn test_adam_kernel() {
     };
     queue.write_buffer(&adam_uniforms_buf, 0, bytemuck::bytes_of(&adam_uni));
 
-    let pipelines = rmesh_backward::BackwardPipelines::new(&device);
-    let adam_bg = rmesh_backward::create_adam_bind_group(
+    let adam_pipeline = AdamPipeline::new(&device);
+    let adam_bg = create_adam_bind_group(
         &device,
-        &pipelines,
+        &adam_pipeline,
         &adam_uniforms_buf,
         &params_buf,
         &grads_buf,
@@ -483,9 +489,9 @@ fn test_adam_kernel() {
 
     // Dispatch
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_backward::record_adam_pass(
+    record_adam_pass(
         &mut encoder,
-        &pipelines,
+        &adam_pipeline,
         std::slice::from_ref(&adam_bg),
         &[param_count],
     );
@@ -725,7 +731,10 @@ fn test_tiled_forward_e2e() {
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
     );
 
     // Tile ranges uses num_keys_buf (scan pipeline writes total_pairs there)
@@ -741,11 +750,15 @@ fn test_tiled_forward_e2e() {
     // Create forward tiled pipeline (SUBGROUP)
     let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
     let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
     let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
@@ -896,7 +909,10 @@ fn test_tiled_backward_e2e() {
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
     );
 
     // Tile ranges uses num_keys_buf (scan pipeline writes total_pairs there)
@@ -910,11 +926,15 @@ fn test_tiled_backward_e2e() {
     );
 
     let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
     let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
@@ -950,14 +970,14 @@ fn test_tiled_backward_e2e() {
 
     // --- Loss computation ---
     let n_pixels = (W * H) as usize;
-    let bwd_pipelines = rmesh_backward::BackwardPipelines::new(&device);
-    let loss_buffers = rmesh_backward::LossBuffers::new(&device, W, H);
+    let loss_pipeline = LossPipeline::new(&device);
+    let loss_buffers = LossBuffers::new(&device, W, H);
 
     // Ground truth: constant gray
     let gt_data: Vec<f32> = vec![0.5; n_pixels * 3];
     queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&gt_data));
 
-    let loss_uni = rmesh_backward::LossUniforms {
+    let loss_uni = LossUniforms {
         width: W,
         height: H,
         loss_type: 0,
@@ -966,12 +986,12 @@ fn test_tiled_backward_e2e() {
     queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
     queue.write_buffer(&loss_buffers.loss_value, 0, &[0u8; 4]);
 
-    let loss_bg = rmesh_backward::create_loss_bind_group(
-        &device, &bwd_pipelines, &loss_buffers, &fwd_tiled.rendered_image,
+    let loss_bg = create_loss_bind_group(
+        &device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image,
     );
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    rmesh_backward::record_loss_pass(&mut encoder, &bwd_pipelines, &loss_bg, W, H);
+    record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
     queue.submit(std::iter::once(encoder.finish()));
 
     // --- Backward tiled ---
@@ -995,9 +1015,15 @@ fn test_tiled_backward_e2e() {
         (&tile_buffers.tile_sort_values, &tile_buffers.tile_sort_keys)
     };
 
+    let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
     let (bwd_bg0, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
-        &device, &tile_pipelines, &buffers, &loss_buffers, &grad_buffers,
-        &fwd_tiled.rendered_image, tile_sort_values_sorted,
+        &device, &bwd_tiled_pipelines,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+        &buffers.vertices, &buffers.indices, &buffers.sh_coeffs,
+        &buffers.densities, &buffers.color_grads, &buffers.circumdata,
+        &buffers.colors, tile_sort_values_sorted,
+        &grad_buffers.d_sh_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_densities, &grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
 
@@ -1006,7 +1032,7 @@ fn test_tiled_backward_e2e() {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("backward_tiled"), timestamp_writes: None,
         });
-        pass.set_pipeline(&tile_pipelines.backward_tiled_pipeline);
+        pass.set_pipeline(&bwd_tiled_pipelines.pipeline);
         pass.set_bind_group(0, &bwd_bg0, &[]);
         pass.set_bind_group(1, &bwd_bg1, &[]);
         let num_tiles = tile_buffers.num_tiles;
@@ -1128,7 +1154,10 @@ fn test_single_tet_gradient_finite_diff() {
         );
         let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
         let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
+            &device, &scan_pipelines, &tile_buffers,
+            &buffers.uniforms, &buffers.vertices, &buffers.indices,
+            &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+            &scan_buffers, &radix_state.num_keys_buf,
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1142,11 +1171,15 @@ fn test_single_tet_gradient_finite_diff() {
 
         let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
         let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers,
+            &device, &fwd_tiled, &buffers.uniforms,
+            &buffers.vertices, &buffers.indices, &buffers.colors,
+            &buffers.densities, &buffers.color_grads,
             &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
         let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers,
+            &device, &fwd_tiled, &buffers.uniforms,
+            &buffers.vertices, &buffers.indices, &buffers.colors,
+            &buffers.densities, &buffers.color_grads,
             &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
@@ -1236,7 +1269,10 @@ fn test_single_tet_gradient_finite_diff() {
         );
         let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
         let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-            &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
+            &device, &scan_pipelines, &tile_buffers,
+            &buffers.uniforms, &buffers.vertices, &buffers.indices,
+            &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+            &scan_buffers, &radix_state.num_keys_buf,
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1250,11 +1286,15 @@ fn test_single_tet_gradient_finite_diff() {
 
         let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
         let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers,
+            &device, &fwd_tiled, &buffers.uniforms,
+            &buffers.vertices, &buffers.indices, &buffers.colors,
+            &buffers.densities, &buffers.color_grads,
             &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
         let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-            &device, &fwd_tiled, &buffers,
+            &device, &fwd_tiled, &buffers.uniforms,
+            &buffers.vertices, &buffers.indices, &buffers.colors,
+            &buffers.densities, &buffers.color_grads,
             &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
@@ -1288,20 +1328,20 @@ fn test_single_tet_gradient_finite_diff() {
         queue.submit(std::iter::once(encoder.finish()));
 
         // Loss
-        let bwd_pipelines = rmesh_backward::BackwardPipelines::new(&device);
-        let loss_buffers = rmesh_backward::LossBuffers::new(&device, W, H);
+        let loss_pipeline = LossPipeline::new(&device);
+        let loss_buffers = LossBuffers::new(&device, W, H);
         queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&gt_data));
 
-        let loss_uni = rmesh_backward::LossUniforms {
+        let loss_uni = LossUniforms {
             width: W, height: H, loss_type, lambda_ssim: 0.0,
         };
         queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
         queue.write_buffer(&loss_buffers.loss_value, 0, &[0u8; 4]);
 
-        let loss_bg = rmesh_backward::create_loss_bind_group(&device, &bwd_pipelines, &loss_buffers, &fwd_tiled.rendered_image);
+        let loss_bg = create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image);
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        rmesh_backward::record_loss_pass(&mut encoder, &bwd_pipelines, &loss_bg, W, H);
+        record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
         queue.submit(std::iter::once(encoder.finish()));
 
         // Backward
@@ -1325,16 +1365,22 @@ fn test_single_tet_gradient_finite_diff() {
             (&tile_buffers.tile_sort_values, &tile_buffers.tile_sort_keys)
         };
 
+        let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
         let (bwd_bg0, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
-            &device, &tile_pipelines, &buffers, &loss_buffers, &grad_buffers,
-            &fwd_tiled.rendered_image, tile_sort_values_sorted,
+            &device, &bwd_tiled_pipelines,
+            &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+            &buffers.vertices, &buffers.indices, &buffers.sh_coeffs,
+            &buffers.densities, &buffers.color_grads, &buffers.circumdata,
+            &buffers.colors, tile_sort_values_sorted,
+            &grad_buffers.d_sh_coeffs, &grad_buffers.d_vertices,
+            &grad_buffers.d_densities, &grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("backward_tiled"), timestamp_writes: None });
-            pass.set_pipeline(&tile_pipelines.backward_tiled_pipeline);
+            pass.set_pipeline(&bwd_tiled_pipelines.pipeline);
             pass.set_bind_group(0, &bwd_bg0, &[]);
             pass.set_bind_group(1, &bwd_bg1, &[]);
             let num_tiles = tile_buffers.num_tiles;
@@ -1551,7 +1597,10 @@ fn test_single_tet_loss_decreases() {
     let tile_fill_bg =
         rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers, &buffers, &scan_buffers, &radix_state.num_keys_buf,
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
     );
 
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -1566,30 +1615,34 @@ fn test_single_tet_loss_decreases() {
     // Forward tiled
     let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
     let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
     let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
-        &device, &fwd_tiled, &buffers,
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.colors,
+        &buffers.densities, &buffers.color_grads,
         &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // Loss + Backward
-    let bwd_pipelines = rmesh_backward::BackwardPipelines::new(&device);
-    let loss_buffers = rmesh_backward::LossBuffers::new(&device, W, H);
+    let loss_pipeline = LossPipeline::new(&device);
+    let loss_buffers = LossBuffers::new(&device, W, H);
     // GT = black: background pixels (rendered=[0,0,0]) contribute zero loss.
     // Only foreground pixels matter → optimizer should drive loss to near zero
     // by making the tet transparent (density→0) or color→black.
     let gt_data: Vec<f32> = vec![0.0; n_pixels * 3];
     queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&gt_data));
 
-    let loss_uni = rmesh_backward::LossUniforms {
+    let loss_uni = LossUniforms {
         width: W, height: H, loss_type: 1, lambda_ssim: 0.0, // L2
     };
     queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
 
-    let loss_bg = rmesh_backward::create_loss_bind_group(
-        &device, &bwd_pipelines, &loss_buffers, &fwd_tiled.rendered_image,
+    let loss_bg = create_loss_bind_group(
+        &device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image,
     );
 
     let sh_stride = scene.num_sh_coeffs() * 3;
@@ -1599,42 +1652,54 @@ fn test_single_tet_loss_decreases() {
     let debug_image = create_rw_buffer(&device, "debug_image", (n_pixels as u64) * 4 * 4);
 
     // Backward bind groups (A/B variants for radix sort result)
+    let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
     let (bwd_bg0_a, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
-        &device, &tile_pipelines, &buffers, &loss_buffers, &grad_buffers,
-        &fwd_tiled.rendered_image, &tile_buffers.tile_sort_values,
+        &device, &bwd_tiled_pipelines,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+        &buffers.vertices, &buffers.indices, &buffers.sh_coeffs,
+        &buffers.densities, &buffers.color_grads, &buffers.circumdata,
+        &buffers.colors, &tile_buffers.tile_sort_values,
+        &grad_buffers.d_sh_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_densities, &grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
-        &device, &tile_pipelines, &buffers, &loss_buffers, &grad_buffers,
-        &fwd_tiled.rendered_image, &radix_state.values_b,
+        &device, &bwd_tiled_pipelines,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
+        &buffers.vertices, &buffers.indices, &buffers.sh_coeffs,
+        &buffers.densities, &buffers.color_grads, &buffers.circumdata,
+        &buffers.colors, &radix_state.values_b,
+        &grad_buffers.d_sh_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_densities, &grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
 
     // Adam state + bind groups (separate uniform buffers per group to avoid overwrite)
-    let adam_state = rmesh_backward::AdamState::new(
+    let adam_state = AdamState::new(
         &device, scene.vertex_count, scene.tet_count, sh_stride,
     );
+    let adam_pipeline = AdamPipeline::new(&device);
     let adam_uni_sh = create_rw_buffer(
-        &device, "adam_uni_sh", std::mem::size_of::<rmesh_backward::AdamUniforms>() as u64,
+        &device, "adam_uni_sh", std::mem::size_of::<AdamUniforms>() as u64,
     );
     let adam_uni_dens = create_rw_buffer(
-        &device, "adam_uni_dens", std::mem::size_of::<rmesh_backward::AdamUniforms>() as u64,
+        &device, "adam_uni_dens", std::mem::size_of::<AdamUniforms>() as u64,
     );
     let adam_uni_cg = create_rw_buffer(
-        &device, "adam_uni_cg", std::mem::size_of::<rmesh_backward::AdamUniforms>() as u64,
+        &device, "adam_uni_cg", std::mem::size_of::<AdamUniforms>() as u64,
     );
-    let adam_bg_sh = rmesh_backward::create_adam_bind_group(
-        &device, &bwd_pipelines, &adam_uni_sh,
+    let adam_bg_sh = create_adam_bind_group(
+        &device, &adam_pipeline, &adam_uni_sh,
         &buffers.sh_coeffs, &grad_buffers.d_sh_coeffs,
         &adam_state.m_sh, &adam_state.v_sh,
     );
-    let adam_bg_dens = rmesh_backward::create_adam_bind_group(
-        &device, &bwd_pipelines, &adam_uni_dens,
+    let adam_bg_dens = create_adam_bind_group(
+        &device, &adam_pipeline, &adam_uni_dens,
         &buffers.densities, &grad_buffers.d_densities,
         &adam_state.m_densities, &adam_state.v_densities,
     );
-    let adam_bg_cg = rmesh_backward::create_adam_bind_group(
-        &device, &bwd_pipelines, &adam_uni_cg,
+    let adam_bg_cg = create_adam_bind_group(
+        &device, &adam_pipeline, &adam_uni_cg,
         &buffers.color_grads, &grad_buffers.d_color_grads,
         &adam_state.m_color_grads, &adam_state.v_color_grads,
     );
@@ -1658,7 +1723,7 @@ fn test_single_tet_loss_decreases() {
     for step in 1..=num_steps {
         // Write Adam uniforms per group (before encoder submission)
         for (i, &count) in param_counts.iter().enumerate() {
-            let adam_uni = rmesh_backward::AdamUniforms {
+            let adam_uni = AdamUniforms {
                 param_count: count,
                 step,
                 lr,
@@ -1718,7 +1783,7 @@ fn test_single_tet_loss_decreases() {
         }
 
         // Loss
-        rmesh_backward::record_loss_pass(&mut encoder, &bwd_pipelines, &loss_bg, W, H);
+        record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
 
         // Backward tiled
         {
@@ -1726,7 +1791,7 @@ fn test_single_tet_loss_decreases() {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("backward_tiled"), timestamp_writes: None,
             });
-            pass.set_pipeline(&tile_pipelines.backward_tiled_pipeline);
+            pass.set_pipeline(&bwd_tiled_pipelines.pipeline);
             pass.set_bind_group(0, bwd_bg0, &[]);
             pass.set_bind_group(1, &bwd_bg1, &[]);
             let num_tiles = tile_buffers.num_tiles;
@@ -1738,9 +1803,9 @@ fn test_single_tet_loss_decreases() {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("adam"), timestamp_writes: None,
             });
-            pass.set_pipeline(&bwd_pipelines.adam_pipeline);
+            pass.set_pipeline(&adam_pipeline.pipeline);
             pass.set_bind_group(0, bg, &[]);
-            let wg_count = (count + 255) / 256;
+            let wg_count: u32 = (count + 255) / 256;
             pass.dispatch_workgroups(wg_count.min(65535), ((wg_count + 65534) / 65535).max(1), 1);
         }
 
