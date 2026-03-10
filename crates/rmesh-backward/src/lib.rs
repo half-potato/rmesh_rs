@@ -706,8 +706,6 @@ impl TileBuffers {
 pub struct TilePipelines {
     pub fill_pipeline: wgpu::ComputePipeline,
     pub fill_bind_group_layout: wgpu::BindGroupLayout,
-    pub tile_gen_pipeline: wgpu::ComputePipeline,
-    pub tile_gen_bind_group_layout: wgpu::BindGroupLayout,
     pub tile_ranges_pipeline: wgpu::ComputePipeline,
     pub tile_ranges_bind_group_layout: wgpu::BindGroupLayout,
     pub backward_tiled_pipeline: wgpu::ComputePipeline,
@@ -742,42 +740,6 @@ impl TilePipelines {
                 label: Some("tile_fill_pipeline"),
                 layout: Some(&fill_pipeline_layout),
                 module: &fill_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        // ----- Tile gen pipeline (9 bindings) — uses convex hull overlap test -----
-        let tile_gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("tile_gen_hull_compute"),
-            source: wgpu::ShaderSource::Wgsl(rmesh_shaders::TILE_GEN_HULL_WGSL.into()),
-        });
-        let tile_gen_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("tile_gen_bgl"),
-                entries: &[
-                    storage_entry(0, true),  // tile_uniforms
-                    storage_entry(1, true),  // main uniforms
-                    storage_entry(2, true),  // vertices
-                    storage_entry(3, true),  // indices
-                    storage_entry(4, true),  // sorted_indices
-                    storage_entry(5, true),  // circumdata
-                    storage_entry(6, false), // tile_sort_keys
-                    storage_entry(7, false), // tile_sort_values
-                    storage_entry(8, false), // tile_pair_count
-                ],
-            });
-        let tile_gen_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("tile_gen_pl"),
-                bind_group_layouts: &[&tile_gen_bind_group_layout],
-                immediate_size: 0,
-            });
-        let tile_gen_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("tile_gen_pipeline"),
-                layout: Some(&tile_gen_pipeline_layout),
-                module: &tile_gen_shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 cache: None,
@@ -874,8 +836,6 @@ impl TilePipelines {
         Self {
             fill_pipeline,
             fill_bind_group_layout,
-            tile_gen_pipeline,
-            tile_gen_bind_group_layout,
             tile_ranges_pipeline,
             tile_ranges_bind_group_layout,
             backward_tiled_pipeline,
@@ -901,29 +861,6 @@ pub fn create_tile_fill_bind_group(
             wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_uniforms.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 1, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 2, resource: tile_buffers.tile_sort_values.as_entire_binding() },
-        ],
-    })
-}
-
-pub fn create_tile_gen_bind_group(
-    device: &wgpu::Device,
-    pipelines: &TilePipelines,
-    tile_buffers: &TileBuffers,
-    scene_buffers: &SceneBuffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("tile_gen_bg"),
-        layout: &pipelines.tile_gen_bind_group_layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: scene_buffers.uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: scene_buffers.vertices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scene_buffers.indices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scene_buffers.sort_values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: scene_buffers.circumdata.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: tile_buffers.tile_sort_values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: tile_buffers.tile_pair_count.as_entire_binding() },
         ],
     })
 }
@@ -1358,105 +1295,6 @@ pub fn record_radix_sort(
 
     // Return true if result ended up in B buffers (odd number of passes)
     num_passes % 2 != 0
-}
-
-// ---------------------------------------------------------------------------
-// Tiled backward recording
-// ---------------------------------------------------------------------------
-
-/// Record the full tiled backward pass.
-///
-/// Stages: tile_fill → tile_gen → radix_sort → tile_ranges → backward_tiled
-pub fn record_tiled_backward(
-    encoder: &mut wgpu::CommandEncoder,
-    device: &wgpu::Device,
-    tile_pipelines: &TilePipelines,
-    radix_pipelines: &RadixSortPipelines,
-    radix_state: &RadixSortState,
-    tile_fill_bg: &wgpu::BindGroup,
-    tile_gen_bg: &wgpu::BindGroup,
-    tile_ranges_bg: &wgpu::BindGroup,
-    bwd_tiled_bg0: &wgpu::BindGroup,
-    bwd_tiled_bg1: &wgpu::BindGroup,
-    tile_buffers: &TileBuffers,
-    // Alternate bind groups for when sort result ends up in B buffers
-    tile_ranges_bg_b: &wgpu::BindGroup,
-    bwd_tiled_bg0_b: &wgpu::BindGroup,
-) {
-    // 0. Fill sort buffers with sentinels (0xFFFFFFFF keys)
-    // Required so the radix sort (which processes max_pairs entries) doesn't
-    // mix stale/random data with the valid tile-tet pairs from tile_gen.
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_fill"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&tile_pipelines.fill_pipeline);
-        pass.set_bind_group(0, tile_fill_bg, &[]);
-        let (fx, fy) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
-        pass.dispatch_workgroups(fx, fy, 1);
-    }
-
-    // 1. Generate tile-tet pairs
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_gen"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&tile_pipelines.tile_gen_pipeline);
-        pass.set_bind_group(0, tile_gen_bg, &[]);
-        let tet_count_upper = tile_buffers.max_pairs_pow2 / 16;
-        let (gx, gy) = dispatch_2d((tet_count_upper + 63) / 64);
-        pass.dispatch_workgroups(gx, gy, 1);
-    }
-
-    // 2. Radix sort tile keys/values
-    let result_in_b = record_radix_sort(
-        encoder,
-        device,
-        radix_pipelines,
-        radix_state,
-        &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_sort_values,
-    );
-
-    // Pick bind groups based on which buffers hold the sorted result
-    let (ranges_bg, bwd_bg0) = if result_in_b {
-        (tile_ranges_bg_b, bwd_tiled_bg0_b)
-    } else {
-        (tile_ranges_bg, bwd_tiled_bg0)
-    };
-
-    // 3. Compute per-tile ranges
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_ranges"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
-        pass.set_bind_group(0, ranges_bg, &[]);
-        let (rx, ry) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
-        pass.dispatch_workgroups(rx, ry, 1);
-    }
-
-    // 4. Tiled backward pass (one workgroup per tile, @workgroup_size(32))
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("backward_tiled"),
-            timestamp_writes: None,
-        });
-        pass.set_pipeline(&tile_pipelines.backward_tiled_pipeline);
-        pass.set_bind_group(0, bwd_bg0, &[]);
-        pass.set_bind_group(1, bwd_tiled_bg1, &[]);
-        let num_tiles = tile_buffers.num_tiles;
-        if num_tiles <= 65535 {
-            pass.dispatch_workgroups(num_tiles, 1, 1);
-        } else {
-            let x = 65535u32;
-            let y = (num_tiles + x - 1) / x;
-            pass.dispatch_workgroups(x, y, 1);
-        }
-    }
 }
 
 /// Helper to create a compute pipeline from a single bind group layout.

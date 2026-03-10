@@ -15,7 +15,7 @@ use glam::{Mat4, Vec3, Vec4};
 use rmesh_backward::{
     create_adam_bind_group, create_backward_bind_groups, create_backward_tiled_bind_groups,
     create_loss_bind_group, create_prepare_dispatch_bind_group, create_rts_bind_group,
-    create_tile_fill_bind_group, create_tile_gen_bind_group, create_tile_gen_scan_bind_group,
+    create_tile_fill_bind_group, create_tile_gen_scan_bind_group,
     create_tile_ranges_bind_group_with_keys, AdamState, AdamUniforms, BackwardPipelines,
     GradientBuffers, LossBuffers, LossUniforms, RadixSortPipelines, RadixSortState,
     ScanBuffers, ScanPipelines, TileBuffers, TilePipelines, TileUniforms,
@@ -125,7 +125,6 @@ struct RMeshRenderer {
     radix_pipelines: RadixSortPipelines,
     radix_state: RadixSortState,
     tile_fill_bg: wgpu::BindGroup,
-    _tile_gen_bg: wgpu::BindGroup,
     // A-buffer bind groups (sort result in primary buffers)
     tile_ranges_bg: wgpu::BindGroup,
     bwd_tiled_bg0: wgpu::BindGroup,
@@ -382,13 +381,6 @@ impl RMeshRenderer {
         radix_state.upload_configs(&queue);
 
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
-        let tile_gen_bg = create_tile_gen_bind_group(
-            &device,
-            &tile_pipelines,
-            &tile_buffers,
-            &scene_buffers,
-        );
-
         // Debug image buffer for backward forward-replay verification
         let n_pixels = (width as u64) * (height as u64);
         let debug_image = device.create_buffer(&wgpu::BufferDescriptor {
@@ -546,7 +538,6 @@ impl RMeshRenderer {
             radix_pipelines,
             radix_state,
             tile_fill_bg,
-            _tile_gen_bg: tile_gen_bg,
             tile_ranges_bg,
             bwd_tiled_bg0,
             bwd_tiled_bg1,
@@ -800,49 +791,6 @@ impl RMeshRenderer {
             );
 
             self.queue.submit(std::iter::once(encoder.finish()));
-        }
-
-        // Debug readbacks
-        {
-            let vis_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.visible_count);
-            let vis_count = u32::from_le_bytes([vis_raw[0], vis_raw[1], vis_raw[2], vis_raw[3]]);
-
-            let nk_raw = read_buffer_raw(&self.device, &self.queue, &self.radix_state.num_keys_buf);
-            let total_pairs = u32::from_le_bytes([nk_raw[0], nk_raw[1], nk_raw[2], nk_raw[3]]);
-
-            // Read tiles_touched to verify forward_compute wrote non-zero values
-            let tt_raw = read_buffer_raw(&self.device, &self.queue, &self.scene_buffers.tiles_touched);
-            let tt_count = tt_raw.len() / 4;
-            let mut tt_nonzero = 0u32;
-            let mut tt_sum = 0u64;
-            let mut tt_first16 = Vec::new();
-            for i in 0..tt_count {
-                let v = u32::from_le_bytes([tt_raw[i*4], tt_raw[i*4+1], tt_raw[i*4+2], tt_raw[i*4+3]]);
-                if v > 0 { tt_nonzero += 1; }
-                tt_sum += v as u64;
-                if i < 16 { tt_first16.push(v); }
-            }
-
-            // Read RTS info (size, vec_size, thread_blocks)
-            let ri_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.rts_uniform);
-            let rts_size = u32::from_le_bytes([ri_raw[0], ri_raw[1], ri_raw[2], ri_raw[3]]);
-            let rts_vec_size = u32::from_le_bytes([ri_raw[4], ri_raw[5], ri_raw[6], ri_raw[7]]);
-            let rts_tblocks = u32::from_le_bytes([ri_raw[8], ri_raw[9], ri_raw[10], ri_raw[11]]);
-
-            // Read first 8 RTS reduction spine values
-            let red_raw = read_buffer_raw(&self.device, &self.queue, &self.scan_buffers.rts_reduction);
-            let mut red_first8 = Vec::new();
-            for i in 0..red_raw.len().min(32)/4 {
-                let v = u32::from_le_bytes([red_raw[i*4], red_raw[i*4+1], red_raw[i*4+2], red_raw[i*4+3]]);
-                red_first8.push(v);
-            }
-
-            eprintln!("[DEBUG forward_tiled] visible_count={vis_count}, total_pairs={total_pairs}, max_pairs_pow2={}",
-                self.tile_buffers.max_pairs_pow2);
-            eprintln!("[DEBUG forward_tiled] tiles_touched: nonzero={tt_nonzero}/{tt_count}, sum={tt_sum}");
-            eprintln!("[DEBUG forward_tiled] tiles_touched first 16: {:?}", tt_first16);
-            eprintln!("[DEBUG forward_tiled] rts_info: size={rts_size}, vec_size={rts_vec_size}, thread_blocks={rts_tblocks}");
-            eprintln!("[DEBUG forward_tiled] rts_reduction first 8: {:?}", red_first8);
         }
 
         // Read back rendered image
