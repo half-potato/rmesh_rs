@@ -14,7 +14,7 @@
 //! Tests gracefully skip if no GPU adapter is available.
 
 use bytemuck;
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Vec3};
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -25,6 +25,7 @@ use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group,
     record_adam_pass, record_loss_pass,
 };
+use rmesh_util::camera::{perspective_matrix, look_at};
 use wgpu::util::DeviceExt;
 
 const SEED: u64 = 42424242;
@@ -111,28 +112,6 @@ fn create_rw_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buff
 // ---------------------------------------------------------------------------
 // Scene helpers (subset of rmesh-render test common module)
 // ---------------------------------------------------------------------------
-
-fn perspective_matrix(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
-    let f = 1.0 / (fov_y_rad / 2.0).tan();
-    Mat4::from_cols(
-        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
-        Vec4::new(0.0, f, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, far / (far - near), 1.0),
-        Vec4::new(0.0, 0.0, -(far * near) / (far - near), 0.0),
-    )
-}
-
-fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
-    let f = (target - eye).normalize();
-    let r = f.cross(up).normalize();
-    let u = r.cross(f);
-    Mat4::from_cols(
-        Vec4::new(r.x, u.x, f.x, 0.0),
-        Vec4::new(r.y, u.y, f.y, 0.0),
-        Vec4::new(r.z, u.z, f.z, 0.0),
-        Vec4::new(-r.dot(eye), -u.dot(eye), -f.dot(eye), 1.0),
-    )
-}
 
 fn setup_camera(eye: Vec3, target: Vec3) -> (Mat4, Mat4) {
     let aspect = W as f32 / H as f32;
@@ -1840,4 +1819,391 @@ fn test_single_tet_loss_decreases() {
         "Loss did not decrease in first 10 steps: step1={:.8}, step10={:.8}",
         losses[0], losses[9]
     );
+}
+
+// ===========================================================================
+// Diagnostic camera tests (using rmesh_util::camera)
+// ===========================================================================
+
+/// Deterministic tet scene at origin for camera diagnostic tests.
+/// Regular tet with vertices at (±0.5, ±0.5, ±0.5), density=3.0, zero color_grads.
+fn known_tet_scene() -> SceneData {
+    // Positive-orientation regular tet inscribed in unit cube
+    let vertices = vec![
+        0.5, 0.5, 0.5,    // v0
+        -0.5, -0.5, 0.5,  // v1
+        -0.5, 0.5, -0.5,  // v2
+        0.5, -0.5, -0.5,  // v3
+    ];
+    let indices = vec![0u32, 1, 2, 3];
+    let densities = vec![3.0f32];
+    let color_grads = vec![0.0f32; 3];
+
+    let circumdata = compute_circumspheres(&vertices, &indices);
+
+    SceneData {
+        vertices,
+        indices,
+        densities,
+        color_grads,
+        circumdata,
+        start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+        vertex_count: 4,
+        tet_count: 1,
+    }
+}
+
+/// Test 1: CPU-only projection verification.
+/// - vp * inv_vp ≈ identity
+/// - All vertices project to clip_w > 0, NDC in [-1,1]²×[0,1]
+/// - Tet covers at least 1 pixel
+#[test]
+fn test_camera_cpu_projection() {
+    use rmesh_util::camera::*;
+
+    let scene = known_tet_scene();
+    let eye = Vec3::new(0.0, -2.0, 0.5);
+    let target = Vec3::ZERO;
+    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, 1.0, 0.01, 100.0);
+    let view = look_at(eye, target, Vec3::Z);
+    let vp = proj * view;
+    let inv_vp = vp.inverse();
+
+    // vp * inv_vp ≈ identity
+    let roundtrip = vp * inv_vp;
+    for i in 0..4 {
+        for j in 0..4 {
+            let expected = if i == j { 1.0 } else { 0.0 };
+            assert!(
+                (roundtrip.col(i)[j] - expected).abs() < 1e-4,
+                "vp * inv_vp [{i}][{j}] = {}, expected {expected}",
+                roundtrip.col(i)[j]
+            );
+        }
+    }
+
+    // All 4 vertices project correctly
+    let mut min_px = f32::INFINITY;
+    let mut max_px = f32::NEG_INFINITY;
+    let mut min_py = f32::INFINITY;
+    let mut max_py = f32::NEG_INFINITY;
+
+    for vi in 0..4 {
+        let v = Vec3::new(
+            scene.vertices[vi * 3],
+            scene.vertices[vi * 3 + 1],
+            scene.vertices[vi * 3 + 2],
+        );
+        let (ndc, clip_w) = project_to_ndc(v, vp);
+        assert!(clip_w > 0.0, "vertex {vi} clip_w = {clip_w}, should be > 0");
+        assert!(
+            ndc.x >= -1.0 && ndc.x <= 1.0,
+            "vertex {vi} ndc.x = {}, out of [-1,1]", ndc.x
+        );
+        assert!(
+            ndc.y >= -1.0 && ndc.y <= 1.0,
+            "vertex {vi} ndc.y = {}, out of [-1,1]", ndc.y
+        );
+        assert!(
+            ndc.z >= 0.0 && ndc.z <= 1.0,
+            "vertex {vi} ndc.z = {}, out of [0,1]", ndc.z
+        );
+
+        let (px, py) = ndc_to_pixel(ndc.x, ndc.y, W as f32, H as f32);
+        min_px = min_px.min(px);
+        max_px = max_px.max(px);
+        min_py = min_py.min(py);
+        max_py = max_py.max(py);
+    }
+
+    let pixel_area = (max_px - min_px) * (max_py - min_py);
+    assert!(
+        pixel_area >= 1.0,
+        "Tet pixel area = {pixel_area}, should be >= 1"
+    );
+    eprintln!(
+        "camera_cpu_projection: pixel extent [{min_px:.1}, {max_px:.1}] x [{min_py:.1}, {max_py:.1}], area={pixel_area:.1}"
+    );
+}
+
+/// Test 2: GPU visibility — forward_compute produces visible tet.
+/// - indirect_args[1] (instance_count) == 1
+/// - tiles_touched[0] > 0
+#[test]
+fn test_camera_gpu_visibility() {
+    let (device, queue) = match create_test_device() {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_camera_gpu_visibility (no GPU)");
+            return;
+        }
+    };
+
+    let scene = known_tet_scene();
+    let eye = Vec3::new(0.0, -2.0, 0.5);
+    let target = Vec3::ZERO;
+    let (vp, inv_vp) = setup_camera(eye, target);
+
+    let (buffers, _material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(
+            &device, &queue, &scene,
+            &vec![0.0f32; scene.tet_count as usize * 3],
+            &scene.color_grads, 0, W, H,
+        );
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    rmesh_render::record_forward_compute(
+        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back indirect_args: [vertex_count, instance_count, first_vertex, first_instance]
+    let args: Vec<u32> = read_buffer(&device, &queue, &buffers.indirect_args, 4);
+    let instance_count = args[1];
+    eprintln!("camera_gpu_visibility: indirect_args = {:?}", args);
+    assert_eq!(
+        instance_count, 1,
+        "Expected 1 visible tet, got {instance_count}"
+    );
+
+    // Read back tiles_touched for the visible tet (index 0 in compact array)
+    let tiles: Vec<u32> = read_buffer(&device, &queue, &buffers.tiles_touched, 1);
+    eprintln!("camera_gpu_visibility: tiles_touched[0] = {}", tiles[0]);
+    assert!(
+        tiles[0] > 0,
+        "Expected tiles_touched > 0, got {}", tiles[0]
+    );
+}
+
+/// Test 3: Deterministic tiled forward with tile_size=16.
+/// Full scan-based tiled pipeline → total_alpha > 0.001.
+#[test]
+fn test_camera_tiled_forward_deterministic() {
+    let (device, queue) = match create_test_device() {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_camera_tiled_forward_deterministic (no GPU)");
+            return;
+        }
+    };
+
+    let scene = known_tet_scene();
+    let eye = Vec3::new(0.0, -2.0, 0.5);
+    let target = Vec3::ZERO;
+    let (vp, inv_vp) = setup_camera(eye, target);
+
+    // --- Forward compute ---
+    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(
+            &device, &queue, &scene,
+            &vec![0.0f32; scene.tet_count as usize * 3],
+            &scene.color_grads, 0, W, H,
+        );
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    rmesh_render::record_forward_compute(
+        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // --- Tiled infrastructure with tile_size=16 ---
+    let tile_size = 16u32;
+    let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    radix_state.upload_configs(&queue);
+
+    let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
+
+    let tile_uni = rmesh_backward::TileUniforms {
+        screen_width: W,
+        screen_height: H,
+        tile_size,
+        tiles_x: tile_buffers.tiles_x,
+        tiles_y: tile_buffers.tiles_y,
+        num_tiles: tile_buffers.num_tiles,
+        visible_tet_count: 0,
+        _pad: [0; 5],
+    };
+    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+    // Create scan bind groups
+    let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = rmesh_backward::create_rts_bind_group(
+        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_fill_bg =
+        rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, &radix_state.num_keys_buf,
+    );
+
+    // Tile ranges bind groups
+    let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+    let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &radix_state.keys_b,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+
+    // Forward tiled pipeline
+    let fwd_tiled = rmesh_render::ForwardTiledPipeline::new(&device, W, H);
+    let fwd_tiled_bg_a = rmesh_render::create_forward_tiled_bind_group(
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+    let fwd_tiled_bg_b = rmesh_render::create_forward_tiled_bind_group(
+        &device, &fwd_tiled, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &material.colors,
+        &buffers.densities, &material.color_grads,
+        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+
+    // --- Dispatch ---
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.clear_buffer(&fwd_tiled.rendered_image, 0, None);
+    encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+    // 1. Scan-based tile pipeline
+    rmesh_backward::record_scan_tile_pipeline(
+        &mut encoder, &scan_pipelines, &tile_pipelines,
+        &prepare_dispatch_bg, &rts_bg,
+        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+    );
+
+    // 2. Radix sort
+    let result_in_b = rmesh_backward::record_radix_sort(
+        &mut encoder, &device, &radix_pipelines, &radix_state,
+        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+    );
+
+    // 3. Tile ranges
+    {
+        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // 4. Forward tiled
+    {
+        let fwd_bg = if result_in_b { &fwd_tiled_bg_b } else { &fwd_tiled_bg_a };
+        rmesh_render::record_forward_tiled(&mut encoder, &fwd_tiled, fwd_bg, tile_buffers.num_tiles);
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back rendered image
+    let pixel_count = (W * H) as usize;
+    let image: Vec<f32> = read_buffer(&device, &queue, &fwd_tiled.rendered_image, pixel_count * 4);
+
+    let total_alpha: f32 = image.iter().skip(3).step_by(4).sum();
+    eprintln!(
+        "camera_tiled_forward_deterministic (tile_size=16): total_alpha = {total_alpha:.4}, num_tiles = {}",
+        tile_buffers.num_tiles
+    );
+    assert!(
+        total_alpha > 0.001,
+        "Tiled forward (tile_size=16) produced all-zero image (total_alpha={total_alpha})"
+    );
+
+    // Check pixel values are reasonable (non-NaN, non-inf)
+    for (i, &v) in image.iter().enumerate() {
+        assert!(v.is_finite(), "Pixel value at index {i} is not finite: {v}");
+    }
+}
+
+/// Test 4: CPU ray-tet intersection via shared camera utilities.
+/// pixel_ray + ray_tet_intersect → valid hit, positive t, non-trivial alpha.
+#[test]
+fn test_camera_ray_tet_intersection() {
+    use rmesh_util::camera::*;
+
+    let scene = known_tet_scene();
+    let eye = Vec3::new(0.0, -2.0, 0.5);
+    let target = Vec3::ZERO;
+    let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, 1.0, 0.01, 100.0);
+    let view = look_at(eye, target, Vec3::Z);
+    let vp = proj * view;
+    let inv_vp = vp.inverse();
+
+    let verts = [
+        Vec3::new(scene.vertices[0], scene.vertices[1], scene.vertices[2]),
+        Vec3::new(scene.vertices[3], scene.vertices[4], scene.vertices[5]),
+        Vec3::new(scene.vertices[6], scene.vertices[7], scene.vertices[8]),
+        Vec3::new(scene.vertices[9], scene.vertices[10], scene.vertices[11]),
+    ];
+
+    // Shoot ray through image center
+    let cx = W as f32 / 2.0;
+    let cy = H as f32 / 2.0;
+    let (origin, dir) = pixel_ray(inv_vp, eye, cx, cy, W as f32, H as f32);
+
+    // Origin should be the camera position
+    assert!(
+        (origin - eye).length() < 1e-5,
+        "pixel_ray origin should be eye, got {origin}"
+    );
+
+    // Ray should hit the tet (it's centered at origin, camera looks at origin)
+    let result = ray_tet_intersect(origin, dir, &verts);
+    assert!(result.is_some(), "Center ray should hit the known tet");
+
+    let (t_enter, t_exit) = result.unwrap();
+    assert!(t_enter > 0.0, "t_enter should be positive, got {t_enter}");
+    assert!(t_exit > t_enter, "t_exit ({t_exit}) should be > t_enter ({t_enter})");
+
+    // Compute alpha from intersection
+    let dist = t_exit - t_enter;
+    let density = scene.densities[0]; // 3.0
+    let od = density * dist;
+    let alpha = 1.0 - (-od).exp();
+    assert!(
+        alpha > 0.01,
+        "Alpha should be non-trivial, got {alpha} (od={od}, dist={dist})"
+    );
+
+    eprintln!(
+        "camera_ray_tet_intersection: t=[{t_enter:.4}, {t_exit:.4}], dist={dist:.4}, od={od:.4}, alpha={alpha:.4}"
+    );
+
+    // Verify a few more pixels around center also hit
+    let mut hits = 0;
+    for dx in -2i32..=2 {
+        for dy in -2i32..=2 {
+            let px = cx + dx as f32;
+            let py = cy + dy as f32;
+            let (o, d) = pixel_ray(inv_vp, eye, px, py, W as f32, H as f32);
+            if ray_tet_intersect(o, d, &verts).is_some() {
+                hits += 1;
+            }
+        }
+    }
+    eprintln!("camera_ray_tet_intersection: {hits}/25 pixels around center hit the tet");
+    assert!(hits > 0, "At least some pixels near center should hit the tet");
 }

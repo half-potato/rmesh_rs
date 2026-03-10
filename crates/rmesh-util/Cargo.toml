@@ -1,0 +1,10 @@
+[package]
+name = "rmesh-util"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = { workspace = true }
+naga_oil = "0.21"
+naga = { version = "28", features = ["wgsl-in", "wgsl-out"] }
+wgpu = { workspace = true }

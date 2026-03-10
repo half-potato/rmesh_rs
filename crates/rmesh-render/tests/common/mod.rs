@@ -9,20 +9,12 @@ use glam::{Mat4, Vec3, Vec4};
 pub use rand::Rng;
 pub use rmesh_data::SceneData;
 
-// Face winding: matches TET_FACES in forward_vertex.wgsl
-const TET_FACES: [[usize; 3]; 4] = [[0, 2, 1], [1, 2, 3], [0, 3, 2], [3, 0, 1]];
+// Re-export shared camera utilities from rmesh-util
+pub use rmesh_util::camera::{perspective_matrix, look_at, softplus, TET_FACES};
 
 // ---------------------------------------------------------------------------
 // Math helpers
 // ---------------------------------------------------------------------------
-
-pub fn softplus(x: f32) -> f32 {
-    if x > 8.0 {
-        x
-    } else {
-        0.1 * (1.0 + (10.0 * x).exp()).ln()
-    }
-}
 
 fn phi(x: f32) -> f32 {
     if x.abs() < 1e-6 {
@@ -720,33 +712,6 @@ pub fn random_single_tet_scene<R: Rng>(rng: &mut R, radius: f32) -> SceneData {
     ];
 
     build_test_scene(verts.to_vec(), indices.to_vec(), density, color_grads)
-}
-
-/// Build a simple perspective projection matrix.
-pub fn perspective_matrix(fov_y_rad: f32, aspect: f32, near: f32, far: f32) -> Mat4 {
-    // Reversed-Z infinite far or standard perspective
-    // Using standard wgpu perspective (clip z ∈ [0,1])
-    let f = 1.0 / (fov_y_rad / 2.0).tan();
-    Mat4::from_cols(
-        Vec4::new(f / aspect, 0.0, 0.0, 0.0),
-        Vec4::new(0.0, f, 0.0, 0.0),
-        Vec4::new(0.0, 0.0, far / (far - near), 1.0),
-        Vec4::new(0.0, 0.0, -(far * near) / (far - near), 0.0),
-    )
-}
-
-/// Build a look-at view matrix (Z-up convention).
-pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
-    let f = (target - eye).normalize();
-    let r = f.cross(up).normalize();
-    let u = r.cross(f);
-
-    Mat4::from_cols(
-        Vec4::new(r.x, u.x, f.x, 0.0),
-        Vec4::new(r.y, u.y, f.y, 0.0),
-        Vec4::new(r.z, u.z, f.z, 0.0),
-        Vec4::new(-r.dot(eye), -u.dot(eye), -f.dot(eye), 1.0),
-    )
 }
 
 /// Comparison helper: check if two images match within tolerance.

@@ -20,3 +20,4 @@ rand = "0.9"
 rand_chacha = "0.9"
 rmesh-data = { path = "../rmesh-data" }
 rmesh-train = { path = "../rmesh-train" }
+rmesh-util = { path = "../rmesh-util" }

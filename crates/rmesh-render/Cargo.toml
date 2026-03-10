@@ -18,3 +18,4 @@ rand = "0.9"
 rand_chacha = "0.9"
 pollster = { workspace = true }
 half = { workspace = true }
+rmesh-util = { path = "../rmesh-util" }

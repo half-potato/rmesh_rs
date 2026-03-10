@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/rmesh-util",
     "crates/rmesh-shaders",
     "crates/rmesh-sort",
     "crates/rmesh-tile",
