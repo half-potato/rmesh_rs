@@ -13,16 +13,16 @@ use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
     create_backward_bind_groups, BackwardPipelines, GradientBuffers, MaterialGradBuffers,
 };
-use rmesh_data::{SceneData, ShCoeffs};
+use rmesh_data::SceneData;
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group, record_tex_to_buffer,
     ForwardPipelines, MaterialBuffers, RenderTargets, SceneBuffers, TexToBufferPipeline, Uniforms,
 };
-use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
+use rmesh_util::shared::{AdamUniforms, LossUniforms};
 
 // Re-export these types so downstream crates (rmesh-python) can use them.
-pub use rmesh_shaders::shared::AdamUniforms as AdamUniformsType;
-pub use rmesh_shaders::shared::LossUniforms as LossUniformsType;
+pub use rmesh_util::shared::AdamUniforms as AdamUniformsType;
+pub use rmesh_util::shared::LossUniforms as LossUniformsType;
 
 // WGSL shader sources.
 const LOSS_COMPUTE_WGSL: &str = include_str!("wgsl/loss_compute.wgsl");
@@ -226,24 +226,14 @@ impl AdamState {
 
 /// Adam optimizer state for material parameters.
 pub struct MaterialAdamState {
-    pub m_coeffs: wgpu::Buffer,
-    pub v_coeffs: wgpu::Buffer,
     pub m_color_grads: wgpu::Buffer,
     pub v_color_grads: wgpu::Buffer,
 }
 
 impl MaterialAdamState {
-    pub fn new(
-        device: &wgpu::Device,
-        tet_count: u32,
-        sh_stride: u32,
-    ) -> Self {
-        let sh_size = (tet_count as u64) * (sh_stride as u64) * 4;
+    pub fn new(device: &wgpu::Device, tet_count: u32) -> Self {
         let grad_size = (tet_count as u64) * 3 * 4;
-
         Self {
-            m_coeffs: create_storage_buffer(device, "adam_m_sh", sh_size),
-            v_coeffs: create_storage_buffer(device, "adam_v_sh", sh_size),
             m_color_grads: create_storage_buffer(device, "adam_m_color_grads", grad_size),
             v_color_grads: create_storage_buffer(device, "adam_v_color_grads", grad_size),
         }
@@ -360,7 +350,6 @@ pub fn record_adam_pass(
 /// Training configuration.
 pub struct TrainConfig {
     pub epochs: u32,
-    pub lr_sh: f32,
     pub lr_vertices: f32,
     pub lr_density: f32,
     pub lr_color_grad: f32,
@@ -376,7 +365,6 @@ impl Default for TrainConfig {
     fn default() -> Self {
         Self {
             epochs: 100,
-            lr_sh: 1e-3,
             lr_vertices: 1e-4,
             lr_density: 1e-2,
             lr_color_grad: 1e-3,
@@ -414,7 +402,6 @@ pub fn train(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneData,
-    sh: &ShCoeffs,
     views: &[TrainingView],
     config: &TrainConfig,
 ) -> Result<()> {
@@ -429,14 +416,13 @@ pub fn train(
 
     // Upload scene + material data
     let buffers = SceneBuffers::upload(device, queue, scene);
-    let material = MaterialBuffers::upload(device, &sh.coeffs, &scene.color_grads, scene.tet_count, sh.degree);
-    let sh_stride = material.stride;
+    let material = MaterialBuffers::upload(device, &scene.color_grads, scene.tet_count);
 
     // Allocate gradient + optimizer state
     let grads = GradientBuffers::new(device, scene.vertex_count, scene.tet_count);
-    let mat_grads = MaterialGradBuffers::new(device, scene.tet_count, sh_stride);
+    let mat_grads = MaterialGradBuffers::new(device, scene.tet_count);
     let adam = AdamState::new(device, scene.vertex_count, scene.tet_count);
-    let mat_adam = MaterialAdamState::new(device, scene.tet_count, sh_stride);
+    let mat_adam = MaterialAdamState::new(device, scene.tet_count);
 
     // Create render targets
     let targets = RenderTargets::new(device, config.render_width, config.render_height);
@@ -475,15 +461,6 @@ pub fn train(
             device,
             &adam_pipeline,
             &adam_uniforms_buf,
-            &material.coeffs,
-            &mat_grads.d_coeffs,
-            &mat_adam.m_coeffs,
-            &mat_adam.v_coeffs,
-        ),
-        create_adam_bind_group(
-            device,
-            &adam_pipeline,
-            &adam_uniforms_buf,
             &buffers.vertices,
             &grads.d_vertices,
             &adam.m_vertices,
@@ -509,19 +486,16 @@ pub fn train(
         ),
     ];
 
-    let sh_param_count = scene.tet_count * sh_stride;
     let vert_param_count = scene.vertex_count * 3;
     let density_param_count = scene.tet_count;
     let grad_param_count = scene.tet_count * 3;
 
     let param_counts = [
-        sh_param_count,
         vert_param_count,
         density_param_count,
         grad_param_count,
     ];
     let learning_rates = [
-        config.lr_sh,
         config.lr_vertices,
         config.lr_density,
         config.lr_color_grad,
@@ -560,9 +534,8 @@ pub fn train(
                 screen_width: view.width as f32,
                 screen_height: view.height as f32,
                 tet_count: scene.tet_count,
-                sh_degree: sh.degree,
                 step,
-                _pad1: [0; 7],
+                _pad1: [0; 8],
             };
 
             // Upload uniforms
@@ -593,7 +566,6 @@ pub fn train(
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("clear grads"),
                 });
-            encoder.clear_buffer(&mat_grads.d_coeffs, 0, None);
             encoder.clear_buffer(&grads.d_vertices, 0, None);
             encoder.clear_buffer(&grads.d_densities, 0, None);
             encoder.clear_buffer(&mat_grads.d_color_grads, 0, None);

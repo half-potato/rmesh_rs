@@ -5,10 +5,10 @@
 //!   - Scan pipelines (RTS prefix scan, prepare dispatch, tile gen)
 //!   - Recording helpers
 
-use rmesh_shaders::shared::TileUniforms;
+use rmesh_util::shared::TileUniforms;
 
 // Re-export shared types.
-pub use rmesh_shaders::shared::TileUniforms as TileUniformsType;
+pub use rmesh_util::shared::TileUniforms as TileUniformsType;
 
 // WGSL shader sources.
 const TILE_FILL_WGSL: &str = include_str!("wgsl/tile_fill_compute.wgsl");

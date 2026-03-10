@@ -16,9 +16,9 @@ struct Uniforms {
     screen_width: f32,
     screen_height: f32,
     tet_count: u32,
-    sh_degree: u32,
     step: u32,
-    _pad1: vec3<u32>,
+    _pad1: vec4<u32>,
+    _pad2: vec4<u32>,
 };
 
 struct DrawIndirectArgs {
@@ -31,33 +31,16 @@ struct DrawIndirectArgs {
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
-@group(0) @binding(3) var<storage, read> sh_coeffs: array<f32>;
-@group(0) @binding(4) var<storage, read> densities: array<f32>;
-@group(0) @binding(5) var<storage, read> color_grads: array<f32>;
-@group(0) @binding(6) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(7) var<storage, read_write> colors: array<f32>;
-@group(0) @binding(8) var<storage, read_write> sort_keys: array<u32>;
-@group(0) @binding(9) var<storage, read_write> sort_values: array<u32>;
-@group(0) @binding(10) var<storage, read_write> indirect_args: DrawIndirectArgs;
+@group(0) @binding(3) var<storage, read> densities: array<f32>;
+@group(0) @binding(4) var<storage, read> color_grads: array<f32>;
+@group(0) @binding(5) var<storage, read> circumdata: array<f32>;
+@group(0) @binding(6) var<storage, read_write> colors: array<f32>;
+@group(0) @binding(7) var<storage, read_write> sort_keys: array<u32>;
+@group(0) @binding(8) var<storage, read_write> sort_values: array<u32>;
+@group(0) @binding(9) var<storage, read_write> indirect_args: DrawIndirectArgs;
 // Compact outputs for tiled path (indexed by vis_idx from atomicAdd)
-@group(0) @binding(11) var<storage, read_write> tiles_touched: array<u32>;
-@group(0) @binding(12) var<storage, read_write> compact_tet_ids: array<u32>;
-
-// --- SH Constants ---
-const C0: f32 = 0.28209479177387814;
-const C1: f32 = 0.4886025119029199;
-const C2_0: f32 = 1.0925484305920792;
-const C2_1: f32 = -1.0925484305920792;
-const C2_2: f32 = 0.31539156525252005;
-const C2_3: f32 = -1.0925484305920792;
-const C2_4: f32 = 0.5462742152960396;
-const C3_0: f32 = -0.5900435899266435;
-const C3_1: f32 = 2.890611442640554;
-const C3_2: f32 = -0.4570457994644658;
-const C3_3: f32 = 0.3731763325901154;
-const C3_4: f32 = -0.4570457994644658;
-const C3_5: f32 = 1.445305721320277;
-const C3_6: f32 = -0.5900435899266435;
+@group(0) @binding(10) var<storage, read_write> tiles_touched: array<u32>;
+@group(0) @binding(11) var<storage, read_write> compact_tet_ids: array<u32>;
 
 fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
     let clip = vp * vec4<f32>(pos, 1.0);
@@ -75,44 +58,6 @@ fn softplus(x: f32) -> f32 {
 fn load_vertex(idx: u32) -> vec3<f32> {
     let i = idx * 3u;
     return vec3<f32>(vertices[i], vertices[i + 1u], vertices[i + 2u]);
-}
-
-fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
-    let x = dir.x;
-    let y = dir.y;
-    let z = dir.z;
-
-    var val = C0 * sh_coeffs[base];
-
-    if (sh_degree >= 1u) {
-        val += -C1 * y * sh_coeffs[base + 1u];
-        val += C1 * z * sh_coeffs[base + 2u];
-        val += -C1 * x * sh_coeffs[base + 3u];
-    }
-
-    if (sh_degree >= 2u) {
-        let xx = x * x;
-        let yy = y * y;
-        let zz = z * z;
-
-        val += C2_0 * x * y * sh_coeffs[base + 4u];
-        val += C2_1 * y * z * sh_coeffs[base + 5u];
-        val += C2_2 * (2.0 * zz - xx - yy) * sh_coeffs[base + 6u];
-        val += C2_3 * x * z * sh_coeffs[base + 7u];
-        val += C2_4 * (xx - yy) * sh_coeffs[base + 8u];
-
-        if (sh_degree >= 3u) {
-            val += C3_0 * y * (3.0 * xx - yy) * sh_coeffs[base + 9u];
-            val += C3_1 * x * y * z * sh_coeffs[base + 10u];
-            val += C3_2 * y * (4.0 * zz - xx - yy) * sh_coeffs[base + 11u];
-            val += C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeffs[base + 12u];
-            val += C3_4 * x * (4.0 * zz - xx - yy) * sh_coeffs[base + 13u];
-            val += C3_5 * z * (xx - yy) * sh_coeffs[base + 14u];
-            val += C3_6 * x * (xx - 3.0 * yy) * sh_coeffs[base + 15u];
-        }
-    }
-
-    return val;
 }
 
 @compute @workgroup_size(64)
@@ -270,22 +215,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         }
     }
 
-    // --- 4. SH evaluation ---
+    // --- 4. Color evaluation (constant 0.5 base) ---
     let centroid = (v0 + v1 + v2 + v3) * 0.25;
-    let dir = normalize(centroid - cam);
-
-    let num_coeffs = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u);
-    let sh_stride = num_coeffs * 3u;
-    let sh_base = tet_id * sh_stride;
-    let nc = num_coeffs;
-
-    var result_color = vec3<f32>(0.0);
-    result_color.x = eval_sh(dir, uniforms.sh_degree, sh_base);
-    result_color.y = eval_sh(dir, uniforms.sh_degree, sh_base + nc);
-    result_color.z = eval_sh(dir, uniforms.sh_degree, sh_base + 2u * nc);
-
-    // Add 0.5 bias (SH2RGB)
-    result_color += vec3<f32>(0.5);
+    var result_color = vec3<f32>(0.5);
 
     // --- 5. Apply color gradient (linear field) ---
     let gx = color_grads[tet_id * 3u];

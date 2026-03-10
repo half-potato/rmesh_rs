@@ -17,9 +17,9 @@ struct Uniforms {
     screen_width: f32,
     screen_height: f32,
     tet_count: u32,
-    sh_degree: u32,
     step: u32,
-    _pad1: vec3<u32>,
+    _pad1: vec4<u32>,
+    _pad2: vec4<u32>,
 };
 
 // Group 0: read-only scene data + sorted indices
@@ -28,36 +28,18 @@ struct Uniforms {
 @group(0) @binding(2) var<storage, read> rendered_image: array<f32>;
 @group(0) @binding(3) var<storage, read> vertices: array<f32>;
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
-@group(0) @binding(5) var<storage, read> sh_coeffs: array<f32>;
-@group(0) @binding(6) var<storage, read> densities: array<f32>;
-@group(0) @binding(7) var<storage, read> color_grads_buf: array<f32>;
-@group(0) @binding(8) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(9) var<storage, read> colors_buf: array<f32>;
-@group(0) @binding(10) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(5) var<storage, read> densities: array<f32>;
+@group(0) @binding(6) var<storage, read> color_grads_buf: array<f32>;
+@group(0) @binding(7) var<storage, read> circumdata: array<f32>;
+@group(0) @binding(8) var<storage, read> colors_buf: array<f32>;
+@group(0) @binding(9) var<storage, read> sorted_indices: array<u32>;
 
 // Group 1: read-write gradient outputs
-@group(1) @binding(0) var<storage, read_write> d_sh_coeffs: array<atomic<u32>>;
-@group(1) @binding(1) var<storage, read_write> d_vertices: array<atomic<u32>>;
-@group(1) @binding(2) var<storage, read_write> d_densities: array<atomic<u32>>;
-@group(1) @binding(3) var<storage, read_write> d_color_grads: array<atomic<u32>>;
+@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<u32>>;
+@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<u32>>;
+@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<u32>>;
 
 const TINY_VAL: f32 = 1e-20;
-
-// SH Constants
-const C0: f32 = 0.28209479177387814;
-const C1: f32 = 0.4886025119029199;
-const C2_0: f32 = 1.0925484305920792;
-const C2_1: f32 = -1.0925484305920792;
-const C2_2: f32 = 0.31539156525252005;
-const C2_3: f32 = -1.0925484305920792;
-const C2_4: f32 = 0.5462742152960396;
-const C3_0: f32 = -0.5900435899266435;
-const C3_1: f32 = 2.890611442640554;
-const C3_2: f32 = -0.4570457994644658;
-const C3_3: f32 = 0.3731763325901154;
-const C3_4: f32 = -0.4570457994644658;
-const C3_5: f32 = 1.445305721320277;
-const C3_6: f32 = -0.5900435899266435;
 
 // Face winding
 const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
@@ -103,80 +85,6 @@ fn load_f32x3_g(idx: u32) -> vec3<f32> {
 // Atomic float add via compare-and-swap — inlined at call sites
 // (naga does not allow ptr<storage, atomic<u32>, read_write> as function arguments)
 
-fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
-    let x = dir.x; let y = dir.y; let z = dir.z;
-    var val = C0 * sh_coeffs[base];
-    if (sh_degree >= 1u) {
-        val += -C1 * y * sh_coeffs[base + 1u];
-        val += C1 * z * sh_coeffs[base + 2u];
-        val += -C1 * x * sh_coeffs[base + 3u];
-    }
-    if (sh_degree >= 2u) {
-        let xx = x * x; let yy = y * y; let zz = z * z;
-        val += C2_0 * x * y * sh_coeffs[base + 4u];
-        val += C2_1 * y * z * sh_coeffs[base + 5u];
-        val += C2_2 * (2.0 * zz - xx - yy) * sh_coeffs[base + 6u];
-        val += C2_3 * x * z * sh_coeffs[base + 7u];
-        val += C2_4 * (xx - yy) * sh_coeffs[base + 8u];
-        if (sh_degree >= 3u) {
-            val += C3_0 * y * (3.0 * xx - yy) * sh_coeffs[base + 9u];
-            val += C3_1 * x * y * z * sh_coeffs[base + 10u];
-            val += C3_2 * y * (4.0 * zz - xx - yy) * sh_coeffs[base + 11u];
-            val += C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeffs[base + 12u];
-            val += C3_4 * x * (4.0 * zz - xx - yy) * sh_coeffs[base + 13u];
-            val += C3_5 * z * (xx - yy) * sh_coeffs[base + 14u];
-            val += C3_6 * x * (xx - 3.0 * yy) * sh_coeffs[base + 15u];
-        }
-    }
-    return val;
-}
-
-fn scatter_sh_grads(dir: vec3<f32>, sh_degree: u32, d_sh_result: vec3<f32>, sh_base: u32, nc: u32) {
-    let x = dir.x; let y = dir.y; let z = dir.z;
-    var basis: array<f32, 16>;
-    basis[0] = C0;
-    var n_basis = 1u;
-    if (sh_degree >= 1u) {
-        basis[1] = -C1 * y;
-        basis[2] = C1 * z;
-        basis[3] = -C1 * x;
-        n_basis = 4u;
-    }
-    if (sh_degree >= 2u) {
-        let xx = x * x; let yy = y * y; let zz = z * z;
-        basis[4] = C2_0 * x * y;
-        basis[5] = C2_1 * y * z;
-        basis[6] = C2_2 * (2.0 * zz - xx - yy);
-        basis[7] = C2_3 * x * z;
-        basis[8] = C2_4 * (xx - yy);
-        n_basis = 9u;
-        if (sh_degree >= 3u) {
-            basis[9] = C3_0 * y * (3.0 * xx - yy);
-            basis[10] = C3_1 * x * y * z;
-            basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
-            basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
-            basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
-            basis[14] = C3_5 * z * (xx - yy);
-            basis[15] = C3_6 * x * (xx - 3.0 * yy);
-            n_basis = 16u;
-        }
-    }
-    let d_channels = array<f32, 3>(d_sh_result.x, d_sh_result.y, d_sh_result.z);
-    for (var c = 0u; c < 3u; c++) {
-        for (var k = 0u; k < n_basis; k++) {
-            let idx = sh_base + c * nc + k;
-            let add_val = d_channels[c] * basis[k];
-            var ob = atomicLoad(&d_sh_coeffs[idx]);
-            loop {
-                let nv = bitcast<u32>(bitcast<f32>(ob) + add_val);
-                let r = atomicCompareExchangeWeak(&d_sh_coeffs[idx], ob, nv);
-                if (r.exchanged) { break; }
-                ob = r.old_value;
-            }
-        }
-    }
-}
-
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let px = global_id.x;
@@ -220,9 +128,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cam = uniforms.cam_pos_pad.xyz;
     let ray_dir = normalize(far_world - near_world);
 
-    let num_coeffs = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u);
-    let sh_stride = num_coeffs * 3u;
-    let nc = num_coeffs;
     let tet_count = uniforms.tet_count;
 
     // 4. Iterate tets: furthest → nearest
@@ -353,16 +258,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         // 4i. Backward: softplus
         let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-        let sh_dir = normalize(centroid - cam);
-
-        let sh_base = tet_id * sh_stride;
-        var sh_result = vec3<f32>(0.0);
-        sh_result.x = eval_sh(sh_dir, uniforms.sh_degree, sh_base);
-        sh_result.y = eval_sh(sh_dir, uniforms.sh_degree, sh_base + nc);
-        sh_result.z = eval_sh(sh_dir, uniforms.sh_degree, sh_base + 2u * nc);
 
         let offset_val = dot(grad, verts[0] - centroid);
-        let sp_input = sh_result + vec3<f32>(0.5 + offset_val);
+        let sp_input = vec3<f32>(0.5 + offset_val);
 
         let d_sp_input = vec3<f32>(
             d_base_color.x * dsoftplus(sp_input.x),
@@ -370,16 +268,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             d_base_color.z * dsoftplus(sp_input.z),
         );
 
-        // 4j. sp_input = sh_result + 0.5 + offset
-        let d_sh_result = d_sp_input;
+        // 4j. sp_input = 0.5 + offset
         let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
 
         d_grad += (verts[0] - centroid) * d_offset_scalar;
         let d_v0_from_offset = grad * d_offset_scalar * 0.75;
         let d_vother_from_offset = -grad * d_offset_scalar * 0.25;
-
-        // 4k. SH gradients
-        scatter_sh_grads(sh_dir, uniforms.sh_degree, d_sh_result, sh_base, nc);
 
         // 4l. Intersection gradients (dt/d(vertices))
         var d_vert_i: array<vec3<f32>, 4>;

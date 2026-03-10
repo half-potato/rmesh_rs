@@ -32,7 +32,7 @@ use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,
     LossPipeline, MaterialAdamState,
 };
-use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
+use rmesh_util::shared::{AdamUniforms, LossUniforms};
 
 /// Helper: read back a GPU buffer to a Vec<f32>.
 fn read_buffer_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<f32> {
@@ -177,12 +177,10 @@ struct RMeshRenderer {
     // Scene metadata
     tet_count: u32,
     _vertex_count: u32,
-    sh_degree: u32,
-    _sh_stride: u32,
     width: u32,
     height: u32,
     step: u32,
-    param_counts: [u32; 4],
+    param_counts: [u32; 3],
 }
 
 #[pymethods]
@@ -192,38 +190,31 @@ impl RMeshRenderer {
     /// Args:
     ///     vertices: [N*3] f32 flat array of vertex positions
     ///     indices: [M*4] u32 flat array of tet indices
-    ///     sh_coeffs: [M*nc*3] f32 flat SH coefficients (nc = (deg+1)^2)
     ///     densities: [M] f32 per-tet densities
     ///     color_grads: [M*3] f32 per-tet color gradients
     ///     circumdata: [M*4] f32 circumsphere data (cx, cy, cz, r^2)
-    ///     sh_degree: SH degree (0-3)
     ///     width: render width
     ///     height: render height
     #[new]
     fn new(
         vertices: PyReadonlyArray1<f32>,
         indices: PyReadonlyArray1<u32>,
-        sh_coeffs: PyReadonlyArray1<f32>,
         densities: PyReadonlyArray1<f32>,
         color_grads: PyReadonlyArray1<f32>,
         circumdata: PyReadonlyArray1<f32>,
-        sh_degree: u32,
         width: u32,
         height: u32,
     ) -> PyResult<Self> {
         let vertices_slice = vertices.as_slice()?;
         let indices_slice = indices.as_slice()?;
-        let sh_coeffs_slice = sh_coeffs.as_slice()?;
         let densities_slice = densities.as_slice()?;
         let color_grads_slice = color_grads.as_slice()?;
         let circumdata_slice = circumdata.as_slice()?;
 
         let tet_count = indices_slice.len() as u32 / 4;
         let vertex_count = vertices_slice.len() as u32 / 3;
-        let num_coeffs = (sh_degree + 1) * (sh_degree + 1);
-        let sh_stride = num_coeffs * 3;
 
-        // Build SceneData (no longer has sh_coeffs/sh_degree)
+        // Build SceneData
         let scene = rmesh_data::SceneData {
             vertices: vertices_slice.to_vec(),
             indices: indices_slice.to_vec(),
@@ -276,11 +267,11 @@ impl RMeshRenderer {
         let loss_pipeline = LossPipeline::new(&device);
         let adam_pipeline = AdamPipeline::new(&device);
 
-        // Upload scene (no longer takes sh_coeffs)
+        // Upload scene
         let scene_buffers = SceneBuffers::upload(&device, &queue, &scene);
 
         // Upload material data separately
-        let material_buffers = MaterialBuffers::upload(&device, sh_coeffs_slice, color_grads_slice, tet_count, sh_degree);
+        let material_buffers = MaterialBuffers::upload(&device, color_grads_slice, tet_count);
 
         // Render targets
         let targets = RenderTargets::new(&device, width, height);
@@ -292,12 +283,12 @@ impl RMeshRenderer {
         // Tex-to-buffer
         let ttb = TexToBufferPipeline::new(&device, &queue, &targets.color_view, width, height);
 
-        // Gradient + optimizer state (no sh_stride)
+        // Gradient + optimizer state
         let grad_buffers =
             GradientBuffers::new(&device, vertex_count, tet_count);
-        let mat_grad_buffers = MaterialGradBuffers::new(&device, tet_count, sh_stride);
+        let mat_grad_buffers = MaterialGradBuffers::new(&device, tet_count);
         let adam_state = AdamState::new(&device, vertex_count, tet_count);
-        let mat_adam_state = MaterialAdamState::new(&device, tet_count, sh_stride);
+        let mat_adam_state = MaterialAdamState::new(&device, tet_count);
 
         // Loss buffers
         let loss_buffers = LossBuffers::new(&device, width, height);
@@ -321,7 +312,7 @@ impl RMeshRenderer {
         );
 
         // Adam bind groups + per-group uniform buffers (separate to avoid overwrite)
-        let adam_uniforms_bufs: Vec<wgpu::Buffer> = (0..4)
+        let adam_uniforms_bufs: Vec<wgpu::Buffer> = (0..3)
             .map(|i| {
                 device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some(&format!("adam_uniforms_{i}")),
@@ -337,15 +328,6 @@ impl RMeshRenderer {
                 &device,
                 &adam_pipeline,
                 &adam_uniforms_bufs[0],
-                &material_buffers.coeffs,
-                &mat_grad_buffers.d_coeffs,
-                &mat_adam_state.m_coeffs,
-                &mat_adam_state.v_coeffs,
-            ),
-            create_adam_bind_group(
-                &device,
-                &adam_pipeline,
-                &adam_uniforms_bufs[1],
                 &scene_buffers.vertices,
                 &grad_buffers.d_vertices,
                 &adam_state.m_vertices,
@@ -354,7 +336,7 @@ impl RMeshRenderer {
             create_adam_bind_group(
                 &device,
                 &adam_pipeline,
-                &adam_uniforms_bufs[2],
+                &adam_uniforms_bufs[1],
                 &scene_buffers.densities,
                 &grad_buffers.d_densities,
                 &adam_state.m_densities,
@@ -363,7 +345,7 @@ impl RMeshRenderer {
             create_adam_bind_group(
                 &device,
                 &adam_pipeline,
-                &adam_uniforms_bufs[3],
+                &adam_uniforms_bufs[2],
                 &material_buffers.color_grads,
                 &mat_grad_buffers.d_color_grads,
                 &mat_adam_state.m_color_grads,
@@ -372,7 +354,6 @@ impl RMeshRenderer {
         ];
 
         let param_counts = [
-            tet_count * sh_stride,
             vertex_count * 3,
             tet_count,
             tet_count * 3,
@@ -420,13 +401,11 @@ impl RMeshRenderer {
             &ttb.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
-            &material_buffers.coeffs,
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &tile_buffers.tile_sort_values,
-            &mat_grad_buffers.d_coeffs,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -452,13 +431,11 @@ impl RMeshRenderer {
             &ttb.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
-            &material_buffers.coeffs,
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &radix_state.values_b,
-            &mat_grad_buffers.d_coeffs,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -512,13 +489,11 @@ impl RMeshRenderer {
             &fwd_tiled.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
-            &material_buffers.coeffs,
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &tile_buffers.tile_sort_values,
-            &mat_grad_buffers.d_coeffs,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -534,13 +509,11 @@ impl RMeshRenderer {
             &fwd_tiled.rendered_image,
             &scene_buffers.vertices,
             &scene_buffers.indices,
-            &material_buffers.coeffs,
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &scene_buffers.circumdata,
             &material_buffers.colors,
             &radix_state.values_b,
-            &mat_grad_buffers.d_coeffs,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -638,8 +611,6 @@ impl RMeshRenderer {
             cached_indices: indices_slice.to_vec(),
             tet_count,
             _vertex_count: vertex_count,
-            sh_degree,
-            _sh_stride: sh_stride,
             width,
             height,
             step: 0,
@@ -678,7 +649,6 @@ impl RMeshRenderer {
             self.width as f32,
             self.height as f32,
             self.tet_count,
-            self.sh_degree,
             self.step,
         );
 
@@ -755,7 +725,6 @@ impl RMeshRenderer {
             self.width as f32,
             self.height as f32,
             self.tet_count,
-            self.sh_degree,
             self.step,
         );
 
@@ -904,7 +873,6 @@ impl RMeshRenderer {
             self.width as f32,
             self.height as f32,
             self.tet_count,
-            self.sh_degree,
             self.step,
         );
 
@@ -1064,7 +1032,7 @@ impl RMeshRenderer {
     ///     dl_d_image: [H, W, 4] f32 gradient of loss w.r.t. rendered image
     ///
     /// Returns:
-    ///     dict with keys 'd_sh_coeffs', 'd_vertices', 'd_densities', 'd_color_grads',
+    ///     dict with keys 'd_vertices', 'd_densities', 'd_color_grads',
     ///     each a 1D numpy f32 array.
     fn backward<'py>(
         &mut self,
@@ -1103,7 +1071,6 @@ impl RMeshRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("backward"),
             });
-        encoder.clear_buffer(&self.mat_grad_buffers.d_coeffs, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
@@ -1177,17 +1144,12 @@ impl RMeshRenderer {
 
         // Read back gradients -- the grad buffers store atomic<u32> that are
         // bitcast f32. The raw bytes are already valid f32 on readback.
-        let d_sh = read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_coeffs);
         let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
         let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
         let d_grads =
             read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
 
         let dict = PyDict::new(py);
-        dict.set_item(
-            "d_sh_coeffs",
-            Array1::from_vec(d_sh).into_pyarray(py),
-        )?;
         dict.set_item(
             "d_vertices",
             Array1::from_vec(d_verts).into_pyarray(py),
@@ -1224,7 +1186,6 @@ impl RMeshRenderer {
     ///     vp: [16] f32 column-major VP matrix
     ///     inv_vp: [16] f32 column-major inverse VP matrix
     ///     gt_image: [H, W, 3] f32 ground truth image
-    ///     lr_sh: learning rate for SH coefficients
     ///     lr_verts: learning rate for vertices
     ///     lr_dens: learning rate for densities
     ///     lr_grads: learning rate for color gradients
@@ -1238,7 +1199,6 @@ impl RMeshRenderer {
         vp: PyReadonlyArray1<f32>,
         inv_vp: PyReadonlyArray1<f32>,
         gt_image: PyReadonlyArray3<f32>,
-        lr_sh: f32,
         lr_verts: f32,
         lr_dens: f32,
         lr_grads: f32,
@@ -1260,7 +1220,6 @@ impl RMeshRenderer {
             self.width as f32,
             self.height as f32,
             self.tet_count,
-            self.sh_degree,
             self.step,
         );
 
@@ -1313,7 +1272,6 @@ impl RMeshRenderer {
             });
 
         // Clear buffers
-        encoder.clear_buffer(&self.mat_grad_buffers.d_coeffs, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
@@ -1416,7 +1374,7 @@ impl RMeshRenderer {
 
         // Adam passes (all in same encoder, separate uniform buffers per group)
         self.step += 1; // Once per train_step, not per param group
-        let learning_rates = [lr_sh, lr_verts, lr_dens, lr_grads];
+        let learning_rates = [lr_verts, lr_dens, lr_grads];
         for (i, (bg, &count)) in self
             .adam_bgs
             .iter()
@@ -1468,7 +1426,6 @@ impl RMeshRenderer {
     fn update_params(
         &mut self,
         vertices: PyReadonlyArray1<f32>,
-        sh_coeffs: PyReadonlyArray1<f32>,
         densities: PyReadonlyArray1<f32>,
         color_grads: PyReadonlyArray1<f32>,
     ) -> PyResult<()> {
@@ -1476,11 +1433,6 @@ impl RMeshRenderer {
             &self.scene_buffers.vertices,
             0,
             bytemuck::cast_slice(vertices.as_slice()?),
-        );
-        self.queue.write_buffer(
-            &self.material_buffers.coeffs,
-            0,
-            bytemuck::cast_slice(sh_coeffs.as_slice()?),
         );
         self.queue.write_buffer(
             &self.scene_buffers.densities,
@@ -1500,13 +1452,11 @@ impl RMeshRenderer {
     /// Use this after wgpu-only training to get the optimized parameters.
     fn get_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let verts = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.vertices);
-        let sh = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.coeffs);
         let dens = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.densities);
         let grads = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.color_grads);
 
         let dict = PyDict::new(py);
         dict.set_item("vertices", Array1::from_vec(verts).into_pyarray(py))?;
-        dict.set_item("sh_coeffs", Array1::from_vec(sh).into_pyarray(py))?;
         dict.set_item("densities", Array1::from_vec(dens).into_pyarray(py))?;
         dict.set_item("color_grads", Array1::from_vec(grads).into_pyarray(py))?;
         Ok(dict)

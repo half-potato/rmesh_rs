@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rmesh-shaders = { path = "../rmesh-shaders" }
+rmesh-util = { path = "../rmesh-util" }
 rmesh-tile = { path = "../rmesh-tile" }
 rmesh-data = { path = "../rmesh-data" }
 wgpu = { workspace = true }
@@ -18,4 +18,4 @@ rand = "0.9"
 rand_chacha = "0.9"
 pollster = { workspace = true }
 half = { workspace = true }
-rmesh-util = { path = "../rmesh-util" }
+rmesh-util = { path = "../rmesh-util", features = ["test-util"] }

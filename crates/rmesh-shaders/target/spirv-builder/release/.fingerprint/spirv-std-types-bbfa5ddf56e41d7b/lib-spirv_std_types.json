@@ -1,1 +1,0 @@
-{"rustc":15082701830378794732,"features":"[\"std\"]","declared_features":"[\"std\"]","target":4639663201326791178,"profile":6955841860616186150,"path":15041515594898915905,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/spirv-std-types-bbfa5ddf56e41d7b/dep-lib-spirv_std_types","checksum":false}}],"rustflags":[],"config":2069994364910194474,"compile_kind":0}

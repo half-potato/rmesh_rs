@@ -19,7 +19,11 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rmesh_data::SceneData;
-use rmesh_shaders::shared::{AdamUniforms, LossUniforms};
+use rmesh_util::shared::{AdamUniforms, LossUniforms};
+use rmesh_util::test_util::{
+    create_test_device, create_rw_buffer, read_buffer,
+    random_single_tet_scene, compute_circumspheres, TestDeviceConfig,
+};
 use rmesh_train::{
     AdamPipeline, AdamState, LossBuffers, LossPipeline,
     create_adam_bind_group, create_loss_bind_group,
@@ -33,84 +37,7 @@ const W: u32 = 64;
 const H: u32 = 64;
 
 // ---------------------------------------------------------------------------
-// GPU setup helpers
-// ---------------------------------------------------------------------------
-
-fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok()?;
-
-        adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::SUBGROUP,
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 16,
-                        max_storage_buffer_binding_size: 1 << 30,
-                        max_buffer_size: 1 << 30,
-                        ..wgpu::Limits::downlevel_defaults()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-    })
-}
-
-fn read_buffer<T: bytemuck::Pod>(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source: &wgpu::Buffer,
-    count: usize,
-) -> Vec<T> {
-    let size = (count * std::mem::size_of::<T>()) as u64;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(source, 0, &readback, 0, size);
-    queue.submit(std::iter::once(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    receiver.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    readback.unmap();
-    result
-}
-
-fn create_rw_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
-    device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size,
-        usage: wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Scene helpers (subset of rmesh-render test common module)
+// Scene helpers
 // ---------------------------------------------------------------------------
 
 fn setup_camera(eye: Vec3, target: Vec3) -> (Mat4, Mat4) {
@@ -121,78 +48,6 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (Mat4, Mat4) {
     (vp, vp.inverse())
 }
 
-fn random_single_tet_scene(rng: &mut ChaCha8Rng, radius: f32) -> SceneData {
-    let mut verts = [0.0f32; 12];
-    for i in 0..4 {
-        verts[i * 3] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-        verts[i * 3 + 1] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-        verts[i * 3 + 2] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-    }
-    let v0 = Vec3::new(verts[0], verts[1], verts[2]);
-    let v1 = Vec3::new(verts[3], verts[4], verts[5]);
-    let v2 = Vec3::new(verts[6], verts[7], verts[8]);
-    let v3 = Vec3::new(verts[9], verts[10], verts[11]);
-    let det = (v1 - v0).dot((v2 - v0).cross(v3 - v0));
-    let indices: Vec<u32> = if det < 0.0 {
-        vec![0, 1, 3, 2]
-    } else {
-        vec![0, 1, 2, 3]
-    };
-
-    let densities = vec![rng.random::<f32>() * 5.0 + 0.5];
-    let color_grads = vec![
-        (rng.random::<f32>() - 0.5) * 0.2,
-        (rng.random::<f32>() - 0.5) * 0.2,
-        (rng.random::<f32>() - 0.5) * 0.2,
-    ];
-
-    let circumdata = compute_circumspheres(&verts, &indices);
-
-    SceneData {
-        vertices: verts.to_vec(),
-        indices,
-        densities,
-        color_grads,
-        circumdata,
-        start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        vertex_count: 4,
-        tet_count: 1,
-    }
-}
-
-fn compute_circumspheres(vertices: &[f32], indices: &[u32]) -> Vec<f32> {
-    let tet_count = indices.len() / 4;
-    let mut circumdata = vec![0.0f32; tet_count * 4];
-    for i in 0..tet_count {
-        let i0 = indices[i * 4] as usize;
-        let i1 = indices[i * 4 + 1] as usize;
-        let i2 = indices[i * 4 + 2] as usize;
-        let i3 = indices[i * 4 + 3] as usize;
-        let v0 = Vec3::new(vertices[i0 * 3], vertices[i0 * 3 + 1], vertices[i0 * 3 + 2]);
-        let v1 = Vec3::new(vertices[i1 * 3], vertices[i1 * 3 + 1], vertices[i1 * 3 + 2]);
-        let v2 = Vec3::new(vertices[i2 * 3], vertices[i2 * 3 + 1], vertices[i2 * 3 + 2]);
-        let v3 = Vec3::new(vertices[i3 * 3], vertices[i3 * 3 + 1], vertices[i3 * 3 + 2]);
-        let a = v1 - v0;
-        let b = v2 - v0;
-        let c = v3 - v0;
-        let (aa, bb, cc) = (a.dot(a), b.dot(b), c.dot(c));
-        let cross_bc = b.cross(c);
-        let cross_ca = c.cross(a);
-        let cross_ab = a.cross(b);
-        let mut denom = 2.0 * a.dot(cross_bc);
-        if denom.abs() < 1e-12 {
-            denom = 1.0;
-        }
-        let r = (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denom;
-        let center = v0 + r;
-        circumdata[i * 4] = center.x;
-        circumdata[i * 4 + 1] = center.y;
-        circumdata[i * 4 + 2] = center.z;
-        circumdata[i * 4 + 3] = r.dot(r);
-    }
-    circumdata
-}
-
 // ===========================================================================
 // Test: 5-pass radix sort
 // ===========================================================================
@@ -201,7 +56,11 @@ fn compute_circumspheres(vertices: &[f32], indices: &[u32]) -> Vec<f32> {
 /// and verifies ascending order.
 #[test]
 fn test_radix_sort_kernel() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_radix_sort_kernel (no GPU)");
@@ -276,7 +135,11 @@ fn test_radix_sort_kernel() {
 /// Verifies per-pixel gradients (dl_d_image) are correct.
 #[test]
 fn test_loss_compute_kernel() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_loss_compute_kernel (no GPU)");
@@ -410,7 +273,11 @@ fn test_loss_compute_kernel() {
 /// Verifies parameters are updated in the correct direction.
 #[test]
 fn test_adam_kernel() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_adam_kernel (no GPU)");
@@ -520,7 +387,11 @@ fn test_adam_kernel() {
 /// Dispatches tile_fill and verifies all keys are set to 0xFFFFFFFF.
 #[test]
 fn test_tile_fill_kernel() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_tile_fill_kernel (no GPU)");
@@ -635,7 +506,11 @@ fn test_tile_fill_kernel() {
 /// will fail during pipeline creation or produce incorrect output.
 #[test]
 fn test_tiled_forward_e2e() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_tiled_forward_e2e (no GPU)");
@@ -660,10 +535,10 @@ fn test_tiled_forward_e2e() {
 
     // --- Forward compute (populates colors, tiles_touched, compact_tet_ids, indirect_args) ---
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &vec![0.0f32; scene.tet_count as usize * 3], &scene.color_grads, 0, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -811,7 +686,11 @@ fn test_tiled_forward_e2e() {
 /// subgroupShuffleXor for warp-level gradient reduction.
 #[test]
 fn test_tiled_backward_e2e() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_tiled_backward_e2e (no GPU)");
@@ -835,10 +714,10 @@ fn test_tiled_backward_e2e() {
 
     // --- Forward setup ---
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &vec![0.0f32; scene.tet_count as usize * 3], &scene.color_grads, 0, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -971,16 +850,14 @@ fn test_tiled_backward_e2e() {
     queue.submit(std::iter::once(encoder.finish()));
 
     // --- Backward tiled ---
-    let color_stride = 1u32 * 3;
     let grad_buffers = rmesh_backward::GradientBuffers::new(
         &device, scene.vertex_count, scene.tet_count,
     );
     let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(
-        &device, scene.tet_count, color_stride,
+        &device, scene.tet_count,
     );
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.clear_buffer(&mat_grad_buffers.d_coeffs, 0, None);
     encoder.clear_buffer(&grad_buffers.d_vertices, 0, None);
     encoder.clear_buffer(&grad_buffers.d_densities, 0, None);
     encoder.clear_buffer(&mat_grad_buffers.d_color_grads, 0, None);
@@ -998,10 +875,10 @@ fn test_tiled_backward_e2e() {
     let (bwd_bg0, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
         &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
-        &buffers.vertices, &buffers.indices, &material.coeffs,
+        &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, tile_sort_values_sorted,
-        &mat_grad_buffers.d_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
@@ -1048,7 +925,11 @@ fn test_tiled_backward_e2e() {
 /// exact (no approximation errors from multi-tet interactions).
 #[test]
 fn test_single_tet_gradient_finite_diff() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_single_tet_gradient_finite_diff (no GPU)");
@@ -1087,10 +968,10 @@ fn test_single_tet_gradient_finite_diff() {
     // Re-creates scene buffers each time because we modify parameters.
     let run_forward_loss = |scene_data: &SceneData| -> f32 {
         let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-            rmesh_render::setup_forward(&device, &queue, scene_data, &vec![0.0f32; scene_data.tet_count as usize * 3], &scene_data.color_grads, 0, W, H);
+            rmesh_render::setup_forward(&device, &queue, scene_data, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 0,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1200,12 +1081,12 @@ fn test_single_tet_gradient_finite_diff() {
     // Helper: run full pipeline + backward, return analytical gradients
     // -----------------------------------------------------------------------
     // Uses scan-based tile pipeline (same as Python path).
-    let run_backward = |scene_data: &SceneData| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let run_backward = |scene_data: &SceneData| -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-            rmesh_render::setup_forward(&device, &queue, scene_data, &vec![0.0f32; scene_data.tet_count as usize * 3], &scene_data.color_grads, 0, W, H);
+            rmesh_render::setup_forward(&device, &queue, scene_data, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 0,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1317,16 +1198,14 @@ fn test_single_tet_gradient_finite_diff() {
         queue.submit(std::iter::once(encoder.finish()));
 
         // Backward
-        let color_stride = 1u32 * 3;
         let grad_buffers = rmesh_backward::GradientBuffers::new(
             &device, scene_data.vertex_count, scene_data.tet_count,
         );
         let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(
-            &device, scene_data.tet_count, color_stride,
+            &device, scene_data.tet_count,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-        encoder.clear_buffer(&mat_grad_buffers.d_coeffs, 0, None);
         encoder.clear_buffer(&grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&grad_buffers.d_densities, 0, None);
         encoder.clear_buffer(&mat_grad_buffers.d_color_grads, 0, None);
@@ -1344,10 +1223,10 @@ fn test_single_tet_gradient_finite_diff() {
         let (bwd_bg0, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
             &device, &bwd_tiled_pipelines,
             &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
-            &buffers.vertices, &buffers.indices, &material.coeffs,
+            &buffers.vertices, &buffers.indices,
             &buffers.densities, &material.color_grads, &buffers.circumdata,
             &material.colors, tile_sort_values_sorted,
-            &mat_grad_buffers.d_coeffs, &grad_buffers.d_vertices,
+            &grad_buffers.d_vertices,
             &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
         );
@@ -1364,17 +1243,16 @@ fn test_single_tet_gradient_finite_diff() {
         queue.submit(std::iter::once(encoder.finish()));
 
         let d_densities: Vec<f32> = read_buffer(&device, &queue, &grad_buffers.d_densities, scene_data.tet_count as usize);
-        let d_color_coeffs: Vec<f32> = read_buffer(&device, &queue, &mat_grad_buffers.d_coeffs, (scene_data.tet_count * color_stride) as usize);
         let d_vertices: Vec<f32> = read_buffer(&device, &queue, &grad_buffers.d_vertices, (scene_data.vertex_count * 3) as usize);
         let d_color_grads: Vec<f32> = read_buffer(&device, &queue, &mat_grad_buffers.d_color_grads, (scene_data.tet_count * 3) as usize);
 
-        (d_densities, d_color_coeffs, d_vertices, d_color_grads)
+        (d_densities, d_vertices, d_color_grads)
     };
 
     // -----------------------------------------------------------------------
     // Run backward to get analytical gradients
     // -----------------------------------------------------------------------
-    let (d_densities, _d_color_coeffs, d_vertices, d_color_grads) = run_backward(&scene);
+    let (d_densities, d_vertices, d_color_grads) = run_backward(&scene);
     let base_loss = run_forward_loss(&scene);
 
     eprintln!("\n=== Single-tet finite-difference gradient test ===");
@@ -1489,11 +1367,15 @@ fn test_single_tet_gradient_finite_diff() {
 /// with fixed vertices. Verifies loss decreases over 50 steps.
 ///
 /// This tests the entire training pipeline end-to-end without requiring
-/// Delaunay triangulation. Only color coefficients, density, and color gradients
+/// Delaunay triangulation. Only density and color gradients
 /// are optimized (vertices are frozen).
 #[test]
 fn test_single_tet_loss_decreases() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_single_tet_loss_decreases (no GPU)");
@@ -1519,9 +1401,9 @@ fn test_single_tet_loss_decreases() {
 
     // Forward buffers + compute pipeline (Adam updates these buffers in-place)
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, &scene, &vec![0.0f32; scene.tet_count as usize * 3], &scene.color_grads, 0, W, H);
+        rmesh_render::setup_forward(&device, &queue, &scene, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1602,12 +1484,11 @@ fn test_single_tet_loss_decreases() {
         &device, &loss_pipeline, &loss_buffers, &fwd_tiled.rendered_image,
     );
 
-    let color_stride = 1u32 * 3;
     let grad_buffers = rmesh_backward::GradientBuffers::new(
         &device, scene.vertex_count, scene.tet_count,
     );
     let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(
-        &device, scene.tet_count, color_stride,
+        &device, scene.tet_count,
     );
     let debug_image = create_rw_buffer(&device, "debug_image", (n_pixels as u64) * 4 * 4);
 
@@ -1616,20 +1497,20 @@ fn test_single_tet_loss_decreases() {
     let (bwd_bg0_a, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
         &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
-        &buffers.vertices, &buffers.indices, &material.coeffs,
+        &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, &tile_buffers.tile_sort_values,
-        &mat_grad_buffers.d_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
         &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
-        &buffers.vertices, &buffers.indices, &material.coeffs,
+        &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads, &buffers.circumdata,
         &material.colors, &radix_state.values_b,
-        &mat_grad_buffers.d_coeffs, &grad_buffers.d_vertices,
+        &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
     );
@@ -1639,22 +1520,14 @@ fn test_single_tet_loss_decreases() {
         &device, scene.vertex_count, scene.tet_count,
     );
     let mat_adam = rmesh_train::MaterialAdamState::new(
-        &device, scene.tet_count, color_stride,
+        &device, scene.tet_count,
     );
     let adam_pipeline = AdamPipeline::new(&device);
-    let adam_uni_color = create_rw_buffer(
-        &device, "adam_uni_color", std::mem::size_of::<AdamUniforms>() as u64,
-    );
     let adam_uni_dens = create_rw_buffer(
         &device, "adam_uni_dens", std::mem::size_of::<AdamUniforms>() as u64,
     );
     let adam_uni_cg = create_rw_buffer(
         &device, "adam_uni_cg", std::mem::size_of::<AdamUniforms>() as u64,
-    );
-    let adam_bg_color = create_adam_bind_group(
-        &device, &adam_pipeline, &adam_uni_color,
-        &material.coeffs, &mat_grad_buffers.d_coeffs,
-        &mat_adam.m_coeffs, &mat_adam.v_coeffs,
     );
     let adam_bg_dens = create_adam_bind_group(
         &device, &adam_pipeline, &adam_uni_dens,
@@ -1667,10 +1540,9 @@ fn test_single_tet_loss_decreases() {
         &mat_adam.m_color_grads, &mat_adam.v_color_grads,
     );
 
-    let adam_bgs = [&adam_bg_color, &adam_bg_dens, &adam_bg_cg];
-    let adam_uni_bufs = [&adam_uni_color, &adam_uni_dens, &adam_uni_cg];
+    let adam_bgs = [&adam_bg_dens, &adam_bg_cg];
+    let adam_uni_bufs = [&adam_uni_dens, &adam_uni_cg];
     let param_counts = [
-        scene.tet_count * color_stride,  // color_coeffs: 1 tet × 3
         scene.tet_count,               // densities: 1 tet
         scene.tet_count * 3,           // color_grads: 1 tet × 3
     ];
@@ -1701,7 +1573,6 @@ fn test_single_tet_loss_decreases() {
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
         // Clear
-        encoder.clear_buffer(&mat_grad_buffers.d_coeffs, 0, None);
         encoder.clear_buffer(&grad_buffers.d_vertices, 0, None);
         encoder.clear_buffer(&grad_buffers.d_densities, 0, None);
         encoder.clear_buffer(&mat_grad_buffers.d_color_grads, 0, None);
@@ -1761,7 +1632,7 @@ fn test_single_tet_loss_decreases() {
             pass.dispatch_workgroups(num_tiles.min(65535), ((num_tiles + 65534) / 65535).max(1), 1);
         }
 
-        // Adam (3 groups: color_coeffs, density, color_grads — vertices frozen)
+        // Adam (2 groups: density, color_grads — vertices frozen)
         for (&bg, &count) in adam_bgs.iter().zip(param_counts.iter()) {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("adam"), timestamp_writes: None,
@@ -1931,7 +1802,11 @@ fn test_camera_cpu_projection() {
 /// - tiles_touched[0] > 0
 #[test]
 fn test_camera_gpu_visibility() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_camera_gpu_visibility (no GPU)");
@@ -1947,12 +1822,11 @@ fn test_camera_gpu_visibility() {
     let (buffers, _material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device, &queue, &scene,
-            &vec![0.0f32; scene.tet_count as usize * 3],
-            &scene.color_grads, 0, W, H,
+            &scene.color_grads, W, H,
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1984,7 +1858,11 @@ fn test_camera_gpu_visibility() {
 /// Full scan-based tiled pipeline → total_alpha > 0.001.
 #[test]
 fn test_camera_tiled_forward_deterministic() {
-    let (device, queue) = match create_test_device() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
         Some(dq) => dq,
         None => {
             eprintln!("Skipping test_camera_tiled_forward_deterministic (no GPU)");
@@ -2001,12 +1879,11 @@ fn test_camera_tiled_forward_deterministic() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device, &queue, &scene,
-            &vec![0.0f32; scene.tet_count as usize * 3],
-            &scene.color_grads, 0, W, H,
+            &scene.color_grads, W, H,
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rmesh-shaders = { path = "../rmesh-shaders" }
+rmesh-util = { path = "../rmesh-util" }
 rmesh-render = { path = "../rmesh-render" }
 rmesh-backward = { path = "../rmesh-backward" }
 rmesh-data = { path = "../rmesh-data" }

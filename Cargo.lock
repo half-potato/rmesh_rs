@@ -2270,7 +2270,6 @@ dependencies = [
  "rand_chacha",
  "rmesh-data",
  "rmesh-render",
- "rmesh-shaders",
  "rmesh-sort",
  "rmesh-tile",
  "rmesh-train",
@@ -2305,8 +2304,8 @@ dependencies = [
  "rmesh-backward",
  "rmesh-data",
  "rmesh-render",
- "rmesh-shaders",
  "rmesh-train",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -2323,18 +2322,9 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rmesh-data",
- "rmesh-shaders",
  "rmesh-tile",
  "rmesh-util",
  "wgpu",
-]
-
-[[package]]
-name = "rmesh-shaders"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam",
 ]
 
 [[package]]
@@ -2350,7 +2340,7 @@ name = "rmesh-tile"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "rmesh-shaders",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -2367,7 +2357,7 @@ dependencies = [
  "rmesh-backward",
  "rmesh-data",
  "rmesh-render",
- "rmesh-shaders",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -2375,9 +2365,14 @@ dependencies = [
 name = "rmesh-util"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "glam",
  "naga",
  "naga_oil",
+ "pollster",
+ "rand",
+ "rand_chacha",
+ "rmesh-data",
  "wgpu",
 ]
 

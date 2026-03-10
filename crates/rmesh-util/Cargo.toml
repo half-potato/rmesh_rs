@@ -5,6 +5,16 @@ edition = "2021"
 
 [dependencies]
 glam = { workspace = true }
+bytemuck = { workspace = true }
 naga_oil = "0.21"
 naga = { version = "28", features = ["wgsl-in", "wgsl-out"] }
 wgpu = { workspace = true }
+
+# Optional deps for test-util feature
+pollster = { workspace = true, optional = true }
+rand = { version = "0.9", optional = true }
+rand_chacha = { version = "0.9", optional = true }
+rmesh-data = { path = "../rmesh-data", optional = true }
+
+[features]
+test-util = ["dep:pollster", "dep:rand", "dep:rand_chacha", "dep:rmesh-data"]

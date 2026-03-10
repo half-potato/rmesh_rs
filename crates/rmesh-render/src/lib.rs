@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 // Re-export shared types for CPU-side use.
-pub use rmesh_shaders::shared::{BVHNode, DrawIndirectCommand, Uniforms};
+pub use rmesh_util::shared::{BVHNode, DrawIndirectCommand, Uniforms};
 
 // Re-export tile types (moved to rmesh-tile crate).
 pub use rmesh_tile::{
@@ -64,16 +64,10 @@ pub struct SceneBuffers {
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
 pub struct MaterialBuffers {
-    /// Raw SH coefficients [M x stride] f32 (binding 3 in forward_compute)
-    pub coeffs: wgpu::Buffer,
-    /// Per-tet color gradient [M x 3] f32 (binding 5 in forward_compute)
+    /// Per-tet color gradient [M x 3] f32
     pub color_grads: wgpu::Buffer,
     /// Evaluated per-tet color [M x 3] f32 (written by forward_compute)
     pub colors: wgpu::Buffer,
-    /// Floats per tet in coeffs buffer (num_coeffs * 3)
-    pub stride: u32,
-    /// SH degree (passed to Uniforms)
-    pub sh_degree: u32,
 }
 
 impl SceneBuffers {
@@ -174,29 +168,16 @@ impl SceneBuffers {
 impl MaterialBuffers {
     /// Upload material data to GPU buffers.
     ///
-    /// * `sh_coeffs` — flat SH coefficients `[M × stride]` f32
     /// * `color_grads` — per-tet color gradient `[M × 3]` f32
     /// * `tet_count` — number of tetrahedra
-    /// * `sh_degree` — SH degree (0–3)
     pub fn upload(
         device: &wgpu::Device,
-        sh_coeffs: &[f32],
         color_grads: &[f32],
         tet_count: u32,
-        sh_degree: u32,
     ) -> Self {
         let trainable = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
-
-        let num_coeffs = (sh_degree + 1) * (sh_degree + 1);
-        let stride = num_coeffs * 3;
-
-        let coeffs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sh_coeffs"),
-            contents: bytemuck::cast_slice(sh_coeffs),
-            usage: trainable,
-        });
 
         let color_grads_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("color_grads"),
@@ -212,11 +193,8 @@ impl MaterialBuffers {
         });
 
         Self {
-            coeffs,
             color_grads: color_grads_buf,
             colors,
-            stride,
-            sh_degree,
         }
     }
 }
@@ -261,16 +239,16 @@ impl ForwardPipelines {
         color_format: wgpu::TextureFormat,
         aux_format: wgpu::TextureFormat,
     ) -> Self {
-        // ----- Compute pipeline (13 bindings) -----
-        // Bindings 0-6: read-only storage (uniforms, vertices, indices, sh_coeffs, densities, color_grads, circumdata)
-        // Bindings 7-12: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
+        // ----- Compute pipeline (12 bindings) -----
+        // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
+        // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
         let compute_read_only = [
-            true, true, true, true, true, true, true, // 0-6 read-only
-            false, false, false, false,                // 7-10 read-write
-            false, false,                              // 11-12 read-write (tiles_touched, compact_tet_ids)
+            true, true, true, true, true, true, // 0-5 read-only
+            false, false, false, false,          // 6-9 read-write
+            false, false,                        // 10-11 read-write (tiles_touched, compact_tet_ids)
         ];
         let compute_entries = storage_entries(
-            13,
+            12,
             wgpu::ShaderStages::COMPUTE,
             &compute_read_only,
         );
@@ -626,13 +604,13 @@ pub fn record_tex_to_buffer(
 // Bind Groups
 // ---------------------------------------------------------------------------
 
-/// Create the compute bind group (13 bindings).
+/// Create the compute bind group (12 bindings).
 ///
 /// Binding order matches `forward_compute.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: sh_coeffs,
-///   4: densities, 5: color_grads, 6: circumdata,
-///   7: colors, 8: sort_keys, 9: sort_values, 10: indirect_args,
-///   11: tiles_touched, 12: compact_tet_ids
+///   0: uniforms, 1: vertices, 2: indices, 3: densities,
+///   4: color_grads, 5: circumdata,
+///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
+///   10: tiles_touched, 11: compact_tet_ids
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
@@ -646,16 +624,15 @@ pub fn create_compute_bind_group(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
             buf_entry(2, &buffers.indices),
-            buf_entry(3, &material.coeffs),
-            buf_entry(4, &buffers.densities),
-            buf_entry(5, &material.color_grads),
-            buf_entry(6, &buffers.circumdata),
-            buf_entry(7, &material.colors),
-            buf_entry(8, &buffers.sort_keys),
-            buf_entry(9, &buffers.sort_values),
-            buf_entry(10, &buffers.indirect_args),
-            buf_entry(11, &buffers.tiles_touched),
-            buf_entry(12, &buffers.compact_tet_ids),
+            buf_entry(3, &buffers.densities),
+            buf_entry(4, &material.color_grads),
+            buf_entry(5, &buffers.circumdata),
+            buf_entry(6, &material.colors),
+            buf_entry(7, &buffers.sort_keys),
+            buf_entry(8, &buffers.sort_values),
+            buf_entry(9, &buffers.indirect_args),
+            buf_entry(10, &buffers.tiles_touched),
+            buf_entry(11, &buffers.compact_tet_ids),
         ],
     })
 }
@@ -903,9 +880,7 @@ pub fn setup_forward(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     scene: &SceneData,
-    sh_coeffs: &[f32],
     color_grads: &[f32],
-    sh_degree: u32,
     width: u32,
     height: u32,
 ) -> (
@@ -920,7 +895,7 @@ pub fn setup_forward(
     let aux_format = wgpu::TextureFormat::Rgba32Float;
 
     let buffers = SceneBuffers::upload(device, queue, scene);
-    let material = MaterialBuffers::upload(device, sh_coeffs, color_grads, scene.tet_count, sh_degree);
+    let material = MaterialBuffers::upload(device, color_grads, scene.tet_count);
     let pipelines = ForwardPipelines::new(device, color_format, aux_format);
     let targets = RenderTargets::new(device, width, height);
 
@@ -938,7 +913,6 @@ pub fn make_uniforms(
     screen_width: f32,
     screen_height: f32,
     tet_count: u32,
-    sh_degree: u32,
     step: u32,
 ) -> Uniforms {
     Uniforms {
@@ -954,9 +928,8 @@ pub fn make_uniforms(
         screen_width,
         screen_height,
         tet_count,
-        sh_degree,
         step,
-        _pad1: [0; 7],
+        _pad1: [0; 8],
     }
 }
 
@@ -966,7 +939,7 @@ pub fn make_uniforms(
 
 /// Tet neighbor adjacency: `neighbors[tet_id * 4 + face_idx]` = neighbor tet or -1.
 pub fn compute_tet_neighbors(indices: &[u32], tet_count: usize) -> Vec<i32> {
-    use rmesh_shaders::shared::TET_FACE_INDICES;
+    use rmesh_util::shared::TET_FACE_INDICES;
 
     let mut neighbors = vec![-1i32; tet_count * 4];
     let mut face_map: HashMap<[u32; 3], (usize, usize)> = HashMap::with_capacity(tet_count * 4);
@@ -1023,7 +996,7 @@ pub fn build_boundary_bvh(
     neighbors: &[i32],
     tet_count: usize,
 ) -> BVHData {
-    use rmesh_shaders::shared::TET_FACE_INDICES;
+    use rmesh_util::shared::TET_FACE_INDICES;
 
     // Collect boundary faces
     let mut boundary_faces: Vec<u32> = Vec::new();

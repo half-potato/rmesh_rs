@@ -20,9 +20,9 @@ struct Uniforms {
     screen_width: f32,
     screen_height: f32,
     tet_count: u32,
-    sh_degree: u32,
     step: u32,
-    _pad1: vec3<u32>,
+    _pad1: vec4<u32>,
+    _pad2: vec4<u32>,
 };
 
 struct BVHNode {

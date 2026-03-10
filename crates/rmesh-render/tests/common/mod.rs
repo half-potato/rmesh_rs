@@ -12,6 +12,9 @@ pub use rmesh_data::SceneData;
 // Re-export shared camera utilities from rmesh-util
 pub use rmesh_util::camera::{perspective_matrix, look_at, softplus, TET_FACES};
 
+// Re-export test utilities from rmesh-util
+pub use rmesh_util::test_util::{build_test_scene, random_single_tet_scene};
+
 // ---------------------------------------------------------------------------
 // Math helpers
 // ---------------------------------------------------------------------------
@@ -381,9 +384,8 @@ async fn gpu_render_scene_async(
         .await
         .ok()?;
 
-    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
     let (buffers, _material, pipelines, targets, compute_bg, render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_sh, &scene.color_grads, 0, w, h);
+        rmesh_render::setup_forward(&device, &queue, scene, &scene.color_grads, w, h);
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
@@ -393,7 +395,6 @@ async fn gpu_render_scene_async(
         w as f32,
         h as f32,
         scene.tet_count,
-        0u32,
         0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -538,8 +539,7 @@ async fn gpu_raytrace_scene_async(
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let aux_format = wgpu::TextureFormat::Rgba32Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
-    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
-    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_sh, &scene.color_grads, scene.tet_count, 0);
+    let material = rmesh_render::MaterialBuffers::upload(&device, &scene.color_grads, scene.tet_count);
     let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format, aux_format);
     let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 
@@ -561,7 +561,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 0,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -617,102 +617,6 @@ async fn gpu_raytrace_scene_async(
 // Test scene builders
 // ---------------------------------------------------------------------------
 
-/// Build a SceneData from raw vertices, indices, and per-tet parameters.
-/// Color coefficients are zeroed out (color comes from the 0.5 bias + color_grads).
-pub fn build_test_scene(
-    vertices: Vec<f32>,
-    indices: Vec<u32>,
-    densities: Vec<f32>,
-    color_grads: Vec<f32>,
-) -> SceneData {
-    let vertex_count = vertices.len() as u32 / 3;
-    let tet_count = indices.len() as u32 / 4;
-    let circumdata = compute_circumspheres_from_verts(&vertices, &indices, tet_count as usize);
-
-    SceneData {
-        vertices,
-        indices,
-        densities,
-        color_grads,
-        circumdata,
-        start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        vertex_count,
-        tet_count,
-    }
-}
-
-/// Compute circumspheres (duplicated from rmesh-data to avoid pub visibility issues).
-fn compute_circumspheres_from_verts(
-    vertices: &[f32],
-    indices: &[u32],
-    tet_count: usize,
-) -> Vec<f32> {
-    let mut circumdata = vec![0.0f32; tet_count * 4];
-    for i in 0..tet_count {
-        let i0 = indices[i * 4] as usize;
-        let i1 = indices[i * 4 + 1] as usize;
-        let i2 = indices[i * 4 + 2] as usize;
-        let i3 = indices[i * 4 + 3] as usize;
-        let v0 = Vec3::new(vertices[i0 * 3], vertices[i0 * 3 + 1], vertices[i0 * 3 + 2]);
-        let v1 = Vec3::new(vertices[i1 * 3], vertices[i1 * 3 + 1], vertices[i1 * 3 + 2]);
-        let v2 = Vec3::new(vertices[i2 * 3], vertices[i2 * 3 + 1], vertices[i2 * 3 + 2]);
-        let v3 = Vec3::new(vertices[i3 * 3], vertices[i3 * 3 + 1], vertices[i3 * 3 + 2]);
-        let a = v1 - v0;
-        let b = v2 - v0;
-        let c = v3 - v0;
-        let (aa, bb, cc) = (a.dot(a), b.dot(b), c.dot(c));
-        let cross_bc = b.cross(c);
-        let cross_ca = c.cross(a);
-        let cross_ab = a.cross(b);
-        let mut denom = 2.0 * a.dot(cross_bc);
-        if denom.abs() < 1e-12 {
-            denom = 1.0;
-        }
-        let r = (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denom;
-        let center = v0 + r;
-        let r_sq = r.dot(r);
-        circumdata[i * 4] = center.x;
-        circumdata[i * 4 + 1] = center.y;
-        circumdata[i * 4 + 2] = center.z;
-        circumdata[i * 4 + 3] = r_sq;
-    }
-    circumdata
-}
-
-/// Generate a random tetrahedron centered roughly at origin.
-/// Ensures positive orientation (det > 0) so face winding produces inward normals.
-pub fn random_tet_vertices<R: Rng>(rng: &mut R, radius: f32) -> ([f32; 12], [u32; 4]) {
-    let mut verts = [0.0f32; 12];
-    for i in 0..4 {
-        verts[i * 3] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-        verts[i * 3 + 1] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-        verts[i * 3 + 2] = (rng.random::<f32>() - 0.5) * 2.0 * radius;
-    }
-    // Ensure positive orientation: det(v1-v0, v2-v0, v3-v0) > 0
-    let v0 = Vec3::new(verts[0], verts[1], verts[2]);
-    let v1 = Vec3::new(verts[3], verts[4], verts[5]);
-    let v2 = Vec3::new(verts[6], verts[7], verts[8]);
-    let v3 = Vec3::new(verts[9], verts[10], verts[11]);
-    let det = (v1 - v0).dot((v2 - v0).cross(v3 - v0));
-    if det < 0.0 {
-        // Swap vertices 2 and 3 to flip orientation
-        return (verts, [0, 1, 3, 2]);
-    }
-    (verts, [0, 1, 2, 3])
-}
-
-/// Build a single-tet test scene with random parameters.
-pub fn random_single_tet_scene<R: Rng>(rng: &mut R, radius: f32) -> SceneData {
-    let (verts, indices) = random_tet_vertices(rng, radius);
-    let density = vec![rng.random::<f32>() * 5.0 + 0.5];
-    let color_grads = vec![
-        (rng.random::<f32>() - 0.5) * 0.2,
-        (rng.random::<f32>() - 0.5) * 0.2,
-        (rng.random::<f32>() - 0.5) * 0.2,
-    ];
-
-    build_test_scene(verts.to_vec(), indices.to_vec(), density, color_grads)
-}
 
 /// Comparison helper: check if two images match within tolerance.
 /// Returns (max_abs_diff, mean_abs_diff, num_pixels_compared).

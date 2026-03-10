@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rmesh-shaders = { path = "../rmesh-shaders" }
+rmesh-util = { path = "../rmesh-util" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }

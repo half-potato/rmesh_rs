@@ -20,9 +20,9 @@ struct Uniforms {
     screen_width: f32,
     screen_height: f32,
     tet_count: u32,
-    sh_degree: u32,
     step: u32,
-    _pad1: vec3<u32>,
+    _pad1: vec4<u32>,
+    _pad2: vec4<u32>,
 };
 
 struct TileUniforms {
@@ -46,37 +46,19 @@ struct TileUniforms {
 @group(0) @binding(2) var<storage, read> rendered_image: array<f32>;
 @group(0) @binding(3) var<storage, read> vertices: array<f32>;
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
-@group(0) @binding(5) var<storage, read> sh_coeffs: array<f32>;
-@group(0) @binding(6) var<storage, read> densities: array<f32>;
-@group(0) @binding(7) var<storage, read> color_grads_buf: array<f32>;
-@group(0) @binding(8) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(9) var<storage, read> colors_buf: array<f32>;
-@group(0) @binding(10) var<storage, read> tile_sort_values: array<u32>;
+@group(0) @binding(5) var<storage, read> densities: array<f32>;
+@group(0) @binding(6) var<storage, read> color_grads_buf: array<f32>;
+@group(0) @binding(7) var<storage, read> circumdata: array<f32>;
+@group(0) @binding(8) var<storage, read> colors_buf: array<f32>;
+@group(0) @binding(9) var<storage, read> tile_sort_values: array<u32>;
 
 // Group 1: read-write gradient outputs + tile metadata
-@group(1) @binding(0) var<storage, read_write> d_sh_coeffs: array<atomic<u32>>;
-@group(1) @binding(1) var<storage, read_write> d_vertices: array<atomic<u32>>;
-@group(1) @binding(2) var<storage, read_write> d_densities: array<atomic<u32>>;
-@group(1) @binding(3) var<storage, read_write> d_color_grads: array<atomic<u32>>;
-@group(1) @binding(4) var<storage, read> tile_ranges: array<u32>;
-@group(1) @binding(5) var<storage, read> tile_uniforms: TileUniforms;
-@group(1) @binding(6) var<storage, read_write> debug_image: array<f32>;
-
-// SH Constants
-const C0: f32 = 0.28209479177387814;
-const C1: f32 = 0.4886025119029199;
-const C2_0: f32 = 1.0925484305920792;
-const C2_1: f32 = -1.0925484305920792;
-const C2_2: f32 = 0.31539156525252005;
-const C2_3: f32 = -1.0925484305920792;
-const C2_4: f32 = 0.5462742152960396;
-const C3_0: f32 = -0.5900435899266435;
-const C3_1: f32 = 2.890611442640554;
-const C3_2: f32 = -0.4570457994644658;
-const C3_3: f32 = 0.3731763325901154;
-const C3_4: f32 = -0.4570457994644658;
-const C3_5: f32 = 1.445305721320277;
-const C3_6: f32 = -0.5900435899266435;
+@group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<u32>>;
+@group(1) @binding(1) var<storage, read_write> d_densities: array<atomic<u32>>;
+@group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<u32>>;
+@group(1) @binding(3) var<storage, read> tile_ranges: array<u32>;
+@group(1) @binding(4) var<storage, read> tile_uniforms: TileUniforms;
+@group(1) @binding(5) var<storage, read_write> debug_image: array<f32>;
 
 // Face winding
 const FACES: array<vec3<u32>, 4> = array<vec3<u32>, 4>(
@@ -117,34 +99,6 @@ fn load_f32x3_v(idx: u32) -> vec3<f32> {
     return vec3<f32>(vertices[idx * 3u], vertices[idx * 3u + 1u], vertices[idx * 3u + 2u]);
 }
 
-fn eval_sh(dir: vec3<f32>, sh_degree: u32, base: u32) -> f32 {
-    let x = dir.x; let y = dir.y; let z = dir.z;
-    var val = C0 * sh_coeffs[base];
-    if (sh_degree >= 1u) {
-        val += -C1 * y * sh_coeffs[base + 1u];
-        val += C1 * z * sh_coeffs[base + 2u];
-        val += -C1 * x * sh_coeffs[base + 3u];
-    }
-    if (sh_degree >= 2u) {
-        let xx = x * x; let yy = y * y; let zz = z * z;
-        val += C2_0 * x * y * sh_coeffs[base + 4u];
-        val += C2_1 * y * z * sh_coeffs[base + 5u];
-        val += C2_2 * (2.0 * zz - xx - yy) * sh_coeffs[base + 6u];
-        val += C2_3 * x * z * sh_coeffs[base + 7u];
-        val += C2_4 * (xx - yy) * sh_coeffs[base + 8u];
-        if (sh_degree >= 3u) {
-            val += C3_0 * y * (3.0 * xx - yy) * sh_coeffs[base + 9u];
-            val += C3_1 * x * y * z * sh_coeffs[base + 10u];
-            val += C3_2 * y * (4.0 * zz - xx - yy) * sh_coeffs[base + 11u];
-            val += C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeffs[base + 12u];
-            val += C3_4 * x * (4.0 * zz - xx - yy) * sh_coeffs[base + 13u];
-            val += C3_5 * z * (xx - yy) * sh_coeffs[base + 14u];
-            val += C3_6 * x * (xx - 3.0 * yy) * sh_coeffs[base + 15u];
-        }
-    }
-    return val;
-}
-
 // Atomic f32 add (CAS pattern)
 fn global_cas_add_density(buf_idx: u32, val: f32) {
     var ob = atomicLoad(&d_densities[buf_idx]);
@@ -171,16 +125,6 @@ fn global_cas_add_color_grad(buf_idx: u32, val: f32) {
     loop {
         let nv = bitcast<u32>(bitcast<f32>(ob) + val);
         let r = atomicCompareExchangeWeak(&d_color_grads[buf_idx], ob, nv);
-        if (r.exchanged) { break; }
-        ob = r.old_value;
-    }
-}
-
-fn global_cas_add_sh(buf_idx: u32, val: f32) {
-    var ob = atomicLoad(&d_sh_coeffs[buf_idx]);
-    loop {
-        let nv = bitcast<u32>(bitcast<f32>(ob) + val);
-        let r = atomicCompareExchangeWeak(&d_sh_coeffs[buf_idx], ob, nv);
         if (r.exchanged) { break; }
         ob = r.old_value;
     }
@@ -222,10 +166,6 @@ fn main(
     let cam = uniforms.cam_pos_pad.xyz;
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
     let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
-
-    let num_coeffs = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u);
-    let sh_stride = num_coeffs * 3u;
-    let nc = num_coeffs;
 
     // Initialize forward replay state
     for (var i = lane; i < 256u; i += 32u) {
@@ -348,22 +288,15 @@ fn main(
         let colors_tet = vec3<f32>(colors_buf[tet_id * 3u], colors_buf[tet_id * 3u + 1u], colors_buf[tet_id * 3u + 2u]);
         let grad_vec = vec3<f32>(color_grads_buf[tet_id * 3u], color_grads_buf[tet_id * 3u + 1u], color_grads_buf[tet_id * 3u + 2u]);
 
-        // Per-tet constants for SH backward
+        // Per-tet constants
         let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
-        let sh_dir = normalize(centroid - cam);
-        let sh_base = tet_id * sh_stride;
-        var sh_result = vec3<f32>(0.0);
-        sh_result.x = eval_sh(sh_dir, uniforms.sh_degree, sh_base);
-        sh_result.y = eval_sh(sh_dir, uniforms.sh_degree, sh_base + nc);
-        sh_result.z = eval_sh(sh_dir, uniforms.sh_degree, sh_base + 2u * nc);
         let offset_val = dot(grad_vec, verts[0] - centroid);
-        let sp_input = sh_result + vec3<f32>(0.5 + offset_val);
+        let sp_input = vec3<f32>(0.5 + offset_val);
 
         // Per-thread gradient accumulators (sum across all pixels this thread processes)
         var d_density_accum: f32 = 0.0;
         var d_vert_accum: array<vec3<f32>, 4>;
         var d_grad_accum = vec3<f32>(0.0);
-        var d_sh_result_accum = vec3<f32>(0.0);
 
         // Process covered pixels
         for (var idx = lane; idx < total; idx += 32u) {
@@ -514,7 +447,6 @@ fn main(
                 d_base_color.z * dsoftplus(sp_input.z),
             );
 
-            let d_sh_result_local = d_sp_input;
             let d_offset_scalar = d_sp_input.x + d_sp_input.y + d_sp_input.z;
 
             d_grad_local += (verts[0] - centroid) * d_offset_scalar;
@@ -562,7 +494,6 @@ fn main(
             d_vert_accum[2] += d_vert_local[2];
             d_vert_accum[3] += d_vert_local[3];
             d_grad_accum += d_grad_local;
-            d_sh_result_accum += d_sh_result_local;
         }
 
         // ===== Warp reduce + flush =====
@@ -579,11 +510,6 @@ fn main(
             warp_reduce(d_grad_accum.y),
             warp_reduce(d_grad_accum.z),
         );
-        let reduced_d_sh = vec3<f32>(
-            warp_reduce(d_sh_result_accum.x),
-            warp_reduce(d_sh_result_accum.y),
-            warp_reduce(d_sh_result_accum.z),
-        );
 
         // Lane 0 writes to global memory
         if (lane == 0u) {
@@ -599,46 +525,6 @@ fn main(
             global_cas_add_color_grad(tet_id * 3u, reduced_d_grad.x);
             global_cas_add_color_grad(tet_id * 3u + 1u, reduced_d_grad.y);
             global_cas_add_color_grad(tet_id * 3u + 2u, reduced_d_grad.z);
-
-            // SH coefficients: basis is per-tet (same direction for all pixels)
-            let x = sh_dir.x; let y = sh_dir.y; let z = sh_dir.z;
-            var basis: array<f32, 16>;
-            basis[0] = C0;
-            var n_basis = 1u;
-            if (uniforms.sh_degree >= 1u) {
-                basis[1] = -C1 * y;
-                basis[2] = C1 * z;
-                basis[3] = -C1 * x;
-                n_basis = 4u;
-            }
-            if (uniforms.sh_degree >= 2u) {
-                let xx = x * x; let yy = y * y; let zz = z * z;
-                basis[4] = C2_0 * x * y;
-                basis[5] = C2_1 * y * z;
-                basis[6] = C2_2 * (2.0 * zz - xx - yy);
-                basis[7] = C2_3 * x * z;
-                basis[8] = C2_4 * (xx - yy);
-                n_basis = 9u;
-                if (uniforms.sh_degree >= 3u) {
-                    basis[9] = C3_0 * y * (3.0 * xx - yy);
-                    basis[10] = C3_1 * x * y * z;
-                    basis[11] = C3_2 * y * (4.0 * zz - xx - yy);
-                    basis[12] = C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy);
-                    basis[13] = C3_4 * x * (4.0 * zz - xx - yy);
-                    basis[14] = C3_5 * z * (xx - yy);
-                    basis[15] = C3_6 * x * (xx - 3.0 * yy);
-                    n_basis = 16u;
-                }
-            }
-
-            let d_channels = array<f32, 3>(reduced_d_sh.x, reduced_d_sh.y, reduced_d_sh.z);
-            for (var c = 0u; c < 3u; c++) {
-                for (var k = 0u; k < n_basis; k++) {
-                    let sh_val = d_channels[c] * basis[k];
-                    let sh_global_idx = tet_id * sh_stride + c * nc + k;
-                    global_cas_add_sh(sh_global_idx, sh_val);
-                }
-            }
         }
         workgroupBarrier();
     }

@@ -15,82 +15,11 @@ use common::*;
 use glam::Vec3;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rmesh_util::test_util::{create_test_device_default as create_test_device, read_buffer};
 
 const SEED: u64 = 42424242;
 const W: u32 = 16;
 const H: u32 = 16;
-
-// ---------------------------------------------------------------------------
-// GPU setup helper
-// ---------------------------------------------------------------------------
-
-/// Create a GPU device with SUBGROUP feature. Returns None if no adapter.
-fn create_test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
-    pollster::block_on(async {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
-            ..Default::default()
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await
-            .ok()?;
-
-        adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    required_features: wgpu::Features::SUBGROUP,
-                    required_limits: wgpu::Limits {
-                        max_storage_buffers_per_shader_stage: 16,
-                        max_storage_buffer_binding_size: 1 << 30,
-                        max_buffer_size: 1 << 30,
-                        ..wgpu::Limits::default()
-                    },
-                    ..Default::default()
-                },
-            )
-            .await
-            .ok()
-    })
-}
-
-/// Read back a GPU buffer as a Vec<T>. Source buffer must have COPY_SRC.
-fn read_buffer<T: bytemuck::Pod>(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    source: &wgpu::Buffer,
-    count: usize,
-) -> Vec<T> {
-    let size = (count * std::mem::size_of::<T>()) as u64;
-    let readback = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("readback"),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(source, 0, &readback, 0, size);
-    queue.submit(std::iter::once(encoder.finish()));
-
-    let slice = readback.slice(..);
-    let (sender, receiver) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
-    });
-    let _ = device.poll(wgpu::PollType::wait_indefinitely());
-    receiver.recv().unwrap().unwrap();
-
-    let data = slice.get_mapped_range();
-    let result: Vec<T> = bytemuck::cast_slice(&data).to_vec();
-    drop(data);
-    readback.unmap();
-    result
-}
 
 fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat4) {
     let aspect = W as f32 / H as f32;
@@ -123,8 +52,7 @@ fn test_forward_compute_kernel() {
     let scene = random_single_tet_scene(&mut rng, 0.3);
 
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
-    let zero_sh = vec![0.0f32; scene.tet_count as usize * 3];
-    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_sh, &scene.color_grads, scene.tet_count, 0);
+    let material = rmesh_render::MaterialBuffers::upload(&device, &scene.color_grads, scene.tet_count);
     let pipelines = rmesh_render::ForwardPipelines::new(
         &device,
         wgpu::TextureFormat::Rgba16Float,
@@ -139,7 +67,7 @@ fn test_forward_compute_kernel() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 0);
+        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args
