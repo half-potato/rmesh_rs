@@ -13,10 +13,10 @@ use pyo3::types::PyDict;
 
 use glam::{Mat4, Vec3, Vec4};
 use rmesh_backward::{
-    create_backward_bind_groups, create_backward_tiled_bind_groups,
+    create_backward_tiled_bind_groups,
     create_prepare_dispatch_bind_group, create_rts_bind_group,
     create_tile_fill_bind_group, create_tile_gen_scan_bind_group,
-    create_tile_ranges_bind_group_with_keys, BackwardPipelines,
+    create_tile_ranges_bind_group_with_keys,
     BackwardTiledPipelines, GradientBuffers, MaterialGradBuffers, RadixSortPipelines, RadixSortState,
     ScanBuffers, ScanPipelines, TileBuffers, TilePipelines, TileUniforms,
 };
@@ -120,7 +120,6 @@ struct RMeshRenderer {
     targets: RenderTargets,
     ttb: TexToBufferPipeline,
     // Backward infrastructure
-    bwd_pipelines: BackwardPipelines,
     bwd_tiled_pipelines: BackwardTiledPipelines,
     grad_buffers: GradientBuffers,
     mat_grad_buffers: MaterialGradBuffers,
@@ -137,28 +136,21 @@ struct RMeshRenderer {
     tile_fill_bg: wgpu::BindGroup,
     // A-buffer bind groups (sort result in primary buffers)
     tile_ranges_bg: wgpu::BindGroup,
-    bwd_tiled_bg0: wgpu::BindGroup,
-    bwd_tiled_bg1: wgpu::BindGroup,
     // B-buffer bind groups (sort result in alternate buffers)
     tile_ranges_bg_b: wgpu::BindGroup,
-    bwd_tiled_bg0_b: wgpu::BindGroup,
     // Forward tiled compute pipeline (subgroup-based, 4x4 tiles)
     fwd_tiled: ForwardTiledPipeline,
     fwd_tiled_bg: wgpu::BindGroup,
     fwd_tiled_bg_b: wgpu::BindGroup,
-    // Debug image buffer for backward forward-replay verification
-    debug_image: wgpu::Buffer,
     // Bind groups
     compute_bg: wgpu::BindGroup,
     render_bg: wgpu::BindGroup,
-    _loss_bg: wgpu::BindGroup,
     // Loss bind group using fwd_tiled.rendered_image (for train_step)
     loss_bg_tiled: wgpu::BindGroup,
     // Backward tiled bind groups using fwd_tiled.rendered_image (A and B variants)
     bwd_tiled_bg0_tiled: wgpu::BindGroup,
     bwd_tiled_bg0_tiled_b: wgpu::BindGroup,
-    _bwd_bg0: wgpu::BindGroup,
-    _bwd_bg1: wgpu::BindGroup,
+    bwd_tiled_bg1: wgpu::BindGroup,
     adam_bgs: Vec<wgpu::BindGroup>,
     adam_uniforms_bufs: Vec<wgpu::Buffer>,
     // Scan-based tile pipeline (RTS prefix scan)
@@ -265,7 +257,6 @@ impl RMeshRenderer {
 
         // Create pipelines
         let fwd_pipelines = ForwardPipelines::new(&device, color_format, aux_format);
-        let bwd_pipelines = BackwardPipelines::new(&device);
         let bwd_tiled_pipelines = BackwardTiledPipelines::new(&device);
         let loss_pipeline = LossPipeline::new(&device);
         let adam_pipeline = AdamPipeline::new(&device);
@@ -296,21 +287,11 @@ impl RMeshRenderer {
         // Loss buffers
         let loss_buffers = LossBuffers::new(&device, width, height);
 
-        // Backward bind groups
-        let loss_bg = create_loss_bind_group(
+        // Loss bind group (non-tiled path, unused but kept for API compat)
+        let _loss_bg = create_loss_bind_group(
             &device,
             &loss_pipeline,
             &loss_buffers,
-            &ttb.rendered_image,
-        );
-        let (bwd_bg0, bwd_bg1) = create_backward_bind_groups(
-            &device,
-            &bwd_pipelines,
-            &scene_buffers,
-            &material_buffers,
-            &loss_buffers.dl_d_image,
-            &grad_buffers,
-            &mat_grad_buffers,
             &ttb.rendered_image,
         );
 
@@ -374,14 +355,6 @@ impl RMeshRenderer {
         radix_state.upload_configs(&queue);
 
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
-        // Debug image buffer for backward forward-replay verification
-        let n_pixels = (width as u64) * (height as u64);
-        let debug_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("debug_image"),
-            size: n_pixels * 4 * 4, // RGBA f32
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
 
         // Forward tiled compute pipeline (4x4 tiles with subgroups)
         let fwd_tiled = ForwardTiledPipeline::new(&device, width, height);
@@ -396,29 +369,6 @@ impl RMeshRenderer {
             &tile_buffers.tile_uniforms,
             &radix_state.num_keys_buf,
         );
-        let (bwd_tiled_bg0, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
-            &device,
-            &bwd_tiled_pipelines,
-            &scene_buffers.uniforms,
-            &loss_buffers.dl_d_image,
-            &ttb.rendered_image,
-            &scene_buffers.vertices,
-            &scene_buffers.indices,
-            &scene_buffers.densities,
-            &material_buffers.color_grads,
-            &scene_buffers.circumdata,
-            &material_buffers.colors,
-            &tile_buffers.tile_sort_values,
-            &material_buffers.base_colors,
-            &grad_buffers.d_vertices,
-            &grad_buffers.d_densities,
-            &mat_grad_buffers.d_color_grads,
-            &mat_grad_buffers.d_base_colors,
-            &tile_buffers.tile_ranges,
-            &tile_buffers.tile_uniforms,
-            &debug_image,
-        );
-
         // B-buffer bind groups (sort result in radix_state.keys_b/values_b)
         let tile_ranges_bg_b = create_tile_ranges_bind_group_with_keys(
             &device,
@@ -427,28 +377,6 @@ impl RMeshRenderer {
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
             &radix_state.num_keys_buf,
-        );
-        let (bwd_tiled_bg0_b, _) = create_backward_tiled_bind_groups(
-            &device,
-            &bwd_tiled_pipelines,
-            &scene_buffers.uniforms,
-            &loss_buffers.dl_d_image,
-            &ttb.rendered_image,
-            &scene_buffers.vertices,
-            &scene_buffers.indices,
-            &scene_buffers.densities,
-            &material_buffers.color_grads,
-            &scene_buffers.circumdata,
-            &material_buffers.colors,
-            &radix_state.values_b,
-            &material_buffers.base_colors,
-            &grad_buffers.d_vertices,
-            &grad_buffers.d_densities,
-            &mat_grad_buffers.d_color_grads,
-            &mat_grad_buffers.d_base_colors,
-            &tile_buffers.tile_ranges,
-            &tile_buffers.tile_uniforms,
-            &debug_image,
         );
 
         // Forward tiled bind groups (A and B buffer variants)
@@ -488,7 +416,7 @@ impl RMeshRenderer {
         );
 
         // Backward tiled bind groups using fwd_tiled.rendered_image (for train_step)
-        let (bwd_tiled_bg0_tiled, _) = create_backward_tiled_bind_groups(
+        let (bwd_tiled_bg0_tiled, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
             &device,
             &bwd_tiled_pipelines,
             &scene_buffers.uniforms,
@@ -498,17 +426,14 @@ impl RMeshRenderer {
             &scene_buffers.indices,
             &scene_buffers.densities,
             &material_buffers.color_grads,
-            &scene_buffers.circumdata,
             &material_buffers.colors,
             &tile_buffers.tile_sort_values,
-            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
             &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
-            &debug_image,
         );
         let (bwd_tiled_bg0_tiled_b, _) = create_backward_tiled_bind_groups(
             &device,
@@ -520,17 +445,14 @@ impl RMeshRenderer {
             &scene_buffers.indices,
             &scene_buffers.densities,
             &material_buffers.color_grads,
-            &scene_buffers.circumdata,
             &material_buffers.colors,
             &radix_state.values_b,
-            &material_buffers.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
             &mat_grad_buffers.d_base_colors,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
-            &debug_image,
         );
 
         // Scan-based tile pipeline infrastructure (RTS prefix scan)
@@ -577,7 +499,6 @@ impl RMeshRenderer {
             fwd_pipelines,
             targets,
             ttb,
-            bwd_pipelines,
             bwd_tiled_pipelines,
             grad_buffers,
             mat_grad_buffers,
@@ -592,22 +513,16 @@ impl RMeshRenderer {
             radix_state,
             tile_fill_bg,
             tile_ranges_bg,
-            bwd_tiled_bg0,
-            bwd_tiled_bg1,
             tile_ranges_bg_b,
-            bwd_tiled_bg0_b,
             fwd_tiled,
             fwd_tiled_bg,
             fwd_tiled_bg_b,
-            debug_image,
             compute_bg,
             render_bg,
-            _loss_bg: loss_bg,
             loss_bg_tiled,
             bwd_tiled_bg0_tiled,
             bwd_tiled_bg0_tiled_b,
-            _bwd_bg0: bwd_bg0,
-            _bwd_bg1: bwd_bg1,
+            bwd_tiled_bg1,
             adam_bgs,
             adam_uniforms_bufs,
             scan_pipelines,
@@ -1087,7 +1002,6 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.mat_grad_buffers.d_base_colors, 0, None);
         encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
-        encoder.clear_buffer(&self.debug_image, 0, None);
 
         // RTS scan-based tile pipeline (reads compact_tet_ids + tiles_touched from forward compute)
         rmesh_backward::record_scan_tile_pipeline(
@@ -1183,20 +1097,6 @@ impl RMeshRenderer {
             Array1::from_vec(d_grads).into_pyarray(py),
         )?;
         Ok(dict)
-    }
-
-    /// Read the debug image written by the backward pass's forward replay.
-    ///
-    /// Returns:
-    ///     numpy array [H, W, 4] f32 (composited RGBA from backward's forward replay)
-    fn read_debug_image<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
-        let data = read_buffer_f32(&self.device, &self.queue, &self.debug_image);
-        let arr = Array3::from_shape_vec(
-            (self.height as usize, self.width as usize, 4),
-            data,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
-        Ok(arr.into_pyarray(py))
     }
 
     /// Full forward+loss+backward+adam step on GPU.
@@ -1299,7 +1199,6 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.loss_buffers.loss_value, 0, None);
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
         encoder.clear_buffer(&self.fwd_tiled.rendered_image, 0, None);
-        encoder.clear_buffer(&self.debug_image, 0, None);
 
         // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids, no sort)
         record_forward_compute(

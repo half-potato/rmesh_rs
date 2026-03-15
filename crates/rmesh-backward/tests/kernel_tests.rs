@@ -1005,8 +1005,6 @@ fn test_multi_tet_gradient_finite_diff() {
         encoder.clear_buffer(&mat_grad_buffers.d_base_colors, 0, None);
         queue.submit(std::iter::once(encoder.finish()));
 
-        let debug_image = create_rw_buffer(&device, "debug_image", (n_pixels as u64) * 4 * 4);
-
         let (tile_sort_values_sorted, _) = if result_in_b {
             (&radix_state.values_b, &radix_state.keys_b)
         } else {
@@ -1018,13 +1016,12 @@ fn test_multi_tet_gradient_finite_diff() {
             &device, &bwd_tiled_pipelines,
             &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
             &buffers.vertices, &buffers.indices,
-            &buffers.densities, &material.color_grads, &buffers.circumdata,
+            &buffers.densities, &material.color_grads,
             &material.colors, tile_sort_values_sorted,
-            &material.base_colors,
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
             &mat_grad_buffers.d_base_colors,
-            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -1294,33 +1291,29 @@ fn test_single_tet_loss_decreases() {
     let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(
         &device, scene.tet_count,
     );
-    let debug_image = create_rw_buffer(&device, "debug_image", (n_pixels as u64) * 4 * 4);
-
     // Backward bind groups (A/B variants for radix sort result)
     let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
     let (bwd_bg0_a, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
         &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
         &buffers.vertices, &buffers.indices,
-        &buffers.densities, &material.color_grads, &buffers.circumdata,
+        &buffers.densities, &material.color_grads,
         &material.colors, &tile_buffers.tile_sort_values,
-        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &mat_grad_buffers.d_base_colors,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
         &device, &bwd_tiled_pipelines,
         &buffers.uniforms, &loss_buffers.dl_d_image, &fwd_tiled.rendered_image,
         &buffers.vertices, &buffers.indices,
-        &buffers.densities, &material.color_grads, &buffers.circumdata,
+        &buffers.densities, &material.color_grads,
         &material.colors, &radix_state.values_b,
-        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &mat_grad_buffers.d_base_colors,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &debug_image,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // Adam state + bind groups (separate uniform buffers per group to avoid overwrite)

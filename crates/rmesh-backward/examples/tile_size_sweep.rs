@@ -10,7 +10,7 @@ use glam::{Mat4, Vec3};
 use rmesh_util::camera::{look_at, perspective_matrix};
 use rmesh_util::shared::{LossUniforms, TileUniforms};
 use rmesh_util::test_util::{
-    create_rw_buffer, create_timestamp_device, grid_tet_scene, TimestampRecorder,
+    create_timestamp_device, grid_tet_scene, TimestampRecorder,
 };
 use rmesh_train::{create_loss_bind_group, LossBuffers, LossPipeline};
 
@@ -41,6 +41,10 @@ fn patch_tiled_shader(src: &str, ts: u32) -> String {
         .replace(
             "array<vec4<f32>, 256>",
             &format!("array<vec4<f32>, {ts_sq}>"),
+        )
+        .replace(
+            "array<f32, 256>",
+            &format!("array<f32, {ts_sq}>"),
         )
         .replace("array<i32, 16>", &format!("array<i32, {ts}>"))
         .replace("array<u32, 17>", &format!("array<u32, {}>", ts + 1))
@@ -147,13 +151,13 @@ fn fwd_tiled_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pipe
     (bgl, pl)
 }
 
-/// Build the backward tiled pipeline layout (2 groups: 11 + 7 bindings).
+/// Build the backward tiled pipeline layout (2 groups: 9 + 6 bindings).
 fn bwd_tiled_layout(
     device: &wgpu::Device,
 ) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::PipelineLayout) {
     let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bwd_tiled_bgl_0"),
-        entries: &(0..11)
+        entries: &(0..9)
             .map(|i| rmesh_tile::storage_entry(i, true))
             .collect::<Vec<_>>(),
     });
@@ -166,7 +170,6 @@ fn bwd_tiled_layout(
             rmesh_tile::storage_entry(3, true),
             rmesh_tile::storage_entry(4, true),
             rmesh_tile::storage_entry(5, false),
-            rmesh_tile::storage_entry(6, false),
         ],
     });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -204,7 +207,6 @@ struct TileSizeState {
     loss_bg: wgpu::BindGroup,
     // Rendered image
     rendered_image: wgpu::Buffer,
-    debug_image: wgpu::Buffer,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,7 +463,6 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
-    let debug_image = create_rw_buffer(device, "debug_image", n_pixels * 4 * 4);
 
     // Forward tiled bind groups (A and B)
     let fwd_tiled_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -517,10 +518,8 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(4, &sb.indices),
             buf_entry(5, &sb.densities),
             buf_entry(6, &mb.color_grads),
-            buf_entry(7, &sb.circumdata),
-            buf_entry(8, &mb.colors),
-            buf_entry(9, &tile_buffers.tile_sort_values),
-            buf_entry(10, &mb.base_colors),
+            buf_entry(7, &mb.colors),
+            buf_entry(8, &tile_buffers.tile_sort_values),
         ],
     });
     let bwd_bg0_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -534,10 +533,8 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(4, &sb.indices),
             buf_entry(5, &sb.densities),
             buf_entry(6, &mb.color_grads),
-            buf_entry(7, &sb.circumdata),
-            buf_entry(8, &mb.colors),
-            buf_entry(9, &radix_state.values_b),
-            buf_entry(10, &mb.base_colors),
+            buf_entry(7, &mb.colors),
+            buf_entry(8, &radix_state.values_b),
         ],
     });
     let bwd_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -549,8 +546,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(2, &shared.mat_grad_buffers.d_color_grads),
             buf_entry(3, &tile_buffers.tile_ranges),
             buf_entry(4, &tile_buffers.tile_uniforms),
-            buf_entry(5, &debug_image),
-            buf_entry(6, &shared.mat_grad_buffers.d_base_colors),
+            buf_entry(5, &shared.mat_grad_buffers.d_base_colors),
         ],
     });
 
@@ -573,7 +569,6 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         bwd_bg1,
         loss_bg,
         rendered_image,
-        debug_image,
     }
 }
 

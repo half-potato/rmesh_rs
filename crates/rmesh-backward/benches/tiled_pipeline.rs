@@ -69,7 +69,6 @@ struct BenchState {
     bwd_bg0_a: wgpu::BindGroup,
     bwd_bg0_b: wgpu::BindGroup,
     bwd_bg1: wgpu::BindGroup,
-    debug_image: wgpu::Buffer,
 }
 
 fn create_bench_state() -> Option<BenchState> {
@@ -243,7 +242,6 @@ fn create_bench_state() -> Option<BenchState> {
     let grad_buffers =
         rmesh_backward::GradientBuffers::new(&device, scene.vertex_count, scene.tet_count);
     let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(&device, scene.tet_count);
-    let debug_image = create_rw_buffer(&device, "debug_image", (n_pixels as u64) * 4 * 4);
 
     let bwd_tiled_pipelines = rmesh_backward::BackwardTiledPipelines::new(&device);
     let (bwd_bg0_a, bwd_bg1) = rmesh_backward::create_backward_tiled_bind_groups(
@@ -256,17 +254,14 @@ fn create_bench_state() -> Option<BenchState> {
         &buffers.indices,
         &buffers.densities,
         &material.color_grads,
-        &buffers.circumdata,
         &material.colors,
         &tile_buffers.tile_sort_values,
-        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities,
         &mat_grad_buffers.d_color_grads,
         &mat_grad_buffers.d_base_colors,
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &debug_image,
     );
     let (bwd_bg0_b, _) = rmesh_backward::create_backward_tiled_bind_groups(
         &device,
@@ -278,17 +273,14 @@ fn create_bench_state() -> Option<BenchState> {
         &buffers.indices,
         &buffers.densities,
         &material.color_grads,
-        &buffers.circumdata,
         &material.colors,
         &radix_state.values_b,
-        &material.base_colors,
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities,
         &mat_grad_buffers.d_color_grads,
         &mat_grad_buffers.d_base_colors,
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &debug_image,
     );
 
     Some(BenchState {
@@ -323,7 +315,6 @@ fn create_bench_state() -> Option<BenchState> {
         bwd_bg0_a,
         bwd_bg0_b,
         bwd_bg1,
-        debug_image,
     })
 }
 

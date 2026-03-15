@@ -30,9 +30,8 @@ struct Uniforms {
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
 @group(0) @binding(5) var<storage, read> densities: array<f32>;
 @group(0) @binding(6) var<storage, read> color_grads_buf: array<f32>;
-@group(0) @binding(7) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(8) var<storage, read> colors_buf: array<f32>;
-@group(0) @binding(9) var<storage, read> sorted_indices: array<u32>;
+@group(0) @binding(7) var<storage, read> colors_buf: array<f32>;
+@group(0) @binding(8) var<storage, read> sorted_indices: array<u32>;
 
 // Group 1: read-write gradient outputs
 @group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<f32>>;
@@ -57,17 +56,6 @@ fn phi(x: f32) -> f32 {
 fn dphi_dx(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return -0.5 + x / 3.0; }
     return (exp(-x) * (1.0 + x) - 1.0) / (x * x);
-}
-
-fn softplus(x: f32) -> f32 {
-    if (x > 8.0) { return x; }
-    return 0.1 * log(1.0 + exp(10.0 * x));
-}
-
-fn dsoftplus(x: f32) -> f32 {
-    if (x > 8.0) { return 1.0; }
-    let e = exp(10.0 * x);
-    return e / (1.0 + e);
 }
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {

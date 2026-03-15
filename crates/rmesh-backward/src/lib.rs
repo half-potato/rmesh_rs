@@ -124,7 +124,7 @@ impl BackwardPipelines {
             source: wgpu::ShaderSource::Wgsl(BACKWARD_COMPUTE_WGSL.into()),
         });
 
-        // Group 0: 10 read-only bindings
+        // Group 0: 9 read-only bindings
         let backward_bind_group_layout_0 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_bind_group_layout_0"),
@@ -136,9 +136,8 @@ impl BackwardPipelines {
                     storage_entry(4, true),  // indices
                     storage_entry(5, true),  // densities
                     storage_entry(6, true),  // color_grads
-                    storage_entry(7, true),  // circumdata
-                    storage_entry(8, true),  // colors
-                    storage_entry(9, true),  // sorted_indices
+                    storage_entry(7, true),  // colors
+                    storage_entry(8, true),  // sorted_indices
                 ],
             });
 
@@ -199,7 +198,7 @@ impl BackwardTiledPipelines {
             source: wgpu::ShaderSource::Wgsl(BACKWARD_TILED_WGSL.into()),
         });
 
-        // Group 0: 11 read-only bindings
+        // Group 0: 9 read-only bindings
         let bg_layout_0 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_tiled_bgl_0"),
@@ -211,14 +210,12 @@ impl BackwardTiledPipelines {
                     storage_entry(4, true),  // indices
                     storage_entry(5, true),  // densities
                     storage_entry(6, true),  // color_grads
-                    storage_entry(7, true),  // circumdata
-                    storage_entry(8, true),  // colors_buf
-                    storage_entry(9, true),  // tile_sort_values
-                    storage_entry(10, true), // base_colors
+                    storage_entry(7, true),  // colors_buf
+                    storage_entry(8, true),  // tile_sort_values
                 ],
             });
 
-        // Group 1: 7 bindings (4 rw + 2 read + 1 rw)
+        // Group 1: 6 bindings (3 rw + 2 read + 1 rw)
         let bg_layout_1 =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("backward_tiled_bgl_1"),
@@ -228,8 +225,7 @@ impl BackwardTiledPipelines {
                     storage_entry(2, false), // d_color_grads
                     storage_entry(3, true),  // tile_ranges
                     storage_entry(4, true),  // tile_uniforms
-                    storage_entry(5, false), // debug_image
-                    storage_entry(6, false), // d_base_colors
+                    storage_entry(5, false), // d_base_colors
                 ],
             });
 
@@ -309,14 +305,10 @@ pub fn create_backward_bind_groups(
             },
             wgpu::BindGroupEntry {
                 binding: 7,
-                resource: scene_buffers.circumdata.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
                 resource: material.colors.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 9,
+                binding: 8,
                 resource: scene_buffers.sort_values.as_entire_binding(),
             },
         ],
@@ -357,17 +349,14 @@ pub fn create_backward_tiled_bind_groups(
     indices: &wgpu::Buffer,
     densities: &wgpu::Buffer,
     color_grads: &wgpu::Buffer,
-    circumdata: &wgpu::Buffer,
     colors: &wgpu::Buffer,
     tile_sort_values: &wgpu::Buffer,
-    base_colors: &wgpu::Buffer,
     d_vertices: &wgpu::Buffer,
     d_densities: &wgpu::Buffer,
     d_color_grads: &wgpu::Buffer,
     d_base_colors: &wgpu::Buffer,
     tile_ranges: &wgpu::Buffer,
     tile_uniforms: &wgpu::Buffer,
-    debug_image: &wgpu::Buffer,
 ) -> (wgpu::BindGroup, wgpu::BindGroup) {
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("backward_tiled_bg_0"),
@@ -380,10 +369,8 @@ pub fn create_backward_tiled_bind_groups(
             wgpu::BindGroupEntry { binding: 4, resource: indices.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 5, resource: densities.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 6, resource: color_grads.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: circumdata.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: colors.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 9, resource: tile_sort_values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 10, resource: base_colors.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 7, resource: colors.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 8, resource: tile_sort_values.as_entire_binding() },
         ],
     });
 
@@ -396,8 +383,7 @@ pub fn create_backward_tiled_bind_groups(
             wgpu::BindGroupEntry { binding: 2, resource: d_color_grads.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 3, resource: tile_ranges.as_entire_binding() },
             wgpu::BindGroupEntry { binding: 4, resource: tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: debug_image.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: d_base_colors.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 5, resource: d_base_colors.as_entire_binding() },
         ],
     });
 
@@ -448,13 +434,3 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-/// Compute 2D dispatch dimensions that stay within the 65535 limit per dimension.
-fn dispatch_2d(total_workgroups: u32) -> (u32, u32) {
-    if total_workgroups <= 65535 {
-        (total_workgroups, 1)
-    } else {
-        let x = 65535u32;
-        let y = (total_workgroups + x - 1) / x;
-        (x, y)
-    }
-}

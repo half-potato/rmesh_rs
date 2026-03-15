@@ -1,7 +1,7 @@
 // Compute-based backward tiled renderer: 1 warp (32 threads) per 16×16 tile.
 //
 // Same scanline-fill thread model as forward_tiled_compute.wgsl.
-// Forward replay in shared memory, gradient reduction via warp shuffle.
+// Back-to-front state undoing in shared memory, gradient reduction via warp shuffle.
 //
 // One workgroup per tile. Dispatch: (num_tiles, 1, 1).
 
@@ -48,10 +48,8 @@ struct TileUniforms {
 @group(0) @binding(4) var<storage, read> indices: array<u32>;
 @group(0) @binding(5) var<storage, read> densities: array<f32>;
 @group(0) @binding(6) var<storage, read> color_grads_buf: array<f32>;
-@group(0) @binding(7) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(8) var<storage, read> colors_buf: array<f32>;
-@group(0) @binding(9) var<storage, read> tile_sort_values: array<u32>;
-@group(0) @binding(10) var<storage, read> base_colors_buf: array<f32>;
+@group(0) @binding(7) var<storage, read> colors_buf: array<f32>;
+@group(0) @binding(8) var<storage, read> tile_sort_values: array<u32>;
 
 // Group 1: read-write gradient outputs + tile metadata
 @group(1) @binding(0) var<storage, read_write> d_vertices: array<atomic<f32>>;
@@ -59,8 +57,7 @@ struct TileUniforms {
 @group(1) @binding(2) var<storage, read_write> d_color_grads: array<atomic<f32>>;
 @group(1) @binding(3) var<storage, read> tile_ranges: array<u32>;
 @group(1) @binding(4) var<storage, read> tile_uniforms: TileUniforms;
-@group(1) @binding(5) var<storage, read_write> debug_image: array<f32>;
-@group(1) @binding(6) var<storage, read_write> d_base_colors: array<atomic<f32>>;
+@group(1) @binding(5) var<storage, read_write> d_base_colors: array<atomic<f32>>;
 
 // Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
@@ -71,7 +68,8 @@ const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
 );
 
 // Workgroup shared memory
-var<workgroup> sm_color: array<vec4<f32>, 256>;  // .xyz = color_accum, .w = log_t
+var<workgroup> sm_state: array<vec4<f32>, 256>;   // .xyz = color, .w = log_t
+var<workgroup> sm_d_log_t: array<f32, 256>;       // running d(log_t) per pixel
 var<workgroup> sm_xl: array<i32, 16>;
 var<workgroup> sm_xr: array<i32, 16>;
 var<workgroup> sm_prefix: array<u32, 17>;
@@ -84,17 +82,6 @@ fn phi(x: f32) -> f32 {
 fn dphi_dx(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return -0.5 + x / 3.0; }
     return (exp(-x) * (1.0 + x) - 1.0) / (x * x);
-}
-
-fn softplus(x: f32) -> f32 {
-    if (x > 8.0) { return x; }
-    return 0.1 * log(1.0 + exp(10.0 * x));
-}
-
-fn dsoftplus(x: f32) -> f32 {
-    if (x > 8.0) { return 1.0; }
-    let e = exp(10.0 * x);
-    return e / (1.0 + e);
 }
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
@@ -155,16 +142,30 @@ fn main(
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
     let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
 
-    // Initialize forward replay state
+    // Initialize state from rendered_image (final forward state) and dl_d_image
     for (var i = lane; i < 256u; i += 32u) {
-        sm_color[i] = vec4<f32>(0.0);
+        let row = i / 16u;
+        let col = i % 16u;
+        let px = tile_x * 16u + col;
+        let py = tile_y * 16u + row;
+        if (px < w && py < h) {
+            let idx = py * w + px;
+            let a = rendered_image[idx * 4u + 3u];
+            sm_state[i] = vec4<f32>(
+                rendered_image[idx * 4u],
+                rendered_image[idx * 4u + 1u],
+                rendered_image[idx * 4u + 2u],
+                log(max(1.0 - a, 1e-20)));
+            sm_d_log_t[i] = -dl_d_image[idx * 4u + 3u] * (1.0 - a);
+        } else {
+            sm_state[i] = vec4<f32>(0.0);
+            sm_d_log_t[i] = 0.0;
+        }
     }
     workgroupBarrier();
 
-    // Process tets front-to-back (same order as forward)
-    var cursor = range_end;
-    while (cursor > range_start) {
-        cursor -= 1u;
+    // Process tets back-to-front (reverse of forward order, for state undoing)
+    for (var cursor = range_start; cursor < range_end; cursor += 1u) {
         let tet_id = tile_sort_values[cursor];
 
         // Load tet geometry
@@ -369,41 +370,39 @@ fn main(
             let w1 = 1.0 - phi_val;
             let c_premul = c_end * w0 + c_start * w1;
 
-            // Read forward replay state
-            let state = sm_color[pixel_local];
-            let log_t_before = state.w;
-            let color_accum_before = state.xyz;
-            let T_j = exp(log_t_before);
-            let color_after = color_accum_before + c_premul * T_j;
+            // Read running state from shared memory
+            let state = sm_state[pixel_local];
+            let color = state.xyz;
+            let log_t = state.w;
+            let d_log_t = sm_d_log_t[pixel_local];
 
-            // Update forward replay state
-            sm_color[pixel_local] = vec4<f32>(color_after, log_t_before - od);
+            // Undo this tet's contribution (recover state before this tet in forward order)
+            let prev_log_t = log_t + od;
+            let t_prev = exp(prev_log_t);
+            let prev_color = color - c_premul * t_prev;
 
-            // Load per-pixel upstream gradients
+            // Load per-pixel upstream color gradient (constant per pixel)
             let d_color = vec3<f32>(
                 dl_d_image[pixel_idx * 4u],
                 dl_d_image[pixel_idx * 4u + 1u],
                 dl_d_image[pixel_idx * 4u + 2u],
             );
-            let alpha_final_val = rendered_image[pixel_idx * 4u + 3u];
-            let d_log_t_final = -dl_d_image[pixel_idx * 4u + 3u] * (1.0 - alpha_final_val);
-            let color_final = vec3<f32>(
-                rendered_image[pixel_idx * 4u],
-                rendered_image[pixel_idx * 4u + 1u],
-                rendered_image[pixel_idx * 4u + 2u],
-            );
 
-            // === Backward computation ===
-            let d_log_t_j = d_log_t_final + dot(d_color, color_final - color_after);
-            let d_c_premul = d_color * T_j;
-            let d_od_state = -d_log_t_j;
+            // === Backward computation (matching non-tiled backward_compute.wgsl) ===
+            let d_c_premul = d_color * t_prev;
+            let d_od_state = -d_log_t;
+            let d_old_log_t = d_log_t + dot(d_color, c_premul) * t_prev;
+
+            // Update shared memory state
+            sm_state[pixel_local] = vec4<f32>(prev_color, prev_log_t);
+            sm_d_log_t[pixel_local] = d_old_log_t;
 
             let dphi_val = dphi_dx(od);
-            let dw0_dod = dphi_val + exp(-od);
+            let dw0_dod = dphi_val + alpha_t;
             let dw1_dod = -dphi_val;
 
-            let d_c_end_integral = d_c_premul * (phi_val - alpha_t);
-            let d_c_start_integral = d_c_premul * (1.0 - phi_val);
+            let d_c_end_integral = d_c_premul * w0;
+            let d_c_start_integral = d_c_premul * w1;
             let d_od_integral = dot(d_c_premul, c_end * dw0_dod + c_start * dw1_dod);
 
             let d_od = d_od_state + d_od_integral;
@@ -435,7 +434,7 @@ fn main(
             let d_v0_from_base = -grad_vec * d_base_offset_scalar;
             d_grad_local += ray_dir * d_dc_dt_val;
 
-            // Gradient w.r.t. base_colors — no softplus in forward (ReLU only, matching Slang interp)
+            // Gradient w.r.t. base_colors
             d_base_colors_accum += d_base_color;
 
             // Intersection gradients
@@ -524,22 +523,5 @@ fn main(
             global_cas_add_base_color(tet_id * 3u + 2u, reduced_d_base.z);
         }
         workgroupBarrier();
-    }
-
-    // Write debug image (forward replay result)
-    for (var i = lane; i < 256u; i += 32u) {
-        let row = i / 16u;
-        let col = i % 16u;
-        let px = tile_x * 16u + col;
-        let py = tile_y * 16u + row;
-        if (px < w && py < h) {
-            let pixel_idx = py * w + px;
-            let state = sm_color[i];
-            let T_final = exp(state.w);
-            debug_image[pixel_idx * 4u] = state.x;
-            debug_image[pixel_idx * 4u + 1u] = state.y;
-            debug_image[pixel_idx * 4u + 2u] = state.z;
-            debug_image[pixel_idx * 4u + 3u] = 1.0 - T_final;
-        }
     }
 }
