@@ -66,6 +66,23 @@ struct TileUniforms {
 @group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
 @group(1) @binding(1) var<storage, read> aux_data: array<f32>;
 
+// --- Safe math utilities (subset of safe_math.wgsl) ---
+const MAX_VAL: f32 = 1e+20;
+const LOG_MAX_VAL: f32 = 46.0517;  // log(1e+20), precomputed
+
+fn safe_clip_v3f(v: vec3<f32>, minv: f32, maxv: f32) -> vec3<f32> {
+    return vec3<f32>(
+        max(min(v.x, maxv), minv),
+        max(min(v.y, maxv), minv),
+        max(min(v.z, maxv), minv)
+    );
+}
+
+fn safe_exp_f32(v: f32) -> f32 {
+    return exp(clamp(v, -88.0, LOG_MAX_VAL));
+}
+// --- End safe math utilities ---
+
 // Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(0u, 2u, 1u, 3u),
@@ -382,51 +399,55 @@ fn main(
                 let c_end = max(base_color + vec3<f32>(dc_dt * t_max_val), vec3<f32>(0.0));
 
                 let dist = t_max_val - t_min_val;
-                let od = max(density_raw * dist, 1e-8);
+                let od = clamp(density_raw * dist, 1e-8, 88.0);
 
                 let alpha_t = exp(-od);
                 let phi_val = phi(od);
                 let w0 = phi_val - alpha_t;
                 let w1 = 1.0 - phi_val;
-                let c_premul = c_end * w0 + c_start * w1;
+                let c_premul = safe_clip_v3f(c_end * w0 + c_start * w1, 0.0, MAX_VAL);
                 let alpha = 1.0 - alpha_t;
 
                 // Composite color into shared memory
                 let state = sm_color[pixel_local];
-                let T_j = exp(state.w);
-                sm_color[pixel_local] = vec4<f32>(
-                    state.xyz + c_premul * T_j,
-                    state.w - od,
-                );
+                let T_j = safe_exp_f32(state.w);
 
-                // Composite aux: normals + depth
-                let nd_state = sm_nd[pixel_local];
-                var entry_normal = vec3<f32>(0.0);
-                if (entry_face_idx < 4u) {
-                    entry_normal = normalize(-face_normals[entry_face_idx]);
-                }
-                let depth_premul = w0 * t_max_val + w1 * t_min_val;
-                sm_nd[pixel_local] = vec4<f32>(
-                    nd_state.xyz + T_j * alpha * entry_normal,
-                    nd_state.w + T_j * depth_premul,
-                );
+                // Early termination: pixel fully opaque, skip all writes
+                if (T_j >= 1e-6) {
+                    sm_color[pixel_local] = vec4<f32>(
+                        state.xyz + c_premul * T_j,
+                        state.w - od,
+                    );
 
-                // Composite aux: entropy
-                let ent_state = sm_ent[pixel_local];
-                let wt = alpha * T_j;
-                let c_mid = (t_min_val + t_max_val) * 0.5;
-                let wc = wt * c_mid;
-                sm_ent[pixel_local] = vec4<f32>(
-                    ent_state.x + wt,
-                    ent_state.y + select(0.0, wt * log(wt), wt > 1e-20),
-                    ent_state.z + wt * c_mid,
-                    ent_state.w + select(0.0, wc * log(wc), wc > 1e-20),
-                );
+                    // Composite aux: normals + depth
+                    let nd_state = sm_nd[pixel_local];
+                    var entry_normal = vec3<f32>(0.0);
+                    if (entry_face_idx < 4u) {
+                        entry_normal = normalize(-face_normals[entry_face_idx]);
+                    }
+                    let depth_premul = w0 * t_max_val + w1 * t_min_val;
+                    sm_nd[pixel_local] = vec4<f32>(
+                        nd_state.xyz + T_j * alpha * entry_normal,
+                        nd_state.w + T_j * depth_premul,
+                    );
 
-                // Composite aux: variable aux (no-op when AUX_DIM=0)
-                for (var ai = 0u; ai < AUX_DIM; ai++) {
-                    let sm_idx = pixel_local * AUX_DIM + ai;
-                    sm_aux[sm_idx] += T_j * alpha * aux_data[tet_id * AUX_DIM + ai];
+                    // Composite aux: entropy
+                    let ent_state = sm_ent[pixel_local];
+                    let wt = alpha * T_j;
+                    let c_mid = (t_min_val + t_max_val) * 0.5;
+                    let wc = wt * c_mid;
+                    sm_ent[pixel_local] = vec4<f32>(
+                        ent_state.x + wt,
+                        ent_state.y + select(0.0, wt * log(wt), wt > 1e-20),
+                        ent_state.z + wt * c_mid,
+                        ent_state.w + select(0.0, wc * log(wc), wc > 1e-20),
+                    );
+
+                    // Composite aux: variable aux (no-op when AUX_DIM=0)
+                    for (var ai = 0u; ai < AUX_DIM; ai++) {
+                        let sm_idx = pixel_local * AUX_DIM + ai;
+                        sm_aux[sm_idx] += T_j * alpha * aux_data[tet_id * AUX_DIM + ai];
+                    }
                 }
             }
         }
@@ -444,7 +465,7 @@ fn main(
 
             // RGBA
             let state = sm_color[i];
-            let T_final = exp(state.w);
+            let T_final = safe_exp_f32(state.w);
             rendered_image[pixel_idx * 4u] = state.x;
             rendered_image[pixel_idx * 4u + 1u] = state.y;
             rendered_image[pixel_idx * 4u + 2u] = state.z;

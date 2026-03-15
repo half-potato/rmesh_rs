@@ -56,6 +56,23 @@ struct BVHNode {
 @group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
 @group(1) @binding(1) var<storage, read> aux_data: array<f32>;
 
+// --- Safe math utilities (subset of safe_math.wgsl) ---
+const MAX_VAL: f32 = 1e+20;
+const LOG_MAX_VAL: f32 = 46.0517;  // log(1e+20), precomputed
+
+fn safe_clip_v3f(v: vec3<f32>, minv: f32, maxv: f32) -> vec3<f32> {
+    return vec3<f32>(
+        max(min(v.x, maxv), minv),
+        max(min(v.y, maxv), minv),
+        max(min(v.z, maxv), minv)
+    );
+}
+
+fn safe_exp_f32(v: f32) -> f32 {
+    return exp(clamp(v, -88.0, LOG_MAX_VAL));
+}
+// --- End safe math utilities ---
+
 // Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(0u, 2u, 1u, 3u),
@@ -192,13 +209,13 @@ fn eval_tet_rt(
     let c_end = max(base_color + vec3<f32>(dc_dt * t_max_val), vec3<f32>(0.0));
 
     let dist = t_max_val - t_min_val;
-    let od = max(density_raw * dist, 1e-8);
+    let od = clamp(density_raw * dist, 1e-8, 88.0);
 
     let alpha_t = exp(-od);
     let phi_val = phi(od);
     let w0 = phi_val - alpha_t;
     let w1 = 1.0 - phi_val;
-    let c_premul = c_end * w0 + c_start * w1;
+    let c_premul = safe_clip_v3f(c_end * w0 + c_start * w1, 0.0, MAX_VAL);
 
     result.c_premul = c_premul;
     result.od = od;
@@ -388,7 +405,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let result = eval_tet_rt(u32(current_tet), cam, ray_dir, t_cursor);
 
         if (result.od > 0.0) {
-            let T_j = exp(log_t);
+            let T_j = safe_exp_f32(log_t);
             color_accum += result.c_premul * T_j;
 
             let alpha = 1.0 - exp(-result.od);
@@ -434,7 +451,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Write RGBA output
-    let T_final = exp(log_t);
+    let T_final = safe_exp_f32(log_t);
     rendered_image[pixel_idx_flat * 4u] = color_accum.x;
     rendered_image[pixel_idx_flat * 4u + 1u] = color_accum.y;
     rendered_image[pixel_idx_flat * 4u + 2u] = color_accum.z;

@@ -62,6 +62,37 @@ struct TileUniforms {
 @group(1) @binding(4) var<storage, read> tile_uniforms: TileUniforms;
 @group(1) @binding(5) var<storage, read_write> d_base_colors: array<atomic<f32>>;
 
+// --- Safe math utilities (subset of safe_math.wgsl) ---
+const TINY_VAL: f32 = 1.0754944e-20;
+const MIN_VAL: f32 = -1e+20;
+const MAX_VAL: f32 = 1e+20;
+const LOG_MAX_VAL: f32 = 46.0517;  // log(1e+20), precomputed
+
+fn safe_clip_f32(v: f32, minv: f32, maxv: f32) -> f32 {
+    return max(min(v, maxv), minv);
+}
+
+fn safe_clip_v3f(v: vec3<f32>, minv: f32, maxv: f32) -> vec3<f32> {
+    return vec3<f32>(
+        max(min(v.x, maxv), minv),
+        max(min(v.y, maxv), minv),
+        max(min(v.z, maxv), minv)
+    );
+}
+
+fn safe_div_f32(a: f32, b: f32) -> f32 {
+    if (abs(b) < TINY_VAL) {
+        return clamp(a / TINY_VAL, MIN_VAL, MAX_VAL);
+    } else {
+        return clamp(a / b, MIN_VAL, MAX_VAL);
+    }
+}
+
+fn safe_exp_f32(v: f32) -> f32 {
+    return exp(clamp(v, -88.0, LOG_MAX_VAL));
+}
+// --- End safe math utilities ---
+
 // Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(0u, 2u, 1u, 3u),
@@ -79,12 +110,13 @@ var<workgroup> sm_prefix: array<u32, 17>;
 
 fn phi(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return 1.0 - x * 0.5; }
-    return (1.0 - exp(-x)) / x;
+    return safe_div_f32(1.0 - exp(-x), x);
 }
 
 fn dphi_dx(x: f32) -> f32 {
     if (abs(x) < 1e-6) { return -0.5 + x / 3.0; }
-    return (exp(-x) * (1.0 + x) - 1.0) / (x * x);
+    let ex = exp(-x);
+    return safe_div_f32(ex * (x + 1.0) - 1.0, x * x);
 }
 
 fn load_f32x3_v(idx: u32) -> vec3<f32> {
@@ -367,12 +399,12 @@ fn main(
             let c_end = max(c_end_raw, vec3<f32>(0.0));
 
             let dist = t_max_val - t_min_val;
-            let od = max(density_raw * dist, 1e-8);
+            let od = clamp(density_raw * dist, 1e-8, 88.0);
             let alpha_t = exp(-od);
             let phi_val = phi(od);
             let w0 = phi_val - alpha_t;
             let w1 = 1.0 - phi_val;
-            let c_premul = c_end * w0 + c_start * w1;
+            let c_premul = safe_clip_v3f(c_end * w0 + c_start * w1, MIN_VAL, MAX_VAL);
 
             // Read running state from shared memory
             let state = sm_state[pixel_local];
@@ -381,9 +413,24 @@ fn main(
             let d_log_t = sm_d_log_t[pixel_local];
 
             // Undo this tet's contribution (recover state before this tet in forward order)
-            let prev_log_t = log_t + od;
-            let t_prev = exp(prev_log_t);
+            // Clamp prev_log_t to <= 0: transmittance can never exceed 1.0.
+            // The backward initializes log_t from log(1-alpha) which saturates at ~-46
+            // for alpha≈1, but the true accumulated log_t can be -6000+. Undoing a
+            // high-od tet would push prev_log_t far above 0, causing gradient explosion.
+            let prev_log_t = min(log_t + od, 0.0);
+            let t_prev = safe_exp_f32(prev_log_t);
             let prev_color = color - c_premul * t_prev;
+
+            // Update shared memory state (always, even if we skip gradient)
+            sm_state[pixel_local] = vec4<f32>(prev_color, prev_log_t);
+
+            // Early termination: if transmittance before this tet was negligible,
+            // it contributed ~0 to the image in forward, so its gradient is ~0.
+            // Skip expensive gradient computation.
+            if (t_prev < 1e-6) {
+                sm_d_log_t[pixel_local] = d_log_t;
+                continue;
+            }
 
             // Load per-pixel upstream color gradient (constant per pixel)
             let d_color = vec3<f32>(
@@ -393,12 +440,10 @@ fn main(
             );
 
             // === Backward computation (matching non-tiled backward_compute.wgsl) ===
-            let d_c_premul = d_color * t_prev;
+            let d_c_premul = safe_clip_v3f(d_color * t_prev, MIN_VAL, MAX_VAL);
             let d_od_state = -d_log_t;
-            let d_old_log_t = d_log_t + dot(d_color, c_premul) * t_prev;
+            let d_old_log_t = safe_clip_f32(d_log_t + dot(d_color, c_premul) * t_prev, MIN_VAL, MAX_VAL);
 
-            // Update shared memory state
-            sm_state[pixel_local] = vec4<f32>(prev_color, prev_log_t);
             sm_d_log_t[pixel_local] = d_old_log_t;
 
             let dphi_val = dphi_dx(od);
@@ -409,9 +454,9 @@ fn main(
             let d_c_start_integral = d_c_premul * w1;
             let d_od_integral = dot(d_c_premul, c_end * dw0_dod + c_start * dw1_dod);
 
-            let d_od = d_od_state + d_od_integral;
-            let d_density_local = d_od * dist;
-            let d_dist = d_od * density_raw;
+            let d_od = safe_clip_f32(d_od_state + d_od_integral, MIN_VAL, MAX_VAL);
+            let d_density_local = safe_clip_f32(d_od * dist, MIN_VAL, MAX_VAL);
+            let d_dist = safe_clip_f32(d_od * density_raw, MIN_VAL, MAX_VAL);
             var d_t_min = -d_dist;
             var d_t_max = d_dist;
 
@@ -439,7 +484,7 @@ fn main(
             d_grad_local += ray_dir * d_dc_dt_val;
 
             // Gradient w.r.t. base_colors
-            d_base_colors_accum += d_base_color;
+            d_base_colors_accum += safe_clip_v3f(d_base_color, MIN_VAL, MAX_VAL);
 
             // Intersection gradients
             // NOTE: explicit zero-init required — WGSL var inside a loop may not
@@ -454,37 +499,39 @@ fn main(
                 let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];
                 let n = cross(vc - va, vb - va);
                 let den = dot(n, ray_dir);
+                let inv_den = safe_div_f32(1.0, den);
                 let hit = cam + ray_dir * t_min_val;
-                let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
-                let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
-                let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
-                d_vert_local[f[0]] += dt_dva * d_t_min;
-                d_vert_local[f[1]] += dt_dvb * d_t_min;
-                d_vert_local[f[2]] += dt_dvc * d_t_min;
+                let dt_dva = (cross(va - hit, vb - vc) + n) * inv_den;
+                let dt_dvb = cross(va - hit, vc - va) * inv_den;
+                let dt_dvc = cross(va - hit, va - vb) * inv_den;
+                d_vert_local[f[0]] += safe_clip_v3f(dt_dva * d_t_min, MIN_VAL, MAX_VAL);
+                d_vert_local[f[1]] += safe_clip_v3f(dt_dvb * d_t_min, MIN_VAL, MAX_VAL);
+                d_vert_local[f[2]] += safe_clip_v3f(dt_dvc * d_t_min, MIN_VAL, MAX_VAL);
             }
             {
                 let f = FACES[max_face];
                 let va = verts[f[0]]; let vb = verts[f[1]]; let vc = verts[f[2]];
                 let n = cross(vc - va, vb - va);
                 let den = dot(n, ray_dir);
+                let inv_den = safe_div_f32(1.0, den);
                 let hit = cam + ray_dir * t_max_val;
-                let dt_dva = (cross(va - hit, vb - vc) + n) * (1.0 / den);
-                let dt_dvb = cross(va - hit, vc - va) * (1.0 / den);
-                let dt_dvc = cross(va - hit, va - vb) * (1.0 / den);
-                d_vert_local[f[0]] += dt_dva * d_t_max;
-                d_vert_local[f[1]] += dt_dvb * d_t_max;
-                d_vert_local[f[2]] += dt_dvc * d_t_max;
+                let dt_dva = (cross(va - hit, vb - vc) + n) * inv_den;
+                let dt_dvb = cross(va - hit, vc - va) * inv_den;
+                let dt_dvc = cross(va - hit, va - vb) * inv_den;
+                d_vert_local[f[0]] += safe_clip_v3f(dt_dva * d_t_max, MIN_VAL, MAX_VAL);
+                d_vert_local[f[1]] += safe_clip_v3f(dt_dvb * d_t_max, MIN_VAL, MAX_VAL);
+                d_vert_local[f[2]] += safe_clip_v3f(dt_dvc * d_t_max, MIN_VAL, MAX_VAL);
             }
 
             d_vert_local[0] += d_v0_from_base;
 
-            // Accumulate per-thread
-            d_density_accum += d_density_local;
-            d_vert_accum[0] += d_vert_local[0];
-            d_vert_accum[1] += d_vert_local[1];
-            d_vert_accum[2] += d_vert_local[2];
-            d_vert_accum[3] += d_vert_local[3];
-            d_grad_accum += d_grad_local;
+            // Accumulate per-thread (clamp contributions to prevent overflow)
+            d_density_accum += safe_clip_f32(d_density_local, MIN_VAL, MAX_VAL);
+            d_vert_accum[0] += safe_clip_v3f(d_vert_local[0], MIN_VAL, MAX_VAL);
+            d_vert_accum[1] += safe_clip_v3f(d_vert_local[1], MIN_VAL, MAX_VAL);
+            d_vert_accum[2] += safe_clip_v3f(d_vert_local[2], MIN_VAL, MAX_VAL);
+            d_vert_accum[3] += safe_clip_v3f(d_vert_local[3], MIN_VAL, MAX_VAL);
+            d_grad_accum += safe_clip_v3f(d_grad_local, MIN_VAL, MAX_VAL);
         }
 
         // ===== Warp reduce + flush =====

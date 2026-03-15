@@ -29,6 +29,20 @@ struct FragmentOutput {
     @location(3) depth: vec4<f32>,
 };
 
+// --- Safe math utilities (subset of safe_math.wgsl) ---
+const MIN_VAL: f32 = -1e+20;
+const MAX_VAL: f32 = 1e+20;
+
+fn safe_clip_v4f(v: vec4<f32>, minv: f32, maxv: f32) -> vec4<f32> {
+    return vec4<f32>(
+        max(min(v.x, maxv), minv),
+        max(min(v.y, maxv), minv),
+        max(min(v.z, maxv), minv),
+        max(min(v.w, maxv), minv)
+    );
+}
+// --- End safe math utilities ---
+
 // phi(x) = (1 - exp(-x)) / x
 // Numerically stable: if |x| < 1e-6, use Taylor expansion phi ~ 1 - x/2
 fn phi(x: f32) -> f32 {
@@ -79,13 +93,13 @@ fn main(in: FragmentInput) -> FragmentOutput {
     let t_max = min(min(t_exit.x, t_exit.y), min(t_exit.z, t_exit.w));
 
     let dist = max(t_max - t_min, 0.0);
-    let od = in.tet_density * dist;
+    let od = clamp(in.tet_density * dist, 0.0, 88.0);
 
     let c_start = max(base_color + vec3<f32>(dc_dt * t_min), vec3<f32>(0.0));
     let c_end = max(base_color + vec3<f32>(dc_dt * t_max), vec3<f32>(0.0));
 
     // Note: (c_end, c_start) -- exit color first, matching webrm convention
-    out.color = compute_integral(c_end, c_start, od);
+    out.color = safe_clip_v4f(compute_integral(c_end, c_start, od), MIN_VAL, MAX_VAL);
     out.aux0 = vec4<f32>(t_min, t_max, od, dist);
 
     // Determine entry face (which t_enter component is max)
