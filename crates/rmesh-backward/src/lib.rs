@@ -5,7 +5,6 @@
 //!   - Backward tiled compute dispatch
 //!   - Gradient buffer management
 
-use rmesh_render::{MaterialBuffers, SceneBuffers};
 use rmesh_util::shared;
 use wgpu;
 
@@ -29,7 +28,6 @@ pub use rmesh_tile::{
 };
 
 // WGSL shader sources, embedded from crate-local files.
-const BACKWARD_COMPUTE_WGSL: &str = include_str!("wgsl/backward_compute.wgsl");
 const BACKWARD_TILED_WGSL: &str = include_str!("wgsl/backward_tiled_compute.wgsl");
 
 /// Gradient buffers for scene geometry parameters.
@@ -101,81 +99,6 @@ impl MaterialGradBuffers {
                 "d_color_grads",
                 (tet_count as u64) * 3 * 4,
             ),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// BackwardPipelines (backward compute only)
-// ---------------------------------------------------------------------------
-
-/// Backward compute pipeline and its bind group layouts.
-pub struct BackwardPipelines {
-    pub backward_pipeline: wgpu::ComputePipeline,
-    pub backward_bind_group_layout_0: wgpu::BindGroupLayout,
-    pub backward_bind_group_layout_1: wgpu::BindGroupLayout,
-}
-
-impl BackwardPipelines {
-    /// Create backward compute pipeline from WGSL source.
-    pub fn new(device: &wgpu::Device) -> Self {
-        let backward_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("backward_compute"),
-            source: wgpu::ShaderSource::Wgsl(BACKWARD_COMPUTE_WGSL.into()),
-        });
-
-        // Group 0: 9 read-only bindings
-        let backward_bind_group_layout_0 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("backward_bind_group_layout_0"),
-                entries: &[
-                    storage_entry(0, true),  // uniforms
-                    storage_entry(1, true),  // dl_d_image
-                    storage_entry(2, true),  // rendered_image
-                    storage_entry(3, true),  // vertices
-                    storage_entry(4, true),  // indices
-                    storage_entry(5, true),  // densities
-                    storage_entry(6, true),  // color_grads
-                    storage_entry(7, true),  // colors
-                    storage_entry(8, true),  // sorted_indices
-                ],
-            });
-
-        // Group 1: 3 read-write bindings
-        let backward_bind_group_layout_1 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("backward_bind_group_layout_1"),
-                entries: &[
-                    storage_entry(0, false), // d_vertices
-                    storage_entry(1, false), // d_densities
-                    storage_entry(2, false), // d_color_grads
-                ],
-            });
-
-        let backward_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("backward_pipeline_layout"),
-                bind_group_layouts: &[
-                    &backward_bind_group_layout_0,
-                    &backward_bind_group_layout_1,
-                ],
-                immediate_size: 0,
-            });
-
-        let backward_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("backward_pipeline"),
-                layout: Some(&backward_pipeline_layout),
-                module: &backward_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
-
-        Self {
-            backward_pipeline,
-            backward_bind_group_layout_0,
-            backward_bind_group_layout_1,
         }
     }
 }
@@ -254,88 +177,6 @@ impl BackwardTiledPipelines {
 // Bind group creation
 // ---------------------------------------------------------------------------
 
-/// Create bind groups for the backward compute pass.
-///
-/// Returns `(group0, group1)` where:
-///   - group0: 10 read-only bindings (scene + material + loss data)
-///   - group1: 3 read-write gradient output bindings
-///
-/// `rendered_image` is the [W x H x 4] f32 buffer from the tex-to-buffer pass.
-pub fn create_backward_bind_groups(
-    device: &wgpu::Device,
-    pipelines: &BackwardPipelines,
-    scene_buffers: &SceneBuffers,
-    material: &MaterialBuffers,
-    dl_d_image: &wgpu::Buffer,
-    grad_buffers: &GradientBuffers,
-    mat_grad_buffers: &MaterialGradBuffers,
-    rendered_image: &wgpu::Buffer,
-) -> (wgpu::BindGroup, wgpu::BindGroup) {
-    let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("backward_bind_group_0"),
-        layout: &pipelines.backward_bind_group_layout_0,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: scene_buffers.uniforms.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: dl_d_image.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: rendered_image.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: scene_buffers.vertices.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: scene_buffers.indices.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 5,
-                resource: scene_buffers.densities.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 6,
-                resource: material.color_grads.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 7,
-                resource: material.colors.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 8,
-                resource: scene_buffers.sort_values.as_entire_binding(),
-            },
-        ],
-    });
-
-    let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("backward_bind_group_1"),
-        layout: &pipelines.backward_bind_group_layout_1,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: grad_buffers.d_vertices.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: grad_buffers.d_densities.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: mat_grad_buffers.d_color_grads.as_entire_binding(),
-            },
-        ],
-    });
-
-    (bg0, bg1)
-}
-
 /// Create the backward tiled bind groups.
 ///
 /// Returns `(bg0, bg1)`.
@@ -393,28 +234,6 @@ pub fn create_backward_tiled_bind_groups(
 // ---------------------------------------------------------------------------
 // Recording functions
 // ---------------------------------------------------------------------------
-
-/// Record the backward compute pass.
-///
-/// Dispatches over pixels in 16x16 workgroups. Uses two bind groups to stay
-/// within the WebGPU per-bind-group buffer limit.
-pub fn record_backward_pass(
-    encoder: &mut wgpu::CommandEncoder,
-    pipelines: &BackwardPipelines,
-    bg0: &wgpu::BindGroup,
-    bg1: &wgpu::BindGroup,
-    width: u32,
-    height: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("backward_pass"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(&pipelines.backward_pipeline);
-    pass.set_bind_group(0, bg0, &[]);
-    pass.set_bind_group(1, bg1, &[]);
-    pass.dispatch_workgroups((width + 15) / 16, (height + 15) / 16, 1);
-}
 
 // ---------------------------------------------------------------------------
 // Internal helpers

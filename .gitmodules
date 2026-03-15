@@ -1,0 +1,3 @@
+[submodule "wtet"]
+	path = wtet
+	url = git@github.com:half-potato/wtet.git

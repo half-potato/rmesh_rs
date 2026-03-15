@@ -6,6 +6,7 @@
 //!
 //! All GPU buffer management and bind group creation lives here.
 
+use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use rmesh_data::SceneData;
 use std::collections::HashMap;
@@ -33,6 +34,7 @@ const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
 const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
 const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
 const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
+const LOCATE_COMPUTE_WGSL: &str = include_str!("wgsl/locate_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -1096,7 +1098,8 @@ pub fn make_uniforms(
         tet_count,
         step,
         tile_size_u: tile_size,
-        _pad1: [0; 7],
+        ray_mode: 0,
+        _pad1: [0; 6],
     }
 }
 
@@ -1362,8 +1365,9 @@ impl RayTracePipeline {
             source: wgpu::ShaderSource::Wgsl(RAYTRACE_COMPUTE_WGSL.into()),
         });
 
-        let read_only = [true, true, true, true, true, true, true, false, true, true, true];
-        let entries = storage_entries(11, wgpu::ShaderStages::COMPUTE, &read_only);
+        // 13 bindings: 0-6 read, 7 rw, 8-12 read
+        let read_only = [true, true, true, true, true, true, true, false, true, true, true, true, true];
+        let entries = storage_entries(13, wgpu::ShaderStages::COMPUTE, &read_only);
 
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1413,6 +1417,10 @@ pub struct RayTraceBuffers {
     pub bvh_nodes: wgpu::Buffer,
     pub boundary_faces: wgpu::Buffer,
     pub start_tet: wgpu::Buffer,
+    /// Per-pixel ray origins [W*H*3] f32 (used when ray_mode=1)
+    pub ray_origins: wgpu::Buffer,
+    /// Per-pixel ray directions [W*H*3] f32 (used when ray_mode=1)
+    pub ray_dirs: wgpu::Buffer,
 }
 
 impl RayTraceBuffers {
@@ -1447,7 +1455,19 @@ impl RayTraceBuffers {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
-        Self { tet_neighbors, bvh_nodes, boundary_faces, start_tet }
+        // Placeholder buffers for ray_origins and ray_dirs (4 bytes each, minimum valid)
+        let ray_origins = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ray_origins"),
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+        let ray_dirs = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("ray_dirs"),
+            contents: bytemuck::cast_slice(&[0.0f32]),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        });
+
+        Self { tet_neighbors, bvh_nodes, boundary_faces, start_tet, ray_origins, ray_dirs }
     }
 }
 
@@ -1474,6 +1494,8 @@ pub fn create_raytrace_bind_group(
             buf_entry(8, &rt_buffers.bvh_nodes),
             buf_entry(9, &rt_buffers.boundary_faces),
             buf_entry(10, &rt_buffers.start_tet),
+            buf_entry(11, &rt_buffers.ray_origins),
+            buf_entry(12, &rt_buffers.ray_dirs),
         ],
     })
 }
@@ -1633,4 +1655,200 @@ pub fn record_rasterize_compute(
     pass.set_bind_group(0, bind_group, &[]);
     let (x, y) = dispatch_2d(num_tiles);
     pass.dispatch_workgroups(x, y, 1);
+}
+
+// ===========================================================================
+// Point Location Pipeline (adjacency walking)
+// ===========================================================================
+
+/// Uniforms for the locate compute shader.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+pub struct LocateUniforms {
+    pub num_queries: u32,
+    pub hint_tet: i32,   // global hint, or -1 to use per-query hint_tets
+    pub tet_count: u32,
+    pub _pad: u32,
+}
+
+/// GPU pipeline for point-in-tet location via adjacency walking.
+pub struct LocatePipeline {
+    pipeline: wgpu::ComputePipeline,
+    bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl LocatePipeline {
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("locate_compute.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(LOCATE_COMPUTE_WGSL.into()),
+        });
+
+        // 7 bindings: 0-5 read, 6 read_write
+        let read_only = [true, true, true, true, true, true, false];
+        let entries = storage_entries(7, wgpu::ShaderStages::COMPUTE, &read_only);
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("locate_bgl"),
+                entries: &entries,
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("locate_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("locate_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Self { pipeline, bind_group_layout }
+    }
+
+    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.bind_group_layout
+    }
+
+    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
+        &self.pipeline
+    }
+}
+
+/// Create the locate bind group.
+///
+/// Binding order matches `locate_compute.wgsl`:
+///   0: locate_uniforms, 1: vertices, 2: indices, 3: tet_neighbors,
+///   4: query_points, 5: hint_tets, 6: result_tets
+pub fn create_locate_bind_group(
+    device: &wgpu::Device,
+    pipeline: &LocatePipeline,
+    locate_uniforms_buf: &wgpu::Buffer,
+    vertices: &wgpu::Buffer,
+    indices: &wgpu::Buffer,
+    tet_neighbors: &wgpu::Buffer,
+    query_points: &wgpu::Buffer,
+    hint_tets: &wgpu::Buffer,
+    result_tets: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("locate_bg"),
+        layout: pipeline.bind_group_layout(),
+        entries: &[
+            buf_entry(0, locate_uniforms_buf),
+            buf_entry(1, vertices),
+            buf_entry(2, indices),
+            buf_entry(3, tet_neighbors),
+            buf_entry(4, query_points),
+            buf_entry(5, hint_tets),
+            buf_entry(6, result_tets),
+        ],
+    })
+}
+
+/// Record the locate compute pass dispatch.
+pub fn record_locate(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &LocatePipeline,
+    bind_group: &wgpu::BindGroup,
+    num_queries: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("locate"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(pipeline.pipeline());
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups((num_queries + 63) / 64, 1, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Point Location: CPU Walking
+// ---------------------------------------------------------------------------
+
+/// Find the tet containing `point` by walking from `hint_tet`.
+///
+/// Same algorithm as the GPU shader but on CPU. Falls back to brute-force
+/// `find_containing_tet()` if the walk exceeds 512 steps.
+///
+/// Vertex-to-face mapping: vertex k -> face opposite vertex k.
+///   vertex 0 -> face 1, vertex 1 -> face 2,
+///   vertex 2 -> face 3, vertex 3 -> face 0.
+pub fn find_containing_tet_walk(
+    vertices: &[f32],
+    indices: &[u32],
+    neighbors: &[i32],
+    tet_count: usize,
+    point: Vec3,
+    hint_tet: usize,
+) -> Option<u32> {
+    const VERTEX_TO_FACE: [usize; 4] = [1, 2, 3, 0];
+    const MAX_ITERS: usize = 512;
+    const EPS: f32 = -1e-6;
+
+    let mut current = if hint_tet < tet_count { hint_tet } else { 0 };
+
+    for _ in 0..MAX_ITERS {
+        let vi = [
+            indices[current * 4] as usize,
+            indices[current * 4 + 1] as usize,
+            indices[current * 4 + 2] as usize,
+            indices[current * 4 + 3] as usize,
+        ];
+        let v = [
+            Vec3::new(vertices[vi[0] * 3], vertices[vi[0] * 3 + 1], vertices[vi[0] * 3 + 2]),
+            Vec3::new(vertices[vi[1] * 3], vertices[vi[1] * 3 + 1], vertices[vi[1] * 3 + 2]),
+            Vec3::new(vertices[vi[2] * 3], vertices[vi[2] * 3 + 1], vertices[vi[2] * 3 + 2]),
+            Vec3::new(vertices[vi[3] * 3], vertices[vi[3] * 3 + 1], vertices[vi[3] * 3 + 2]),
+        ];
+
+        let d = v[1] - v[0];
+        let e = v[2] - v[0];
+        let f = v[3] - v[0];
+        let p = point - v[0];
+
+        let det = d.dot(e.cross(f));
+        if det.abs() < 1e-20 {
+            // Degenerate tet — fall back to brute force
+            return find_containing_tet(vertices, indices, tet_count, point);
+        }
+        let inv_det = 1.0 / det;
+
+        let u = p.dot(e.cross(f)) * inv_det; // bary for v1
+        let vc = d.dot(p.cross(f)) * inv_det; // bary for v2
+        let w = d.dot(e.cross(p)) * inv_det; // bary for v3
+        let s = 1.0 - u - vc - w; // bary for v0
+
+        // Check containment
+        if s >= EPS && u >= EPS && vc >= EPS && w >= EPS {
+            return Some(current as u32);
+        }
+
+        // Find most negative barycentric
+        let barys = [s, u, vc, w];
+        let mut min_idx = 0;
+        for k in 1..4 {
+            if barys[k] < barys[min_idx] {
+                min_idx = k;
+            }
+        }
+
+        let face_idx = VERTEX_TO_FACE[min_idx];
+        let neighbor = neighbors[current * 4 + face_idx];
+
+        if neighbor < 0 {
+            return None; // Outside mesh
+        }
+
+        current = neighbor as usize;
+    }
+
+    // Walk exhausted — fall back to brute force
+    find_containing_tet(vertices, indices, tet_count, point)
 }

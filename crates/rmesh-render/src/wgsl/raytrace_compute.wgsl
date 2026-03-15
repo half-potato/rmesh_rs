@@ -22,7 +22,7 @@ struct Uniforms {
     tet_count: u32,
     step: u32,
     tile_size_u: u32,
-    _pad1a: u32,
+    ray_mode: u32,
     _pad1b: u32,
     _pad1c: u32,
     _pad2: vec4<u32>,
@@ -46,6 +46,8 @@ struct BVHNode {
 @group(0) @binding(8) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(0) @binding(9) var<storage, read> boundary_faces: array<u32>;
 @group(0) @binding(10) var<storage, read> start_tet_buf: array<i32>;
+@group(0) @binding(11) var<storage, read> ray_origins: array<f32>;  // [W*H*3] per-pixel origins
+@group(0) @binding(12) var<storage, read> ray_dirs: array<f32>;     // [W*H*3] per-pixel directions
 
 // Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
@@ -283,21 +285,34 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    // Compute ray from pixel coordinates via inverse VP
-    let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
-    let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / f32(h));
+    let pixel_idx_flat = py * w + px;
 
-    let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
-    let near_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
-    let far_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 1.0, 1.0);
-    let near_world = near_clip.xyz / near_clip.w;
-    let far_world = far_clip.xyz / far_clip.w;
+    // Determine ray origin, direction, and start tet based on ray_mode
+    var cam: vec3<f32>;
+    var ray_dir: vec3<f32>;
+    var start_tet_id: i32;
 
-    let cam = uniforms.cam_pos_pad.xyz;
-    let ray_dir = normalize(far_world - near_world);
+    if (uniforms.ray_mode == 1u) {
+        // Custom rays from buffers (multi-origin support)
+        let ri = pixel_idx_flat * 3u;
+        cam = vec3<f32>(ray_origins[ri], ray_origins[ri + 1u], ray_origins[ri + 2u]);
+        ray_dir = normalize(vec3<f32>(ray_dirs[ri], ray_dirs[ri + 1u], ray_dirs[ri + 2u]));
+        start_tet_id = start_tet_buf[pixel_idx_flat];
+    } else {
+        // Legacy: derive from inv_vp
+        let ndc_x = (2.0 * (f32(px) + 0.5) / f32(w)) - 1.0;
+        let ndc_y = 1.0 - (2.0 * (f32(py) + 0.5) / f32(h));
 
-    // Determine start tet and t_cursor
-    let start_tet_id = start_tet_buf[0];
+        let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
+        let near_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+        let far_clip = inv_vp * vec4<f32>(ndc_x, ndc_y, 1.0, 1.0);
+        let near_world = near_clip.xyz / near_clip.w;
+        let far_world = far_clip.xyz / far_clip.w;
+
+        cam = uniforms.cam_pos_pad.xyz;
+        ray_dir = normalize(far_world - near_world);
+        start_tet_id = start_tet_buf[0];
+    }
     var current_tet: i32;
     var t_cursor: f32;
 
@@ -311,11 +326,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let hit = bvh_trace(cam, ray_dir, num_nodes);
         if (hit.tet_id < 0) {
             // No hit — write background (transparent black)
-            let pixel_idx = py * w + px;
-            rendered_image[pixel_idx * 4u] = 0.0;
-            rendered_image[pixel_idx * 4u + 1u] = 0.0;
-            rendered_image[pixel_idx * 4u + 2u] = 0.0;
-            rendered_image[pixel_idx * 4u + 3u] = 0.0;
+            rendered_image[pixel_idx_flat * 4u] = 0.0;
+            rendered_image[pixel_idx_flat * 4u + 1u] = 0.0;
+            rendered_image[pixel_idx_flat * 4u + 2u] = 0.0;
+            rendered_image[pixel_idx_flat * 4u + 3u] = 0.0;
             return;
         }
         current_tet = hit.tet_id;
@@ -349,10 +363,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Write output
-    let pixel_idx = py * w + px;
     let T_final = exp(log_t);
-    rendered_image[pixel_idx * 4u] = color_accum.x;
-    rendered_image[pixel_idx * 4u + 1u] = color_accum.y;
-    rendered_image[pixel_idx * 4u + 2u] = color_accum.z;
-    rendered_image[pixel_idx * 4u + 3u] = 1.0 - T_final;
+    rendered_image[pixel_idx_flat * 4u] = color_accum.x;
+    rendered_image[pixel_idx_flat * 4u + 1u] = color_accum.y;
+    rendered_image[pixel_idx_flat * 4u + 2u] = color_accum.z;
+    rendered_image[pixel_idx_flat * 4u + 3u] = 1.0 - T_final;
 }

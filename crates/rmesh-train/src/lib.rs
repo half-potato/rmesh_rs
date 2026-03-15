@@ -11,12 +11,21 @@
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
-    create_backward_bind_groups, BackwardPipelines, GradientBuffers, MaterialGradBuffers,
+    create_backward_tiled_bind_groups, BackwardTiledPipelines,
+    GradientBuffers, MaterialGradBuffers, TileUniforms,
+    RadixSortPipelines, RadixSortState,
+    TileBuffers, TilePipelines,
+    ScanPipelines, ScanBuffers,
+    create_tile_fill_bind_group, create_tile_ranges_bind_group_with_keys,
+    create_prepare_dispatch_bind_group, create_rts_bind_group,
+    create_tile_gen_scan_bind_group,
+    record_scan_tile_pipeline,
 };
 use rmesh_data::SceneData;
 use rmesh_render::{
-    create_compute_bind_group, create_render_bind_group, record_tex_to_buffer,
-    ForwardPipelines, MaterialBuffers, RenderTargets, SceneBuffers, TexToBufferPipeline, Uniforms,
+    create_compute_bind_group, create_rasterize_bind_group, record_project_compute,
+    record_rasterize_compute,
+    ForwardPipelines, MaterialBuffers, RasterizeComputePipeline, SceneBuffers, Uniforms,
 };
 use rmesh_util::shared::{AdamUniforms, LossUniforms};
 
@@ -392,7 +401,7 @@ impl TrainingView {
     }
 }
 
-/// Run the training loop.
+/// Run the training loop (tiled forward + tiled backward).
 pub fn train(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -402,10 +411,11 @@ pub fn train(
 ) -> Result<()> {
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let aux_format = wgpu::TextureFormat::Rgba32Float;
+    let tile_size = 12u32;
 
     // Create pipelines
     let fwd_pipelines = ForwardPipelines::new(device, color_format, aux_format);
-    let bwd_pipelines = BackwardPipelines::new(device);
+    let bwd_tiled_pipelines = BackwardTiledPipelines::new(device);
     let loss_pipeline = LossPipeline::new(device);
     let adam_pipeline = AdamPipeline::new(device);
 
@@ -420,29 +430,88 @@ pub fn train(
     let adam = AdamState::new(device, scene.vertex_count, scene.tet_count);
     let mat_adam = MaterialAdamState::new(device, scene.tet_count);
 
-    // Create render targets
-    let targets = RenderTargets::new(device, config.render_width, config.render_height);
-
-    // Create bind groups for forward pass
+    // Forward compute bind group
     let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers, &material);
-    let render_bg = create_render_bind_group(device, &fwd_pipelines, &buffers, &material);
 
-    // Loss buffers
-    let loss_buffers = LossBuffers::new(device, config.render_width, config.render_height);
+    // Tiled forward pipeline
+    let rasterize = RasterizeComputePipeline::new(device, config.render_width, config.render_height);
 
-    // Tex-to-buffer pipeline
-    let ttb = TexToBufferPipeline::new(
-        device,
-        queue,
-        &targets.color_view,
-        config.render_width,
-        config.render_height,
+    // Tile infrastructure
+    let tile_pipelines = TilePipelines::new(device);
+    let tile_buffers = TileBuffers::new(device, scene.tet_count, config.render_width, config.render_height, tile_size);
+    let radix_pipelines = RadixSortPipelines::new(device);
+    let radix_state = RadixSortState::new(device, tile_buffers.max_pairs_pow2, 32);
+    radix_state.upload_configs(queue);
+
+    let tile_fill_bg = create_tile_fill_bind_group(device, &tile_pipelines, &tile_buffers);
+
+    // A/B tile ranges bind groups
+    let tile_ranges_bg = create_tile_ranges_bind_group_with_keys(
+        device, &tile_pipelines,
+        &tile_buffers.tile_sort_keys, &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+    );
+    let tile_ranges_bg_b = create_tile_ranges_bind_group_with_keys(
+        device, &tile_pipelines,
+        &radix_state.keys_b, &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
     );
 
-    // Create bind groups for backward pass
-    let loss_bg = create_loss_bind_group(device, &loss_pipeline, &loss_buffers, &ttb.rendered_image);
-    let (bwd_bg0, bwd_bg1) =
-        create_backward_bind_groups(device, &bwd_pipelines, &buffers, &material, &loss_buffers.dl_d_image, &grads, &mat_grads, &ttb.rendered_image);
+    // Forward tiled bind groups (A and B)
+    let rasterize_bg = create_rasterize_bind_group(
+        device, &rasterize, &buffers.uniforms, &buffers.vertices,
+        &buffers.indices, &material.colors, &buffers.densities,
+        &material.color_grads, &tile_buffers.tile_sort_values,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+    let rasterize_bg_b = create_rasterize_bind_group(
+        device, &rasterize, &buffers.uniforms, &buffers.vertices,
+        &buffers.indices, &material.colors, &buffers.densities,
+        &material.color_grads, &radix_state.values_b,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+
+    // Scan pipeline infrastructure
+    let scan_pipelines = ScanPipelines::new(device);
+    let scan_buffers = ScanBuffers::new(device, scene.tet_count);
+    let prepare_dispatch_bg = create_prepare_dispatch_bind_group(
+        device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = create_rts_bind_group(
+        device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_gen_scan_bg = create_tile_gen_scan_bind_group(
+        device, &scan_pipelines, &tile_buffers, &buffers.uniforms,
+        &buffers.vertices, &buffers.indices, &buffers.compact_tet_ids,
+        &buffers.circumdata, &buffers.tiles_touched, &scan_buffers,
+        &radix_state.num_keys_buf,
+    );
+
+    // Loss buffers + bind group (using rasterize.rendered_image)
+    let loss_buffers = LossBuffers::new(device, config.render_width, config.render_height);
+    let loss_bg = create_loss_bind_group(device, &loss_pipeline, &loss_buffers, &rasterize.rendered_image);
+
+    // Backward tiled bind groups (A and B, using rasterize.rendered_image)
+    let (bwd_tiled_bg0, bwd_tiled_bg1) = create_backward_tiled_bind_groups(
+        device, &bwd_tiled_pipelines, &buffers.uniforms,
+        &loss_buffers.dl_d_image, &rasterize.rendered_image,
+        &buffers.vertices, &buffers.indices, &buffers.densities,
+        &material.color_grads, &material.colors,
+        &tile_buffers.tile_sort_values,
+        &grads.d_vertices, &grads.d_densities,
+        &mat_grads.d_color_grads, &mat_grads.d_base_colors,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
+    let (bwd_tiled_bg0_b, _) = create_backward_tiled_bind_groups(
+        device, &bwd_tiled_pipelines, &buffers.uniforms,
+        &loss_buffers.dl_d_image, &rasterize.rendered_image,
+        &buffers.vertices, &buffers.indices, &buffers.densities,
+        &material.color_grads, &material.colors,
+        &radix_state.values_b,
+        &grads.d_vertices, &grads.d_densities,
+        &mat_grads.d_color_grads, &mat_grads.d_base_colors,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    );
 
     // Adam bind groups — one per parameter group
     let adam_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -454,42 +523,26 @@ pub fn train(
 
     let adam_bgs = [
         create_adam_bind_group(
-            device,
-            &adam_pipeline,
-            &adam_uniforms_buf,
-            &buffers.vertices,
-            &grads.d_vertices,
-            &adam.m_vertices,
-            &adam.v_vertices,
+            device, &adam_pipeline, &adam_uniforms_buf,
+            &buffers.vertices, &grads.d_vertices,
+            &adam.m_vertices, &adam.v_vertices,
         ),
         create_adam_bind_group(
-            device,
-            &adam_pipeline,
-            &adam_uniforms_buf,
-            &buffers.densities,
-            &grads.d_densities,
-            &adam.m_densities,
-            &adam.v_densities,
+            device, &adam_pipeline, &adam_uniforms_buf,
+            &buffers.densities, &grads.d_densities,
+            &adam.m_densities, &adam.v_densities,
         ),
         create_adam_bind_group(
-            device,
-            &adam_pipeline,
-            &adam_uniforms_buf,
-            &material.color_grads,
-            &mat_grads.d_color_grads,
-            &mat_adam.m_color_grads,
-            &mat_adam.v_color_grads,
+            device, &adam_pipeline, &adam_uniforms_buf,
+            &material.color_grads, &mat_grads.d_color_grads,
+            &mat_adam.m_color_grads, &mat_adam.v_color_grads,
         ),
     ];
 
-    let vert_param_count = scene.vertex_count * 3;
-    let density_param_count = scene.tet_count;
-    let grad_param_count = scene.tet_count * 3;
-
     let param_counts = [
-        vert_param_count,
-        density_param_count,
-        grad_param_count,
+        scene.vertex_count * 3,
+        scene.tet_count,
+        scene.tet_count * 3,
     ];
     let learning_rates = [
         config.lr_vertices,
@@ -499,10 +552,7 @@ pub fn train(
 
     log::info!(
         "Training: {} tets, {} vertices, {} views, {} epochs",
-        scene.tet_count,
-        scene.vertex_count,
-        views.len(),
-        config.epochs
+        scene.tet_count, scene.vertex_count, views.len(), config.epochs
     );
 
     let mut step = 0u32;
@@ -531,94 +581,110 @@ pub fn train(
                 screen_height: view.height as f32,
                 tet_count: scene.tet_count,
                 step,
-                tile_size_u: 12,
-                _pad1: [0; 7],
+                tile_size_u: tile_size,
+                ray_mode: 0,
+                _pad1: [0; 6],
             };
 
             // Upload uniforms
             queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-            // Upload ground truth
-            queue.write_buffer(
-                &loss_buffers.ground_truth,
-                0,
-                bytemuck::cast_slice(&view.gt_image),
-            );
+            // Upload tile uniforms
+            let tile_uni = TileUniforms {
+                screen_width: config.render_width,
+                screen_height: config.render_height,
+                tile_size,
+                tiles_x: tile_buffers.tiles_x,
+                tiles_y: tile_buffers.tiles_y,
+                num_tiles: tile_buffers.num_tiles,
+                visible_tet_count: 0,
+                _pad: [0; 5],
+            };
+            queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
 
-            // Upload loss uniforms
+            // Upload ground truth + loss uniforms
+            queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&view.gt_image));
             let loss_uni = LossUniforms {
                 width: view.width,
                 height: view.height,
                 loss_type: config.loss_type,
                 lambda_ssim: 0.0,
             };
-            queue.write_buffer(
-                &loss_buffers.loss_uniforms,
-                0,
-                bytemuck::bytes_of(&loss_uni),
-            );
+            queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
 
-            // Clear gradient buffers
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("clear grads"),
-                });
+            // Single encoder: clear + forward compute + scan + sort + tile_ranges
+            //                 + forward tiled + loss + backward tiled + adam
+            let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("train_step"),
+            });
+
+            // Clear buffers
             encoder.clear_buffer(&grads.d_vertices, 0, None);
             encoder.clear_buffer(&grads.d_densities, 0, None);
+            encoder.clear_buffer(&mat_grads.d_base_colors, 0, None);
             encoder.clear_buffer(&mat_grads.d_color_grads, 0, None);
             encoder.clear_buffer(&loss_buffers.loss_value, 0, None);
-            queue.submit(std::iter::once(encoder.finish()));
+            encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+            encoder.clear_buffer(&rasterize.rendered_image, 0, None);
 
-            // Forward pass
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("forward"),
-                });
-            rmesh_render::record_forward_pass(
-                &mut encoder,
-                &fwd_pipelines,
-                &buffers,
-                &targets,
-                &compute_bg,
-                &render_bg,
-                scene.tet_count,
-                queue,
+            // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids)
+            record_project_compute(
+                &mut encoder, &fwd_pipelines, &buffers, &compute_bg,
+                scene.tet_count, queue,
             );
-            record_tex_to_buffer(&mut encoder, &ttb);
-            queue.submit(std::iter::once(encoder.finish()));
 
-            // Loss pass
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("loss"),
-                });
-            record_loss_pass(
-                &mut encoder,
-                &loss_pipeline,
-                &loss_bg,
-                view.width,
-                view.height,
+            // Scan-based tile pipeline
+            record_scan_tile_pipeline(
+                &mut encoder, &scan_pipelines, &tile_pipelines,
+                &prepare_dispatch_bg, &rts_bg, &tile_fill_bg,
+                &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
             );
-            queue.submit(std::iter::once(encoder.finish()));
 
-            // Backward pass
-            let mut encoder =
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("backward"),
-                });
-            rmesh_backward::record_backward_pass(
-                &mut encoder,
-                &bwd_pipelines,
-                &bwd_bg0,
-                &bwd_bg1,
-                view.width,
-                view.height,
+            // Radix sort
+            let result_in_b = rmesh_backward::record_radix_sort(
+                &mut encoder, device, &radix_pipelines, &radix_state,
+                &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
             );
-            queue.submit(std::iter::once(encoder.finish()));
 
-            // Adam pass — one dispatch per parameter group
+            let (ranges_bg, fwd_bg, bwd_bg0) = if result_in_b {
+                (&tile_ranges_bg_b, &rasterize_bg_b, &bwd_tiled_bg0_b)
+            } else {
+                (&tile_ranges_bg, &rasterize_bg, &bwd_tiled_bg0)
+            };
+
+            // Tile ranges
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tile_ranges"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+                pass.set_bind_group(0, ranges_bg, &[]);
+                let total = (tile_buffers.max_pairs_pow2 + 255) / 256;
+                let (x, y) = dispatch_2d(total);
+                pass.dispatch_workgroups(x, y, 1);
+            }
+
+            // Forward tiled compute
+            record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
+
+            // Loss compute
+            record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, view.width, view.height);
+
+            // Backward tiled compute
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("backward_tiled"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&bwd_tiled_pipelines.pipeline);
+                pass.set_bind_group(0, bwd_bg0, &[]);
+                pass.set_bind_group(1, &bwd_tiled_bg1, &[]);
+                let (x, y) = dispatch_2d(tile_buffers.num_tiles);
+                pass.dispatch_workgroups(x, y, 1);
+            }
+
+            // Adam passes
+            step += 1;
             for (i, (bg, &count)) in adam_bgs.iter().zip(param_counts.iter()).enumerate() {
-                step += 1;
                 let adam_uni = AdamUniforms {
                     param_count: count,
                     step,
@@ -630,26 +696,21 @@ pub fn train(
                 };
                 queue.write_buffer(&adam_uniforms_buf, 0, bytemuck::bytes_of(&adam_uni));
 
-                let mut encoder =
-                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("adam"),
-                    });
-                record_adam_pass(
-                    &mut encoder,
-                    &adam_pipeline,
-                    std::slice::from_ref(bg),
-                    &[count],
-                );
-                queue.submit(std::iter::once(encoder.finish()));
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("adam"), timestamp_writes: None,
+                });
+                pass.set_pipeline(&adam_pipeline.pipeline);
+                pass.set_bind_group(0, bg, &[]);
+                let (ax, ay) = dispatch_2d((count + 255) / 256);
+                pass.dispatch_workgroups(ax, ay, 1);
             }
+
+            queue.submit(std::iter::once(encoder.finish()));
 
             if step % 100 == 0 {
                 log::info!(
                     "Step {}, epoch {}, view {}/{}",
-                    step,
-                    epoch,
-                    view_idx + 1,
-                    views.len()
+                    step, epoch, view_idx + 1, views.len()
                 );
             }
         }

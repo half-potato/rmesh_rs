@@ -34,8 +34,10 @@ pub struct Uniforms {
     pub step: u32,
     /// Tile size for tiled pipeline (must match shaders).
     pub tile_size_u: u32,
+    /// Ray mode: 0 = derive from inv_vp (legacy), 1 = read from ray buffers.
+    pub ray_mode: u32,
     /// Padding to maintain 192-byte struct size.
-    pub _pad1: [u32; 7],
+    pub _pad1: [u32; 6],
 }
 
 impl Uniforms {

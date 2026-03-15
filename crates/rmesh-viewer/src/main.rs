@@ -269,7 +269,8 @@ impl App {
             tet_count: gpu.tet_count,
             step: 0,
             tile_size_u: 12,
-            _pad1: [0; 7],
+            ray_mode: 0,
+            _pad1: [0; 6],
         };
 
         gpu.queue

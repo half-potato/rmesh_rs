@@ -7,7 +7,7 @@
 //!   - `update_params()` / `get_params()`: parameter transfer for PyTorch optimizer path
 
 use numpy::ndarray::{Array1, Array3};
-use numpy::{IntoPyArray, PyArray3, PyReadonlyArray1, PyReadonlyArray3};
+use numpy::{IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
@@ -22,9 +22,10 @@ use rmesh_backward::{
 };
 use rmesh_render::{
     build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
-    create_rasterize_bind_group, create_raytrace_bind_group, create_render_bind_group,
-    find_containing_tet, make_uniforms, record_project_compute, record_forward_pass,
-    record_rasterize_compute, record_raytrace, record_tex_to_buffer, ForwardPipelines,
+    create_locate_bind_group, create_rasterize_bind_group, create_raytrace_bind_group,
+    create_render_bind_group, find_containing_tet_walk, make_uniforms, record_locate,
+    record_project_compute, record_forward_pass, record_rasterize_compute, record_raytrace,
+    record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms,
     RasterizeComputePipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
     SceneBuffers, TexToBufferPipeline,
 };
@@ -151,6 +152,11 @@ struct RMeshRenderer {
     bwd_tiled_bg0_tiled: wgpu::BindGroup,
     bwd_tiled_bg0_tiled_b: wgpu::BindGroup,
     bwd_tiled_bg1: wgpu::BindGroup,
+    // Backward tiled bind groups using ttb.rendered_image (HW raster path, A and B variants)
+    bwd_tiled_bg0_hw: wgpu::BindGroup,
+    bwd_tiled_bg0_hw_b: wgpu::BindGroup,
+    // Loss bind group using ttb.rendered_image (HW raster path)
+    _loss_bg_hw: wgpu::BindGroup,
     adam_bgs: Vec<wgpu::BindGroup>,
     adam_uniforms_bufs: Vec<wgpu::Buffer>,
     // Scan-based tile pipeline (RTS prefix scan)
@@ -163,9 +169,17 @@ struct RMeshRenderer {
     rt_pipeline: RayTracePipeline,
     rt_buffers: RayTraceBuffers,
     rt_bind_group: wgpu::BindGroup,
-    // Cached scene data for find_containing_tet
+    // Point location pipeline
+    locate_pipeline: LocatePipeline,
+    locate_uniforms_buf: wgpu::Buffer,
+    locate_query_buf: wgpu::Buffer,
+    locate_hint_buf: wgpu::Buffer,
+    locate_result_buf: wgpu::Buffer,
+    locate_capacity: u32,
+    // Cached scene data for find_containing_tet and locate_tets
     cached_vertices: Vec<f32>,
     cached_indices: Vec<u32>,
+    cached_neighbors: Vec<i32>,
     // Scene metadata
     tet_count: u32,
     _vertex_count: u32,
@@ -456,6 +470,54 @@ impl RMeshRenderer {
             &tile_buffers.tile_uniforms,
         );
 
+        // HW raster backward bind groups using ttb.rendered_image
+        let (bwd_tiled_bg0_hw, _) = create_backward_tiled_bind_groups(
+            &device,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
+            &ttb.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.densities,
+            &material_buffers.color_grads,
+            &material_buffers.colors,
+            &tile_buffers.tile_sort_values,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+        let (bwd_tiled_bg0_hw_b, _) = create_backward_tiled_bind_groups(
+            &device,
+            &bwd_tiled_pipelines,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
+            &ttb.rendered_image,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &scene_buffers.densities,
+            &material_buffers.color_grads,
+            &material_buffers.colors,
+            &radix_state.values_b,
+            &grad_buffers.d_vertices,
+            &grad_buffers.d_densities,
+            &mat_grad_buffers.d_color_grads,
+            &mat_grad_buffers.d_base_colors,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+        );
+
+        // Loss bind group using ttb.rendered_image (HW raster path)
+        let loss_bg_hw = create_loss_bind_group(
+            &device,
+            &loss_pipeline,
+            &loss_buffers,
+            &ttb.rendered_image,
+        );
+
         // Scan-based tile pipeline infrastructure (RTS prefix scan)
         let scan_pipelines = ScanPipelines::new(&device);
         let scan_buffers = ScanBuffers::new(&device, tet_count);
@@ -492,6 +554,33 @@ impl RMeshRenderer {
         let rt_buffers = RayTraceBuffers::new(&device, &neighbors, &bvh);
         let rt_bind_group = create_raytrace_bind_group(&device, &rt_pipeline, &scene_buffers, &material_buffers, &rt_buffers);
 
+        // Point location pipeline
+        let locate_pipeline = LocatePipeline::new(&device);
+        let locate_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("locate_uniforms"),
+            size: std::mem::size_of::<LocateUniforms>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let locate_query_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("locate_query"),
+            size: 12, // 1 point * 3 floats * 4 bytes
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let locate_hint_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("locate_hint"),
+            size: 4, // 1 i32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let locate_result_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("locate_result"),
+            size: 4, // 1 i32
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -524,6 +613,9 @@ impl RMeshRenderer {
             bwd_tiled_bg0_tiled,
             bwd_tiled_bg0_tiled_b,
             bwd_tiled_bg1,
+            bwd_tiled_bg0_hw,
+            bwd_tiled_bg0_hw_b,
+            _loss_bg_hw: loss_bg_hw,
             adam_bgs,
             adam_uniforms_bufs,
             scan_pipelines,
@@ -534,8 +626,15 @@ impl RMeshRenderer {
             rt_pipeline,
             rt_buffers,
             rt_bind_group,
+            locate_pipeline,
+            locate_uniforms_buf,
+            locate_query_buf,
+            locate_hint_buf,
+            locate_result_buf,
+            locate_capacity: 1,
             cached_vertices: vertices_slice.to_vec(),
             cached_indices: indices_slice.to_vec(),
+            cached_neighbors: neighbors,
             tet_count,
             _vertex_count: vertex_count,
             width,
@@ -778,15 +877,22 @@ impl RMeshRenderer {
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major view-projection matrix
     ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///     ray_origins: optional [N*3] f32 per-pixel ray origins (multi-origin support)
+    ///     ray_dirs: optional [N*3] f32 per-pixel ray directions
+    ///     start_tets: optional [N] i32 per-pixel start tet IDs
     ///
     /// Returns:
     ///     numpy array [H, W, 4] f32 (RGBA)
+    #[pyo3(signature = (cam_pos, vp, inv_vp, ray_origins=None, ray_dirs=None, start_tets=None))]
     fn forward_raytrace<'py>(
         &mut self,
         py: Python<'py>,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
         inv_vp: PyReadonlyArray1<f32>,
+        ray_origins: Option<PyReadonlyArray1<f32>>,
+        ray_dirs: Option<PyReadonlyArray1<f32>>,
+        start_tets: Option<PyReadonlyArray1<i32>>,
     ) -> PyResult<Bound<'py, PyArray3<f32>>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
@@ -796,7 +902,7 @@ impl RMeshRenderer {
         let vp_mat = mat4_from_flat(vp_slice);
         let inv_vp_mat = mat4_from_flat(inv_vp_slice);
 
-        let uniforms = make_uniforms(
+        let mut uniforms = make_uniforms(
             vp_mat,
             inv_vp_mat,
             cam,
@@ -807,26 +913,111 @@ impl RMeshRenderer {
             self.tile_size,
         );
 
+        let has_custom_rays = ray_origins.is_some() && ray_dirs.is_some();
+
+        if has_custom_rays {
+            uniforms.ray_mode = 1;
+
+            let origins_slice = ray_origins.as_ref().unwrap().as_slice()?;
+            let dirs_slice = ray_dirs.as_ref().unwrap().as_slice()?;
+            let n_pixels = (self.width * self.height) as usize;
+
+            if origins_slice.len() != n_pixels * 3 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("ray_origins must be [W*H*3] = {} elements, got {}", n_pixels * 3, origins_slice.len())
+                ));
+            }
+            if dirs_slice.len() != n_pixels * 3 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    format!("ray_dirs must be [W*H*3] = {} elements, got {}", n_pixels * 3, dirs_slice.len())
+                ));
+            }
+
+            // Resize and upload ray buffers
+            let ray_buf_size = (n_pixels * 3 * 4) as u64;
+            if self.rt_buffers.ray_origins.size() < ray_buf_size {
+                self.rt_buffers.ray_origins = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ray_origins"),
+                    size: ray_buf_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.rt_buffers.ray_dirs = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ray_dirs"),
+                    size: ray_buf_size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                // Recreate bind group with new buffers
+                self.rt_bind_group = create_raytrace_bind_group(
+                    &self.device, &self.rt_pipeline, &self.scene_buffers,
+                    &self.material_buffers, &self.rt_buffers,
+                );
+            }
+            self.queue.write_buffer(&self.rt_buffers.ray_origins, 0, bytemuck::cast_slice(origins_slice));
+            self.queue.write_buffer(&self.rt_buffers.ray_dirs, 0, bytemuck::cast_slice(dirs_slice));
+
+            // Upload per-pixel start tets
+            if let Some(ref tets) = start_tets {
+                let tets_slice = tets.as_slice()?;
+                let start_tet_size = (n_pixels * 4) as u64;
+                if self.rt_buffers.start_tet.size() < start_tet_size {
+                    self.rt_buffers.start_tet = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("start_tet"),
+                        size: start_tet_size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.rt_bind_group = create_raytrace_bind_group(
+                        &self.device, &self.rt_pipeline, &self.scene_buffers,
+                        &self.material_buffers, &self.rt_buffers,
+                    );
+                }
+                self.queue.write_buffer(&self.rt_buffers.start_tet, 0, bytemuck::cast_slice(tets_slice));
+            } else {
+                // All -1 (use BVH entry for all rays)
+                let neg_ones = vec![-1i32; n_pixels];
+                let start_tet_size = (n_pixels * 4) as u64;
+                if self.rt_buffers.start_tet.size() < start_tet_size {
+                    self.rt_buffers.start_tet = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("start_tet"),
+                        size: start_tet_size,
+                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.rt_bind_group = create_raytrace_bind_group(
+                        &self.device, &self.rt_pipeline, &self.scene_buffers,
+                        &self.material_buffers, &self.rt_buffers,
+                    );
+                }
+                self.queue.write_buffer(&self.rt_buffers.start_tet, 0, bytemuck::cast_slice(&neg_ones));
+            }
+        } else {
+            uniforms.ray_mode = 0;
+
+            // Find containing tet (CPU walk with brute-force fallback)
+            let start_tet = find_containing_tet_walk(
+                &self.cached_vertices,
+                &self.cached_indices,
+                &self.cached_neighbors,
+                self.tet_count as usize,
+                cam,
+                0,
+            )
+            .map(|t| t as i32)
+            .unwrap_or(-1);
+            self.queue.write_buffer(
+                &self.rt_buffers.start_tet,
+                0,
+                bytemuck::cast_slice(&[start_tet]),
+            );
+        }
+
         // Upload uniforms
         self.queue.write_buffer(
             &self.scene_buffers.uniforms,
             0,
             bytemuck::bytes_of(&uniforms),
-        );
-
-        // Find containing tet (CPU brute force)
-        let start_tet = find_containing_tet(
-            &self.cached_vertices,
-            &self.cached_indices,
-            self.tet_count as usize,
-            cam,
-        )
-        .map(|t| t as i32)
-        .unwrap_or(-1);
-        self.queue.write_buffer(
-            &self.rt_buffers.start_tet,
-            0,
-            bytemuck::cast_slice(&[start_tet]),
         );
 
         // Single encoder: forward compute (SH eval) + raytrace
@@ -871,6 +1062,95 @@ impl RMeshRenderer {
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         Ok(array.into_pyarray(py))
+    }
+
+    /// Locate the containing tet for each query point via GPU adjacency walking.
+    ///
+    /// Args:
+    ///     query_points: [N*3] f32 flat array of 3D query points
+    ///     hint_tet: global starting tet hint (default 0)
+    ///
+    /// Returns:
+    ///     numpy array [N] i32 — tet index for each query, or -1 if outside mesh
+    #[pyo3(signature = (query_points, hint_tet=0))]
+    fn locate_tets<'py>(
+        &mut self,
+        py: Python<'py>,
+        query_points: PyReadonlyArray1<f32>,
+        hint_tet: i32,
+    ) -> PyResult<Bound<'py, PyArray1<i32>>> {
+        let pts = query_points.as_slice()?;
+        if pts.len() % 3 != 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("query_points length must be divisible by 3, got {}", pts.len())
+            ));
+        }
+        let n = (pts.len() / 3) as u32;
+        if n == 0 {
+            return Ok(Array1::<i32>::default(0).into_pyarray(py));
+        }
+
+        // Resize buffers if needed
+        if n > self.locate_capacity {
+            self.locate_query_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("locate_query"),
+                size: (n as u64) * 3 * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.locate_hint_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("locate_hint"),
+                size: (n as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.locate_result_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("locate_result"),
+                size: (n as u64) * 4,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            self.locate_capacity = n;
+        }
+
+        // Upload query points
+        self.queue.write_buffer(&self.locate_query_buf, 0, bytemuck::cast_slice(pts));
+
+        // Upload uniforms (use global hint_tet, so hint_tets buffer is unused)
+        let uni = LocateUniforms {
+            num_queries: n,
+            hint_tet,
+            tet_count: self.tet_count,
+            _pad: 0,
+        };
+        self.queue.write_buffer(&self.locate_uniforms_buf, 0, bytemuck::bytes_of(&uni));
+
+        // Create bind group
+        let bg = create_locate_bind_group(
+            &self.device,
+            &self.locate_pipeline,
+            &self.locate_uniforms_buf,
+            &self.scene_buffers.vertices,
+            &self.scene_buffers.indices,
+            &self.rt_buffers.tet_neighbors,
+            &self.locate_query_buf,
+            &self.locate_hint_buf,
+            &self.locate_result_buf,
+        );
+
+        // Record and submit
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("locate_tets"),
+        });
+        record_locate(&mut encoder, &self.locate_pipeline, &bg, n);
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back results
+        let raw = read_buffer_raw(&self.device, &self.queue, &self.locate_result_buf);
+        let result_i32: &[i32] = bytemuck::cast_slice(&raw);
+        let result = Array1::from_vec(result_i32[..n as usize].to_vec());
+
+        Ok(result.into_pyarray(py))
     }
 
     /// Read back the auxiliary buffer from the last forward pass.
@@ -1102,6 +1382,155 @@ impl RMeshRenderer {
             Array1::from_vec(d_grads).into_pyarray(py),
         )?;
         Ok(dict)
+    }
+
+    /// Run the backward pass for HW raster forward path.
+    ///
+    /// Same as backward() but uses ttb.rendered_image (from HW raster + tex-to-buffer)
+    /// instead of rasterize.rendered_image (from tiled forward).
+    ///
+    /// Call after forward() (not forward_tiled()).
+    ///
+    /// Args:
+    ///     dl_d_image: [H, W, 4] f32 gradient of loss w.r.t. rendered image
+    ///
+    /// Returns:
+    ///     dict with keys 'd_vertices', 'd_densities', 'd_color_grads', 'd_base_colors',
+    ///     each a 1D numpy f32 array.
+    fn backward_hw<'py>(
+        &mut self,
+        py: Python<'py>,
+        dl_d_image: PyReadonlyArray3<f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let dl_data = dl_d_image.as_slice()?;
+
+        // Upload gradient
+        self.queue.write_buffer(
+            &self.loss_buffers.dl_d_image,
+            0,
+            bytemuck::cast_slice(dl_data),
+        );
+
+        // Upload tile uniforms
+        let tile_uni = TileUniforms {
+            screen_width: self.width,
+            screen_height: self.height,
+            tile_size: self.tile_size,
+            tiles_x: self.tile_buffers.tiles_x,
+            tiles_y: self.tile_buffers.tiles_y,
+            num_tiles: self.tile_buffers.num_tiles,
+            visible_tet_count: 0,
+            _pad: [0; 5],
+        };
+        self.queue.write_buffer(
+            &self.tile_buffers.tile_uniforms,
+            0,
+            bytemuck::bytes_of(&tile_uni),
+        );
+
+        // Clear gradient buffers + tile ranges
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("backward_hw"),
+            });
+        encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
+        encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_base_colors, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
+        encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
+
+        // RTS scan-based tile pipeline
+        rmesh_backward::record_scan_tile_pipeline(
+            &mut encoder,
+            &self.scan_pipelines,
+            &self.tile_pipelines,
+            &self.prepare_dispatch_bg,
+            &self.rts_bg,
+            &self.tile_fill_bg,
+            &self.tile_gen_scan_bg,
+            &self.scan_buffers,
+            &self.tile_buffers,
+        );
+
+        // Radix sort
+        let result_in_b = rmesh_backward::record_radix_sort(
+            &mut encoder,
+            &self.device,
+            &self.radix_pipelines,
+            &self.radix_state,
+            &self.tile_buffers.tile_sort_keys,
+            &self.tile_buffers.tile_sort_values,
+        );
+
+        // Use HW bind groups that reference ttb.rendered_image
+        let (ranges_bg, bwd_bg0) = if result_in_b {
+            (&self.tile_ranges_bg_b, &self.bwd_tiled_bg0_hw_b)
+        } else {
+            (&self.tile_ranges_bg, &self.bwd_tiled_bg0_hw)
+        };
+
+        // Tile ranges
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tile_ranges"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
+            pass.set_bind_group(0, ranges_bg, &[]);
+            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            if total <= 65535 {
+                pass.dispatch_workgroups(total, 1, 1);
+            } else {
+                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+            }
+        }
+
+        // Backward tiled compute
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("backward_tiled"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.bwd_tiled_pipelines.pipeline);
+            pass.set_bind_group(0, bwd_bg0, &[]);
+            pass.set_bind_group(1, &self.bwd_tiled_bg1, &[]);
+            let num_tiles = self.tile_buffers.num_tiles;
+            if num_tiles <= 65535 {
+                pass.dispatch_workgroups(num_tiles, 1, 1);
+            } else {
+                let x = 65535u32;
+                let y = (num_tiles + x - 1) / x;
+                pass.dispatch_workgroups(x, y, 1);
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back gradients
+        let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
+        let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
+        let d_base_cols =
+            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
+        let d_grads =
+            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
+
+        let dict = PyDict::new(py);
+        dict.set_item("d_vertices", Array1::from_vec(d_verts).into_pyarray(py))?;
+        dict.set_item("d_densities", Array1::from_vec(d_dens).into_pyarray(py))?;
+        dict.set_item("d_base_colors", Array1::from_vec(d_base_cols).into_pyarray(py))?;
+        dict.set_item("d_color_grads", Array1::from_vec(d_grads).into_pyarray(py))?;
+        Ok(dict)
+    }
+
+    /// Backward pass for raytrace forward (not yet implemented).
+    fn backward_raytrace<'py>(
+        &mut self,
+        _py: Python<'py>,
+        _dl_d_image: PyReadonlyArray3<f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "Raytrace backward not yet implemented"
+        ))
     }
 
     /// Full forward+loss+backward+adam step on GPU.
