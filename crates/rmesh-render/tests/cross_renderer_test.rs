@@ -261,7 +261,131 @@ fn test_single_tet_multi_angle_cross_renderer() {
 }
 
 // ===========================================================================
-// Multi-tet cross-renderer tests
+// Multi-renderer comparison helper
+// ===========================================================================
+
+/// Test all GPU renderers against CPU reference for a given scene/camera.
+///
+/// Renders the scene with CPU, HW raster, raytrace, and tiled compute,
+/// then asserts each GPU result matches CPU within tolerance.
+fn assert_all_renderers_match_cpu(
+    scene: &rmesh_data::SceneData,
+    eye: Vec3,
+    target: Vec3,
+    label: &str,
+) {
+    let (vp, inv_vp) = setup_camera(eye, target);
+    let cpu = cpu_render_scene(scene, eye, vp, inv_vp, W, H);
+    let total_alpha: f32 = cpu.iter().map(|p| p[3]).sum();
+    assert!(total_alpha > 0.01, "{label}: CPU image is all-zero");
+
+    // (name, gpu_image, tolerance)
+    let renderers: Vec<(&str, Option<Vec<[f32; 4]>>, f32)> = vec![
+        ("HW raster", gpu_render_scene(scene, eye, vp, inv_vp, W, H), 0.05),
+        ("raytrace", gpu_raytrace_scene(scene, eye, vp, inv_vp, W, H), 0.01),
+        ("tiled", gpu_tiled_render_scene(scene, eye, vp, inv_vp, W, H), 0.01),
+    ];
+
+    for (name, result, tol) in &renderers {
+        if let Some(ref gpu) = result {
+            let (max_diff, mean_diff, _) = compare_images(&cpu, gpu);
+            eprintln!("{label}: CPU vs {name}: max={max_diff:.6}, mean={mean_diff:.8}");
+            if mean_diff > *tol {
+                print_pixel_diffs("cpu", name, &cpu, gpu, *tol, 5);
+            }
+            assert!(
+                mean_diff < *tol,
+                "{label}: CPU vs {name}: mean_diff {mean_diff} >= {tol}"
+            );
+        } else {
+            eprintln!("{label}: Skipping {name} (no GPU)");
+        }
+    }
+}
+
+// ===========================================================================
+// Multi-tet all-renderer tests (HW raster + raytrace + tiled)
+// ===========================================================================
+
+/// Two tets sharing a face — tests sorting + compositing across ALL renderers.
+#[test]
+fn test_two_tet_all_renderers() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+
+    let vertices = vec![
+        0.0, 0.0, 0.0, // v0
+        1.0, 0.0, 0.0, // v1
+        0.5, 1.0, 0.0, // v2
+        0.5, 0.3, 0.8, // v3 (above)
+        0.5, 0.3, -0.8, // v4 (below)
+    ];
+    let indices = vec![
+        0, 1, 2, 3, // tet 0
+        0, 2, 1, 4, // tet 1
+    ];
+    let densities = vec![
+        rng.random::<f32>() * 3.0 + 0.5,
+        rng.random::<f32>() * 3.0 + 0.5,
+    ];
+    let color_grads = vec![
+        (rng.random::<f32>() - 0.5) * 0.1,
+        (rng.random::<f32>() - 0.5) * 0.1,
+        (rng.random::<f32>() - 0.5) * 0.1,
+        (rng.random::<f32>() - 0.5) * 0.1,
+        (rng.random::<f32>() - 0.5) * 0.1,
+        (rng.random::<f32>() - 0.5) * 0.1,
+    ];
+
+    let scene = build_test_scene(vertices, indices, densities, color_grads);
+
+    let eye = Vec3::new(3.0, 0.4, 1.0);
+    let target = Vec3::new(0.5, 0.4, 0.0);
+
+    eprintln!("=== Two-tet all-renderers test ===");
+    assert_all_renderers_match_cpu(&scene, eye, target, "two_tet");
+}
+
+/// Four tets — full multi-tet compositing across ALL renderers.
+#[test]
+fn test_four_tet_all_renderers() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+
+    let s = 0.5f32;
+    let vertices = vec![
+        0.0, 0.0, 0.0, // v0: center
+        s, s, s,       // v1
+        -s, s, s,      // v2
+        -s, -s, s,     // v3
+        s, -s, s,      // v4
+        s, s, -s,      // v5
+        -s, s, -s,     // v6
+        -s, -s, -s,    // v7
+        s, -s, -s,     // v8
+    ];
+    let indices = vec![
+        0, 1, 2, 3, // tet 0
+        0, 1, 4, 5, // tet 1
+        0, 2, 6, 3, // tet 2
+        0, 5, 8, 7, // tet 3
+    ];
+
+    let tet_count = 4;
+    let densities: Vec<f32> = (0..tet_count)
+        .map(|_| rng.random::<f32>() * 3.0 + 0.5)
+        .collect();
+    let color_grads: Vec<f32> = (0..tet_count * 3)
+        .map(|_| (rng.random::<f32>() - 0.5) * 0.1)
+        .collect();
+
+    let scene = build_test_scene(vertices, indices, densities, color_grads);
+
+    eprintln!("=== Four-tet all-renderers test ===");
+    assert_all_renderers_match_cpu(&scene, Vec3::new(3.0, 0.0, 0.0), Vec3::ZERO, "four_tet_from_x");
+    assert_all_renderers_match_cpu(&scene, Vec3::new(2.0, 2.0, 2.0), Vec3::ZERO, "four_tet_diagonal");
+}
+
+// ===========================================================================
+// Multi-tet cross-renderer tests (raytrace + tiled only, legacy)
 // ===========================================================================
 
 /// Two tets sharing a face — tests sorting + compositing across renderers.

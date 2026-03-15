@@ -35,11 +35,13 @@ struct BenchState {
     queue: wgpu::Queue,
     // Scene
     tet_count: u32,
-    // Forward compute
+    // Forward project + HW rasterization
     buffers: rmesh_render::SceneBuffers,
     material: rmesh_render::MaterialBuffers,
     fwd_pipelines: rmesh_render::ForwardPipelines,
+    targets: rmesh_render::RenderTargets,
     compute_bg: wgpu::BindGroup,
+    render_bg: wgpu::BindGroup,
     // Tiled pipeline
     tile_pipelines: rmesh_backward::TilePipelines,
     radix_pipelines: rmesh_backward::RadixSortPipelines,
@@ -54,6 +56,9 @@ struct BenchState {
     tile_gen_scan_bg: wgpu::BindGroup,
     tile_ranges_bg_a: wgpu::BindGroup,
     tile_ranges_bg_b: wgpu::BindGroup,
+    // HW raster sort (for sorted forward HW pass)
+    hw_sort_state: rmesh_backward::RadixSortState,
+    render_bg_b: wgpu::BindGroup,
     // Forward tiled
     rasterize: rmesh_render::RasterizeComputePipeline,
     rasterize_bg_a: wgpu::BindGroup,
@@ -85,7 +90,7 @@ fn create_bench_state() -> Option<BenchState> {
 
     // Forward compute
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+    let (buffers, material, fwd_pipelines, targets, compute_bg, render_bg) =
         rmesh_render::setup_forward(
             &device,
             &queue,
@@ -179,6 +184,14 @@ fn create_bench_state() -> Option<BenchState> {
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
         &radix_state.num_keys_buf,
+    );
+
+    // HW raster sort infrastructure (sized for tet_count, not tile pairs)
+    let hw_n_pow2 = scene.tet_count.next_power_of_two();
+    let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32);
+    hw_sort_state.upload_configs(&queue);
+    let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
+        &device, &fwd_pipelines, &buffers, &material, &hw_sort_state.values_b,
     );
 
     // Forward tiled
@@ -290,7 +303,9 @@ fn create_bench_state() -> Option<BenchState> {
         buffers,
         material,
         fwd_pipelines,
+        targets,
         compute_bg,
+        render_bg,
         tile_pipelines,
         radix_pipelines,
         tile_buffers,
@@ -303,6 +318,8 @@ fn create_bench_state() -> Option<BenchState> {
         tile_gen_scan_bg,
         tile_ranges_bg_a,
         tile_ranges_bg_b,
+        hw_sort_state,
+        render_bg_b,
         rasterize,
         rasterize_bg_a,
         rasterize_bg_b,
@@ -728,6 +745,79 @@ fn run_rasterize_only(s: &BenchState, result_in_b: bool) {
     let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
 }
 
+/// Run the full HW vertex-fragment rasterization pipeline (project_compute + sort + render pass).
+fn run_forward_hw_rasterize(s: &BenchState) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    rmesh_render::record_sorted_forward_pass(
+        &mut encoder,
+        &s.device,
+        &s.fwd_pipelines,
+        &s.radix_pipelines,
+        &s.hw_sort_state,
+        &s.buffers,
+        &s.targets,
+        &s.compute_bg,
+        &s.render_bg,
+        &s.render_bg_b,
+        s.tet_count,
+        &s.queue,
+    );
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+/// Run only the loss compute kernel (assumes rendered_image is populated).
+fn run_loss_only(s: &BenchState) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    encoder.clear_buffer(&s.loss_buffers.loss_value, 0, None);
+    record_loss_pass(&mut encoder, &s.loss_pipeline, &s.loss_bg, W, H);
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+/// Run only the backward tiled kernel (assumes forward + loss are already done).
+fn run_backward_only(s: &BenchState, result_in_b: bool) {
+    let mut encoder = s
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    encoder.clear_buffer(&s.grad_buffers.d_vertices, 0, None);
+    encoder.clear_buffer(&s.grad_buffers.d_densities, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_color_grads, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_base_colors, 0, None);
+
+    let bwd_bg0 = if result_in_b {
+        &s.bwd_bg0_b
+    } else {
+        &s.bwd_bg0_a
+    };
+    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("backward_rasterize"),
+        timestamp_writes: None,
+    });
+    pass.set_pipeline(&s.bwd_tiled_pipelines.pipeline);
+    pass.set_bind_group(0, bwd_bg0, &[]);
+    pass.set_bind_group(1, &s.bwd_bg1, &[]);
+    let num_tiles = s.tile_buffers.num_tiles;
+    pass.dispatch_workgroups(
+        num_tiles.min(65535),
+        ((num_tiles + 65534) / 65535).max(1),
+        1,
+    );
+    drop(pass);
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
 fn bench_forward(c: &mut Criterion) {
     let state = match create_bench_state() {
         Some(s) => s,
@@ -778,6 +868,11 @@ fn bench_forward(c: &mut Criterion) {
     };
     c.bench_function("rasterize_compute_2M", |b| {
         b.iter(|| run_rasterize_only(&state, result_in_b));
+    });
+
+    // HW vertex-fragment rasterization pipeline (project_compute + render pass)
+    c.bench_function("forward_hw_rasterize_2M", |b| {
+        b.iter(|| run_forward_hw_rasterize(&state));
     });
 
     // GPU timestamp breakdown (single run after criterion)
@@ -939,11 +1034,40 @@ fn bench_backward(c: &mut Criterion) {
         }
     };
 
-    // Warmup
+    // Warmup: run full forward+backward to populate all buffers
     run_backward(&state);
 
+    // Full backward pipeline (project + scan + sort + rasterize + loss + backward)
     c.bench_function("backward_tiled_2M", |b| {
         b.iter(|| run_backward(&state));
+    });
+
+    // Determine which buffer the sort result lands in
+    let result_in_b = {
+        let mut encoder = state
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let r = rmesh_backward::record_radix_sort(
+            &mut encoder,
+            &state.device,
+            &state.radix_pipelines,
+            &state.radix_state,
+            &state.tile_buffers.tile_sort_keys,
+            &state.tile_buffers.tile_sort_values,
+        );
+        state.queue.submit(std::iter::once(encoder.finish()));
+        let _ = state.device.poll(wgpu::PollType::wait_indefinitely());
+        r
+    };
+
+    // Loss compute only (assumes rendered_image populated from warmup)
+    c.bench_function("loss_compute_2M", |b| {
+        b.iter(|| run_loss_only(&state));
+    });
+
+    // Backward rasterize only (assumes forward + loss populated from warmup)
+    c.bench_function("backward_rasterize_2M", |b| {
+        b.iter(|| run_backward_only(&state, result_in_b));
     });
 
     // GPU timestamp breakdown (single run after criterion)

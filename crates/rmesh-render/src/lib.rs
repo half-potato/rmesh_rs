@@ -677,6 +677,33 @@ pub fn create_render_bind_group(
     })
 }
 
+/// Create a render bind group with an explicit sort_values buffer.
+///
+/// Same as [`create_render_bind_group`] but binding 6 uses a caller-provided
+/// `sort_values` buffer instead of `buffers.sort_values`. This is needed when
+/// the radix sort result ends up in the alternate (B) buffer.
+pub fn create_render_bind_group_with_sort_values(
+    device: &wgpu::Device,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sort_values: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("render_bind_group_sort_b"),
+        layout: &pipelines.render_bind_group_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.vertices),
+            buf_entry(2, &buffers.indices),
+            buf_entry(3, &material.colors),
+            buf_entry(4, &buffers.densities),
+            buf_entry(5, &material.color_grads),
+            buf_entry(6, sort_values),
+        ],
+    })
+}
+
 /// Shorthand for a full-buffer bind group entry.
 fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
@@ -879,6 +906,129 @@ pub fn record_forward_pass(
         rpass.set_bind_group(0, render_bg, &[]);
 
         // Draw indirect -- instance_count comes from compute pass atomicAdd
+        rpass.draw_indirect(&buffers.indirect_args, 0);
+    }
+}
+
+/// Record a sorted forward pass: project_compute → radix sort → render.
+///
+/// Unlike [`record_forward_pass`], this inserts a radix sort between the
+/// compute and render passes so that tets are drawn back-to-front.
+/// The sort uses ascending order on `~depth_bits` keys written by
+/// `project_compute`, which gives correct back-to-front compositing with
+/// the existing premultiplied alpha blend state (src=One, dst=OneMinusSrcAlpha).
+///
+/// The caller must provide two render bind groups:
+/// - `render_bg_a`: uses `buffers.sort_values` (primary A buffer)
+/// - `render_bg_b`: uses `sort_state.values_b` (alternate B buffer)
+///
+/// The function selects the correct bind group based on which buffer
+/// holds the sorted result (depends on number of radix sort passes).
+pub fn record_sorted_forward_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    device: &wgpu::Device,
+    pipelines: &ForwardPipelines,
+    sort_pipelines: &rmesh_sort::RadixSortPipelines,
+    sort_state: &rmesh_sort::RadixSortState,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    compute_bg: &wgpu::BindGroup,
+    render_bg_a: &wgpu::BindGroup,
+    render_bg_b: &wgpu::BindGroup,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+) {
+    // ----- 1. Reset indirect args -----
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+
+    // Write sort element count to radix sort's num_keys_buf.
+    // project_compute dispatches n_pow2 threads; padding threads write
+    // sort_keys = 0xFFFFFFFF which sorts to the end.
+    let n_pow2 = tet_count.next_power_of_two();
+    queue.write_buffer(&sort_state.num_keys_buf, 0, bytemuck::bytes_of(&n_pow2));
+
+    // ----- 2. Compute pass -----
+    {
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute"),
+            timestamp_writes: None,
+        });
+        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_bind_group(0, compute_bg, &[]);
+
+        let workgroup_size = 64u32;
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
+
+    // ----- 3. Radix sort (back-to-front via ascending ~depth_bits) -----
+    let result_in_b = rmesh_sort::record_radix_sort(
+        encoder, device, sort_pipelines, sort_state,
+        &buffers.sort_keys, &buffers.sort_values,
+    );
+
+    // ----- 4. Render pass -----
+    let render_bg = if result_in_b { render_bg_b } else { render_bg_a };
+    {
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("forward_render"),
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.aux0_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+            ],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+
+        rpass.set_viewport(
+            0.0,
+            0.0,
+            targets.width as f32,
+            targets.height as f32,
+            0.0,
+            1.0,
+        );
+        rpass.set_scissor_rect(0, 0, targets.width, targets.height);
+        rpass.set_pipeline(&pipelines.render_pipeline);
+        rpass.set_bind_group(0, render_bg, &[]);
+
         rpass.draw_indirect(&buffers.indirect_args, 0);
     }
 }

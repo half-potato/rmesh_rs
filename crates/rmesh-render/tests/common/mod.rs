@@ -381,8 +381,19 @@ async fn gpu_render_scene_async(
         .ok()?;
 
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, _material, pipelines, targets, compute_bg, render_bg) =
+    let (buffers, material, pipelines, targets, compute_bg, render_bg) =
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+
+    // Sort infrastructure for sorted HW raster forward pass
+    let n_pow2 = scene.tet_count.next_power_of_two();
+    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
+    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32);
+    sort_state.upload_configs(&queue);
+
+    // B-variant render bind group (uses sort_state.values_b)
+    let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
+        &device, &pipelines, &buffers, &material, &sort_state.values_b,
+    );
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
@@ -400,13 +411,17 @@ async fn gpu_render_scene_async(
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test_forward"),
     });
-    rmesh_render::record_forward_pass(
+    rmesh_render::record_sorted_forward_pass(
         &mut encoder,
+        &device,
         &pipelines,
+        &sort_pipelines,
+        &sort_state,
         &buffers,
         &targets,
         &compute_bg,
         &render_bg,
+        &render_bg_b,
         scene.tet_count,
         &queue,
     );

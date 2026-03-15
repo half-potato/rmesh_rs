@@ -7,6 +7,7 @@ edition = "2021"
 rmesh-util = { path = "../rmesh-util" }
 rmesh-tile = { path = "../rmesh-tile" }
 rmesh-data = { path = "../rmesh-data" }
+rmesh-sort = { path = "../rmesh-sort" }
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 glam = { workspace = true }
@@ -19,5 +20,4 @@ rand_chacha = "0.9"
 pollster = { workspace = true }
 half = { workspace = true }
 rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
-rmesh-sort = { path = "../rmesh-sort" }
 rmesh-tile = { path = "../rmesh-tile" }
