@@ -32,8 +32,10 @@ pub struct Uniforms {
     pub tet_count: u32,
     /// Current training step
     pub step: u32,
-    /// Padding to maintain 192-byte struct size (two vec4<u32> in WGSL).
-    pub _pad1: [u32; 8],
+    /// Tile size for tiled pipeline (must match shaders).
+    pub tile_size_u: u32,
+    /// Padding to maintain 192-byte struct size.
+    pub _pad1: [u32; 7],
 }
 
 impl Uniforms {

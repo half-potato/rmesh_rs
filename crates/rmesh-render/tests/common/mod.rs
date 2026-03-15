@@ -402,6 +402,7 @@ async fn gpu_render_scene_async(
         h as f32,
         scene.tet_count,
         0,
+        16,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -572,7 +573,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -678,9 +679,7 @@ async fn gpu_tiled_render_scene_async(
         .await
         .ok()?;
 
-    // Must be 16 to match project_compute.wgsl (hardcoded tile_size=16.0)
-    // and rasterize_compute.wgsl (hardcoded 16×16 pixel tiles).
-    let tile_size = 16u32;
+    let tile_size = 12u32;
 
     // Forward compute setup
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
@@ -688,7 +687,7 @@ async fn gpu_tiled_render_scene_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

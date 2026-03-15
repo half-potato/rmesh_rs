@@ -571,7 +571,7 @@ fn test_tiled_forward_e2e() {
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -582,9 +582,7 @@ fn test_tiled_forward_e2e() {
     queue.submit(std::iter::once(encoder.finish()));
 
     // --- Set up tiled pipeline (scan-based, same as Python path) ---
-    // tile_size must be 16 to match the hardcoded 16-pixel tiles in
-    // project_compute.wgsl and rasterize_compute.wgsl.
-    let tile_size = 16u32;
+    let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
     let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
@@ -743,9 +741,7 @@ fn test_multi_tet_gradient_finite_diff() {
     let target = Vec3::new(0.5, 0.4, 0.0);
     let (vp, inv_vp) = setup_camera(eye, target);
 
-    // Must match the hardcoded tile pixel size in project_compute.wgsl (line 144)
-    // and rasterize_compute.wgsl (line 106).
-    let tile_size = 16u32;
+    let tile_size = 12u32;
     let n_pixels = (W * H) as usize;
 
     // Ground truth: constant gray
@@ -765,7 +761,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -879,7 +875,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1204,12 +1200,11 @@ fn test_single_tet_loss_decreases() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-    // Tiled pipeline — tile_size must be 16 to match shader hardcoded 16-pixel tiles
-    let tile_size = 16u32;
+    let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
     let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
@@ -1634,7 +1629,7 @@ fn test_camera_gpu_visibility() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1662,7 +1657,7 @@ fn test_camera_gpu_visibility() {
     );
 }
 
-/// Test 3: Deterministic tiled forward with tile_size=16.
+/// Test 3: Deterministic tiled forward with tile_size=12.
 /// Full scan-based tiled pipeline → total_alpha > 0.001.
 #[test]
 fn test_camera_tiled_forward_deterministic() {
@@ -1692,7 +1687,7 @@ fn test_camera_tiled_forward_deterministic() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1702,8 +1697,8 @@ fn test_camera_tiled_forward_deterministic() {
     );
     queue.submit(std::iter::once(encoder.finish()));
 
-    // --- Tiled infrastructure with tile_size=16 ---
-    let tile_size = 16u32;
+    // --- Tiled infrastructure with tile_size=12 ---
+    let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
     let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
@@ -1810,12 +1805,12 @@ fn test_camera_tiled_forward_deterministic() {
 
     let total_alpha: f32 = image.iter().skip(3).step_by(4).sum();
     eprintln!(
-        "camera_tiled_forward_deterministic (tile_size=16): total_alpha = {total_alpha:.4}, num_tiles = {}",
+        "camera_tiled_forward_deterministic (tile_size=12): total_alpha = {total_alpha:.4}, num_tiles = {}",
         tile_buffers.num_tiles
     );
     assert!(
         total_alpha > 0.001,
-        "Tiled forward (tile_size=16) produced all-zero image (total_alpha={total_alpha})"
+        "Tiled forward (tile_size=12) produced all-zero image (total_alpha={total_alpha})"
     );
 
     // Check pixel values are reasonable (non-NaN, non-inf)

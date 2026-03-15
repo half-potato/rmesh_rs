@@ -109,6 +109,7 @@ fn create_bench_state() -> Option<BenchState> {
         H as f32,
         scene.tet_count,
         0u32,
+        TILE_SIZE,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 

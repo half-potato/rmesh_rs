@@ -531,7 +531,8 @@ pub fn train(
                 screen_height: view.height as f32,
                 tet_count: scene.tet_count,
                 step,
-                _pad1: [0; 8],
+                tile_size_u: 12,
+                _pad1: [0; 7],
             };
 
             // Upload uniforms

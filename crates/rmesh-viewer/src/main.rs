@@ -268,7 +268,8 @@ impl App {
             screen_height: h as f32,
             tet_count: gpu.tet_count,
             step: 0,
-            _pad1: [0; 8],
+            tile_size_u: 12,
+            _pad1: [0; 7],
         };
 
         gpu.queue

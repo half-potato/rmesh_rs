@@ -17,7 +17,10 @@ struct Uniforms {
     screen_height: f32,
     tet_count: u32,
     step: u32,
-    _pad1: vec4<u32>,
+    tile_size_u: u32,
+    _pad1a: u32,
+    _pad1b: u32,
+    _pad1c: u32,
     _pad2: vec4<u32>,
 };
 
@@ -134,7 +137,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     // Compute tiles_touched for prefix scan (conservative scanline)
     let W = uniforms.screen_width;
     let H = uniforms.screen_height;
-    let tile_size = 16.0; // must match tile_size used in tile_gen
+    let tile_size = f32(uniforms.tile_size_u);
 
     if (any_behind) {
         // Cull entirely — behind-camera tets would overflow pair buffers

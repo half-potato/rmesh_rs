@@ -1,7 +1,8 @@
 //! Tile-size sweep benchmark.
 //!
-//! Patches WGSL shaders for each tile size (8, 12, 16, 20, 24, 32),
-//! builds fresh pipelines, and measures forward+backward GPU time.
+//! Tests tile sizes (8, 12, 16, 20, 24, 32) via the runtime `tile_size`
+//! uniform parameter, and measures forward+backward GPU time.
+//! Shared memory arrays are patched only for tile sizes > 16.
 //!
 //! Usage:
 //!   cargo run -p rmesh-backward --release --example tile_size_sweep
@@ -22,7 +23,7 @@ const BENCH_ITERS: u32 = 5;
 
 const TILE_SIZES: &[u32] = &[8, 12, 16, 20, 24, 32];
 
-// Shader sources (base tile size = 16)
+// Shader sources — project_compute reads tile_size from uniforms at runtime.
 const PROJECT_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/project_compute.wgsl");
 const RASTERIZE_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/rasterize_compute.wgsl");
 const BWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-backward/src/wgsl/backward_tiled_compute.wgsl");
@@ -31,45 +32,23 @@ const BWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-backward/src/wgs
 // Shader patching
 // ---------------------------------------------------------------------------
 
-/// Patch a tiled shader (forward_tiled or backward_tiled) from tile_size=16 to `ts`.
+/// Patch shared memory array declarations in a tiled shader for tile sizes > 16.
+///
+/// Tile arithmetic (offsets, loop bounds, etc.) now reads `tile_uniforms.tile_size`
+/// at runtime, so only compile-time shared memory array sizes need patching.
+/// For tile_size ≤ 16 the default arrays (256 pixels, 16 rows, 17 prefix) suffice.
 fn patch_tiled_shader(src: &str, ts: u32) -> String {
+    if ts <= 16 {
+        return src.to_string();
+    }
     let ts_sq = ts * ts;
-    let ts_m1 = ts as i32 - 1;
-
-    src
-        // Shared memory declarations
-        .replace(
-            "array<vec4<f32>, 256>",
-            &format!("array<vec4<f32>, {ts_sq}>"),
-        )
-        .replace(
-            "array<f32, 256>",
-            &format!("array<f32, {ts_sq}>"),
-        )
-        .replace("array<i32, 16>", &format!("array<i32, {ts}>"))
-        .replace("array<u32, 17>", &format!("array<u32, {}>", ts + 1))
-        // Tile offset: tile_x * 16u, tile_y * 16u
-        .replace("* 16u", &format!("* {ts}u"))
-        // Pixel loop bounds: i < 256u
-        .replace("< 256u", &format!("< {ts_sq}u"))
-        // Row/lane bounds: lane < 16u, r < 16u
-        .replace("< 16u", &format!("< {ts}u"))
-        // Prefix sum read: sm_prefix[16u]
-        .replace("sm_prefix[16u]", &format!("sm_prefix[{ts}u]"))
-        // Pixel index: row * 16u + col → already covered by "* 16u" above
-        // Write-out: i / 16u, i % 16u
-        .replace("/ 16u", &format!("/ {ts}u"))
-        .replace("% 16u", &format!("% {ts}u"))
-        // Max column bound: min(..., 15)
-        .replace(", 15)", &format!(", {ts_m1})"))
-}
-
-/// Patch project_compute.wgsl tile_size constant.
-fn patch_project_compute(src: &str, ts: u32) -> String {
     src.replace(
-        "let tile_size = 16.0;",
-        &format!("let tile_size = {ts}.0;"),
+        "array<vec4<f32>, 256>",
+        &format!("array<vec4<f32>, {ts_sq}>"),
     )
+    .replace("array<f32, 256>", &format!("array<f32, {ts_sq}>"))
+    .replace("array<i32, 16>", &format!("array<i32, {ts}>"))
+    .replace("array<u32, 17>", &format!("array<u32, {}>", ts + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +235,7 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -330,8 +309,8 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     let queue = &shared.queue;
     let n_pixels = (W as u64) * (H as u64);
 
-    // Patch shaders
-    let fwd_compute_src = patch_project_compute(PROJECT_COMPUTE_SRC, tile_size);
+    // Patch shared memory sizes for tile_size > 16; arithmetic reads from uniforms at runtime.
+    // project_compute reads uniforms.tile_size_u — no patching needed.
     let rasterize_src = patch_tiled_shader(RASTERIZE_COMPUTE_SRC, tile_size);
     let bwd_tiled_src = patch_tiled_shader(BWD_TILED_SRC, tile_size);
 
@@ -343,7 +322,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     // Create pipelines from patched sources
     let fwd_compute_pipeline = create_compute_pipeline(
         device,
-        &fwd_compute_src,
+        PROJECT_COMPUTE_SRC,
         &format!("fwd_compute_ts{tile_size}"),
         &fwd_compute_pl,
     );
@@ -816,6 +795,17 @@ fn main() {
 
         let ts = create_tile_size_state(&shared, tile_size);
         let num_tiles = ts.tile_buffers.num_tiles;
+
+        // Update uniforms buffer with the correct tile_size for this run
+        let (vp, inv_vp, eye) = setup_camera();
+        let uniforms = rmesh_render::make_uniforms(
+            vp, inv_vp, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size,
+        );
+        shared.queue.write_buffer(
+            &shared.scene_buffers.uniforms,
+            0,
+            bytemuck::bytes_of(&uniforms),
+        );
 
         // Warmup
         for _ in 0..WARMUP_ITERS {

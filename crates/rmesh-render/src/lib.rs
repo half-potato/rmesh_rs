@@ -1079,6 +1079,7 @@ pub fn make_uniforms(
     screen_height: f32,
     tet_count: u32,
     step: u32,
+    tile_size: u32,
 ) -> Uniforms {
     Uniforms {
         vp_col0: vp.col(0).into(),
@@ -1094,7 +1095,8 @@ pub fn make_uniforms(
         screen_height,
         tet_count,
         step,
-        _pad1: [0; 8],
+        tile_size_u: tile_size,
+        _pad1: [0; 7],
     }
 }
 

@@ -172,6 +172,7 @@ struct RMeshRenderer {
     width: u32,
     height: u32,
     step: u32,
+    tile_size: u32,
     param_counts: [u32; 3],
 }
 
@@ -344,7 +345,7 @@ impl RMeshRenderer {
         ];
 
         // Tiled backward infrastructure
-        let tile_size = 16u32;
+        let tile_size = 12u32;
         let tile_pipelines = TilePipelines::new(&device);
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
@@ -540,6 +541,7 @@ impl RMeshRenderer {
             width,
             height,
             step: 0,
+            tile_size: 12,
             param_counts,
         })
     }
@@ -576,6 +578,7 @@ impl RMeshRenderer {
             self.height as f32,
             self.tet_count,
             self.step,
+            self.tile_size,
         );
 
         // Upload uniforms
@@ -652,6 +655,7 @@ impl RMeshRenderer {
             self.height as f32,
             self.tet_count,
             self.step,
+            self.tile_size,
         );
 
         // Upload uniforms
@@ -665,7 +669,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 16,
+            tile_size: self.tile_size,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -800,6 +804,7 @@ impl RMeshRenderer {
             self.height as f32,
             self.tet_count,
             self.step,
+            self.tile_size,
         );
 
         // Upload uniforms
@@ -978,7 +983,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 16,
+            tile_size: self.tile_size,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,
@@ -1141,6 +1146,7 @@ impl RMeshRenderer {
             self.height as f32,
             self.tet_count,
             self.step,
+            self.tile_size,
         );
 
         // Upload uniforms + ground truth
@@ -1171,7 +1177,7 @@ impl RMeshRenderer {
         let tile_uni = TileUniforms {
             screen_width: self.width,
             screen_height: self.height,
-            tile_size: 16,
+            tile_size: self.tile_size,
             tiles_x: self.tile_buffers.tiles_x,
             tiles_y: self.tile_buffers.tiles_y,
             num_tiles: self.tile_buffers.num_tiles,

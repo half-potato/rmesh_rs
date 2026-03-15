@@ -70,7 +70,7 @@ fn test_project_compute_kernel() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0);
+        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0, 12);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args

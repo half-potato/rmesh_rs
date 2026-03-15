@@ -26,7 +26,10 @@ struct Uniforms {
     screen_height: f32,
     tet_count: u32,
     step: u32,
-    _pad1: vec4<u32>,
+    tile_size_u: u32,
+    _pad1a: u32,
+    _pad1b: u32,
+    _pad1c: u32,
     _pad2: vec4<u32>,
 };
 
@@ -98,8 +101,9 @@ fn main(
     let h = tile_uniforms.screen_height;
     let W = f32(w);
     let H = f32(h);
-    let tile_ox = f32(tile_x * 16u);
-    let tile_oy = f32(tile_y * 16u);
+    let TS = tile_uniforms.tile_size;
+    let tile_ox = f32(tile_x * TS);
+    let tile_oy = f32(tile_y * TS);
 
     let range_start = tile_ranges[tile_id * 2u];
     let range_end = tile_ranges[tile_id * 2u + 1u];
@@ -108,8 +112,8 @@ fn main(
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
     let inv_vp = mat4x4<f32>(uniforms.inv_vp_col0, uniforms.inv_vp_col1, uniforms.inv_vp_col2, uniforms.inv_vp_col3);
 
-    // Initialize per-pixel state (32 threads × 8 pixels each)
-    for (var i = lane; i < 256u; i += 32u) {
+    // Initialize per-pixel state (32 threads × pixels each)
+    for (var i = lane; i < TS * TS; i += 32u) {
         sm_color[i] = vec4<f32>(0.0);
     }
     workgroupBarrier();
@@ -147,8 +151,8 @@ fn main(
             proj[3] = vec2<f32>((c3.x / c3.w + 1.0) * 0.5 * W - tile_ox, (1.0 - c3.y / c3.w) * 0.5 * H - tile_oy);
         }
 
-        // Scanline fill (Variant A): threads 0-15 each compute one row
-        if (lane < 16u) {
+        // Scanline fill (Variant A): threads 0..TS each compute one row
+        if (lane < TS) {
             var xl_f: f32 = 1e10;
             var xr_f: f32 = -1e10;
 
@@ -231,7 +235,7 @@ fn main(
             if (xl_f <= xr_f) {
                 let eps = 0.001;
                 let xl_i = max(i32(ceil(xl_f - 0.5 - eps)), 0);
-                let xr_i = min(i32(floor(xr_f - 0.5 + eps)), 15);
+                let xr_i = min(i32(floor(xr_f - 0.5 + eps)), i32(TS) - 1);
                 if (xl_i <= xr_i) {
                     sm_xl[lane] = xl_i;
                     sm_xr[lane] = xr_i;
@@ -249,7 +253,7 @@ fn main(
         // Prefix sum of row widths (thread 0)
         if (lane == 0u) {
             sm_prefix[0] = 0u;
-            for (var r = 0u; r < 16u; r++) {
+            for (var r = 0u; r < TS; r++) {
                 let row_w = u32(max(sm_xr[r] - sm_xl[r] + 1, 0));
                 sm_prefix[r + 1u] = sm_prefix[r] + row_w;
             }
@@ -263,7 +267,7 @@ fn main(
         var verts: array<vec3<f32>, 4>;
         verts[0] = v0; verts[1] = v1; verts[2] = v2; verts[3] = v3;
 
-        let total = sm_prefix[16u];
+        let total = sm_prefix[TS];
         if (total == 0u) {
             // No pixels covered — skip to next tet (barrier already done)
             continue;
@@ -273,17 +277,17 @@ fn main(
         for (var idx = lane; idx < total; idx += 32u) {
             // Map linear index to (row, col) via prefix sum
             var row = 0u;
-            for (var r = 0u; r < 16u; r++) {
+            for (var r = 0u; r < TS; r++) {
                 if (idx < sm_prefix[r + 1u]) {
                     row = r;
                     break;
                 }
             }
             let col = u32(sm_xl[row]) + (idx - sm_prefix[row]);
-            let pixel_local = row * 16u + col;
+            let pixel_local = row * TS + col;
 
-            let px = tile_x * 16u + col;
-            let py = tile_y * 16u + row;
+            let px = tile_x * TS + col;
+            let py = tile_y * TS + row;
 
             if (px >= w || py >= h) {
                 continue;
@@ -360,12 +364,12 @@ fn main(
         workgroupBarrier();
     }
 
-    // Write output (32 threads × 8 pixels each)
-    for (var i = lane; i < 256u; i += 32u) {
-        let row = i / 16u;
-        let col = i % 16u;
-        let px = tile_x * 16u + col;
-        let py = tile_y * 16u + row;
+    // Write output (32 threads × pixels each)
+    for (var i = lane; i < TS * TS; i += 32u) {
+        let row = i / TS;
+        let col = i % TS;
+        let px = tile_x * TS + col;
+        let py = tile_y * TS + row;
         if (px < w && py < h) {
             let pixel_idx = py * w + px;
             let state = sm_color[i];
