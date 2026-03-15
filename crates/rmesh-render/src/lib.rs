@@ -245,12 +245,11 @@ fn storage_entries(count: u32, visibility: wgpu::ShaderStages, read_only: &[bool
 impl ForwardPipelines {
     /// Create all three pipelines from WGSL shader sources.
     ///
-    /// `color_format`: texture format for the main color attachment (e.g. Rgba16Float).
-    /// `aux_format`: texture format for the auxiliary attachment (e.g. Rgba32Float).
+    /// `color_format`: texture format for all color attachments (Rgba16Float).
+    /// Total bytes per sample must not exceed 32 bytes (4 * 8 = 32 for Rgba16Float).
     pub fn new(
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
-        aux_format: wgpu::TextureFormat,
     ) -> Self {
         // ----- Compute pipeline (13 bindings) -----
         // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
@@ -368,8 +367,21 @@ impl ForwardPipelines {
                         }),
                         // Color attachment 1 (aux): no blending
                         Some(wgpu::ColorTargetState {
-                            format: aux_format,
+                            format: color_format,
                             blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        // Color attachment 2 (normals): premultiplied alpha blend
+                        // Uses color_format (Rgba16Float) because Rgba32Float is not blendable
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        }),
+                        // Color attachment 3 (depth): premultiplied alpha blend
+                        Some(wgpu::ColorTargetState {
+                            format: color_format,
+                            blend: Some(premul_blend),
                             write_mask: wgpu::ColorWrites::ALL,
                         }),
                     ],
@@ -396,12 +408,20 @@ impl ForwardPipelines {
 pub struct RenderTargets {
     /// Main color output texture (e.g. Rgba16Float)
     pub color_texture: wgpu::Texture,
-    /// Auxiliary output texture (Rgba32Float)
+    /// Auxiliary output texture (Rgba16Float)
     pub aux0_texture: wgpu::Texture,
+    /// Normals output texture (Rgba16Float, premultiplied alpha blend)
+    pub normals_texture: wgpu::Texture,
+    /// Depth output texture (Rgba16Float, premultiplied alpha blend)
+    pub depth_texture: wgpu::Texture,
     /// View into color texture
     pub color_view: wgpu::TextureView,
     /// View into aux texture
     pub aux0_view: wgpu::TextureView,
+    /// View into normals texture
+    pub normals_view: wgpu::TextureView,
+    /// View into depth texture
+    pub depth_view: wgpu::TextureView,
     pub width: u32,
     pub height: u32,
 }
@@ -410,7 +430,6 @@ impl RenderTargets {
     /// Create render target textures at the given resolution.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let color_format = wgpu::TextureFormat::Rgba16Float;
-        let aux_format = wgpu::TextureFormat::Rgba32Float;
 
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("color_target"),
@@ -439,7 +458,42 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: aux_format,
+            format: color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // Normals and depth use Rgba16Float (blendable) instead of Rgba32Float
+        let normals_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("normals_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("depth_target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: color_format,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -448,12 +502,18 @@ impl RenderTargets {
 
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         Self {
             color_texture,
             aux0_texture,
+            normals_texture,
+            depth_texture,
             color_view,
             aux0_view,
+            normals_view,
+            depth_view,
             width,
             height,
         }
@@ -888,6 +948,36 @@ pub fn record_forward_pass(
                     },
                     depth_slice: None,
                 }),
+                // Attachment 2: normals (premultiplied alpha blend)
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.normals_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                // Attachment 3: depth (premultiplied alpha blend)
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.depth_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
             ],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -1012,6 +1102,36 @@ pub fn record_sorted_forward_pass(
                     },
                     depth_slice: None,
                 }),
+                // Attachment 2: normals (premultiplied alpha blend)
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.normals_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                // Attachment 3: depth (premultiplied alpha blend)
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.depth_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 0.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
             ],
             depth_stencil_attachment: None,
             timestamp_writes: None,
@@ -1059,11 +1179,10 @@ pub fn setup_forward(
     wgpu::BindGroup,
 ) {
     let color_format = wgpu::TextureFormat::Rgba16Float;
-    let aux_format = wgpu::TextureFormat::Rgba32Float;
 
     let buffers = SceneBuffers::upload(device, queue, scene);
     let material = MaterialBuffers::upload(device, base_colors, color_grads, scene.tet_count);
-    let pipelines = ForwardPipelines::new(device, color_format, aux_format);
+    let pipelines = ForwardPipelines::new(device, color_format);
     let targets = RenderTargets::new(device, width, height);
 
     let compute_bg = create_compute_bind_group(device, &pipelines, &buffers, &material);
@@ -1082,6 +1201,7 @@ pub fn make_uniforms(
     tet_count: u32,
     step: u32,
     tile_size: u32,
+    min_t: f32,
 ) -> Uniforms {
     Uniforms {
         vp_col0: vp.col(0).into(),
@@ -1099,7 +1219,8 @@ pub fn make_uniforms(
         step,
         tile_size_u: tile_size,
         ray_mode: 0,
-        _pad1: [0; 6],
+        min_t,
+        _pad1: [0; 5],
     }
 }
 
@@ -1352,20 +1473,34 @@ pub fn find_containing_tet(
 pub struct RayTracePipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    aux_bind_group_layout: wgpu::BindGroupLayout,
     /// The output storage buffer: [W x H x 4] f32
     pub rendered_image: wgpu::Buffer,
+    /// Auxiliary output buffer: [W x H x AUX_STRIDE] f32
+    pub aux_image: wgpu::Buffer,
+    /// Default aux bind group (group 1) with dummy aux_data
+    aux_bind_group: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
+    pub aux_dim: u32,
+    pub aux_stride: u32,
 }
 
 impl RayTracePipeline {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32, aux_dim: u32) -> Self {
+        let aux_stride = 8 + aux_dim;
+
+        // String-substitute AUX_DIM and AUX_ACC_SIZE in shader source
+        let source = RAYTRACE_COMPUTE_WGSL
+            .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
+            .replace("/*AUX_ACC_SIZE*/1u", &format!("{}u", aux_dim.max(1)));
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("raytrace_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(RAYTRACE_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
-        // 13 bindings: 0-6 read, 7 rw, 8-12 read
+        // Group 0: 13 bindings (0-6 read, 7 rw, 8-12 read)
         let read_only = [true, true, true, true, true, true, true, false, true, true, true, true, true];
         let entries = storage_entries(13, wgpu::ShaderStages::COMPUTE, &read_only);
 
@@ -1375,9 +1510,17 @@ impl RayTracePipeline {
                 entries: &entries,
             });
 
+        // Group 1: aux_image (rw), aux_data (read)
+        let aux_entries = storage_entries(2, wgpu::ShaderStages::COMPUTE, &[false, true]);
+        let aux_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("raytrace_aux_bgl"),
+                entries: &aux_entries,
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("raytrace_pl"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &aux_bind_group_layout],
             immediate_size: 0,
         });
 
@@ -1399,7 +1542,37 @@ impl RayTracePipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout, rendered_image, width, height }
+        let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raytrace_aux_image"),
+            size: (width as u64) * (height as u64) * (aux_stride as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Dummy aux_data buffer (4 bytes minimum)
+        let aux_data_dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("raytrace_aux_data_dummy"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("raytrace_aux_bg_default"),
+            layout: &aux_bind_group_layout,
+            entries: &[
+                buf_entry(0, &aux_image),
+                buf_entry(1, &aux_data_dummy),
+            ],
+        });
+
+        Self {
+            pipeline, bind_group_layout, aux_bind_group_layout,
+            rendered_image, aux_image, aux_bind_group,
+            width, height, aux_dim, aux_stride,
+        }
     }
 
     pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
@@ -1514,6 +1687,7 @@ pub fn record_raytrace(
     });
     pass.set_pipeline(rt_pipeline.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
+    pass.set_bind_group(1, &rt_pipeline.aux_bind_group, &[]);
     pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
 }
 
@@ -1528,22 +1702,35 @@ pub fn record_raytrace(
 pub struct RasterizeComputePipeline {
     pipeline: wgpu::ComputePipeline,
     bind_group_layout: wgpu::BindGroupLayout,
+    aux_bind_group_layout: wgpu::BindGroupLayout,
     /// The output storage buffer: [W x H x 4] f32
     pub rendered_image: wgpu::Buffer,
+    /// Auxiliary output buffer: [W x H x AUX_STRIDE] f32
+    pub aux_image: wgpu::Buffer,
+    /// Default aux bind group (group 1) with dummy aux_data
+    aux_bind_group: wgpu::BindGroup,
     pub width: u32,
     pub height: u32,
+    pub aux_dim: u32,
+    pub aux_stride: u32,
 }
 
 impl RasterizeComputePipeline {
     /// Create the forward tiled pipeline and allocate the rendered_image buffer.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
+    pub fn new(device: &wgpu::Device, width: u32, height: u32, aux_dim: u32) -> Self {
+        let aux_stride = 8 + aux_dim;
+
+        // String-substitute AUX_DIM and SM_AUX_SIZE in shader source
+        let source = RASTERIZE_COMPUTE_WGSL
+            .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
+            .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", (256 * aux_dim).max(1)));
+
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rasterize_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(RASTERIZE_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
-        // 10 bindings: uniforms, vertices, indices, colors, densities, color_grads,
-        //              tile_sort_values, tile_ranges, tile_uniforms, rendered_image
+        // Group 0: 10 bindings
         let read_only = [true, true, true, true, true, true, true, true, true, false];
         let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
             .iter()
@@ -1557,9 +1744,21 @@ impl RasterizeComputePipeline {
                 entries: &entries,
             });
 
+        // Group 1: aux_image (rw), aux_data (read)
+        let aux_entries: Vec<wgpu::BindGroupLayoutEntry> = [false, true]
+            .iter()
+            .enumerate()
+            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
+            .collect();
+        let aux_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("rasterize_aux_bgl"),
+                entries: &aux_entries,
+            });
+
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rasterize_compute_pl"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, &aux_bind_group_layout],
             immediate_size: 0,
         });
 
@@ -1581,12 +1780,43 @@ impl RasterizeComputePipeline {
             mapped_at_creation: false,
         });
 
+        let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rasterize_aux_image"),
+            size: (width as u64) * (height as u64) * (aux_stride as u64) * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        // Dummy aux_data buffer (4 bytes minimum)
+        let aux_data_dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("rasterize_aux_data_dummy"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("rasterize_aux_bg_default"),
+            layout: &aux_bind_group_layout,
+            entries: &[
+                buf_entry(0, &aux_image),
+                buf_entry(1, &aux_data_dummy),
+            ],
+        });
+
         Self {
             pipeline,
             bind_group_layout,
+            aux_bind_group_layout,
             rendered_image,
+            aux_image,
+            aux_bind_group,
             width,
             height,
+            aux_dim,
+            aux_stride,
         }
     }
 
@@ -1653,6 +1883,7 @@ pub fn record_rasterize_compute(
     });
     pass.set_pipeline(rasterize.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
+    pass.set_bind_group(1, &rasterize.aux_bind_group, &[]);
     let (x, y) = dispatch_2d(num_tiles);
     pass.dispatch_workgroups(x, y, 1);
 }

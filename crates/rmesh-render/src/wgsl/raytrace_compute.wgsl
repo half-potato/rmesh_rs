@@ -2,10 +2,14 @@
 //
 // Per-ray algorithm:
 //   1. If camera is inside mesh (start_tet >= 0), begin at containing tet
-//   2. Otherwise, BVH traverse to find nearest boundary face → entry tet
+//   2. Otherwise, BVH traverse to find nearest boundary face -> entry tet
 //   3. Walk through mesh via tet_neighbors adjacency until exit or threshold
 //
-// No sorting required — O(depth_complexity) per ray.
+// No sorting required -- O(depth_complexity) per ray.
+
+const AUX_DIM: u32 = /*AUX_DIM*/0u;
+const AUX_STRIDE: u32 = 8u + AUX_DIM;
+const AUX_ACC_SIZE: u32 = /*AUX_ACC_SIZE*/1u;
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -23,7 +27,7 @@ struct Uniforms {
     step: u32,
     tile_size_u: u32,
     ray_mode: u32,
-    _pad1b: u32,
+    min_t: f32,
     _pad1c: u32,
     _pad2: vec4<u32>,
 };
@@ -49,7 +53,10 @@ struct BVHNode {
 @group(0) @binding(11) var<storage, read> ray_origins: array<f32>;  // [W*H*3] per-pixel origins
 @group(0) @binding(12) var<storage, read> ray_dirs: array<f32>;     // [W*H*3] per-pixel directions
 
-// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+@group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
+@group(1) @binding(1) var<storage, read> aux_data: array<f32>;
+
+// Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
 const FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(0u, 2u, 1u, 3u),
     vec4<u32>(1u, 2u, 3u, 0u),
@@ -71,13 +78,16 @@ fn load_f32x3_v(idx: u32) -> vec3<f32> {
 }
 
 // Ray-tet intersection with exit face tracking.
-// Returns (c_premul.xyz, od, t_exit, exit_face).
+// Returns (c_premul.xyz, od, t_exit, exit_face, entry_face, t_enter, entry_normal).
 // od < 0 means miss. exit_face = 4 means miss.
 struct RayTetResult {
     c_premul: vec3<f32>,
     od: f32,
     t_exit: f32,
     exit_face: u32,
+    entry_face: u32,
+    t_enter: f32,
+    entry_normal: vec3<f32>,
 };
 
 fn eval_tet_rt(
@@ -91,6 +101,9 @@ fn eval_tet_rt(
     result.od = -1.0;
     result.t_exit = t_near;
     result.exit_face = 4u;
+    result.entry_face = 4u;
+    result.t_enter = t_near;
+    result.entry_normal = vec3<f32>(0.0);
 
     let vi0 = indices[tet_id * 4u];
     let vi1 = indices[tet_id * 4u + 1u];
@@ -108,7 +121,11 @@ fn eval_tet_rt(
     var t_min_val: f32 = -3.402823e38;
     var t_max_val: f32 = 3.402823e38;
     var exit_face_idx = 4u;
+    var entry_face_idx = 4u;
     var valid = true;
+
+    // Store face normals (inward-pointing) for entry normal lookup
+    var face_normals: array<vec3<f32>, 4>;
 
     for (var fi = 0u; fi < 4u; fi++) {
         let f = FACES[fi];
@@ -121,6 +138,7 @@ fn eval_tet_rt(
         if (dot(n, v_opp - va) < 0.0) {
             n = -n;
         }
+        face_normals[fi] = n;
 
         let num = dot(n, va - cam);
         let den = dot(n, ray_dir);
@@ -134,7 +152,10 @@ fn eval_tet_rt(
 
         if (den > 0.0) {
             // Entering face
-            if (t > t_min_val) { t_min_val = t; }
+            if (t > t_min_val) {
+                t_min_val = t;
+                entry_face_idx = fi;
+            }
         } else {
             // Exiting face
             if (t < t_max_val) {
@@ -150,6 +171,13 @@ fn eval_tet_rt(
     if (!valid || t_min_val >= t_max_val) {
         return result;
     }
+
+    // Compute entry normal (outward-pointing = negated inward)
+    if (entry_face_idx < 4u) {
+        result.entry_normal = normalize(-face_normals[entry_face_idx]);
+    }
+    result.entry_face = entry_face_idx;
+    result.t_enter = t_min_val;
 
     // Volume integral (same as eval_tet in rasterize_compute.wgsl)
     let density_raw = densities[tet_id];
@@ -261,7 +289,7 @@ fn bvh_trace(cam: vec3<f32>, ray_dir: vec3<f32>, num_bvh_nodes: u32) -> BVHHit {
                 }
             }
         } else {
-            // Internal node — push children
+            // Internal node -- push children
             if (stack_ptr < BVH_STACK_SIZE - 1u) {
                 stack[stack_ptr] = u32(node.left_or_face);
                 stack_ptr += 1u;
@@ -313,6 +341,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         ray_dir = normalize(far_world - near_world);
         start_tet_id = start_tet_buf[0];
     }
+    // Apply min_t ray origin offset (matches Slang camera.min_t)
+    cam = cam + ray_dir * uniforms.min_t;
+
     var current_tet: i32;
     var t_cursor: f32;
 
@@ -321,15 +352,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         current_tet = start_tet_id;
         t_cursor = 0.0;
     } else {
-        // Camera outside mesh — BVH trace to find entry
+        // Camera outside mesh -- BVH trace to find entry
         let num_nodes = arrayLength(&bvh_nodes);
         let hit = bvh_trace(cam, ray_dir, num_nodes);
         if (hit.tet_id < 0) {
-            // No hit — write background (transparent black)
+            // No hit -- write background (transparent black)
             rendered_image[pixel_idx_flat * 4u] = 0.0;
             rendered_image[pixel_idx_flat * 4u + 1u] = 0.0;
             rendered_image[pixel_idx_flat * 4u + 2u] = 0.0;
             rendered_image[pixel_idx_flat * 4u + 3u] = 0.0;
+            // Write zeros to aux_image
+            let aux_base = pixel_idx_flat * AUX_STRIDE;
+            for (var ai = 0u; ai < AUX_STRIDE; ai++) {
+                aux_image[aux_base + ai] = 0.0;
+            }
             return;
         }
         current_tet = hit.tet_id;
@@ -338,6 +374,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Adjacency traversal loop
     var color_accum = vec3<f32>(0.0);
+    var normal_accum = vec3<f32>(0.0);
+    var depth_accum: f32 = 0.0;
+    var entropy = vec4<f32>(0.0);
+    var aux_accum: array<f32, AUX_ACC_SIZE>;
+    for (var ai = 0u; ai < AUX_DIM; ai++) {
+        aux_accum[ai] = 0.0;
+    }
     var log_t: f32 = 0.0;
     var iter = 0u;
 
@@ -347,11 +390,39 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (result.od > 0.0) {
             let T_j = exp(log_t);
             color_accum += result.c_premul * T_j;
+
+            let alpha = 1.0 - exp(-result.od);
+
+            // Entry face normal (outward = toward camera)
+            normal_accum += T_j * alpha * result.entry_normal;
+
+            // Depth integral (same phi-based weights as color)
+            let phi_val = phi(result.od);
+            let alpha_t = exp(-result.od);
+            let w0 = phi_val - alpha_t;
+            let w1 = 1.0 - phi_val;
+            let depth_premul = w0 * result.t_exit + w1 * result.t_enter;
+            depth_accum += T_j * depth_premul;
+
+            // Entropy
+            let wt = alpha * T_j;
+            let c_mid = (result.t_enter + result.t_exit) * 0.5;
+            entropy[0] += wt;
+            entropy[1] += select(0.0, wt * log(wt), wt > 1e-20);
+            entropy[2] += wt * c_mid;
+            let wc = wt * c_mid;
+            entropy[3] += select(0.0, wc * log(wc), wc > 1e-20);
+
+            // Variable aux (loop is no-op when AUX_DIM=0)
+            for (var ai = 0u; ai < AUX_DIM; ai++) {
+                aux_accum[ai] += T_j * alpha * aux_data[u32(current_tet) * AUX_DIM + ai];
+            }
+
             log_t -= result.od;
         }
 
         if (result.exit_face >= 4u) {
-            // Miss or degenerate — stop
+            // Miss or degenerate -- stop
             break;
         }
 
@@ -362,10 +433,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         iter += 1u;
     }
 
-    // Write output
+    // Write RGBA output
     let T_final = exp(log_t);
     rendered_image[pixel_idx_flat * 4u] = color_accum.x;
     rendered_image[pixel_idx_flat * 4u + 1u] = color_accum.y;
     rendered_image[pixel_idx_flat * 4u + 2u] = color_accum.z;
     rendered_image[pixel_idx_flat * 4u + 3u] = 1.0 - T_final;
+
+    // Write aux output: [normal.xyz, depth, entropy.4, aux_data...]
+    let aux_base = pixel_idx_flat * AUX_STRIDE;
+    aux_image[aux_base + 0u] = normal_accum.x;
+    aux_image[aux_base + 1u] = normal_accum.y;
+    aux_image[aux_base + 2u] = normal_accum.z;
+    aux_image[aux_base + 3u] = depth_accum;
+    aux_image[aux_base + 4u] = entropy[0];
+    aux_image[aux_base + 5u] = entropy[1];
+    aux_image[aux_base + 6u] = entropy[2];
+    aux_image[aux_base + 7u] = entropy[3];
+    for (var ai = 0u; ai < AUX_DIM; ai++) {
+        aux_image[aux_base + 8u + ai] = aux_accum[ai];
+    }
 }

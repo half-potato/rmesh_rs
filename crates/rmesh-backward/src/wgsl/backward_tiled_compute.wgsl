@@ -23,7 +23,7 @@ struct Uniforms {
     step: u32,
     tile_size_u: u32,
     ray_mode: u32,
-    _pad1b: u32,
+    min_t: f32,
     _pad1c: u32,
     _pad2: vec4<u32>,
 };

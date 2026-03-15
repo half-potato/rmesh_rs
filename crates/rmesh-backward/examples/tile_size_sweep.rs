@@ -38,17 +38,24 @@ const BWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-backward/src/wgs
 /// at runtime, so only compile-time shared memory array sizes need patching.
 /// For tile_size ≤ 16 the default arrays (256 pixels, 16 rows, 17 prefix) suffice.
 fn patch_tiled_shader(src: &str, ts: u32) -> String {
+    // Always substitute AUX constants (aux_dim=0 for benchmarks)
+    let mut s = src
+        .replace("/*AUX_DIM*/0u", "0u")
+        .replace("/*SM_AUX_SIZE*/1u", "1u")
+        .replace("/*AUX_ACC_SIZE*/1u", "1u");
     if ts <= 16 {
-        return src.to_string();
+        return s;
     }
     let ts_sq = ts * ts;
-    src.replace(
-        "array<vec4<f32>, 256>",
-        &format!("array<vec4<f32>, {ts_sq}>"),
-    )
-    .replace("array<f32, 256>", &format!("array<f32, {ts_sq}>"))
-    .replace("array<i32, 16>", &format!("array<i32, {ts}>"))
-    .replace("array<u32, 17>", &format!("array<u32, {}>", ts + 1))
+    s = s
+        .replace(
+            "array<vec4<f32>, 256>",
+            &format!("array<vec4<f32>, {ts_sq}>"),
+        )
+        .replace("array<f32, 256>", &format!("array<f32, {ts_sq}>"))
+        .replace("array<i32, 16>", &format!("array<i32, {ts}>"))
+        .replace("array<u32, 17>", &format!("array<u32, {}>", ts + 1));
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -110,8 +117,8 @@ fn fwd_compute_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pi
     (bgl, pl)
 }
 
-/// Build the forward tiled pipeline layout (10 bindings, 1 group).
-fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+/// Build the forward tiled pipeline layout (10 bindings group 0, 2 bindings group 1 for aux).
+fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::PipelineLayout) {
     let read_only = [true, true, true, true, true, true, true, true, true, false];
     let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
         .iter()
@@ -122,12 +129,20 @@ fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pipe
         label: Some("rasterize_bgl"),
         entries: &entries,
     });
+    // Group 1: aux_image (rw) + aux_data (read)
+    let aux_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("rasterize_aux_bgl"),
+        entries: &[
+            rmesh_tile::storage_entry(0, false),
+            rmesh_tile::storage_entry(1, true),
+        ],
+    });
     let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("rasterize_pl"),
-        bind_group_layouts: &[&bgl],
+        bind_group_layouts: &[&bgl, &aux_bgl],
         immediate_size: 0,
     });
-    (bgl, pl)
+    (bgl, aux_bgl, pl)
 }
 
 /// Build the backward tiled pipeline layout (2 groups: 9 + 6 bindings).
@@ -180,6 +195,7 @@ struct TileSizeState {
     tile_ranges_bg_b: wgpu::BindGroup,
     rasterize_bg_a: wgpu::BindGroup,
     rasterize_bg_b: wgpu::BindGroup,
+    rasterize_aux_bg: wgpu::BindGroup,
     bwd_bg0_a: wgpu::BindGroup,
     bwd_bg0_b: wgpu::BindGroup,
     bwd_bg1: wgpu::BindGroup,
@@ -235,7 +251,7 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -316,7 +332,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
 
     // Create pipeline layouts
     let (fwd_compute_bgl, fwd_compute_pl) = fwd_compute_layout(device);
-    let (rasterize_bgl, rasterize_pl) = rasterize_layout(device);
+    let (rasterize_bgl, rasterize_aux_bgl, rasterize_pl) = rasterize_layout(device);
     let (bwd_bgl0, bwd_bgl1, bwd_pl) = bwd_tiled_layout(device);
 
     // Create pipelines from patched sources
@@ -443,6 +459,28 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         mapped_at_creation: false,
     });
 
+    // Aux image buffer (8 f32/pixel for aux_dim=0)
+    let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aux_image"),
+        size: n_pixels * 8 * 4, // AUX_STRIDE=8 when AUX_DIM=0
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let aux_data_dummy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("aux_data_dummy"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let rasterize_aux_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("rasterize_aux_bg"),
+        layout: &rasterize_aux_bgl,
+        entries: &[
+            buf_entry(0, &aux_image),
+            buf_entry(1, &aux_data_dummy),
+        ],
+    });
+
     // Forward tiled bind groups (A and B)
     let rasterize_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rasterize_bg_a"),
@@ -543,6 +581,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         tile_ranges_bg_b,
         rasterize_bg_a,
         rasterize_bg_b,
+        rasterize_aux_bg,
         bwd_bg0_a,
         bwd_bg0_b,
         bwd_bg1,
@@ -695,6 +734,7 @@ fn record_forward_backward(
         });
         pass.set_pipeline(&ts.rasterize_pipeline);
         pass.set_bind_group(0, fwd_bg, &[]);
+        pass.set_bind_group(1, &ts.rasterize_aux_bg, &[]);
         let (x, y) = rmesh_tile::dispatch_2d(ts.tile_buffers.num_tiles);
         pass.dispatch_workgroups(x, y, 1);
     }
@@ -799,7 +839,7 @@ fn main() {
         // Update uniforms buffer with the correct tile_size for this run
         let (vp, inv_vp, eye) = setup_camera();
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size,
+            vp, inv_vp, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0,
         );
         shared.queue.write_buffer(
             &shared.scene_buffers.uniforms,

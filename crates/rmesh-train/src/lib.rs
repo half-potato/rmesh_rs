@@ -410,11 +410,10 @@ pub fn train(
     config: &TrainConfig,
 ) -> Result<()> {
     let color_format = wgpu::TextureFormat::Rgba16Float;
-    let aux_format = wgpu::TextureFormat::Rgba32Float;
     let tile_size = 12u32;
 
     // Create pipelines
-    let fwd_pipelines = ForwardPipelines::new(device, color_format, aux_format);
+    let fwd_pipelines = ForwardPipelines::new(device, color_format);
     let bwd_tiled_pipelines = BackwardTiledPipelines::new(device);
     let loss_pipeline = LossPipeline::new(device);
     let adam_pipeline = AdamPipeline::new(device);
@@ -434,7 +433,7 @@ pub fn train(
     let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers, &material);
 
     // Tiled forward pipeline
-    let rasterize = RasterizeComputePipeline::new(device, config.render_width, config.render_height);
+    let rasterize = RasterizeComputePipeline::new(device, config.render_width, config.render_height, 0);
 
     // Tile infrastructure
     let tile_pipelines = TilePipelines::new(device);
@@ -583,7 +582,8 @@ pub fn train(
                 step,
                 tile_size_u: tile_size,
                 ray_mode: 0,
-                _pad1: [0; 6],
+                min_t: 0.0,
+                _pad1: [0; 5],
             };
 
             // Upload uniforms

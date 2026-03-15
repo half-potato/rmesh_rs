@@ -19,7 +19,7 @@ struct Uniforms {
     step: u32,
     tile_size_u: u32,
     ray_mode: u32,
-    _pad1b: u32,
+    min_t: f32,
     _pad1c: u32,
     _pad2: vec4<u32>,
 };
@@ -32,6 +32,10 @@ struct VertexOutput {
     @location(3) plane_denominators: vec4<f32>,
     @location(4) ray_dir: vec3<f32>,
     @location(5) dc_dt: f32,
+    @location(6) @interpolate(flat) face_n0: vec3<f32>,
+    @location(7) @interpolate(flat) face_n1: vec3<f32>,
+    @location(8) @interpolate(flat) face_n2: vec3<f32>,
+    @location(9) @interpolate(flat) face_n3: vec3<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
@@ -42,7 +46,7 @@ struct VertexOutput {
 @group(0) @binding(5) var<storage, read> color_grads: array<f32>;
 @group(0) @binding(6) var<storage, read> sorted_indices: array<u32>;
 
-// Face (a, b, c, opposite_vertex) — opposite used to flip normal inward
+// Face (a, b, c, opposite_vertex) -- opposite used to flip normal inward
 const TET_FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(0u, 2u, 1u, 3u),
     vec4<u32>(1u, 2u, 3u, 0u),
@@ -50,7 +54,7 @@ const TET_FACES: array<vec4<u32>, 4> = array<vec4<u32>, 4>(
     vec4<u32>(3u, 0u, 1u, 2u),
 );
 
-// 12 entries: face index for each of the 12 vertices (4 faces × 3 verts)
+// 12 entries: face index for each of the 12 vertices (4 faces x 3 verts)
 const FACE_VERTEX_MAP: array<vec2<u32>, 12> = array<vec2<u32>, 12>(
     vec2<u32>(0u, 0u), vec2<u32>(0u, 1u), vec2<u32>(0u, 2u), // face 0
     vec2<u32>(1u, 0u), vec2<u32>(1u, 1u), vec2<u32>(1u, 2u), // face 1
@@ -100,13 +104,13 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
     // (world_pos - cam) gives exact (p - cam) at each fragment, so the fragment
     // shader's division by d = length(ray_dir) yields the true normalized direction.
     // Normalizing here would introduce interpolation error (weighted sum of unit
-    // vectors ≠ unit vector in the correct direction).
+    // vectors != unit vector in the correct direction).
     let ray_dir = world_pos - cam;
 
     // Density
     out.tet_density = densities[tet_id];
 
-    // Color gradient → dc/dt along ray
+    // Color gradient -> dc/dt along ray
     let grad = load_grad(tet_id);
     out.dc_dt = dot(grad, ray_dir);
 
@@ -116,8 +120,10 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
     out.base_color = color + vec3<f32>(offset);
 
     // Ray-plane intersection parameters for all 4 faces
+    // Also store inward-pointing face normals for fragment shader
     var numerators = vec4<f32>(0.0);
     var denominators = vec4<f32>(0.0);
+    var face_normals: array<vec3<f32>, 4>;
 
     for (var i = 0u; i < 4u; i++) {
         let f = TET_FACES[i];
@@ -130,6 +136,7 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
         if (dot(n, v_opp - va) < 0.0) {
             n = -n;
         }
+        face_normals[i] = n;
 
         numerators[i] = dot(n, va - cam);
         denominators[i] = dot(n, ray_dir);
@@ -138,6 +145,10 @@ fn main(@builtin(instance_index) instance_idx: u32, @builtin(vertex_index) vert_
     out.plane_numerators = numerators;
     out.plane_denominators = denominators;
     out.ray_dir = ray_dir;
+    out.face_n0 = face_normals[0];
+    out.face_n1 = face_normals[1];
+    out.face_n2 = face_normals[2];
+    out.face_n3 = face_normals[3];
 
     // Project to clip space
     let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);

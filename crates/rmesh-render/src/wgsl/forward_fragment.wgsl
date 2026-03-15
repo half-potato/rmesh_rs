@@ -6,6 +6,8 @@
 // MRT outputs:
 //   location(0): premultiplied color (RGBA)
 //   location(1): auxiliary float4 (t_enter, t_exit, optical_depth, dist)
+//   location(2): normals (premultiplied alpha)
+//   location(3): depth (premultiplied alpha)
 
 struct FragmentInput {
     @location(0) @interpolate(flat) tet_density: f32,
@@ -14,15 +16,21 @@ struct FragmentInput {
     @location(3) plane_denominators: vec4<f32>,
     @location(4) ray_dir: vec3<f32>,
     @location(5) dc_dt: f32,
+    @location(6) @interpolate(flat) face_n0: vec3<f32>,
+    @location(7) @interpolate(flat) face_n1: vec3<f32>,
+    @location(8) @interpolate(flat) face_n2: vec3<f32>,
+    @location(9) @interpolate(flat) face_n3: vec3<f32>,
 };
 
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
     @location(1) aux0: vec4<f32>,
+    @location(2) normals: vec4<f32>,
+    @location(3) depth: vec4<f32>,
 };
 
-// φ(x) = (1 - exp(-x)) / x
-// Numerically stable: if |x| < 1e-6, use Taylor expansion φ ≈ 1 - x/2
+// phi(x) = (1 - exp(-x)) / x
+// Numerically stable: if |x| < 1e-6, use Taylor expansion phi ~ 1 - x/2
 fn phi(x: f32) -> f32 {
     if (abs(x) < 1e-6) {
         return 1.0 - x * 0.5;
@@ -53,7 +61,7 @@ fn main(in: FragmentInput) -> FragmentOutput {
     let neg_inf = vec4<f32>(-3.402823e38);
     let pos_inf = vec4<f32>(3.402823e38);
 
-    // Classify planes: denom > 0 → entering, denom < 0 → exiting
+    // Classify planes: denom > 0 -> entering, denom < 0 -> exiting
     let t_enter = vec4<f32>(
         select(neg_inf.x, all_t.x, plane_denom.x > 0.0),
         select(neg_inf.y, all_t.y, plane_denom.y > 0.0),
@@ -76,9 +84,41 @@ fn main(in: FragmentInput) -> FragmentOutput {
     let c_start = max(base_color + vec3<f32>(dc_dt * t_min), vec3<f32>(0.0));
     let c_end = max(base_color + vec3<f32>(dc_dt * t_max), vec3<f32>(0.0));
 
-    // Note: (c_end, c_start) — exit color first, matching webrm convention
+    // Note: (c_end, c_start) -- exit color first, matching webrm convention
     out.color = compute_integral(c_end, c_start, od);
     out.aux0 = vec4<f32>(t_min, t_max, od, dist);
+
+    // Determine entry face (which t_enter component is max)
+    var entry_face = 0u;
+    var max_t_enter = t_enter.x;
+    if (t_enter.y > max_t_enter) { max_t_enter = t_enter.y; entry_face = 1u; }
+    if (t_enter.z > max_t_enter) { max_t_enter = t_enter.z; entry_face = 2u; }
+    if (t_enter.w > max_t_enter) { max_t_enter = t_enter.w; entry_face = 3u; }
+
+    // Entry normal (outward = negated inward face normal)
+    var entry_normal_raw: vec3<f32>;
+    switch entry_face {
+        case 0u: { entry_normal_raw = in.face_n0; }
+        case 1u: { entry_normal_raw = in.face_n1; }
+        case 2u: { entry_normal_raw = in.face_n2; }
+        default: { entry_normal_raw = in.face_n3; }
+    }
+    let entry_normal = normalize(-entry_normal_raw);
+
+    // Alpha and depth from volume integral
+    let alpha_t = exp(-od);
+    let alpha = 1.0 - alpha_t;
+    let phi_val = phi(od);
+    let w0 = phi_val - alpha_t;
+    let w1 = 1.0 - phi_val;
+    let depth_premul = w0 * t_max + w1 * t_min;
+
+    // MRT target 2: normals (premultiplied alpha blend)
+    out.normals = vec4<f32>(alpha * entry_normal, alpha);
+
+    // MRT target 3: depth (premultiplied alpha blend)
+    // depth_premul is already weighted by (w0+w1)=alpha, so it's premultiplied
+    out.depth = vec4<f32>(depth_premul, 0.0, 0.0, alpha);
 
     return out;
 }

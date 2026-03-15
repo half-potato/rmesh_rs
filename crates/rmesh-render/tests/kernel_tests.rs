@@ -59,7 +59,6 @@ fn test_project_compute_kernel() {
     let pipelines = rmesh_render::ForwardPipelines::new(
         &device,
         wgpu::TextureFormat::Rgba16Float,
-        wgpu::TextureFormat::Rgba32Float,
     );
     let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 
@@ -70,7 +69,7 @@ fn test_project_compute_kernel() {
     let (vp, inv_vp) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0, 12);
+        rmesh_render::make_uniforms(vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args
@@ -127,7 +126,7 @@ fn test_rasterize_pipeline_creation() {
     };
 
     // This will panic if the shader fails to compile (e.g., subgroups not supported)
-    let pipeline = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let pipeline = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
 
     // Verify the output buffer was created with correct size
     assert_eq!(pipeline.width, W);

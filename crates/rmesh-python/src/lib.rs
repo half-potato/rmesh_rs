@@ -188,6 +188,7 @@ struct RMeshRenderer {
     step: u32,
     tile_size: u32,
     param_counts: [u32; 3],
+    min_t: f32,
 }
 
 #[pymethods]
@@ -268,10 +269,9 @@ impl RMeshRenderer {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Device error: {e}")))?;
 
         let color_format = wgpu::TextureFormat::Rgba16Float;
-        let aux_format = wgpu::TextureFormat::Rgba32Float;
 
         // Create pipelines
-        let fwd_pipelines = ForwardPipelines::new(&device, color_format, aux_format);
+        let fwd_pipelines = ForwardPipelines::new(&device, color_format);
         let bwd_tiled_pipelines = BackwardTiledPipelines::new(&device);
         let loss_pipeline = LossPipeline::new(&device);
         let adam_pipeline = AdamPipeline::new(&device);
@@ -372,7 +372,7 @@ impl RMeshRenderer {
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
 
         // Forward tiled compute pipeline (4x4 tiles with subgroups)
-        let rasterize = RasterizeComputePipeline::new(&device, width, height);
+        let rasterize = RasterizeComputePipeline::new(&device, width, height, 0);
 
         // A-buffer bind groups (sort result in primary tile_sort_keys/values)
         // Use num_keys_buf as tile_pair_count since scan pipeline writes total_pairs there
@@ -550,7 +550,7 @@ impl RMeshRenderer {
         // Ray trace setup
         let neighbors = compute_tet_neighbors(&scene.indices, tet_count as usize);
         let bvh = build_boundary_bvh(&scene.vertices, &scene.indices, &neighbors, tet_count as usize);
-        let rt_pipeline = RayTracePipeline::new(&device, width, height);
+        let rt_pipeline = RayTracePipeline::new(&device, width, height, 0);
         let rt_buffers = RayTraceBuffers::new(&device, &neighbors, &bvh);
         let rt_bind_group = create_raytrace_bind_group(&device, &rt_pipeline, &scene_buffers, &material_buffers, &rt_buffers);
 
@@ -642,7 +642,13 @@ impl RMeshRenderer {
             step: 0,
             tile_size: 12,
             param_counts,
+            min_t: 0.0,
         })
+    }
+
+    /// Set the minimum ray-origin offset along view direction (matches Slang camera.min_t).
+    fn set_min_t(&mut self, min_t: f32) {
+        self.min_t = min_t;
     }
 
     /// Run the forward rendering pipeline.
@@ -678,6 +684,7 @@ impl RMeshRenderer {
             self.tet_count,
             self.step,
             self.tile_size,
+            self.min_t,
         );
 
         // Upload uniforms
@@ -728,16 +735,19 @@ impl RMeshRenderer {
     ///     cam_pos: [3] f32 camera position
     ///     vp: [16] f32 column-major view-projection matrix
     ///     inv_vp: [16] f32 column-major inverse view-projection matrix
+    ///     render_aux: if True, also return aux [H,W,8] (normals, depth, entropy)
     ///
     /// Returns:
-    ///     numpy array [H, W, 4] f32 (RGBA)
+    ///     numpy array [H, W, 4] f32 (RGBA), or tuple (rgba, aux) if render_aux=True
+    #[pyo3(signature = (cam_pos, vp, inv_vp, render_aux=false))]
     fn forward_tiled<'py>(
         &mut self,
         py: Python<'py>,
         cam_pos: PyReadonlyArray1<f32>,
         vp: PyReadonlyArray1<f32>,
         inv_vp: PyReadonlyArray1<f32>,
-    ) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        render_aux: bool,
+    ) -> PyResult<Py<PyAny>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
         let inv_vp_slice = inv_vp.as_slice()?;
@@ -755,6 +765,7 @@ impl RMeshRenderer {
             self.tet_count,
             self.step,
             self.tile_size,
+            self.min_t,
         );
 
         // Upload uniforms
@@ -789,9 +800,12 @@ impl RMeshRenderer {
                     label: Some("rasterize_compute"),
                 });
 
-            // Clear tile buffers + forward output
+            // Clear tile buffers + forward output + aux
             encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
             encoder.clear_buffer(&self.rasterize.rendered_image, 0, None);
+            if render_aux {
+                encoder.clear_buffer(&self.rasterize.aux_image, 0, None);
+            }
 
             // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids, no sort)
             record_project_compute(
@@ -862,13 +876,28 @@ impl RMeshRenderer {
         // Read back rendered image
         let data = read_buffer_f32(&self.device, &self.queue, &self.rasterize.rendered_image);
 
-        let array = Array3::from_shape_vec(
+        let rgba = Array3::from_shape_vec(
             (self.height as usize, self.width as usize, 4),
             data,
         )
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
-        Ok(array.into_pyarray(py))
+        if render_aux {
+            let aux_stride = self.rasterize.aux_stride as usize;
+            let aux_data = read_buffer_f32(&self.device, &self.queue, &self.rasterize.aux_image);
+            let aux = Array3::from_shape_vec(
+                (self.height as usize, self.width as usize, aux_stride),
+                aux_data,
+            )
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+            let tuple = pyo3::types::PyTuple::new(py, &[
+                rgba.into_pyarray(py).into_any(),
+                aux.into_pyarray(py).into_any(),
+            ])?;
+            Ok(tuple.into())
+        } else {
+            Ok(rgba.into_pyarray(py).into_any().unbind())
+        }
     }
 
     /// Run the ray tracing forward pipeline (adjacency traversal, no sorting).
@@ -880,10 +909,11 @@ impl RMeshRenderer {
     ///     ray_origins: optional [N*3] f32 per-pixel ray origins (multi-origin support)
     ///     ray_dirs: optional [N*3] f32 per-pixel ray directions
     ///     start_tets: optional [N] i32 per-pixel start tet IDs
+    ///     render_aux: if True, also return aux [H,W,8] (normals, depth, entropy)
     ///
     /// Returns:
-    ///     numpy array [H, W, 4] f32 (RGBA)
-    #[pyo3(signature = (cam_pos, vp, inv_vp, ray_origins=None, ray_dirs=None, start_tets=None))]
+    ///     numpy array [H, W, 4] f32 (RGBA), or tuple (rgba, aux) if render_aux=True
+    #[pyo3(signature = (cam_pos, vp, inv_vp, ray_origins=None, ray_dirs=None, start_tets=None, render_aux=false))]
     fn forward_raytrace<'py>(
         &mut self,
         py: Python<'py>,
@@ -893,7 +923,8 @@ impl RMeshRenderer {
         ray_origins: Option<PyReadonlyArray1<f32>>,
         ray_dirs: Option<PyReadonlyArray1<f32>>,
         start_tets: Option<PyReadonlyArray1<i32>>,
-    ) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        render_aux: bool,
+    ) -> PyResult<Py<PyAny>> {
         let cam_pos_slice = cam_pos.as_slice()?;
         let vp_slice = vp.as_slice()?;
         let inv_vp_slice = inv_vp.as_slice()?;
@@ -911,6 +942,7 @@ impl RMeshRenderer {
             self.tet_count,
             self.step,
             self.tile_size,
+            self.min_t,
         );
 
         let has_custom_rays = ray_origins.is_some() && ray_dirs.is_some();
@@ -1029,6 +1061,9 @@ impl RMeshRenderer {
                 });
 
             encoder.clear_buffer(&self.rt_pipeline.rendered_image, 0, None);
+            if render_aux {
+                encoder.clear_buffer(&self.rt_pipeline.aux_image, 0, None);
+            }
 
             // Forward compute (SH eval → colors_buf)
             record_project_compute(
@@ -1055,13 +1090,28 @@ impl RMeshRenderer {
         // Read back rendered image
         let data = read_buffer_f32(&self.device, &self.queue, &self.rt_pipeline.rendered_image);
 
-        let array = Array3::from_shape_vec(
+        let rgba = Array3::from_shape_vec(
             (self.height as usize, self.width as usize, 4),
             data,
         )
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
-        Ok(array.into_pyarray(py))
+        if render_aux {
+            let aux_stride = self.rt_pipeline.aux_stride as usize;
+            let aux_data = read_buffer_f32(&self.device, &self.queue, &self.rt_pipeline.aux_image);
+            let aux = Array3::from_shape_vec(
+                (self.height as usize, self.width as usize, aux_stride),
+                aux_data,
+            )
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+            let tuple = pyo3::types::PyTuple::new(py, &[
+                rgba.into_pyarray(py).into_any(),
+                aux.into_pyarray(py).into_any(),
+            ])?;
+            Ok(tuple.into())
+        } else {
+            Ok(rgba.into_pyarray(py).into_any().unbind())
+        }
     }
 
     /// Locate the containing tet for each query point via GPU adjacency walking.
@@ -1576,6 +1626,7 @@ impl RMeshRenderer {
             self.tet_count,
             self.step,
             self.tile_size,
+            self.min_t,
         );
 
         // Upload uniforms + ground truth

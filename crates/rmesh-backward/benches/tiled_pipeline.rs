@@ -110,6 +110,7 @@ fn create_bench_state() -> Option<BenchState> {
         scene.tet_count,
         0u32,
         TILE_SIZE,
+        0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -196,7 +197,7 @@ fn create_bench_state() -> Option<BenchState> {
     );
 
     // Forward tiled
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
     let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device,
         &rasterize,

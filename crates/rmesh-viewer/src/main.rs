@@ -188,9 +188,8 @@ impl App {
         surface.configure(&device, &surface_config);
 
         let color_format = wgpu::TextureFormat::Rgba16Float;
-        let aux_format = wgpu::TextureFormat::Rgba32Float;
 
-        let pipelines = ForwardPipelines::new(&device, color_format, aux_format);
+        let pipelines = ForwardPipelines::new(&device, color_format);
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
         let default_base_colors = vec![0.5f32; self.scene_data.tet_count as usize * 3];
         let material = MaterialBuffers::upload(
@@ -270,7 +269,8 @@ impl App {
             step: 0,
             tile_size_u: 12,
             ray_mode: 0,
-            _pad1: [0; 6],
+            min_t: 0.0,
+            _pad1: [0; 5],
         };
 
         gpu.queue

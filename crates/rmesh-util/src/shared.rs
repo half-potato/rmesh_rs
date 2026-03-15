@@ -36,8 +36,10 @@ pub struct Uniforms {
     pub tile_size_u: u32,
     /// Ray mode: 0 = derive from inv_vp (legacy), 1 = read from ray buffers.
     pub ray_mode: u32,
+    /// Minimum ray-origin offset along view direction (matches Slang camera.min_t).
+    pub min_t: f32,
     /// Padding to maintain 192-byte struct size.
-    pub _pad1: [u32; 6],
+    pub _pad1: [u32; 5],
 }
 
 impl Uniforms {

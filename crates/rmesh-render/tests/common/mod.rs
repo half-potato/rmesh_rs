@@ -403,6 +403,7 @@ async fn gpu_render_scene_async(
         scene.tet_count,
         0,
         16,
+        0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -548,11 +549,10 @@ async fn gpu_raytrace_scene_async(
 
     // Upload scene
     let color_format = wgpu::TextureFormat::Rgba16Float;
-    let aux_format = wgpu::TextureFormat::Rgba32Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
-    let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format, aux_format);
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format);
     let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
 
     // Build ray trace data
@@ -560,7 +560,7 @@ async fn gpu_raytrace_scene_async(
     let bvh = rmesh_render::build_boundary_bvh(
         &scene.vertices, &scene.indices, &neighbors, scene.tet_count as usize,
     );
-    let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, w, h);
+    let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, w, h, 0);
     let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &neighbors, &bvh);
 
     // Determine start tet
@@ -573,7 +573,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -687,7 +687,7 @@ async fn gpu_tiled_render_scene_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -745,7 +745,7 @@ async fn gpu_tiled_render_scene_async(
     );
 
     // Forward tiled pipeline
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h);
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h, 0);
     let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,

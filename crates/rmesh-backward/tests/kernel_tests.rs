@@ -571,7 +571,7 @@ fn test_tiled_forward_e2e() {
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -632,7 +632,7 @@ fn test_tiled_forward_e2e() {
     );
 
     // Create forward tiled pipeline (SUBGROUP)
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
     let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
@@ -761,7 +761,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -812,7 +812,7 @@ fn test_multi_tet_gradient_finite_diff() {
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
         );
 
-        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
         let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
             &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
@@ -875,7 +875,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12,
+            vp, inv_vp, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -926,7 +926,7 @@ fn test_multi_tet_gradient_finite_diff() {
             &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
         );
 
-        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+        let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
         let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
             &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
@@ -1200,7 +1200,7 @@ fn test_single_tet_loss_decreases() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1248,7 +1248,7 @@ fn test_single_tet_loss_decreases() {
     );
 
     // Forward tiled
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
     let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
@@ -1629,7 +1629,7 @@ fn test_camera_gpu_visibility() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1687,7 +1687,7 @@ fn test_camera_tiled_forward_deterministic() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12,
+        vp, inv_vp, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1747,7 +1747,7 @@ fn test_camera_tiled_forward_deterministic() {
     );
 
     // Forward tiled pipeline
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H);
+    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
     let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
