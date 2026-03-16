@@ -81,22 +81,34 @@ fn render_tet_pixel(
     let plane_denom: [f32; 4] = std::array::from_fn(|i| denominators[i] / d);
     let dc_dt = color_grad.dot(raw_ray_dir) / d;
 
-    // Compute t values
-    let all_t: [f32; 4] = std::array::from_fn(|i| numerators[i] / plane_denom[i]);
-
-    // Classify entering/exiting
+    // Classify entering/exiting (matching rasterize_compute.wgsl logic)
     let mut t_min = f32::NEG_INFINITY;
     let mut t_max = f32::INFINITY;
+    let mut valid = true;
 
     for i in 0..4 {
-        if plane_denom[i] > 0.0 {
-            // Entering
-            t_min = t_min.max(all_t[i]);
-        } else if plane_denom[i] < 0.0 {
-            // Exiting
-            t_max = t_max.min(all_t[i]);
+        let den = plane_denom[i];
+        let num = numerators[i];
+        // Match GPU: abs(den) < 1e-20 → parallel face
+        if den.abs() < 1e-20 {
+            // Ray parallel to face; if ray is outside this face, no intersection
+            if num > 0.0 {
+                valid = false;
+            }
+            continue;
         }
-        // denom == 0 → parallel, skip
+        let t = num / den;
+        if den > 0.0 {
+            // Entering
+            t_min = t_min.max(t);
+        } else {
+            // Exiting
+            t_max = t_max.min(t);
+        }
+    }
+
+    if !valid {
+        return [0.0; 4];
     }
 
     let dist = (t_max - t_min).max(0.0);

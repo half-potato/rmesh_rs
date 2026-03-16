@@ -20,10 +20,22 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
     return out;
 }
 
+// Linear → sRGB transfer function (exact per sRGB spec)
+fn linear_to_srgb(c: f32) -> f32 {
+    if (c <= 0.0031308) {
+        return c * 12.92;
+    }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let color = textureSample(src_tex, src_sampler, in.uv);
-    // Premultiplied alpha on black background — RGB is already correct.
-    // Set alpha=1 for the swapchain (opaque window).
-    return vec4<f32>(color.rgb, 1.0);
+    // Apply linear → sRGB gamma and set alpha=1 for opaque swapchain.
+    return vec4<f32>(
+        linear_to_srgb(color.r),
+        linear_to_srgb(color.g),
+        linear_to_srgb(color.b),
+        1.0,
+    );
 }

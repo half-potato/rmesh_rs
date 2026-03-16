@@ -123,7 +123,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
 
     let cam = uniforms.cam_pos_pad.xyz;
     let diff = vec3<f32>(cx, cy, cz) - cam;
-    let depth = dot(diff, diff) - r2;
+    let depth_raw = dot(diff, diff) - r2;
+    // Clamp to valid range — NaN/inf from degenerate circumspheres would corrupt sort
+    let depth = clamp(depth_raw, -1e20, 1e20);
     let depth_bits = bitcast<u32>(depth);
     sort_keys[tet_id] = ~depth_bits; // Invert for back-to-front sort
     sort_values[tet_id] = tet_id;

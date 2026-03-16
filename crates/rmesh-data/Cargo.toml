@@ -11,3 +11,4 @@ log = { workspace = true }
 half = { workspace = true }
 image = { workspace = true }
 flate2 = { workspace = true }
+rayon = { workspace = true }
