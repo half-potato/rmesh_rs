@@ -126,11 +126,12 @@ fn create_bench_state() -> Option<BenchState> {
 
     // Tiled pipeline
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
     let tile_buffers =
         rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, TILE_SIZE);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
     let radix_state =
-        rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+        rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -198,9 +199,9 @@ fn create_bench_state() -> Option<BenchState> {
         &radix_state.num_keys_buf,
     );
 
-    // HW raster sort infrastructure (sized for tet_count, not tile pairs)
+    // HW raster sort infrastructure (sized for tet_count, not tile pairs — 32-bit keys)
     let hw_n_pow2 = scene.tet_count.next_power_of_two();
-    let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32);
+    let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32, 1);
     hw_sort_state.upload_configs(&queue);
     let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
         &device, &fwd_pipelines, &buffers, &material, &hw_sort_state.values_b,

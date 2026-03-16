@@ -13,7 +13,7 @@ use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
     create_backward_tiled_bind_groups, BackwardTiledPipelines,
     GradientBuffers, MaterialGradBuffers, TileUniforms,
-    RadixSortPipelines, RadixSortState,
+    RadixSortPipelines, RadixSortState, sorting_bits_for_tiles,
     TileBuffers, TilePipelines,
     ScanPipelines, ScanBuffers,
     create_tile_fill_bind_group, create_tile_ranges_bind_group_with_keys,
@@ -438,8 +438,9 @@ pub fn train(
     // Tile infrastructure
     let tile_pipelines = TilePipelines::new(device);
     let tile_buffers = TileBuffers::new(device, scene.tet_count, config.render_width, config.render_height, tile_size);
-    let radix_pipelines = RadixSortPipelines::new(device);
-    let radix_state = RadixSortState::new(device, tile_buffers.max_pairs_pow2, 32);
+    let sorting_bits = sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_pipelines = RadixSortPipelines::new(device, 2);
+    let radix_state = RadixSortState::new(device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(queue);
 
     let tile_fill_bg = create_tile_fill_bind_group(device, &tile_pipelines, &tile_buffers);

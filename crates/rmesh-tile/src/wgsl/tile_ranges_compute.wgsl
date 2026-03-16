@@ -1,4 +1,5 @@
 // Find per-tile [start, end) ranges in the sorted tile-tet pair array.
+// Keys are 64-bit: tile_sort_keys[idx*2] = depth, tile_sort_keys[idx*2+1] = tile_id.
 // Dispatched for tile_pair_count[0] threads.
 
 @group(0) @binding(0) var<storage, read> tile_sort_keys: array<u32>;
@@ -16,25 +17,22 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
         return;
     }
 
-    let key = tile_sort_keys[idx];
+    let tile_id = tile_sort_keys[idx * 2u + 1u];
     // Sentinel keys (0xFFFFFFFF) are sorted to end — skip them
-    if (key == 0xFFFFFFFFu) {
+    if (tile_id == 0xFFFFFFFFu) {
         return;
     }
-
-    let tile_id = key >> 15u;
 
     // Check if this is the start of a new tile
     if (idx == 0u) {
         tile_ranges[tile_id * 2u] = idx;
     } else {
-        let prev_key = tile_sort_keys[idx - 1u];
-        let prev_tile = prev_key >> 15u;
+        let prev_tile = tile_sort_keys[(idx - 1u) * 2u + 1u];
         if (tile_id != prev_tile) {
             // Start of new tile
             tile_ranges[tile_id * 2u] = idx;
             // End of previous tile
-            if (prev_key != 0xFFFFFFFFu) {
+            if (prev_tile != 0xFFFFFFFFu) {
                 tile_ranges[prev_tile * 2u + 1u] = idx;
             }
         }

@@ -6,6 +6,7 @@ const BITS_PER_PASS: u32 = 4;
 const BIN_COUNT: u32 = 16; // 1 << BITS_PER_PASS
 const ELEMENTS_PER_THREAD: u32 = 4;
 const BLOCK_SIZE: u32 = 1024; // WG * ELEMENTS_PER_THREAD
+const KEY_STRIDE: u32 = /*KEY_STRIDE*/1u;
 
 fn div_ceil(a: u32, b: u32) -> u32 {
     return (a + b - 1u) / b;
@@ -48,7 +49,9 @@ fn main(
 
     for (var i = 0u; i < ELEMENTS_PER_THREAD; i++) {
         if (data_index < num_keys) {
-            let local_key = (src[data_index] >> shift_bit) & 0xfu;
+            let word = select(0u, 1u, KEY_STRIDE > 1u && shift_bit >= 32u);
+            let eff_shift = shift_bit - word * 32u;
+            let local_key = (src[data_index * KEY_STRIDE + word] >> eff_shift) & 0xfu;
             atomicAdd(&histogram[local_key], 1u);
         }
         data_index += WG;

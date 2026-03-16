@@ -118,9 +118,9 @@ fn test_radix_sort_kernel() {
     queue.write_buffer(&keys_a, 0, bytemuck::cast_slice(&keys_data));
     queue.write_buffer(&values_a, 0, bytemuck::cast_slice(&values_data));
 
-    // Create pipelines and sort state
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, n, 32);
+    // Create pipelines and sort state (32-bit keys, key_stride=1)
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, n, 32, 1);
     radix_state.upload_configs(&queue);
 
     // Write num_keys
@@ -591,9 +591,10 @@ fn test_tiled_forward_e2e() {
     // --- Set up tiled pipeline (scan-based, same as Python path) ---
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -780,9 +781,10 @@ fn test_multi_tet_gradient_finite_diff() {
 
         // Scan-based tiled pipeline
         let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
         let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
-        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
         radix_state.upload_configs(&queue);
 
         let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -894,9 +896,10 @@ fn test_multi_tet_gradient_finite_diff() {
 
         // Scan-based tiled pipeline
         let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
         let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
-        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
         radix_state.upload_configs(&queue);
 
         let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -1213,9 +1216,10 @@ fn test_single_tet_loss_decreases() {
 
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -1707,9 +1711,10 @@ fn test_camera_tiled_forward_deterministic() {
     // --- Tiled infrastructure with tile_size=12 ---
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);

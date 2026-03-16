@@ -114,7 +114,7 @@ impl TileBuffers {
 
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),
-            size: (max_pairs_pow2 as u64) * 4,
+            size: (max_pairs_pow2 as u64) * 8, // 2 u32s per key (64-bit: lo=depth, hi=tile_id)
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });

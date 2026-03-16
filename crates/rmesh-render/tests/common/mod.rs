@@ -407,10 +407,10 @@ async fn gpu_render_scene_async(
     let (buffers, material, pipelines, targets, compute_bg, render_bg) =
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
-    // Sort infrastructure for sorted HW raster forward pass
+    // Sort infrastructure for sorted HW raster forward pass (32-bit keys)
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32);
+    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1);
+    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1);
     sort_state.upload_configs(&queue);
 
     // B-variant render bind group (uses sort_state.values_b)
@@ -730,9 +730,10 @@ async fn gpu_tiled_render_scene_async(
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, 32);
+    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);

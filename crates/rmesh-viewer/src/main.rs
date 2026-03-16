@@ -12,6 +12,7 @@
 
 use anyhow::{Context, Result};
 use glam::{Mat4, Vec3};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use winit::application::ApplicationHandler;
@@ -20,6 +21,9 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
+use wgpu::util::DeviceExt;
+
 use rayon::prelude::*;
 use rmesh_render::{
     create_compute_bind_group, create_render_bind_group,
@@ -27,9 +31,12 @@ use rmesh_render::{
     RenderTargets, SceneBuffers, Uniforms, create_blit_bind_group, record_blit,
 };
 
-// SH basis function constants (match eval_sh_py.py / webrm)
+// SH basis function constants — kept for CPU reference fallback (evaluate_sh_colors).
+#[allow(dead_code)]
 const C0: f32 = 0.28209479;
+#[allow(dead_code)]
 const C1: f32 = 0.48860251;
+#[allow(dead_code)]
 const C2: [f32; 5] = [
     1.0925484305920792,
     -1.0925484305920792,
@@ -37,6 +44,7 @@ const C2: [f32; 5] = [
     -1.0925484305920792,
     0.5462742152960396,
 ];
+#[allow(dead_code)]
 const C3: [f32; 7] = [
     -0.5900435899266435,
     2.890611442640554,
@@ -147,6 +155,15 @@ struct GpuState {
     render_bg_b: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
     tet_count: u32,
+    // GPU SH evaluation
+    sh_eval_pipeline: ShEvalPipeline,
+    sh_eval_bg: wgpu::BindGroup,
+    sh_coeffs_buf: wgpu::Buffer,
+    sh_eval_uniforms_buf: wgpu::Buffer,
+    sh_degree: u32,
+    // egui
+    egui_renderer: egui_wgpu::Renderer,
+    egui_state: egui_winit::State,
 }
 
 struct App {
@@ -159,6 +176,12 @@ struct App {
     middle_pressed: bool,
     right_pressed: bool,
     last_mouse: (f64, f64),
+    // egui + FPS
+    egui_ctx: egui::Context,
+    frame_times: VecDeque<std::time::Instant>,
+    fps: f64,
+    loaded_path: Option<PathBuf>,
+    pending_load: Option<PathBuf>,
 }
 
 impl App {
@@ -180,16 +203,16 @@ impl App {
             middle_pressed: false,
             right_pressed: false,
             last_mouse: (0.0, 0.0),
+            egui_ctx: egui::Context::default(),
+            frame_times: VecDeque::with_capacity(120),
+            fps: 0.0,
+            loaded_path: None,
+            pending_load: None,
         }
     }
 
-    /// Evaluate SH coefficients to base colors for the current camera position (parallel).
-    ///
-    /// Matches the webrm compute shader (webgpu_rs.js) exactly:
-    ///   - Planar memory layout: featIndex = channel * numCoeffs + coeff
-    ///   - Direction = centroid - camPos (point FROM camera TO tet)
-    ///   - Degree-1 signs: -C1*y, +C1*z, -C1*x
-    ///   - Applies softplus(SH + 0.5 + grad_offset_at_v0, beta=10)
+    /// CPU reference SH evaluation (kept as fallback, not called per-frame).
+    #[allow(dead_code)]
     fn evaluate_sh_colors(&self) -> Vec<f32> {
         let t_count = self.scene_data.tet_count as usize;
         let degree = self.sh_coeffs.degree as usize;
@@ -319,8 +342,8 @@ impl App {
 
             let mut limits = wgpu::Limits::default();
             limits.max_storage_buffers_per_shader_stage = 16;
-            limits.max_storage_buffer_binding_size = 256 * 1024 * 1024; // 256 MB
-            limits.max_buffer_size = 512 * 1024 * 1024; // 512 MB
+            limits.max_storage_buffer_binding_size = 1024 * 1024 * 1024; // 1 GB
+            limits.max_buffer_size = 1024 * 1024 * 1024; // 1 GB
 
             let (device, queue) = adapter
                 .request_device(
@@ -372,14 +395,43 @@ impl App {
         let t0 = std::time::Instant::now();
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
 
-        // Evaluate SH colors instead of flat gray
-        let base_colors = self.evaluate_sh_colors();
+        // Allocate base_colors with zeros — GPU SH eval will fill them
+        let zero_colors = vec![0.0f32; self.scene_data.tet_count as usize * 3];
         let material = MaterialBuffers::upload(
             &device,
-            &base_colors,
+            &zero_colors,
             &self.scene_data.color_grads,
             self.scene_data.tet_count,
         );
+
+        // Upload SH coefficients to GPU (one-time, only changes on file reload)
+        let sh_coeffs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sh_coeffs"),
+            contents: bytemuck::cast_slice(&self.sh_coeffs.coeffs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+
+        // SH eval uniforms buffer (updated each frame with cam_pos)
+        let sh_eval_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sh_eval_uniforms"),
+            size: std::mem::size_of::<ShEvalUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        log::info!("Compiling SH eval pipeline...");
+        let sh_eval_pipeline = ShEvalPipeline::new(&device);
+        let sh_eval_bg = sh_eval_pipeline.create_bind_group(
+            &device,
+            &sh_eval_uniforms_buf,
+            &buffers.vertices,
+            &buffers.indices,
+            &sh_coeffs_buf,
+            &material.color_grads,
+            &material.base_colors,
+        );
+        let sh_degree = self.sh_coeffs.degree;
+
         log::info!("Buffers uploaded: {:.2}s", t0.elapsed().as_secs_f64());
 
         let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
@@ -387,9 +439,9 @@ impl App {
         // Radix sort state
         log::info!("Creating radix sort pipelines...");
         let t0 = std::time::Instant::now();
-        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device);
+        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1);
         let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
-        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32);
+        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1);
         sort_state.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -404,6 +456,22 @@ impl App {
         );
 
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
+
+        // egui setup
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            surface_format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+
         log::info!("GPU init total: {:.2}s", t_total.elapsed().as_secs_f64());
 
         self.gpu = Some(GpuState {
@@ -423,14 +491,64 @@ impl App {
             render_bg_b,
             blit_bg,
             tet_count: self.scene_data.tet_count,
+            sh_eval_pipeline,
+            sh_eval_bg,
+            sh_coeffs_buf,
+            sh_eval_uniforms_buf,
+            sh_degree,
+            egui_renderer,
+            egui_state,
         });
     }
 
+    fn update_fps(&mut self) {
+        let now = std::time::Instant::now();
+        self.frame_times.push_back(now);
+        // Keep a 1-second window
+        while let Some(&front) = self.frame_times.front() {
+            if now.duration_since(front).as_secs_f64() > 1.0 {
+                self.frame_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.fps = self.frame_times.len() as f64;
+    }
+
     fn render(&mut self) {
-        let gpu = match &self.gpu {
-            Some(g) => g,
-            None => return,
+        self.update_fps();
+
+        if self.gpu.is_none() {
+            return;
+        }
+
+        let (w, h) = {
+            let g = self.gpu.as_ref().unwrap();
+            (g.surface_config.width, g.surface_config.height)
         };
+        let aspect = w as f32 / h as f32;
+
+        // Camera matrices (view_matrix updates self.camera.position)
+        let view_mat = self.camera.view_matrix();
+        let proj_mat = self.camera.projection_matrix(aspect);
+        let vp = proj_mat * view_mat;
+
+        let inv_view = view_mat.inverse();
+        let cam_right = inv_view.col(0).truncate();
+        let cam_up = inv_view.col(1).truncate();
+        let cam_back = inv_view.col(2).truncate();
+        let c2w = glam::Mat3::from_cols(cam_right, -cam_up, -cam_back);
+
+        let f_val = 1.0 / (self.camera.fov_y / 2.0).tan();
+        let fx = f_val * h as f32 / 2.0;
+        let fy = f_val * h as f32 / 2.0;
+        let intrinsics = [fx, fy, w as f32 / 2.0, h as f32 / 2.0];
+
+        let vp_cols = vp.to_cols_array_2d();
+        let pos = self.camera.position.to_array();
+        let fps = self.fps;
+
+        let gpu = self.gpu.as_mut().unwrap();
 
         let output = match gpu.surface.get_current_texture() {
             Ok(t) => t,
@@ -447,32 +565,6 @@ impl App {
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let w = gpu.surface_config.width;
-        let h = gpu.surface_config.height;
-        let aspect = w as f32 / h as f32;
-
-        let view_mat = self.camera.view_matrix();
-        let proj_mat = self.camera.projection_matrix(aspect);
-        let vp = proj_mat * view_mat;
-
-        // Extract c2w rotation from inverse view matrix
-        // RH convention: camera axes are x=right, y=up, z=backward
-        // Pinhole convention: x=right, y=DOWN, z=FORWARD
-        let inv_view = view_mat.inverse();
-        let cam_right = inv_view.col(0).truncate();
-        let cam_up = inv_view.col(1).truncate();
-        let cam_back = inv_view.col(2).truncate();
-        let c2w = glam::Mat3::from_cols(cam_right, -cam_up, -cam_back);
-
-        // Intrinsics from FOV
-        let f_val = 1.0 / (self.camera.fov_y / 2.0).tan();
-        let fx = f_val * h as f32 / 2.0;
-        let fy = f_val * h as f32 / 2.0;
-        let intrinsics = [fx, fy, w as f32 / 2.0, h as f32 / 2.0];
-
-        let vp_cols = vp.to_cols_array_2d();
-        let pos = self.camera.position.to_array();
 
         let uniforms = Uniforms {
             vp_col0: vp_cols[0],
@@ -497,19 +589,78 @@ impl App {
         gpu.queue
             .write_buffer(&gpu.buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-        // Upload view-dependent SH colors
-        let base_colors = self.evaluate_sh_colors();
+        // Update SH eval uniforms and dispatch GPU SH evaluation
+        let sh_uniforms = ShEvalUniforms {
+            cam_pos: [pos[0], pos[1], pos[2], 0.0],
+            tet_count: gpu.tet_count,
+            sh_degree: gpu.sh_degree,
+            _pad: [0; 2],
+        };
         gpu.queue.write_buffer(
-            &gpu.material_buffers.base_colors,
+            &gpu.sh_eval_uniforms_buf,
             0,
-            bytemuck::cast_slice(&base_colors),
+            bytemuck::bytes_of(&sh_uniforms),
         );
+
+        // --- egui frame ---
+        let window = self.window.as_ref().unwrap();
+        let raw_input = gpu.egui_state.take_egui_input(window);
+        let tet_count = gpu.tet_count;
+        let mut open_file = false;
+        #[allow(deprecated)]
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Open...").clicked() {
+                            open_file = true;
+                            ui.close_menu();
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(format!(
+                            "FPS: {:.0}  |  {} tets  |  {}x{}",
+                            fps, tet_count, w, h
+                        ));
+                    });
+                });
+            });
+        });
+        if open_file {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("Scene", &["rmesh", "ply"])
+                .pick_file()
+            {
+                self.pending_load = Some(path);
+            }
+        }
+        gpu.egui_state
+            .handle_platform_output(window, full_output.platform_output);
+
+        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_desc = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [w, h],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+
+        // Update egui textures
+        for (id, image_delta) in &full_output.textures_delta.set {
+            gpu.egui_renderer
+                .update_texture(&gpu.device, &gpu.queue, *id, image_delta);
+        }
 
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("forward pass"),
             });
+
+        gpu.egui_renderer
+            .update_buffers(&gpu.device, &gpu.queue, &mut encoder, &paint_jobs, &screen_desc);
+
+        // GPU SH evaluation (replaces CPU evaluate_sh_colors + write_buffer)
+        gpu.sh_eval_pipeline
+            .record(&mut encoder, &gpu.sh_eval_bg, gpu.tet_count);
 
         // Sorted forward pass: compute → radix sort → HW render
         rmesh_render::record_sorted_forward_pass(
@@ -530,8 +681,162 @@ impl App {
         // Blit Rgba16Float render target to sRGB swapchain
         record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
 
+        // egui render pass (overlay on swapchain)
+        {
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            }).forget_lifetime();
+            gpu.egui_renderer.render(&mut rpass, &paint_jobs, &screen_desc);
+        }
+
         gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        // Free egui textures after submit
+        for id in &full_output.textures_delta.free {
+            gpu.egui_renderer.free_texture(id);
+        }
+
         output.present();
+
+        // Handle deferred file load
+        if let Some(path) = self.pending_load.take() {
+            self.load_file(&path);
+        }
+    }
+
+    fn load_file(&mut self, path: &std::path::Path) {
+        log::info!("Loading: {}", path.display());
+        let file_data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to read {}: {}", path.display(), e);
+                return;
+            }
+        };
+
+        let is_ply = path
+            .extension()
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("ply"));
+
+        let (scene, sh) = if is_ply {
+            match rmesh_data::load_ply(&file_data) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("Failed to parse PLY: {}", e);
+                    return;
+                }
+            }
+        } else {
+            match rmesh_data::load_rmesh(&file_data)
+                .or_else(|_| rmesh_data::load_rmesh_raw(&file_data))
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    log::error!("Failed to parse scene: {}", e);
+                    return;
+                }
+            }
+        };
+
+        log::info!(
+            "Loaded: {} vertices, {} tets, SH degree {}",
+            scene.vertex_count,
+            scene.tet_count,
+            sh.degree,
+        );
+
+        // Update scene data
+        self.scene_data = scene;
+        self.sh_coeffs = sh;
+        self.loaded_path = Some(path.to_path_buf());
+
+        // Reset camera
+        let pos = Vec3::new(
+            self.scene_data.start_pose[0],
+            self.scene_data.start_pose[1],
+            self.scene_data.start_pose[2],
+        );
+        if pos.length() > 0.001 {
+            self.camera = Camera::new(pos);
+        }
+
+        // Rebuild GPU buffers
+        if let Some(gpu) = &mut self.gpu {
+            gpu.buffers = SceneBuffers::upload(&gpu.device, &gpu.queue, &self.scene_data);
+
+            let zero_colors = vec![0.0f32; self.scene_data.tet_count as usize * 3];
+            gpu.material_buffers = MaterialBuffers::upload(
+                &gpu.device,
+                &zero_colors,
+                &self.scene_data.color_grads,
+                self.scene_data.tet_count,
+            );
+            gpu.tet_count = self.scene_data.tet_count;
+
+            // Recreate SH coeffs buffer and bind group
+            gpu.sh_coeffs_buf =
+                gpu.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("sh_coeffs"),
+                        contents: bytemuck::cast_slice(&self.sh_coeffs.coeffs),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+            gpu.sh_degree = self.sh_coeffs.degree;
+            gpu.sh_eval_bg = gpu.sh_eval_pipeline.create_bind_group(
+                &gpu.device,
+                &gpu.sh_eval_uniforms_buf,
+                &gpu.buffers.vertices,
+                &gpu.buffers.indices,
+                &gpu.sh_coeffs_buf,
+                &gpu.material_buffers.color_grads,
+                &gpu.material_buffers.base_colors,
+            );
+
+            // Recreate sort state for new tet count
+            let n_pow2 = (gpu.tet_count as u32).next_power_of_two();
+            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1);
+            gpu.sort_state.upload_configs(&gpu.queue);
+
+            // Recreate bind groups
+            gpu.compute_bg = create_compute_bind_group(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+            );
+            gpu.render_bg = create_render_bind_group(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+            );
+            gpu.render_bg_b = create_render_bind_group_with_sort_values(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.sort_state.values_b,
+            );
+        }
+
+        // Update window title
+        if let Some(window) = &self.window {
+            let name = path
+                .file_name()
+                .map_or("rmesh viewer".into(), |n| format!("rmesh viewer - {}", n.to_string_lossy()));
+            window.set_title(&name);
+        }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
@@ -556,8 +861,15 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let title = self
+            .loaded_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map_or("rmesh viewer".into(), |n| {
+                format!("rmesh viewer - {}", n.to_string_lossy())
+            });
         let attrs = Window::default_attributes()
-            .with_title("rmesh viewer")
+            .with_title(title)
             .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.init_gpu(window.clone());
@@ -571,6 +883,16 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Feed events to egui first
+        if let Some(gpu) = &mut self.gpu {
+            if let Some(window) = &self.window {
+                let _ = gpu.egui_state.on_window_event(window, &event);
+            }
+        }
+
+        // Check if egui wants the pointer (from previous frame)
+        let egui_wants_pointer = self.egui_ctx.egui_wants_pointer_input();
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::KeyboardInput {
@@ -587,7 +909,7 @@ impl ApplicationHandler for App {
                 self.resize(size);
             }
 
-            WindowEvent::MouseInput { state, button, .. } => match button {
+            WindowEvent::MouseInput { state, button, .. } if !egui_wants_pointer => match button {
                 MouseButton::Left => {
                     self.left_pressed = state == ElementState::Pressed;
                 }
@@ -604,20 +926,22 @@ impl ApplicationHandler for App {
                 let dx = position.x - self.last_mouse.0;
                 let dy = position.y - self.last_mouse.1;
 
-                if self.left_pressed {
-                    self.camera.orbit(dx as f32, dy as f32);
-                }
-                if self.middle_pressed {
-                    self.camera.pan(dx as f32, dy as f32);
-                }
-                if self.right_pressed {
-                    self.camera.zoom(dy as f32);
+                if !egui_wants_pointer {
+                    if self.left_pressed {
+                        self.camera.orbit(dx as f32, dy as f32);
+                    }
+                    if self.middle_pressed {
+                        self.camera.pan(dx as f32, dy as f32);
+                    }
+                    if self.right_pressed {
+                        self.camera.zoom(dy as f32);
+                    }
                 }
 
                 self.last_mouse = (position.x, position.y);
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_wants_pointer => {
                 let scroll = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.1,
@@ -673,6 +997,7 @@ fn main() -> Result<()> {
 
     let event_loop = EventLoop::new().context("Failed to create event loop")?;
     let mut app = App::new(scene, sh);
+    app.loaded_path = Some(scene_path);
     event_loop.run_app(&mut app)?;
 
     Ok(())

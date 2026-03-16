@@ -79,6 +79,13 @@ pub const RADIX_ELEMENTS_PER_THREAD: u32 = 4;
 pub const RADIX_BLOCK_SIZE: u32 = RADIX_WG * RADIX_ELEMENTS_PER_THREAD; // 1024
 pub const RADIX_BIN_COUNT: u32 = 16;
 
+/// Compute sorting_bits for 64-bit tile sort keys: 32 bits of depth + enough
+/// bits to distinguish all tile IDs, rounded up to a multiple of 4.
+pub fn sorting_bits_for_tiles(num_tiles: u32) -> u32 {
+    let tile_bits = if num_tiles <= 1 { 1 } else { 32 - (num_tiles - 1).leading_zeros() };
+    (32 + tile_bits + 3) & !3
+}
+
 /// Pipelines for the 5-stage radix sort.
 pub struct RadixSortPipelines {
     pub count_pipeline: wgpu::ComputePipeline,
@@ -94,11 +101,15 @@ pub struct RadixSortPipelines {
 }
 
 impl RadixSortPipelines {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, key_stride: u32) -> Self {
+        // String-substitute KEY_STRIDE in count and scatter shaders.
+        let count_src = RADIX_SORT_COUNT_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
+        let scatter_src = RADIX_SORT_SCATTER_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
+
         // Count: config(r), num_keys(r), src(r), counts(rw)
         let count_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort_count"),
-            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_COUNT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(count_src.into()),
         });
         let count_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("radix_count_bgl"),
@@ -158,7 +169,7 @@ impl RadixSortPipelines {
         // Scatter: config(r), num_keys(r), src(r), values(r), counts(r), out(rw), out_values(rw)
         let scatter_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort_scatter"),
-            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_SCATTER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(scatter_src.into()),
         });
         let scatter_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("radix_scatter_bgl"),
@@ -199,13 +210,14 @@ pub struct RadixSortState {
     pub config_buffers: Vec<wgpu::Buffer>,
     pub max_num_wgs: u32,
     pub sorting_bits: u32,
+    pub key_stride: u32,
 }
 
 impl RadixSortState {
-    pub fn new(device: &wgpu::Device, sort_buf_size: u32, sorting_bits: u32) -> Self {
+    pub fn new(device: &wgpu::Device, sort_buf_size: u32, sorting_bits: u32, key_stride: u32) -> Self {
         let max_num_wgs = (sort_buf_size + RADIX_BLOCK_SIZE - 1) / RADIX_BLOCK_SIZE;
 
-        let keys_b = create_storage_buffer(device, "radix_keys_b", (sort_buf_size as u64) * 4);
+        let keys_b = create_storage_buffer(device, "radix_keys_b", (sort_buf_size as u64) * (key_stride as u64) * 4);
         let values_b = create_storage_buffer(device, "radix_values_b", (sort_buf_size as u64) * 4);
 
         let counts = create_storage_buffer(
@@ -239,6 +251,7 @@ impl RadixSortState {
             config_buffers,
             max_num_wgs,
             sorting_bits,
+            key_stride,
         }
     }
 

@@ -6,6 +6,7 @@ const BITS_PER_PASS: u32 = 4;
 const BIN_COUNT: u32 = 16;
 const ELEMENTS_PER_THREAD: u32 = 4;
 const BLOCK_SIZE: u32 = 1024;
+const KEY_STRIDE: u32 = /*KEY_STRIDE*/1u;
 
 fn div_ceil(a: u32, b: u32) -> u32 {
     return (a + b - 1u) / b;
@@ -55,16 +56,24 @@ fn main(
         if (local_id.x < BIN_COUNT) {
             local_histogram[local_id.x] = 0u;
         }
-        var local_key = ~0u;
+        var local_key_lo = ~0u;
+        var local_key_hi = ~0u;
         var local_value = 0u;
 
         if (data_index < num_keys) {
-            local_key = src[data_index];
+            local_key_lo = src[data_index * KEY_STRIDE];
+            if (KEY_STRIDE > 1u) {
+                local_key_hi = src[data_index * KEY_STRIDE + 1u];
+            }
             local_value = values[data_index];
         }
 
+        let word = select(0u, 1u, KEY_STRIDE > 1u && config.shift >= 32u);
+        let eff_shift = config.shift - word * 32u;
+
         for (var bit_shift = 0u; bit_shift < BITS_PER_PASS; bit_shift += 2u) {
-            let key_index = (local_key >> config.shift) & 0xfu;
+            let key_word = select(local_key_lo, local_key_hi, word == 1u);
+            let key_index = (key_word >> eff_shift) & 0xfu;
             let bit_key = (key_index >> bit_shift) & 3u;
             var packed_histogram = 1u << (bit_key * 8u);
             // workgroup prefix sum
@@ -87,17 +96,25 @@ fn main(
             }
             let key_offset = (local_sum >> (bit_key * 8u)) & 0xffu;
 
-            lds_sums[key_offset] = local_key;
+            lds_sums[key_offset] = local_key_lo;
             workgroupBarrier();
-            local_key = lds_sums[local_id.x];
+            local_key_lo = lds_sums[local_id.x];
             workgroupBarrier();
+
+            if (KEY_STRIDE > 1u) {
+                lds_sums[key_offset] = local_key_hi;
+                workgroupBarrier();
+                local_key_hi = lds_sums[local_id.x];
+                workgroupBarrier();
+            }
 
             lds_sums[key_offset] = local_value;
             workgroupBarrier();
             local_value = lds_sums[local_id.x];
             workgroupBarrier();
         }
-        let key_index = (local_key >> config.shift) & 0xfu;
+        let key_word2 = select(local_key_lo, local_key_hi, word == 1u);
+        let key_index = (key_word2 >> eff_shift) & 0xfu;
         atomicAdd(&local_histogram[key_index], 1u);
         workgroupBarrier();
         var histogram_local_sum = 0u;
@@ -127,7 +144,10 @@ fn main(
         }
         let total_offset = global_offset + local_offset;
         if (total_offset < num_keys) {
-            out[total_offset] = local_key;
+            out[total_offset * KEY_STRIDE] = local_key_lo;
+            if (KEY_STRIDE > 1u) {
+                out[total_offset * KEY_STRIDE + 1u] = local_key_hi;
+            }
             out_values[total_offset] = local_value;
         }
         if (local_id.x < BIN_COUNT) {

@@ -13,7 +13,7 @@ pub use shared::TileUniforms;
 
 // Re-export sort types (moved to rmesh-sort crate).
 pub use rmesh_sort::{
-    RadixSortPipelines, RadixSortState, record_radix_sort,
+    RadixSortPipelines, RadixSortState, record_radix_sort, sorting_bits_for_tiles,
 };
 
 // Re-export tile types (moved to rmesh-tile crate).

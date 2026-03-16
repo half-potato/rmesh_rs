@@ -29,3 +29,7 @@ flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 rayon = "1"
 pyo3 = { version = "0.28.2", features = ["extension-module"] }
 numpy = "0.28"
+egui = { git = "https://github.com/emilk/egui.git", branch = "main" }
+egui-wgpu = { git = "https://github.com/emilk/egui.git", branch = "main" }
+egui-winit = { git = "https://github.com/emilk/egui.git", branch = "main" }
+rfd = "0.15"

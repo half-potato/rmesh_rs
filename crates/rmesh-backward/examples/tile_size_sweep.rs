@@ -259,7 +259,7 @@ fn create_shared_state() -> Option<SharedState> {
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
     let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
 
     let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
         &device,
@@ -363,10 +363,12 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         H,
         tile_size,
     );
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
     let radix_state = rmesh_backward::RadixSortState::new(
         device,
         tile_buffers.max_pairs_pow2,
-        32,
+        sorting_bits,
+        2,
     );
     radix_state.upload_configs(queue);
 

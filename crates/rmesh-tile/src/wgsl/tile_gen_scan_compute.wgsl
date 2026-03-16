@@ -141,7 +141,6 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
     let diff = vec3<f32>(cx, cy, cz) - cam;
     let depth = dot(diff, diff) - r2;
     let inv_depth = ~bitcast<u32>(depth);
-    let depth_bits = inv_depth >> 17u;
 
     // Conservative scanline tile enumeration (Variant B) — same algorithm as project_compute
     let T = ts;
@@ -187,12 +186,12 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>,
 
             for (var tx = tx0; tx <= tx1; tx++) {
                 let tile_id = ty * tile_uniforms.tiles_x + tx;
-                let key = (tile_id << 15u) | (depth_bits & 0x7FFFu);
 
                 if (local_count < max_write) {
                     let write_idx = write_start + local_count;
-                    if (write_idx < arrayLength(&tile_sort_keys)) {
-                        tile_sort_keys[write_idx] = key;
+                    if (write_idx < arrayLength(&tile_sort_keys) / 2u) {
+                        tile_sort_keys[write_idx * 2u] = inv_depth;
+                        tile_sort_keys[write_idx * 2u + 1u] = tile_id;
                         tile_sort_values[write_idx] = tet_id;
                     }
                     local_count++;
