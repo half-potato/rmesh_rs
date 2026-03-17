@@ -191,7 +191,8 @@ pub fn record_primitive_pass(
     queue: &wgpu::Queue,
     pipeline: &PrimitivePipeline,
     geometry: &PrimitiveGeometry,
-    targets: &PrimitiveTargets,
+    color_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
     primitives: &[Primitive],
     vp: &glam::Mat4,
 ) {
@@ -200,7 +201,7 @@ pub fn record_primitive_pass(
         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("prim_clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &targets.color_view,
+                view: color_view,
                 resolve_target: None,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -209,7 +210,7 @@ pub fn record_primitive_pass(
                 depth_slice: None,
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &targets.depth_view,
+                view: depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -248,7 +249,7 @@ pub fn record_primitive_pass(
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("primitives"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &targets.color_view,
+            view: color_view,
             resolve_target: None,
             ops: wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -257,7 +258,7 @@ pub fn record_primitive_pass(
             depth_slice: None,
         })],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &targets.depth_view,
+            view: depth_view,
             depth_ops: Some(wgpu::Operations {
                 load: wgpu::LoadOp::Clear(1.0),
                 store: wgpu::StoreOp::Store,

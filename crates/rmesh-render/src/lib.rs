@@ -367,7 +367,13 @@ impl ForwardPipelines {
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
                 },
-                depth_stencil: None, // No depth test -- back-to-front alpha blending
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_shader,
@@ -491,7 +497,13 @@ impl MeshForwardPipelines {
                     polygon_mode: wgpu::PolygonMode::Fill,
                     conservative: false,
                 },
-                depth_stencil: None,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_shader,
@@ -1133,6 +1145,7 @@ pub fn record_forward_pass(
     render_bg: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
+    depth_view: &wgpu::TextureView,
 ) {
     // ----- 1. Reset indirect args -----
     // vertex_count=12 (4 tri faces), instance_count=0 (compute pass will atomicAdd)
@@ -1169,17 +1182,12 @@ pub fn record_forward_pass(
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("forward_render"),
             color_attachments: &[
-                // Attachment 0: main color (premultiplied alpha blend)
+                // Attachment 0: main color (premultiplied alpha blend, load to preserve primitives)
                 Some(wgpu::RenderPassColorAttachment {
                     view: &targets.color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1230,7 +1238,14 @@ pub fn record_forward_pass(
                     depth_slice: None,
                 }),
             ],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1280,6 +1295,7 @@ pub fn record_sorted_forward_pass(
     render_bg_b: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
+    depth_view: &wgpu::TextureView,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -1329,12 +1345,7 @@ pub fn record_sorted_forward_pass(
                     view: &targets.color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1384,7 +1395,14 @@ pub fn record_sorted_forward_pass(
                     depth_slice: None,
                 }),
             ],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
@@ -1429,6 +1447,7 @@ pub fn record_sorted_mesh_forward_pass(
     indirect_convert_bg: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
+    depth_view: &wgpu::TextureView,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -1492,9 +1511,7 @@ pub fn record_sorted_mesh_forward_pass(
                     view: &targets.color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.0, g: 0.0, b: 0.0, a: 0.0,
-                        }),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                     depth_slice: None,
@@ -1533,7 +1550,14 @@ pub fn record_sorted_mesh_forward_pass(
                     depth_slice: None,
                 }),
             ],
-            depth_stencil_attachment: None,
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,

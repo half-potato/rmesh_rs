@@ -22,8 +22,7 @@ use rmesh_interact::{
 };
 use rmesh_compositor::{
     PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
-    CompositorPipeline, CompositorTargets, CompositorUniforms,
-    create_compositor_bind_group, record_primitive_pass, record_composite,
+    record_primitive_pass,
 };
 
 #[wasm_bindgen(start)]
@@ -47,8 +46,6 @@ struct SceneState {
     sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
     tet_count: u32,
-    compositor_bg: wgpu::BindGroup,
-    compositor_blit_bg: wgpu::BindGroup,
 }
 
 #[wasm_bindgen]
@@ -64,12 +61,10 @@ pub struct WebViewer {
     targets: RenderTargets,
     sh_eval_pipeline: ShEvalPipeline,
     scene: Option<SceneState>,
-    // Compositor
+    // Primitives
     primitive_geometry: PrimitiveGeometry,
     primitive_pipeline: PrimitivePipeline,
     primitive_targets: PrimitiveTargets,
-    compositor_pipeline: CompositorPipeline,
-    compositor_targets: CompositorTargets,
     show_primitives: bool,
     // Interaction
     interaction: TransformInteraction,
@@ -159,12 +154,10 @@ impl WebViewer {
 
         let camera = Camera::new(Vec3::new(0.0, 3.0, -2.0));
 
-        // Compositor setup
+        // Primitive setup
         let primitive_geometry = PrimitiveGeometry::new(&device);
         let primitive_pipeline = PrimitivePipeline::new(&device);
         let primitive_targets = PrimitiveTargets::new(&device, width, height);
-        let compositor_pipeline = CompositorPipeline::new(&device);
-        let compositor_targets = CompositorTargets::new(&device, width, height);
 
         log::info!("WebViewer initialized ({width}×{height})");
 
@@ -183,8 +176,6 @@ impl WebViewer {
             primitive_geometry,
             primitive_pipeline,
             primitive_targets,
-            compositor_pipeline,
-            compositor_targets,
             show_primitives: false,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
@@ -313,7 +304,21 @@ impl WebViewer {
         self.sh_eval_pipeline
             .record(&mut encoder, &scene.sh_eval_bg, scene.tet_count);
 
+        // Primitive pass first: renders to volume color target + primitive depth target
+        // (clears both even if no primitives, so forward pass can LoadOp::Load)
+        record_primitive_pass(
+            &mut encoder,
+            &self.queue,
+            &self.primitive_pipeline,
+            &self.primitive_geometry,
+            &self.targets.color_view,
+            &self.primitive_targets.depth_view,
+            if self.show_primitives { &self.primitives } else { &[] },
+            &vp,
+        );
+
         // Sorted forward pass: compute → radix sort → HW render
+        // Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         rmesh_render::record_sorted_forward_pass(
             &mut encoder,
             &self.device,
@@ -327,42 +332,11 @@ impl WebViewer {
             &scene.render_bg_b,
             scene.tet_count,
             &self.queue,
+            &self.primitive_targets.depth_view,
         );
 
-        // Primitive + compositor passes (when enabled and primitives exist)
-        if self.show_primitives && !self.primitives.is_empty() {
-            record_primitive_pass(
-                &mut encoder,
-                &self.queue,
-                &self.primitive_pipeline,
-                &self.primitive_geometry,
-                &self.primitive_targets,
-                &self.primitives,
-                &vp,
-            );
-
-            let comp_uniforms = CompositorUniforms {
-                near: self.camera.near_z,
-                far: self.camera.far_z,
-                _pad: [0.0; 2],
-            };
-            self.queue.write_buffer(
-                &self.compositor_pipeline.uniforms_buffer,
-                0,
-                bytemuck::bytes_of(&comp_uniforms),
-            );
-
-            record_composite(
-                &mut encoder,
-                &self.compositor_pipeline,
-                &scene.compositor_bg,
-                &self.compositor_targets.color_view,
-            );
-
-            record_blit(&mut encoder, &self.blit_pipeline, &scene.compositor_blit_bg, &view);
-        } else {
-            record_blit(&mut encoder, &self.blit_pipeline, &scene.blit_bg, &view);
-        }
+        // Blit directly — no compositor needed
+        record_blit(&mut encoder, &self.blit_pipeline, &scene.blit_bg, &view);
 
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
@@ -380,29 +354,15 @@ impl WebViewer {
         self.surface.configure(&self.device, &self.surface_config);
         self.targets = RenderTargets::new(&self.device, width, height);
 
-        // Recreate compositor targets
+        // Recreate primitive depth target
         self.primitive_targets = PrimitiveTargets::new(&self.device, width, height);
-        self.compositor_targets = CompositorTargets::new(&self.device, width, height);
 
-        // Recreate blit bind group and compositor bind groups since views changed
+        // Recreate blit bind group since color_view changed
         if let Some(scene) = &mut self.scene {
             scene.blit_bg = create_blit_bind_group(
                 &self.device,
                 &self.blit_pipeline,
                 &self.targets.color_view,
-            );
-            scene.compositor_bg = create_compositor_bind_group(
-                &self.device,
-                &self.compositor_pipeline,
-                &self.targets.color_view,
-                &self.targets.depth_view,
-                &self.primitive_targets.color_view,
-                &self.primitive_targets.depth_view,
-            );
-            scene.compositor_blit_bg = create_blit_bind_group(
-                &self.device,
-                &self.blit_pipeline,
-                &self.compositor_targets.color_view,
             );
         }
     }
@@ -665,20 +625,6 @@ impl WebViewer {
             &self.targets.color_view,
         );
 
-        let compositor_bg = create_compositor_bind_group(
-            &self.device,
-            &self.compositor_pipeline,
-            &self.targets.color_view,
-            &self.targets.depth_view,
-            &self.primitive_targets.color_view,
-            &self.primitive_targets.depth_view,
-        );
-        let compositor_blit_bg = create_blit_bind_group(
-            &self.device,
-            &self.blit_pipeline,
-            &self.compositor_targets.color_view,
-        );
-
         self.scene = Some(SceneState {
             buffers,
             material,
@@ -692,8 +638,6 @@ impl WebViewer {
             sh_eval_uniforms_buf,
             sh_degree: sh_coeffs.degree,
             tet_count,
-            compositor_bg,
-            compositor_blit_bg,
         });
     }
 }

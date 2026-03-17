@@ -40,8 +40,7 @@ use rmesh_render::{
 };
 use rmesh_compositor::{
     PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
-    CompositorPipeline, CompositorTargets, CompositorUniforms,
-    create_compositor_bind_group, record_primitive_pass, record_composite,
+    record_primitive_pass,
 };
 
 // SH basis function constants — kept for CPU reference fallback (evaluate_sh_colors).
@@ -100,14 +99,10 @@ struct GpuState {
     // Fluid simulation
     fluid_sim: Option<FluidSim>,
     tet_neighbors_buf: Option<wgpu::Buffer>,
-    // Compositor (primitive overlay)
+    // Primitives (depth-first compositing via hardware early-z)
     primitive_geometry: PrimitiveGeometry,
     primitive_pipeline: PrimitivePipeline,
     primitive_targets: PrimitiveTargets,
-    compositor_pipeline: CompositorPipeline,
-    compositor_targets: CompositorTargets,
-    compositor_bg: wgpu::BindGroup,
-    compositor_blit_bg: wgpu::BindGroup,
     // egui
     egui_renderer: egui_wgpu::Renderer,
     egui_state: egui_winit::State,
@@ -488,21 +483,10 @@ impl App {
 
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
 
-        // Compositor setup
+        // Primitive setup (depth used for hardware early-z culling in forward pass)
         let primitive_geometry = PrimitiveGeometry::new(&device);
         let primitive_pipeline = PrimitivePipeline::new(&device);
         let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
-        let compositor_pipeline = CompositorPipeline::new(&device);
-        let compositor_targets = CompositorTargets::new(&device, size.width.max(1), size.height.max(1));
-        let compositor_bg = create_compositor_bind_group(
-            &device,
-            &compositor_pipeline,
-            &targets.color_view,
-            &targets.depth_view,
-            &primitive_targets.color_view,
-            &primitive_targets.depth_view,
-        );
-        let compositor_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &compositor_targets.color_view);
 
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -553,10 +537,6 @@ impl App {
             primitive_geometry,
             primitive_pipeline,
             primitive_targets,
-            compositor_pipeline,
-            compositor_targets,
-            compositor_bg,
-            compositor_blit_bg,
             egui_renderer,
             egui_state,
         });
@@ -973,7 +953,55 @@ impl App {
             }
         }
 
-        // Sorted forward pass: compute → radix sort → render
+        // 1. Primitive pass first: renders to volume color target + primitive depth target
+        //    (clears both even if no primitives, so forward pass can use LoadOp::Load)
+        {
+            // Temporarily apply preview transform so the grabbed object follows the mouse
+            let preview_restore = if self.show_primitives {
+                if let Some(idx) = self.interaction.selected() {
+                    let ctx = InteractContext {
+                        view_matrix: view_mat,
+                        proj_matrix: proj_mat,
+                        viewport_width: w as f32,
+                        viewport_height: h as f32,
+                    };
+                    if let Some(preview) = self.interaction.preview_transform(&ctx) {
+                        if idx < self.primitives.len() {
+                            let original = self.primitives[idx].transform;
+                            self.primitives[idx].transform = preview;
+                            Some((idx, original))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            record_primitive_pass(
+                &mut encoder,
+                &gpu.queue,
+                &gpu.primitive_pipeline,
+                &gpu.primitive_geometry,
+                &gpu.targets.color_view,
+                &gpu.primitive_targets.depth_view,
+                if self.show_primitives { &self.primitives } else { &[] },
+                &vp,
+            );
+
+            // Restore original transform after rendering
+            if let Some((idx, original)) = preview_restore {
+                self.primitives[idx].transform = original;
+            }
+        }
+
+        // 2. Sorted forward pass: compute → radix sort → render
+        //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         if self.use_mesh_shader
             && gpu.mesh_pipelines.is_some()
             && gpu.mesh_render_bg_a.is_some()
@@ -993,6 +1021,7 @@ impl App {
                 gpu.indirect_convert_bg.as_ref().unwrap(),
                 gpu.tet_count,
                 &gpu.queue,
+                &gpu.primitive_targets.depth_view,
             );
         } else {
             rmesh_render::record_sorted_forward_pass(
@@ -1008,74 +1037,12 @@ impl App {
                 &gpu.render_bg_b,
                 gpu.tet_count,
                 &gpu.queue,
+                &gpu.primitive_targets.depth_view,
             );
         }
 
-        // Primitive + compositor passes (when enabled and primitives exist)
-        if self.show_primitives && !self.primitives.is_empty() {
-            // Temporarily apply preview transform so the grabbed object follows the mouse
-            let preview_restore = if let Some(idx) = self.interaction.selected() {
-                let ctx = InteractContext {
-                    view_matrix: view_mat,
-                    proj_matrix: proj_mat,
-                    viewport_width: w as f32,
-                    viewport_height: h as f32,
-                };
-                if let Some(preview) = self.interaction.preview_transform(&ctx) {
-                    if idx < self.primitives.len() {
-                        let original = self.primitives[idx].transform;
-                        self.primitives[idx].transform = preview;
-                        Some((idx, original))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            record_primitive_pass(
-                &mut encoder,
-                &gpu.queue,
-                &gpu.primitive_pipeline,
-                &gpu.primitive_geometry,
-                &gpu.primitive_targets,
-                &self.primitives,
-                &vp,
-            );
-
-            // Restore original transform after rendering
-            if let Some((idx, original)) = preview_restore {
-                self.primitives[idx].transform = original;
-            }
-
-            // Write compositor uniforms (near/far)
-            let comp_uniforms = CompositorUniforms {
-                near: self.camera.near_z,
-                far: self.camera.far_z,
-                _pad: [0.0; 2],
-            };
-            gpu.queue.write_buffer(
-                &gpu.compositor_pipeline.uniforms_buffer,
-                0,
-                bytemuck::bytes_of(&comp_uniforms),
-            );
-
-            record_composite(
-                &mut encoder,
-                &gpu.compositor_pipeline,
-                &gpu.compositor_bg,
-                &gpu.compositor_targets.color_view,
-            );
-
-            // Blit composited result to sRGB swapchain
-            record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.compositor_blit_bg, &view);
-        } else {
-            // Blit Rgba16Float render target directly to sRGB swapchain
-            record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
-        }
+        // 3. Blit directly — no compositor needed
+        record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.blit_bg, &view);
 
         // egui render pass (overlay on swapchain)
         {
@@ -1300,22 +1267,8 @@ impl App {
                 &gpu.targets.color_view,
             );
 
-            // Recreate compositor targets and bind groups
+            // Recreate primitive depth target
             gpu.primitive_targets = PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
-            gpu.compositor_targets = CompositorTargets::new(&gpu.device, new_size.width, new_size.height);
-            gpu.compositor_bg = create_compositor_bind_group(
-                &gpu.device,
-                &gpu.compositor_pipeline,
-                &gpu.targets.color_view,
-                &gpu.targets.depth_view,
-                &gpu.primitive_targets.color_view,
-                &gpu.primitive_targets.depth_view,
-            );
-            gpu.compositor_blit_bg = create_blit_bind_group(
-                &gpu.device,
-                &gpu.blit_pipeline,
-                &gpu.compositor_targets.color_view,
-            );
         }
     }
 }

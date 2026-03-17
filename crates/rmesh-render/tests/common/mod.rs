@@ -433,10 +433,47 @@ async fn gpu_render_scene_async(
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
+    // Create dummy depth texture (all-pass) for forward pass depth attachment
+    let dummy_depth_tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("test_dummy_depth"),
+        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let dummy_depth_view = dummy_depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
+
     // Record and submit
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("test_forward"),
     });
+    // Clear color and depth before forward pass (which uses LoadOp::Load)
+    {
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("test_clear"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &targets.color_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &dummy_depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            ..Default::default()
+        });
+    }
     rmesh_render::record_sorted_forward_pass(
         &mut encoder,
         &device,
@@ -450,6 +487,7 @@ async fn gpu_render_scene_async(
         &render_bg_b,
         scene.tet_count,
         &queue,
+        &dummy_depth_view,
     );
 
     // Copy color texture to readback buffer

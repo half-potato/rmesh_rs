@@ -204,6 +204,8 @@ struct RMeshRenderer {
     cached_vertices: Vec<f32>,
     cached_indices: Vec<u32>,
     cached_neighbors: Vec<i32>,
+    // Dummy depth view for forward pass (no primitives, all-pass)
+    dummy_depth_view: wgpu::TextureView,
     // Scene metadata
     tet_count: u32,
     _vertex_count: u32,
@@ -308,6 +310,19 @@ impl RMeshRenderer {
 
         // Render targets
         let targets = RenderTargets::new(&device, width, height);
+
+        // Dummy depth texture (cleared to 1.0 = all-pass) for forward pass depth attachment
+        let dummy_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dummy_depth"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let dummy_depth_view = dummy_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Forward bind groups
         let compute_bg = create_compute_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);
@@ -687,6 +702,7 @@ impl RMeshRenderer {
             cached_vertices: vertices_slice.to_vec(),
             cached_indices: indices_slice.to_vec(),
             cached_neighbors: neighbors,
+            dummy_depth_view,
             tet_count,
             _vertex_count: vertex_count,
             width,
@@ -753,6 +769,30 @@ impl RMeshRenderer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("forward"),
             });
+        // Clear color target and depth before forward pass (which uses LoadOp::Load)
+        {
+            let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear_for_forward"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.targets.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.dummy_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+        }
         record_forward_pass(
             &mut encoder,
             &self.fwd_pipelines,
@@ -762,6 +802,7 @@ impl RMeshRenderer {
             &self.render_bg,
             self.tet_count,
             &self.queue,
+            &self.dummy_depth_view,
         );
         record_tex_to_buffer(&mut encoder, &self.ttb);
         self.queue.submit(std::iter::once(encoder.finish()));
