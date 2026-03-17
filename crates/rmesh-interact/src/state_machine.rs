@@ -93,7 +93,7 @@ enum InteractState {
         axis: AxisConstraint,
         numeric: NumericInput,
         original_transform: Transform,
-        mouse_accum: f32,
+        mouse_accum: [f32; 2],
         shift_held: bool,
     },
 }
@@ -153,11 +153,11 @@ impl TransformInteraction {
         &mut self,
         event: &InteractEvent,
         primitives: &mut [Primitive],
-        _ctx: &InteractContext,
+        ctx: &InteractContext,
     ) -> InteractResult {
         match &mut self.state {
             InteractState::Idle => self.process_idle(event, primitives),
-            InteractState::Transforming { .. } => self.process_transforming(event, primitives),
+            InteractState::Transforming { .. } => self.process_transforming(event, primitives, ctx),
         }
     }
 
@@ -186,7 +186,7 @@ impl TransformInteraction {
                         axis: AxisConstraint::Free,
                         numeric: NumericInput::new(),
                         original_transform: primitives[idx].transform,
-                        mouse_accum: 0.0,
+                        mouse_accum: [0.0, 0.0],
                         shift_held: false,
                     };
                     InteractResult::PreviewUpdated
@@ -209,6 +209,7 @@ impl TransformInteraction {
         &mut self,
         event: &InteractEvent,
         primitives: &mut [Primitive],
+        ctx: &InteractContext,
     ) -> InteractResult {
         // Extract mutable fields — we need to pattern-match the state
         let InteractState::Transforming {
@@ -262,7 +263,7 @@ impl TransformInteraction {
                 InteractKey::Enter => {
                     if let Some(idx) = self.selected {
                         if idx < primitives.len() {
-                            primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum);
+                            primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
                         }
                     }
                     self.state = InteractState::Idle;
@@ -293,7 +294,8 @@ impl TransformInteraction {
             InteractEvent::MouseMove { dx, dy } => {
                 // Only accumulate mouse movement when no numeric input
                 if numeric.is_empty() {
-                    *mouse_accum += dx + dy;
+                    mouse_accum[0] += dx;
+                    mouse_accum[1] += dy;
                     InteractResult::PreviewUpdated
                 } else {
                     InteractResult::Noop
@@ -304,7 +306,7 @@ impl TransformInteraction {
                 // LMB = confirm
                 if let Some(idx) = self.selected {
                     if idx < primitives.len() {
-                        primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum);
+                        primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
                     }
                 }
                 self.state = InteractState::Idle;
@@ -326,17 +328,33 @@ impl TransformInteraction {
         mode: TransformMode,
         axis: AxisConstraint,
         numeric: &NumericInput,
-        mouse_accum: f32,
+        mouse_accum: [f32; 2],
+        ctx: &InteractContext,
     ) -> Transform {
-        let value = numeric.value().unwrap_or(mouse_accum * Self::sensitivity(mode));
-        let mask = axis.mask();
-
         match mode {
-            TransformMode::Grab => Transform {
-                position: original.position + mask * value,
-                ..original
-            },
+            TransformMode::Grab => {
+                if let Some(value) = numeric.value() {
+                    let mask = axis.mask();
+                    Transform {
+                        position: original.position + mask * value,
+                        ..original
+                    }
+                } else {
+                    // Project mouse delta to world-space movement
+                    let delta = Self::mouse_to_world_grab(
+                        mouse_accum, axis, ctx,
+                    );
+                    Transform {
+                        position: original.position + delta,
+                        ..original
+                    }
+                }
+            }
             TransformMode::Scale => {
+                let value = numeric.value().unwrap_or(
+                    (mouse_accum[0] + mouse_accum[1]) * Self::sensitivity(TransformMode::Scale),
+                );
+                let mask = axis.mask();
                 let factor = Vec3::ONE + mask * value;
                 Transform {
                     scale: original.scale * factor,
@@ -344,11 +362,14 @@ impl TransformInteraction {
                 }
             }
             TransformMode::Rotate => {
+                let value = numeric.value().unwrap_or(
+                    (mouse_accum[0] + mouse_accum[1]) * Self::sensitivity(TransformMode::Rotate),
+                );
                 let angle = value.to_radians();
                 let rot_axis = match axis {
-                    AxisConstraint::Free => Vec3::Z, // default to Z for free rotation
+                    AxisConstraint::Free => Vec3::Z,
                     AxisConstraint::SingleAxis(a) => a.unit(),
-                    AxisConstraint::Plane(a) => a.unit(), // rotate around the plane's normal
+                    AxisConstraint::Plane(a) => a.unit(),
                 };
                 let rot = Quat::from_axis_angle(rot_axis, angle);
                 Transform {
@@ -359,17 +380,65 @@ impl TransformInteraction {
         }
     }
 
+    /// Convert screen-space mouse delta to world-space grab displacement.
+    fn mouse_to_world_grab(
+        mouse_accum: [f32; 2],
+        axis: AxisConstraint,
+        ctx: &InteractContext,
+    ) -> Vec3 {
+        let sensitivity = 0.01;
+        let dx = mouse_accum[0] * sensitivity;
+        let dy = mouse_accum[1] * sensitivity;
+
+        // Extract camera right and up vectors from the view matrix
+        let view = ctx.view_matrix;
+        let right = Vec3::new(view.col(0).x, view.col(1).x, view.col(2).x).normalize();
+        let up = Vec3::new(view.col(0).y, view.col(1).y, view.col(2).y).normalize();
+
+        match axis {
+            AxisConstraint::Free => {
+                // Move in the camera's right/up plane
+                right * dx - up * dy
+            }
+            AxisConstraint::SingleAxis(a) => {
+                // Project screen delta onto the screen-space direction of the axis
+                let world_dir = a.unit();
+                let screen_dir = Vec3::new(
+                    right.dot(world_dir),
+                    up.dot(world_dir),
+                    0.0,
+                );
+                let screen_len = screen_dir.length();
+                if screen_len < 1e-6 {
+                    return Vec3::ZERO; // axis points at camera, can't project
+                }
+                let screen_dir = screen_dir / screen_len;
+                // Dot the mouse delta with the screen projection of the axis
+                let projected = dx * screen_dir.x - dy * screen_dir.y;
+                world_dir * (projected / screen_len)
+                }
+            AxisConstraint::Plane(normal_axis) => {
+                // Move in the plane perpendicular to normal_axis,
+                // but only along the camera right/up components that lie in that plane
+                let n = normal_axis.unit();
+                let plane_right = (right - n * n.dot(right)).normalize_or_zero();
+                let plane_up = (up - n * n.dot(up)).normalize_or_zero();
+                plane_right * dx - plane_up * dy
+            }
+        }
+    }
+
     fn sensitivity(mode: TransformMode) -> f32 {
         match mode {
-            TransformMode::Grab => 0.01,
             TransformMode::Scale => 0.005,
             TransformMode::Rotate => 0.5, // degrees per pixel
+            _ => 0.01,
         }
     }
 
     /// Compute the preview transform for the currently-transforming primitive.
     /// Returns `None` if not in a transform state.
-    pub fn preview_transform(&self) -> Option<Transform> {
+    pub fn preview_transform(&self, ctx: &InteractContext) -> Option<Transform> {
         if let InteractState::Transforming {
             mode,
             axis,
@@ -379,7 +448,7 @@ impl TransformInteraction {
             ..
         } = &self.state
         {
-            Some(Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum))
+            Some(Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx))
         } else {
             None
         }
@@ -476,7 +545,7 @@ mod tests {
         assert_eq!(r, InteractResult::PreviewUpdated);
 
         // Check preview
-        let preview = ti.preview_transform().unwrap();
+        let preview = ti.preview_transform(&ctx).unwrap();
         assert!((preview.position.x - 5.0).abs() < 1e-6);
         assert!(preview.position.y.abs() < 1e-6);
         assert!(preview.position.z.abs() < 1e-6);
@@ -518,7 +587,7 @@ mod tests {
         ti.process_event(&InteractEvent::KeyDown(InteractKey::Y), &mut prims, &ctx);
         ti.process_event(&InteractEvent::CharInput('2'), &mut prims, &ctx);
 
-        let preview = ti.preview_transform().unwrap();
+        let preview = ti.preview_transform(&ctx).unwrap();
         // Scale Y should be 1 + 2 = 3
         assert!((preview.scale.y - 3.0).abs() < 1e-6);
         assert!((preview.scale.x - 1.0).abs() < 1e-6);
@@ -537,7 +606,7 @@ mod tests {
         ti.process_event(&InteractEvent::CharInput('9'), &mut prims, &ctx);
         ti.process_event(&InteractEvent::CharInput('0'), &mut prims, &ctx);
 
-        let preview = ti.preview_transform().unwrap();
+        let preview = ti.preview_transform(&ctx).unwrap();
         // 90 degrees around Z
         let expected = Quat::from_axis_angle(Vec3::Z, 90.0_f32.to_radians());
         let dot = preview.rotation.dot(expected).abs();
@@ -561,7 +630,7 @@ mod tests {
             &ctx,
         );
 
-        let preview = ti.preview_transform().unwrap();
+        let preview = ti.preview_transform(&ctx).unwrap();
         // 100 * 0.01 = 1.0 on X
         assert!((preview.position.x - 1.0).abs() < 1e-4);
     }
@@ -581,7 +650,7 @@ mod tests {
 
         ti.process_event(&InteractEvent::CharInput('3'), &mut prims, &ctx);
 
-        let preview = ti.preview_transform().unwrap();
+        let preview = ti.preview_transform(&ctx).unwrap();
         // X locked, YZ affected
         assert!(preview.position.x.abs() < 1e-6);
         assert!((preview.position.y - 3.0).abs() < 1e-6);

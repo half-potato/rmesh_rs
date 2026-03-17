@@ -122,6 +122,7 @@ struct App {
     left_pressed: bool,
     middle_pressed: bool,
     right_pressed: bool,
+    shift_pressed: bool,
     last_mouse: (f64, f64),
     // egui + FPS
     egui_ctx: egui::Context,
@@ -161,6 +162,7 @@ impl App {
             left_pressed: false,
             middle_pressed: false,
             right_pressed: false,
+            shift_pressed: false,
             last_mouse: (0.0, 0.0),
             egui_ctx: egui::Context::default(),
             frame_times: VecDeque::with_capacity(120),
@@ -308,13 +310,19 @@ impl App {
 
             log::info!("GPU: {:?}", adapter.get_info().name);
 
-            let mesh_shader_supported = adapter
-                .features()
-                .contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER);
+            let adapter_features = adapter.features();
+            let backend = adapter.get_info().backend;
+            let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP)
+                && backend != wgpu::Backend::Metal; // naga MSL doesn't support subgroups yet
+            let mesh_shader_supported = subgroup_supported
+                && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER);
+            log::info!("Subgroup support: {}", subgroup_supported);
             log::info!("Mesh shader support: {}", mesh_shader_supported);
 
-            let mut required_features = wgpu::Features::SUBGROUP
-                | wgpu::Features::SHADER_FLOAT32_ATOMIC;
+            let mut required_features = wgpu::Features::SHADER_FLOAT32_ATOMIC;
+            if subgroup_supported {
+                required_features |= wgpu::Features::SUBGROUP;
+            }
             if mesh_shader_supported {
                 required_features |= wgpu::Features::EXPERIMENTAL_MESH_SHADER;
             }
@@ -1005,6 +1013,29 @@ impl App {
 
         // Primitive + compositor passes (when enabled and primitives exist)
         if self.show_primitives && !self.primitives.is_empty() {
+            // Temporarily apply preview transform so the grabbed object follows the mouse
+            let preview_restore = if let Some(idx) = self.interaction.selected() {
+                let ctx = InteractContext {
+                    view_matrix: view_mat,
+                    proj_matrix: proj_mat,
+                    viewport_width: w as f32,
+                    viewport_height: h as f32,
+                };
+                if let Some(preview) = self.interaction.preview_transform(&ctx) {
+                    if idx < self.primitives.len() {
+                        let original = self.primitives[idx].transform;
+                        self.primitives[idx].transform = preview;
+                        Some((idx, original))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             record_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
@@ -1014,6 +1045,11 @@ impl App {
                 &self.primitives,
                 &vp,
             );
+
+            // Restore original transform after rendering
+            if let Some((idx, original)) = preview_restore {
+                self.primitives[idx].transform = original;
+            }
 
             // Write compositor uniforms (near/far)
             let comp_uniforms = CompositorUniforms {
@@ -1363,6 +1399,11 @@ impl ApplicationHandler for App {
                     return;
                 };
 
+                // Track shift state for shift+left-click pan
+                if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
+                    self.shift_pressed = key_event.state == ElementState::Pressed;
+                }
+
                 // Try interaction system first
                 let mut consumed = false;
                 if let Some(ikey) = winit_key_to_interact(code) {
@@ -1457,7 +1498,9 @@ impl ApplicationHandler for App {
                             &interact_ctx,
                         );
                     } else {
-                        if self.left_pressed {
+                        if self.left_pressed && self.shift_pressed {
+                            self.camera.pan(dx as f32, dy as f32);
+                        } else if self.left_pressed {
                             self.camera.orbit(dx as f32, dy as f32);
                         }
                         if self.middle_pressed {

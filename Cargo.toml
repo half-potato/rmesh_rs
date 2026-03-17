@@ -14,12 +14,11 @@ members = [
     "crates/rmesh-compositor",
     "crates/rmesh-viewer",
     "crates/rmesh-viewer-web",
-    "crates/rmesh-python",
     "wtet",
 ]
 
 [workspace.dependencies]
-wgpu = "28"
+wgpu = { version = "28", features = ["webgl"] }   # or "webgpu" for WebGPU backend
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 glam = { version = "0.32", features = ["bytemuck"] }

@@ -60,15 +60,16 @@ impl PrimitiveGeometry {
 fn generate_cube() -> Vec<PrimitiveVertex> {
     let mut verts = Vec::with_capacity(36);
 
+    // Each quad's vertices must be ordered so that (v1-v0)×(v2-v0) = outward normal (CCW).
     let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
         // +X
         ([1.0, 0.0, 0.0], [[0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5]]),
         // -X
         ([-1.0, 0.0, 0.0], [[-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5], [-0.5, -0.5, -0.5]]),
         // +Y
-        ([0.0, 1.0, 0.0], [[-0.5, 0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]]),
-        // -Y (fixed winding for back-face cull correctness)
-        ([0.0, -1.0, 0.0], [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, -0.5, -0.5], [-0.5, -0.5, -0.5]]),
+        ([0.0, 1.0, 0.0], [[-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]]),
+        // -Y
+        ([0.0, -1.0, 0.0], [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]]),
         // +Z
         ([0.0, 0.0, 1.0], [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]]),
         // -Z
@@ -117,14 +118,14 @@ fn generate_sphere(slices: u32, stacks: u32) -> Vec<PrimitiveVertex> {
             // Top triangle (skip degenerate at north pole)
             if i > 0 {
                 verts.push(PrimitiveVertex { position: p00, normal: n00 });
-                verts.push(PrimitiveVertex { position: p10, normal: n10 });
                 verts.push(PrimitiveVertex { position: p11, normal: n11 });
+                verts.push(PrimitiveVertex { position: p10, normal: n10 });
             }
             // Bottom triangle (skip degenerate at south pole)
             if i < stacks - 1 {
                 verts.push(PrimitiveVertex { position: p00, normal: n00 });
-                verts.push(PrimitiveVertex { position: p11, normal: n11 });
                 verts.push(PrimitiveVertex { position: p01, normal: n01 });
+                verts.push(PrimitiveVertex { position: p11, normal: n11 });
             }
         }
     }
@@ -135,10 +136,10 @@ fn generate_sphere(slices: u32, stacks: u32) -> Vec<PrimitiveVertex> {
 fn generate_plane() -> Vec<PrimitiveVertex> {
     let n = [0.0, 1.0, 0.0];
     let quad = [
-        [-0.5, 0.0, -0.5],
-        [0.5, 0.0, -0.5],
-        [0.5, 0.0, 0.5],
         [-0.5, 0.0, 0.5],
+        [0.5, 0.0, 0.5],
+        [0.5, 0.0, -0.5],
+        [-0.5, 0.0, -0.5],
     ];
 
     vec![
@@ -162,7 +163,7 @@ fn generate_cylinder(segments: u32) -> Vec<PrimitiveVertex> {
         let (s0, c0) = (a0.sin(), a0.cos());
         let (s1, c1) = (a1.sin(), a1.cos());
 
-        // Side quad
+        // Side quad (CCW when viewed from outside)
         let n0 = [c0, 0.0, s0];
         let n1 = [c1, 0.0, s1];
         let p0b = [c0 * r, -h, s0 * r];
@@ -171,24 +172,24 @@ fn generate_cylinder(segments: u32) -> Vec<PrimitiveVertex> {
         let p1t = [c1 * r, h, s1 * r];
 
         verts.push(PrimitiveVertex { position: p0b, normal: n0 });
-        verts.push(PrimitiveVertex { position: p1b, normal: n1 });
         verts.push(PrimitiveVertex { position: p1t, normal: n1 });
+        verts.push(PrimitiveVertex { position: p1b, normal: n1 });
 
         verts.push(PrimitiveVertex { position: p0b, normal: n0 });
-        verts.push(PrimitiveVertex { position: p1t, normal: n1 });
         verts.push(PrimitiveVertex { position: p0t, normal: n0 });
+        verts.push(PrimitiveVertex { position: p1t, normal: n1 });
 
         // Top cap
         let nt = [0.0, 1.0, 0.0];
         verts.push(PrimitiveVertex { position: [0.0, h, 0.0], normal: nt });
-        verts.push(PrimitiveVertex { position: p0t, normal: nt });
         verts.push(PrimitiveVertex { position: p1t, normal: nt });
+        verts.push(PrimitiveVertex { position: p0t, normal: nt });
 
         // Bottom cap
         let nb = [0.0, -1.0, 0.0];
         verts.push(PrimitiveVertex { position: [0.0, -h, 0.0], normal: nb });
-        verts.push(PrimitiveVertex { position: p1b, normal: nb });
         verts.push(PrimitiveVertex { position: p0b, normal: nb });
+        verts.push(PrimitiveVertex { position: p1b, normal: nb });
     }
 
     verts

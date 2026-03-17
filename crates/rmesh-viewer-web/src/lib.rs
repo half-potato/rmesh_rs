@@ -77,6 +77,7 @@ pub struct WebViewer {
     next_primitive_id: u32,
 }
 
+#[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
 impl WebViewer {
     /// Create a viewer attached to a `<canvas>` element by its DOM id. Async — must `await` in JS.
