@@ -342,7 +342,7 @@ impl TransformInteraction {
                 } else {
                     // Project mouse delta to world-space movement
                     let delta = Self::mouse_to_world_grab(
-                        mouse_accum, axis, ctx,
+                        mouse_accum, axis, original.position, ctx,
                     );
                     Transform {
                         position: original.position + delta,
@@ -384,11 +384,21 @@ impl TransformInteraction {
     fn mouse_to_world_grab(
         mouse_accum: [f32; 2],
         axis: AxisConstraint,
+        obj_pos: Vec3,
         ctx: &InteractContext,
     ) -> Vec3 {
-        let sensitivity = 0.01;
-        let dx = mouse_accum[0] * sensitivity;
-        let dy = mouse_accum[1] * sensitivity;
+        // Compute depth of the object in view-space to get correct pixel-to-world scaling.
+        // view_pos.z is negative (OpenGL convention), depth = -view_pos.z
+        let view_pos = ctx.view_matrix * obj_pos.extend(1.0);
+        let depth = (-view_pos.z).max(0.01);
+
+        // proj_matrix[1][1] = 1/tan(fov_y/2), so focal_px = proj[1][1] * viewport_height/2
+        // world_units_per_pixel = depth / focal_px
+        let focal_px = ctx.proj_matrix.col(1).y * ctx.viewport_height * 0.5;
+        let world_per_px = depth / focal_px;
+
+        let dx = mouse_accum[0] * world_per_px;
+        let dy = mouse_accum[1] * world_per_px;
 
         // Extract camera right and up vectors from the view matrix
         let view = ctx.view_matrix;
@@ -501,9 +511,12 @@ mod tests {
     use crate::transform::PrimitiveKind;
 
     fn dummy_ctx() -> InteractContext {
+        // Camera at z=5 looking at origin
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 800.0 / 600.0, 0.1, 100.0);
         InteractContext {
-            view_matrix: Mat4::IDENTITY,
-            proj_matrix: Mat4::IDENTITY,
+            view_matrix: view,
+            proj_matrix: proj,
             viewport_width: 800.0,
             viewport_height: 600.0,
         }
@@ -631,8 +644,13 @@ mod tests {
         );
 
         let preview = ti.preview_transform(&ctx).unwrap();
-        // 100 * 0.01 = 1.0 on X
-        assert!((preview.position.x - 1.0).abs() < 1e-4);
+        // Depth-aware sensitivity: object at origin, camera at z=5 → depth=5
+        // proj[1][1] = 1/tan(fov_y/2), focal_px = proj[1][1] * 300
+        // world_per_px = 5 / focal_px ≈ 0.0069
+        // 100 px * ~0.0069 ≈ 0.69 world units on X
+        assert!(preview.position.x > 0.5, "x={}", preview.position.x);
+        assert!(preview.position.x < 1.0, "x={}", preview.position.x);
+        assert!(preview.position.y.abs() < 1e-4);
     }
 
     #[test]
