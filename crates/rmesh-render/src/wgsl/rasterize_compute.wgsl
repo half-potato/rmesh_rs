@@ -389,13 +389,7 @@ fn main(
 
             if (!(valid && t_min_val < t_max_val)) {
                 // Ray miss: scanline covers pixel but ray doesn't hit tet.
-                // Classify: degenerate slab (thin tet, t_min ≈ t_max) vs true miss.
-                if (valid && (t_min_val - t_max_val) < 0.01) {
-                    // Degenerate: valid slab but t_min >= t_max by a tiny margin
-                    sm_stats[pixel_local].z += 1u; // reuse occluded slot
-                } else {
-                    sm_stats[pixel_local].x += 1u;
-                }
+                sm_stats[pixel_local].x += 1u;
             } else {
                 // Volume integral
                 let base_offset = dot(grad_vec, ray_o - verts[0]);

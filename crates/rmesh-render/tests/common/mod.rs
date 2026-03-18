@@ -491,6 +491,7 @@ async fn gpu_render_scene_async(
         None,
         false,
         None, None, None,
+        None,
     );
 
     // Copy color texture to readback buffer

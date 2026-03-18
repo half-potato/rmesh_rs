@@ -302,7 +302,7 @@ impl WebViewer {
 
         // GPU SH evaluation
         self.sh_eval_pipeline
-            .record(&mut encoder, &scene.sh_eval_bg, scene.tet_count);
+            .record(&mut encoder, &scene.sh_eval_bg, scene.tet_count, None);
 
         // Primitive pass first: renders to volume color target + primitive depth target
         // (clears both even if no primitives, so forward pass can LoadOp::Load)
@@ -336,6 +336,7 @@ impl WebViewer {
             None,
             false,
             None, None, None,
+            None,
         );
 
         // Blit directly — no compositor needed

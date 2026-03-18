@@ -68,6 +68,19 @@ const C3: [f32; 7] = [
     -0.5900435899266435,
 ];
 
+/// Per-frame GPU timing breakdown from timestamp queries.
+/// Indices: 0,1=project  2,3=prepass/indirect  4,5=render  6,7=SH eval
+#[derive(Clone, Default)]
+struct GpuTimings {
+    sh_eval_ms: f32,
+    project_ms: f32,
+    sort_ms: f32,
+    render_ms: f32,
+    total_ms: f32,
+}
+
+const TS_QUERY_COUNT: u32 = 8;
+
 struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -116,6 +129,15 @@ struct GpuState {
     // Instance count readback (for debugging)
     instance_count_readback: wgpu::Buffer,
     visible_instance_count: u32,
+    // GPU timestamp profiling (double-buffered readback)
+    ts_query_set: wgpu::QuerySet,
+    ts_resolve_buf: wgpu::Buffer,
+    ts_readback: [wgpu::Buffer; 2],
+    ts_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
+    ts_frame: usize,
+    ts_period_ns: f32,
+    gpu_times_ms: GpuTimings,
+    instance_count_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct App {
@@ -326,7 +348,8 @@ impl App {
             log::info!("Subgroup support: {}", subgroup_supported);
             log::info!("Mesh shader support: {}", mesh_shader_supported);
 
-            let mut required_features = wgpu::Features::SHADER_FLOAT32_ATOMIC;
+            let mut required_features = wgpu::Features::SHADER_FLOAT32_ATOMIC
+                | wgpu::Features::TIMESTAMP_QUERY;
             if subgroup_supported {
                 required_features |= wgpu::Features::SUBGROUP;
             }
@@ -336,8 +359,8 @@ impl App {
 
             let mut limits = wgpu::Limits::default();
             limits.max_storage_buffers_per_shader_stage = 16;
-            limits.max_storage_buffer_binding_size = 1024 * 1024 * 1024; // 1 GB
-            limits.max_buffer_size = 1024 * 1024 * 1024; // 1 GB
+            limits.max_storage_buffer_binding_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
+            limits.max_buffer_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
 
             // Copy mesh shader limits from adapter (they default to 0 = disabled)
             if mesh_shader_supported {
@@ -520,6 +543,30 @@ impl App {
             mapped_at_creation: false,
         });
 
+        // GPU timestamp profiling
+        let ts_period_ns = queue.get_timestamp_period();
+        let ts_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu_profiler"),
+            ty: wgpu::QueryType::Timestamp,
+            count: TS_QUERY_COUNT,
+        });
+        let ts_resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ts_resolve"),
+            size: (TS_QUERY_COUNT as u64) * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let ts_readback = std::array::from_fn(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(if i == 0 { "ts_readback_a" } else { "ts_readback_b" }),
+                size: (TS_QUERY_COUNT as u64) * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        let ts_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
+            std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
             &device,
@@ -577,6 +624,14 @@ impl App {
             egui_state,
             instance_count_readback,
             visible_instance_count: 0,
+            ts_query_set,
+            ts_resolve_buf,
+            ts_readback,
+            ts_readback_ready,
+            ts_frame: 0,
+            ts_period_ns,
+            gpu_times_ms: GpuTimings::default(),
+            instance_count_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
 
@@ -627,8 +682,52 @@ impl App {
         let pos = self.camera.position.to_array();
         let fps = self.fps;
         let visible_count = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
+        let gpu_times = self.gpu.as_ref().map_or(GpuTimings::default(), |g| g.gpu_times_ms.clone());
 
         let gpu = self.gpu.as_mut().unwrap();
+
+        // --- Non-blocking readback of previous frame's data ---
+        {
+            use std::sync::atomic::Ordering;
+            gpu.device.poll(wgpu::PollType::Poll).ok();
+
+            // Read previous frame's GPU timestamps
+            let prev = (gpu.ts_frame + 1) % 2;
+            if gpu.ts_readback_ready[prev].load(Ordering::Acquire) {
+                let slice = gpu.ts_readback[prev].slice(..);
+                let data = slice.get_mapped_range();
+                let ts: &[u64] = bytemuck::cast_slice(&data);
+                let p = gpu.ts_period_ns as f64 / 1_000_000.0; // convert to ms
+
+                let project = (ts[1].wrapping_sub(ts[0])) as f64 * p;
+                let sort = (ts[2].wrapping_sub(ts[1])) as f64 * p;
+                let render = (ts[5].wrapping_sub(ts[4])) as f64 * p;
+                let sh = (ts[7].wrapping_sub(ts[6])) as f64 * p;
+                let total = (ts[5].wrapping_sub(ts[6])) as f64 * p; // SH start → render end
+
+                gpu.gpu_times_ms = GpuTimings {
+                    sh_eval_ms: sh as f32,
+                    project_ms: project as f32,
+                    sort_ms: sort as f32,
+                    render_ms: render as f32,
+                    total_ms: total as f32,
+                };
+
+                drop(data);
+                gpu.ts_readback[prev].unmap();
+                gpu.ts_readback_ready[prev].store(false, Ordering::Release);
+            }
+
+            // Read previous frame's instance count
+            if gpu.instance_count_ready.load(Ordering::Acquire) {
+                let slice = gpu.instance_count_readback.slice(..);
+                let data = slice.get_mapped_range();
+                gpu.visible_instance_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                drop(data);
+                gpu.instance_count_readback.unmap();
+                gpu.instance_count_ready.store(false, Ordering::Release);
+            }
+        }
 
         // Apply deferred surface reconfigure (must happen before get_current_texture)
         if gpu.pending_reconfigure {
@@ -747,8 +846,13 @@ impl App {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} visible / {} tets  |  {}x{}",
-                            fps, visible_count, tet_count, w, h
+                            "FPS: {:.0}  |  {} visible / {} tets  |  {}x{}  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Render:{:.1})",
+                            fps, visible_count, tet_count, w, h,
+                            gpu_times.total_ms,
+                            gpu_times.sh_eval_ms,
+                            gpu_times.project_ms,
+                            gpu_times.sort_ms,
+                            gpu_times.render_ms,
                         ));
                     });
                 });
@@ -908,7 +1012,7 @@ impl App {
 
         // GPU SH evaluation (replaces CPU evaluate_sh_colors + write_buffer)
         gpu.sh_eval_pipeline
-            .record(&mut encoder, &gpu.sh_eval_bg, gpu.tet_count);
+            .record(&mut encoder, &gpu.sh_eval_bg, gpu.tet_count, Some(&gpu.ts_query_set));
 
         // Fluid simulation step (if enabled)
         if self.fluid_enabled {
@@ -1065,6 +1169,7 @@ impl App {
                 &gpu.queue,
                 &gpu.primitive_targets.depth_view,
                 Some(&gpu.hw_compute_bg),
+                Some(&gpu.ts_query_set),
             );
         } else {
             rmesh_render::record_sorted_forward_pass(
@@ -1086,6 +1191,7 @@ impl App {
                 Some(&gpu.prepass_bg_a),
                 Some(&gpu.prepass_bg_b),
                 Some(&gpu.quad_render_bg),
+                Some(&gpu.ts_query_set),
             );
         }
 
@@ -1118,17 +1224,47 @@ impl App {
             gpu.egui_renderer.render(&mut rpass, &paint_jobs, &screen_desc);
         }
 
+        // Resolve GPU timestamps and copy to readback buffer
+        let cur_rb = gpu.ts_frame % 2;
+        encoder.resolve_query_set(
+            &gpu.ts_query_set,
+            0..TS_QUERY_COUNT,
+            &gpu.ts_resolve_buf,
+            0,
+        );
+        encoder.copy_buffer_to_buffer(
+            &gpu.ts_resolve_buf, 0,
+            &gpu.ts_readback[cur_rb], 0,
+            (TS_QUERY_COUNT as u64) * 8,
+        );
+
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
-        // Readback visible instance count (blocking, but only 4 bytes)
+        // Async map of this frame's timestamp readback (will be ready next frame)
         {
-            let slice = gpu.instance_count_readback.slice(..);
-            slice.map_async(wgpu::MapMode::Read, |_| {});
-            gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
-            let data = slice.get_mapped_range();
-            gpu.visible_instance_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-            drop(data);
-            gpu.instance_count_readback.unmap();
+            use std::sync::atomic::Ordering;
+            let ready = gpu.ts_readback_ready[cur_rb].clone();
+            gpu.ts_readback[cur_rb]
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    if result.is_ok() {
+                        ready.store(true, Ordering::Release);
+                    }
+                });
+            gpu.ts_frame += 1;
+        }
+
+        // Async map instance count readback (will be ready next frame)
+        {
+            use std::sync::atomic::Ordering;
+            let ready = gpu.instance_count_ready.clone();
+            gpu.instance_count_readback
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    if result.is_ok() {
+                        ready.store(true, Ordering::Release);
+                    }
+                });
         }
 
         // Free egui textures after submit

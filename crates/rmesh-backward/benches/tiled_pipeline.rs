@@ -823,6 +823,7 @@ fn run_forward_hw_rasterize(s: &BenchState) {
         None,
         false,
         None, None, None,
+        None,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));

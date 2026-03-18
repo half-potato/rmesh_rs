@@ -57,7 +57,7 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
     println!("Total tet-pixel pairs: {grand_total}");
     println!("  Ray miss:   {:>12} ({:5.1}%)", total_miss, pct(total_miss));
     println!("  Ghost:      {:>12} ({:5.1}%)", total_ghost, pct(total_ghost));
-    println!("  Degen slab: {:>12} ({:5.1}%)  (valid slab, t_min ≈ t_max)", total_occluded, pct(total_occluded));
+    println!("  Occluded:   {:>12} ({:5.1}%)", total_occluded, pct(total_occluded));
     println!("  Useful:     {:>12} ({:5.1}%)", total_useful, pct(total_useful));
 
     // Per-pixel statistics
@@ -172,7 +172,7 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
         indexed.sort_by(|a, b| b.1[4].cmp(&a.1[4]));
         println!("\n  Top 10 hottest tiles:");
         println!("    {:>4} {:>4}  {:>8}  {:>7} {:>7} {:>7} {:>7}  {:>6}",
-            "tx", "ty", "total", "miss", "ghost", "degen", "useful", "max_px");
+            "tx", "ty", "total", "miss", "ghost", "occl", "useful", "max_px");
         for &(tile_idx, ts_data) in indexed.iter().take(10) {
             let tx = tile_idx as u32 % tiles_x;
             let ty = tile_idx as u32 / tiles_x;

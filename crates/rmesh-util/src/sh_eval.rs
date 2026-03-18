@@ -180,6 +180,7 @@ impl ShEvalPipeline {
         encoder: &mut wgpu::CommandEncoder,
         bind_group: &wgpu::BindGroup,
         tet_count: u32,
+        profiler: Option<&wgpu::QuerySet>,
     ) {
         const WG_SIZE: u32 = 256;
         const MAX_DIM: u32 = 65535;
@@ -190,7 +191,11 @@ impl ShEvalPipeline {
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sh_eval compute"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(6),
+                end_of_pass_write_index: Some(7),
+            }),
         });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bind_group, &[]);

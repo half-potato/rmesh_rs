@@ -1569,6 +1569,7 @@ pub fn record_sorted_forward_pass(
     prepass_bg_a: Option<&wgpu::BindGroup>,
     prepass_bg_b: Option<&wgpu::BindGroup>,
     quad_render_bg: Option<&wgpu::BindGroup>,
+    profiler: Option<&wgpu::QuerySet>,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -1590,7 +1591,11 @@ pub fn record_sorted_forward_pass(
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("project_compute"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            }),
         });
         if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&pipelines.hw_compute_pipeline);
@@ -1623,7 +1628,11 @@ pub fn record_sorted_forward_pass(
         };
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("forward_prepass"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(2),
+                end_of_pass_write_index: Some(3),
+            }),
         });
         cpass.set_pipeline(&pipelines.prepass_compute_pipeline);
         cpass.set_bind_group(0, prepass_bg, &[]);
@@ -1710,7 +1719,11 @@ pub fn record_sorted_forward_pass(
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(4),
+                end_of_pass_write_index: Some(5),
+            }),
             occlusion_query_set: None,
             multiview_mask: None,
         });
@@ -1760,6 +1773,7 @@ pub fn record_sorted_mesh_forward_pass(
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
     hw_compute_bg: Option<&wgpu::BindGroup>,
+    profiler: Option<&wgpu::QuerySet>,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -1783,7 +1797,11 @@ pub fn record_sorted_mesh_forward_pass(
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("project_compute"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(0),
+                end_of_pass_write_index: Some(1),
+            }),
         });
         if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
@@ -1811,7 +1829,11 @@ pub fn record_sorted_mesh_forward_pass(
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("indirect_convert"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(2),
+                end_of_pass_write_index: Some(3),
+            }),
         });
         cpass.set_pipeline(&mesh_pipelines.indirect_convert_pipeline);
         cpass.set_bind_group(0, indirect_convert_bg, &[]);
@@ -1875,7 +1897,11 @@ pub fn record_sorted_mesh_forward_pass(
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::RenderPassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: Some(4),
+                end_of_pass_write_index: Some(5),
+            }),
             occlusion_query_set: None,
             multiview_mask: None,
         });
