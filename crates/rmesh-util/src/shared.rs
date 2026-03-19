@@ -39,8 +39,10 @@ pub struct Uniforms {
     pub ray_mode: u32,
     /// Minimum ray-origin offset along view direction (matches Slang camera.min_t).
     pub min_t: f32,
+    /// SH degree for inline SH evaluation (0 = use base_colors path, 1-3 = eval SH).
+    pub sh_degree: u32,
     /// Padding to maintain 192-byte struct size.
-    pub _pad1: [u32; 5],
+    pub _pad1: [u32; 4],
 }
 
 impl Uniforms {

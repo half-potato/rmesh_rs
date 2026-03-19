@@ -27,7 +27,6 @@ use rmesh_interact::{
 };
 use rmesh_sim::{FluidParams, FluidSim};
 use rmesh_util::camera::Camera;
-use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
 use wgpu::util::DeviceExt;
 
 use rayon::prelude::*;
@@ -79,7 +78,34 @@ struct GpuTimings {
     total_ms: f32,
 }
 
+/// Per-frame CPU timing breakdown (rolling average).
+#[derive(Clone, Default)]
+struct CpuTimings {
+    poll_readback_ms: f32,
+    acquire_ms: f32,
+    egui_ms: f32,
+    encode_ms: f32,
+    submit_ms: f32,
+    present_ms: f32,
+    total_ms: f32,
+}
+
 const TS_QUERY_COUNT: u32 = 8;
+
+/// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
+fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
+    let mut packed = vec![0u32; (coeffs.len() + 1) / 2];
+    for i in (0..coeffs.len()).step_by(2) {
+        let lo = half::f16::from_f32(coeffs[i]);
+        let hi = if i + 1 < coeffs.len() {
+            half::f16::from_f32(coeffs[i + 1])
+        } else {
+            half::f16::ZERO
+        };
+        packed[i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
+    }
+    packed
+}
 
 struct GpuState {
     device: wgpu::Device,
@@ -99,11 +125,8 @@ struct GpuState {
     render_bg_b: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
     tet_count: u32,
-    // GPU SH evaluation
-    sh_eval_pipeline: ShEvalPipeline,
-    sh_eval_bg: wgpu::BindGroup,
+    // SH coefficients (f16-packed, bound to project_compute)
     sh_coeffs_buf: wgpu::Buffer,
-    sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
     pending_reconfigure: bool,
     // Mesh shader (optional)
@@ -137,6 +160,7 @@ struct GpuState {
     ts_frame: usize,
     ts_period_ns: f32,
     gpu_times_ms: GpuTimings,
+    cpu_times_ms: CpuTimings,
     instance_count_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -419,7 +443,7 @@ impl App {
             present_mode: wgpu::PresentMode::AutoVsync,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: 3,
         };
         surface.configure(&device, &surface_config);
 
@@ -450,32 +474,13 @@ impl App {
             self.scene_data.tet_count,
         );
 
-        // Upload SH coefficients to GPU (one-time, only changes on file reload)
+        // Upload SH coefficients to GPU as f16-packed u32 array
+        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs);
         let sh_coeffs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sh_coeffs"),
-            contents: bytemuck::cast_slice(&self.sh_coeffs.coeffs),
+            contents: bytemuck::cast_slice(&sh_coeffs_packed),
             usage: wgpu::BufferUsages::STORAGE,
         });
-
-        // SH eval uniforms buffer (updated each frame with cam_pos)
-        let sh_eval_uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sh_eval_uniforms"),
-            size: std::mem::size_of::<ShEvalUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        log::info!("Compiling SH eval pipeline...");
-        let sh_eval_pipeline = ShEvalPipeline::new(&device);
-        let sh_eval_bg = sh_eval_pipeline.create_bind_group(
-            &device,
-            &sh_eval_uniforms_buf,
-            &buffers.vertices,
-            &buffers.indices,
-            &sh_coeffs_buf,
-            &material.color_grads,
-            &material.base_colors,
-        );
         let sh_degree = self.sh_coeffs.degree;
 
         log::info!("Buffers uploaded: {:.2}s", t0.elapsed().as_secs_f64());
@@ -485,23 +490,23 @@ impl App {
         // Radix sort state
         log::info!("Creating radix sort pipelines...");
         let t0 = std::time::Instant::now();
-        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1);
+        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
         let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
-        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1);
+        let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
         sort_state.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
         // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
 
-        let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material);
-        let hw_compute_bg = create_hw_compute_bind_group(&device, &pipelines, &buffers, &material);
+        let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
+        let hw_compute_bg = create_hw_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
             &device,
             &pipelines,
             &buffers,
             &material,
-            &sort_state.values_b,
+            sort_state.values_b(),
         );
 
         // Mesh shader bind groups (if supported)
@@ -509,7 +514,7 @@ impl App {
             if let Some(ref mp) = mesh_pipelines {
                 let a = create_mesh_render_bind_group(&device, mp, &buffers, &material);
                 let b = create_mesh_render_bind_group_with_sort_values(
-                    &device, mp, &buffers, &material, &sort_state.values_b,
+                    &device, mp, &buffers, &material, sort_state.values_b(),
                 );
                 let ic = create_indirect_convert_bind_group(&device, mp, &buffers);
                 (Some(a), Some(b), Some(ic))
@@ -522,7 +527,7 @@ impl App {
             &device, &pipelines, &buffers, &material, &buffers.sort_values,
         );
         let prepass_bg_b = create_prepass_bind_group(
-            &device, &pipelines, &buffers, &material, &sort_state.values_b,
+            &device, &pipelines, &buffers, &material, sort_state.values_b(),
         );
         let quad_render_bg = create_quad_render_bind_group(
             &device, &pipelines, &buffers,
@@ -602,10 +607,7 @@ impl App {
             render_bg_b,
             blit_bg,
             tet_count: self.scene_data.tet_count,
-            sh_eval_pipeline,
-            sh_eval_bg,
             sh_coeffs_buf,
-            sh_eval_uniforms_buf,
             sh_degree,
             pending_reconfigure: false,
             mesh_pipelines,
@@ -631,6 +633,7 @@ impl App {
             ts_frame: 0,
             ts_period_ns,
             gpu_times_ms: GpuTimings::default(),
+            cpu_times_ms: CpuTimings::default(),
             instance_count_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
@@ -683,8 +686,11 @@ impl App {
         let fps = self.fps;
         let visible_count = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
         let gpu_times = self.gpu.as_ref().map_or(GpuTimings::default(), |g| g.gpu_times_ms.clone());
+        let cpu_times = self.gpu.as_ref().map_or(CpuTimings::default(), |g| g.cpu_times_ms.clone());
 
         let gpu = self.gpu.as_mut().unwrap();
+
+        let t_frame_start = std::time::Instant::now();
 
         // --- Non-blocking readback of previous frame's data ---
         {
@@ -728,6 +734,7 @@ impl App {
                 gpu.instance_count_ready.store(false, Ordering::Release);
             }
         }
+        let t_after_poll = std::time::Instant::now();
 
         // Apply deferred surface reconfigure (must happen before get_current_texture)
         if gpu.pending_reconfigure {
@@ -737,9 +744,13 @@ impl App {
             } else {
                 wgpu::PresentMode::Mailbox
             };
+            log::info!("Reconfiguring surface: present_mode={:?} frame_latency={}",
+                gpu.surface_config.present_mode,
+                gpu.surface_config.desired_maximum_frame_latency);
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
         }
 
+        let t_before_acquire = std::time::Instant::now();
         let output = match gpu.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -751,6 +762,7 @@ impl App {
                 return;
             }
         };
+        let t_after_acquire = std::time::Instant::now();
 
         let view = output
             .texture
@@ -773,24 +785,14 @@ impl App {
             tile_size_u: 12,
             ray_mode: 0,
             min_t: 0.0,
-            _pad1: [0; 5],
+            sh_degree: gpu.sh_degree,
+            _pad1: [0; 4],
         };
 
         gpu.queue
             .write_buffer(&gpu.buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-        // Update SH eval uniforms and dispatch GPU SH evaluation
-        let sh_uniforms = ShEvalUniforms {
-            cam_pos: [pos[0], pos[1], pos[2], 0.0],
-            tet_count: gpu.tet_count,
-            sh_degree: gpu.sh_degree,
-            _pad: [0; 2],
-        };
-        gpu.queue.write_buffer(
-            &gpu.sh_eval_uniforms_buf,
-            0,
-            bytemuck::bytes_of(&sh_uniforms),
-        );
+        let t_before_egui = std::time::Instant::now();
 
         // --- egui frame ---
         let window = self.window.as_ref().unwrap();
@@ -846,13 +848,20 @@ impl App {
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} visible / {} tets  |  {}x{}  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Render:{:.1})",
-                            fps, visible_count, tet_count, w, h,
+                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
+                            fps, visible_count, tet_count,
                             gpu_times.total_ms,
                             gpu_times.sh_eval_ms,
                             gpu_times.project_ms,
                             gpu_times.sort_ms,
                             gpu_times.render_ms,
+                            cpu_times.total_ms,
+                            cpu_times.poll_readback_ms,
+                            cpu_times.acquire_ms,
+                            cpu_times.egui_ms,
+                            cpu_times.encode_ms,
+                            cpu_times.submit_ms,
+                            cpu_times.present_ms,
                         ));
                     });
                 });
@@ -1001,6 +1010,8 @@ impl App {
                 .update_texture(&gpu.device, &gpu.queue, *id, image_delta);
         }
 
+        let t_after_egui = std::time::Instant::now();
+
         let mut encoder = gpu
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1009,10 +1020,6 @@ impl App {
 
         gpu.egui_renderer
             .update_buffers(&gpu.device, &gpu.queue, &mut encoder, &paint_jobs, &screen_desc);
-
-        // GPU SH evaluation (replaces CPU evaluate_sh_colors + write_buffer)
-        gpu.sh_eval_pipeline
-            .record(&mut encoder, &gpu.sh_eval_bg, gpu.tet_count, Some(&gpu.ts_query_set));
 
         // Fluid simulation step (if enabled)
         if self.fluid_enabled {
@@ -1238,7 +1245,9 @@ impl App {
             (TS_QUERY_COUNT as u64) * 8,
         );
 
+        let t_before_submit = std::time::Instant::now();
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        let t_after_submit = std::time::Instant::now();
 
         // Async map of this frame's timestamp readback (will be ready next frame)
         {
@@ -1272,7 +1281,23 @@ impl App {
             gpu.egui_renderer.free_texture(id);
         }
 
+        let t_before_present = std::time::Instant::now();
         output.present();
+        let t_after_present = std::time::Instant::now();
+
+        // EMA smoothing (alpha = 0.05 for stable readout)
+        let alpha = 0.05f32;
+        let mix = |old: f32, new: f32| old * (1.0 - alpha) + new * alpha;
+        let prev = &gpu.cpu_times_ms;
+        gpu.cpu_times_ms = CpuTimings {
+            poll_readback_ms: mix(prev.poll_readback_ms, (t_after_poll - t_frame_start).as_secs_f32() * 1000.0),
+            acquire_ms: mix(prev.acquire_ms, (t_after_acquire - t_before_acquire).as_secs_f32() * 1000.0),
+            egui_ms: mix(prev.egui_ms, (t_after_egui - t_before_egui).as_secs_f32() * 1000.0),
+            encode_ms: mix(prev.encode_ms, (t_before_submit - t_after_egui).as_secs_f32() * 1000.0),
+            submit_ms: mix(prev.submit_ms, (t_after_submit - t_before_submit).as_secs_f32() * 1000.0),
+            present_ms: mix(prev.present_ms, (t_after_present - t_before_present).as_secs_f32() * 1000.0),
+            total_ms: mix(prev.total_ms, (t_after_present - t_frame_start).as_secs_f32() * 1000.0),
+        };
 
         // Handle deferred file load
         if let Some(path) = self.pending_load.take() {
@@ -1349,28 +1374,20 @@ impl App {
             );
             gpu.tet_count = self.scene_data.tet_count;
 
-            // Recreate SH coeffs buffer and bind group
+            // Recreate SH coeffs buffer (f16-packed)
+            let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs);
             gpu.sh_coeffs_buf =
                 gpu.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label: Some("sh_coeffs"),
-                        contents: bytemuck::cast_slice(&self.sh_coeffs.coeffs),
+                        contents: bytemuck::cast_slice(&sh_coeffs_packed),
                         usage: wgpu::BufferUsages::STORAGE,
                     });
             gpu.sh_degree = self.sh_coeffs.degree;
-            gpu.sh_eval_bg = gpu.sh_eval_pipeline.create_bind_group(
-                &gpu.device,
-                &gpu.sh_eval_uniforms_buf,
-                &gpu.buffers.vertices,
-                &gpu.buffers.indices,
-                &gpu.sh_coeffs_buf,
-                &gpu.material_buffers.color_grads,
-                &gpu.material_buffers.base_colors,
-            );
 
             // Recreate sort state for new tet count
             let n_pow2 = (gpu.tet_count as u32).next_power_of_two();
-            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1);
+            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
             gpu.sort_state.upload_configs(&gpu.queue);
 
             // Recreate bind groups
@@ -1379,12 +1396,14 @@ impl App {
                 &gpu.pipelines,
                 &gpu.buffers,
                 &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
             );
             gpu.hw_compute_bg = create_hw_compute_bind_group(
                 &gpu.device,
                 &gpu.pipelines,
                 &gpu.buffers,
                 &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
             );
             gpu.render_bg = create_render_bind_group(
                 &gpu.device,
@@ -1397,7 +1416,7 @@ impl App {
                 &gpu.pipelines,
                 &gpu.buffers,
                 &gpu.material_buffers,
-                &gpu.sort_state.values_b,
+                gpu.sort_state.values_b(),
             );
 
             // Recreate quad prepass + render bind groups
@@ -1407,7 +1426,7 @@ impl App {
             );
             gpu.prepass_bg_b = create_prepass_bind_group(
                 &gpu.device, &gpu.pipelines, &gpu.buffers, &gpu.material_buffers,
-                &gpu.sort_state.values_b,
+                gpu.sort_state.values_b(),
             );
             gpu.quad_render_bg = create_quad_render_bind_group(
                 &gpu.device, &gpu.pipelines, &gpu.buffers,
@@ -1420,7 +1439,7 @@ impl App {
                 ));
                 gpu.mesh_render_bg_b = Some(create_mesh_render_bind_group_with_sort_values(
                     &gpu.device, mp, &gpu.buffers, &gpu.material_buffers,
-                    &gpu.sort_state.values_b,
+                    gpu.sort_state.values_b(),
                 ));
                 gpu.indirect_convert_bg = Some(create_indirect_convert_bind_group(
                     &gpu.device, mp, &gpu.buffers,

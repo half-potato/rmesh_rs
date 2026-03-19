@@ -13,7 +13,7 @@ use glam::{Mat4, Quat, Vec3};
 use rmesh_backward::{
     create_backward_tiled_bind_groups, BackwardTiledPipelines,
     GradientBuffers, MaterialGradBuffers, TileUniforms,
-    RadixSortPipelines, RadixSortState, sorting_bits_for_tiles,
+    RadixSortPipelines, RadixSortState, sorting_bits_for_tiles, SortBackend,
     TileBuffers, TilePipelines,
     ScanPipelines, ScanBuffers,
     create_tile_fill_bind_group, create_tile_ranges_bind_group_with_keys,
@@ -429,8 +429,15 @@ pub fn train(
     let adam = AdamState::new(device, scene.vertex_count, scene.tet_count);
     let mat_adam = MaterialAdamState::new(device, scene.tet_count);
 
+    // Dummy sh_coeffs buffer (training uses sh_degree=0 / base_colors path)
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     // Forward compute bind group
-    let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers, &material);
+    let compute_bg = create_compute_bind_group(device, &fwd_pipelines, &buffers, &material, &dummy_sh);
 
     // Tiled forward pipeline
     let rasterize = RasterizeComputePipeline::new(device, config.render_width, config.render_height, 0);
@@ -438,9 +445,9 @@ pub fn train(
     // Tile infrastructure
     let tile_pipelines = TilePipelines::new(device);
     let tile_buffers = TileBuffers::new(device, scene.tet_count, config.render_width, config.render_height, tile_size);
-    let sorting_bits = sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_pipelines = RadixSortPipelines::new(device, 2);
-    let radix_state = RadixSortState::new(device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = sorting_bits_for_tiles(tile_buffers.num_tiles, SortBackend::Drs);
+    let radix_pipelines = RadixSortPipelines::new(device, 2, SortBackend::Drs);
+    let radix_state = RadixSortState::new(device, tile_buffers.max_pairs_pow2, sorting_bits, 2, SortBackend::Drs);
     radix_state.upload_configs(queue);
 
     let tile_fill_bg = create_tile_fill_bind_group(device, &tile_pipelines, &tile_buffers);
@@ -449,12 +456,12 @@ pub fn train(
     let tile_ranges_bg = create_tile_ranges_bind_group_with_keys(
         device, &tile_pipelines,
         &tile_buffers.tile_sort_keys, &tile_buffers.tile_ranges,
-        &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = create_tile_ranges_bind_group_with_keys(
         device, &tile_pipelines,
-        &radix_state.keys_b, &tile_buffers.tile_ranges,
-        &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        radix_state.keys_b(), &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Forward tiled bind groups (A and B)
@@ -467,7 +474,7 @@ pub fn train(
     let rasterize_bg_b = create_rasterize_bind_group(
         device, &rasterize, &buffers.uniforms, &buffers.vertices,
         &buffers.indices, &material.colors, &buffers.densities,
-        &material.color_grads, &radix_state.values_b,
+        &material.color_grads, radix_state.values_b(),
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
@@ -484,7 +491,7 @@ pub fn train(
         device, &scan_pipelines, &tile_buffers, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &buffers.compact_tet_ids,
         &buffers.circumdata, &buffers.tiles_touched, &scan_buffers,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
 
     // Loss buffers + bind group (using rasterize.rendered_image)
@@ -507,7 +514,7 @@ pub fn train(
         &loss_buffers.dl_d_image, &rasterize.rendered_image,
         &buffers.vertices, &buffers.indices, &buffers.densities,
         &material.color_grads, &material.colors,
-        &radix_state.values_b,
+        radix_state.values_b(),
         &grads.d_vertices, &grads.d_densities,
         &mat_grads.d_color_grads, &mat_grads.d_base_colors,
         &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
@@ -597,7 +604,8 @@ pub fn train(
                 tile_size_u: tile_size,
                 ray_mode: 0,
                 min_t: 0.0,
-                _pad1: [0; 5],
+                sh_degree: 0,
+                _pad1: [0; 4],
             };
 
             // Upload uniforms

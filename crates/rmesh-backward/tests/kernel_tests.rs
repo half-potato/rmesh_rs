@@ -119,12 +119,12 @@ fn test_radix_sort_kernel() {
     queue.write_buffer(&values_a, 0, bytemuck::cast_slice(&values_data));
 
     // Create pipelines and sort state (32-bit keys, key_stride=1)
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, n, 32, 1);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, n, 32, 1, rmesh_backward::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     // Write num_keys
-    queue.write_buffer(&radix_state.num_keys_buf, 0, bytemuck::bytes_of(&n));
+    queue.write_buffer(radix_state.num_keys_buf(), 0, bytemuck::bytes_of(&n));
 
     // Dispatch sort
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -135,8 +135,8 @@ fn test_radix_sort_kernel() {
     // Read back from whichever buffer has the result
     let (sorted_keys, sorted_values) = if result_in_b {
         (
-            read_buffer::<u32>(&device, &queue, &radix_state.keys_b, n as usize),
-            read_buffer::<u32>(&device, &queue, &radix_state.values_b, n as usize),
+            read_buffer::<u32>(&device, &queue, radix_state.keys_b(), n as usize),
+            read_buffer::<u32>(&device, &queue, radix_state.values_b(), n as usize),
         )
     } else {
         (
@@ -580,7 +580,7 @@ fn test_tiled_forward_e2e() {
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -593,10 +593,10 @@ fn test_tiled_forward_e2e() {
     // --- Set up tiled pipeline (scan-based, same as Python path) ---
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -628,17 +628,17 @@ fn test_tiled_forward_e2e() {
         &device, &scan_pipelines, &tile_buffers,
         &buffers.uniforms, &buffers.vertices, &buffers.indices,
         &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, &radix_state.num_keys_buf,
+        &scan_buffers, radix_state.num_keys_buf(),
     );
 
     // Tile ranges uses num_keys_buf (scan pipeline writes total_pairs there)
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
         &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &radix_state.keys_b,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Create forward tiled pipeline (SUBGROUP)
@@ -653,7 +653,7 @@ fn test_tiled_forward_e2e() {
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
-        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // --- Dispatch scan-based tiled forward pipeline ---
@@ -771,7 +771,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -783,10 +783,10 @@ fn test_multi_tet_gradient_finite_diff() {
 
         // Scan-based tiled pipeline
         let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
         let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
-        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
         radix_state.upload_configs(&queue);
 
         let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -811,16 +811,16 @@ fn test_multi_tet_gradient_finite_diff() {
             &device, &scan_pipelines, &tile_buffers,
             &buffers.uniforms, &buffers.vertices, &buffers.indices,
             &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-            &scan_buffers, &radix_state.num_keys_buf,
+            &scan_buffers, radix_state.num_keys_buf(),
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
             &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
         );
         let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
-            &device, &tile_pipelines, &radix_state.keys_b,
-            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+            &device, &tile_pipelines, radix_state.keys_b(),
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
         );
 
         let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
@@ -834,7 +834,7 @@ fn test_multi_tet_gradient_finite_diff() {
             &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
-            &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -886,7 +886,7 @@ fn test_multi_tet_gradient_finite_diff() {
             rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
 
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0,
         );
         queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -898,10 +898,10 @@ fn test_multi_tet_gradient_finite_diff() {
 
         // Scan-based tiled pipeline
         let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
         let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
-        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
         radix_state.upload_configs(&queue);
 
         let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -926,16 +926,16 @@ fn test_multi_tet_gradient_finite_diff() {
             &device, &scan_pipelines, &tile_buffers,
             &buffers.uniforms, &buffers.vertices, &buffers.indices,
             &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-            &scan_buffers, &radix_state.num_keys_buf,
+            &scan_buffers, radix_state.num_keys_buf(),
         );
 
         let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
             &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
         );
         let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
-            &device, &tile_pipelines, &radix_state.keys_b,
-            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+            &device, &tile_pipelines, radix_state.keys_b(),
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
         );
 
         let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
@@ -949,7 +949,7 @@ fn test_multi_tet_gradient_finite_diff() {
             &device, &rasterize, &buffers.uniforms,
             &buffers.vertices, &buffers.indices, &material.colors,
             &buffers.densities, &material.color_grads,
-            &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -1014,7 +1014,7 @@ fn test_multi_tet_gradient_finite_diff() {
         queue.submit(std::iter::once(encoder.finish()));
 
         let (tile_sort_values_sorted, _) = if result_in_b {
-            (&radix_state.values_b, &radix_state.keys_b)
+            (radix_state.values_b(), radix_state.keys_b())
         } else {
             (&tile_buffers.tile_sort_values, &tile_buffers.tile_sort_keys)
         };
@@ -1212,16 +1212,16 @@ fn test_single_tet_loss_decreases() {
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -1248,16 +1248,16 @@ fn test_single_tet_loss_decreases() {
         &device, &scan_pipelines, &tile_buffers,
         &buffers.uniforms, &buffers.vertices, &buffers.indices,
         &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, &radix_state.num_keys_buf,
+        &scan_buffers, radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
         &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &radix_state.keys_b,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Forward tiled
@@ -1272,7 +1272,7 @@ fn test_single_tet_loss_decreases() {
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
-        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // Loss + Backward
@@ -1317,7 +1317,7 @@ fn test_single_tet_loss_decreases() {
         &buffers.uniforms, &loss_buffers.dl_d_image, &rasterize.rendered_image,
         &buffers.vertices, &buffers.indices,
         &buffers.densities, &material.color_grads,
-        &material.colors, &radix_state.values_b,
+        &material.colors, radix_state.values_b(),
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities, &mat_grad_buffers.d_color_grads,
         &mat_grad_buffers.d_base_colors,
@@ -1642,7 +1642,7 @@ fn test_camera_gpu_visibility() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1700,7 +1700,7 @@ fn test_camera_tiled_forward_deterministic() {
         );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -1713,10 +1713,10 @@ fn test_camera_tiled_forward_deterministic() {
     // --- Tiled infrastructure with tile_size=12 ---
     let tile_size = 12u32;
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
     let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -1747,17 +1747,17 @@ fn test_camera_tiled_forward_deterministic() {
         &device, &scan_pipelines, &tile_buffers,
         &buffers.uniforms, &buffers.vertices, &buffers.indices,
         &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, &radix_state.num_keys_buf,
+        &scan_buffers, radix_state.num_keys_buf(),
     );
 
     // Tile ranges bind groups
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
         &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &radix_state.keys_b,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Forward tiled pipeline
@@ -1772,7 +1772,7 @@ fn test_camera_tiled_forward_deterministic() {
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
-        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // --- Dispatch ---

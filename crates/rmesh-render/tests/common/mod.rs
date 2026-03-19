@@ -409,13 +409,13 @@ async fn gpu_render_scene_async(
 
     // Sort infrastructure for sorted HW raster forward pass (32-bit keys)
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1);
+    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(&queue);
 
     // B-variant render bind group (uses sort_state.values_b)
     let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
-        &device, &pipelines, &buffers, &material, &sort_state.values_b,
+        &device, &pipelines, &buffers, &material, sort_state.values_b(),
     );
 
     // Write uniforms
@@ -430,6 +430,7 @@ async fn gpu_render_scene_async(
         0,
         16,
         0.0,
+        0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -623,7 +624,13 @@ async fn gpu_raytrace_scene_async(
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
     let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format);
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material, &dummy_sh);
 
     // Build ray trace data
     let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
@@ -643,7 +650,7 @@ async fn gpu_raytrace_scene_async(
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -759,7 +766,7 @@ async fn gpu_tiled_render_scene_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -772,10 +779,10 @@ async fn gpu_tiled_render_scene_async(
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
+    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_sort::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
@@ -805,16 +812,16 @@ async fn gpu_tiled_render_scene_async(
         &device, &scan_pipelines, &tile_buffers,
         &buffers.uniforms, &buffers.vertices, &buffers.indices,
         &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, &radix_state.num_keys_buf,
+        &scan_buffers, radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
         &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &radix_state.keys_b,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Forward tiled pipeline
@@ -829,7 +836,7 @@ async fn gpu_tiled_render_scene_async(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
-        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // Dispatch tiled forward pipeline
@@ -968,7 +975,7 @@ async fn gpu_tiled_render_with_stats_async(
         rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -981,10 +988,10 @@ async fn gpu_tiled_render_with_stats_async(
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
+    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_sort::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
@@ -1014,16 +1021,16 @@ async fn gpu_tiled_render_with_stats_async(
         &device, &scan_pipelines, &tile_buffers,
         &buffers.uniforms, &buffers.vertices, &buffers.indices,
         &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, &radix_state.num_keys_buf,
+        &scan_buffers, radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
         &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &radix_state.keys_b,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, &radix_state.num_keys_buf,
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
     );
 
     // Forward tiled pipeline
@@ -1038,7 +1045,7 @@ async fn gpu_tiled_render_with_stats_async(
         &device, &rasterize, &buffers.uniforms,
         &buffers.vertices, &buffers.indices, &material.colors,
         &buffers.densities, &material.color_grads,
-        &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
     );
 
     // Dispatch tiled forward pipeline

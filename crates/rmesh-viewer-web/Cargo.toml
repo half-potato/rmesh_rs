@@ -26,3 +26,4 @@ web-sys = { workspace = true, features = [
 console_log = { workspace = true }
 console_error_panic_hook = { workspace = true }
 js-sys = { workspace = true }
+half = { workspace = true }

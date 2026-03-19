@@ -251,7 +251,7 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0,
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -259,7 +259,7 @@ fn create_shared_state() -> Option<SharedState> {
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
     let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
 
     let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
         &device,
@@ -363,12 +363,13 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         H,
         tile_size,
     );
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
     let radix_state = rmesh_backward::RadixSortState::new(
         device,
         tile_buffers.max_pairs_pow2,
         sorting_bits,
         2,
+        rmesh_backward::SortBackend::Drs,
     );
     radix_state.upload_configs(queue);
 
@@ -430,7 +431,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         &sb.circumdata,
         &sb.tiles_touched,
         &shared.scan_buffers,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
 
     // Tile ranges bind groups (A and B)
@@ -440,15 +441,15 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         &tile_buffers.tile_sort_keys,
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
         device,
         &shared.tile_pipelines,
-        &radix_state.keys_b,
+        radix_state.keys_b(),
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
 
     // Rendered image buffer
@@ -510,7 +511,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(3, &mb.colors),
             buf_entry(4, &sb.densities),
             buf_entry(5, &mb.color_grads),
-            buf_entry(6, &radix_state.values_b),
+            buf_entry(6, radix_state.values_b()),
             buf_entry(7, &tile_buffers.tile_ranges),
             buf_entry(8, &tile_buffers.tile_uniforms),
             buf_entry(9, &rendered_image),
@@ -553,7 +554,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
             buf_entry(5, &sb.densities),
             buf_entry(6, &mb.color_grads),
             buf_entry(7, &mb.colors),
-            buf_entry(8, &radix_state.values_b),
+            buf_entry(8, radix_state.values_b()),
         ],
     });
     let bwd_bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -849,7 +850,7 @@ fn main() {
         // Update uniforms buffer with the correct tile_size for this run
         let (vp, c2w, intrinsics, eye) = setup_camera();
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0,
+            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0, 0,
         );
         shared.queue.write_buffer(
             &shared.scene_buffers.uniforms,

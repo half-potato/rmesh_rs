@@ -18,7 +18,7 @@ use rmesh_backward::{
     create_tile_fill_bind_group, create_tile_gen_scan_bind_group,
     create_tile_ranges_bind_group_with_keys,
     BackwardTiledPipelines, GradientBuffers, MaterialGradBuffers, RadixSortPipelines, RadixSortState,
-    ScanBuffers, ScanPipelines, TileBuffers, TilePipelines, TileUniforms,
+    ScanBuffers, ScanPipelines, SortBackend, TileBuffers, TilePipelines, TileUniforms,
 };
 use rmesh_render::{
     build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
@@ -324,8 +324,15 @@ impl RMeshRenderer {
         });
         let dummy_depth_view = dummy_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Dummy sh_coeffs buffer (Python training uses sh_degree=0 / base_colors path)
+        let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy_sh_coeffs"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         // Forward bind groups
-        let compute_bg = create_compute_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);
+        let compute_bg = create_compute_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers, &dummy_sh);
         let render_bg = create_render_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);
 
         // Tex-to-buffer
@@ -403,9 +410,9 @@ impl RMeshRenderer {
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
         // Radix sort — 64-bit keys: lo=depth(32 bits), hi=tile_id
-        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
-        let radix_pipelines = RadixSortPipelines::new(&device, 2);
-        let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let radix_pipelines = RadixSortPipelines::new(&device, 2, SortBackend::Drs);
+        let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, SortBackend::Drs);
         radix_state.upload_configs(&queue);
 
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
@@ -421,16 +428,16 @@ impl RMeshRenderer {
             &tile_buffers.tile_sort_keys,
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
-            &radix_state.num_keys_buf,
+            radix_state.num_keys_buf(),
         );
         // B-buffer bind groups (sort result in radix_state.keys_b/values_b)
         let tile_ranges_bg_b = create_tile_ranges_bind_group_with_keys(
             &device,
             &tile_pipelines,
-            &radix_state.keys_b,
+            radix_state.keys_b(),
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
-            &radix_state.num_keys_buf,
+            radix_state.num_keys_buf(),
         );
 
         // Forward tiled bind groups (A and B buffer variants)
@@ -456,7 +463,7 @@ impl RMeshRenderer {
             &material_buffers.colors,
             &scene_buffers.densities,
             &material_buffers.color_grads,
-            &radix_state.values_b,
+            radix_state.values_b(),
             &tile_buffers.tile_ranges,
             &tile_buffers.tile_uniforms,
         );
@@ -500,7 +507,7 @@ impl RMeshRenderer {
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &material_buffers.colors,
-            &radix_state.values_b,
+            radix_state.values_b(),
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -540,7 +547,7 @@ impl RMeshRenderer {
             &scene_buffers.densities,
             &material_buffers.color_grads,
             &material_buffers.colors,
-            &radix_state.values_b,
+            radix_state.values_b(),
             &grad_buffers.d_vertices,
             &grad_buffers.d_densities,
             &mat_grad_buffers.d_color_grads,
@@ -583,7 +590,7 @@ impl RMeshRenderer {
             &scene_buffers.circumdata,
             &scene_buffers.tiles_touched,
             &scan_buffers,
-            &radix_state.num_keys_buf,
+            radix_state.num_keys_buf(),
         );
 
         // Ray trace setup
@@ -634,7 +641,7 @@ impl RMeshRenderer {
             &device, &error_pipeline,
             &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
             &material_buffers.colors, &scene_buffers.densities, &material_buffers.color_grads,
-            &radix_state.values_b, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
         );
         let error_bg1 = create_error_bg1(
             &device, &error_pipeline,
@@ -754,6 +761,7 @@ impl RMeshRenderer {
             self.step,
             self.tile_size,
             self.min_t,
+            0,
         );
 
         // Upload uniforms
@@ -861,6 +869,7 @@ impl RMeshRenderer {
             self.step,
             self.tile_size,
             self.min_t,
+            0,
         );
 
         // Upload uniforms
@@ -1040,6 +1049,7 @@ impl RMeshRenderer {
             self.step,
             self.tile_size,
             self.min_t,
+            0,
         );
 
         let has_custom_rays = ray_origins.is_some() && ray_dirs.is_some();
@@ -1828,6 +1838,7 @@ impl RMeshRenderer {
             self.step,
             self.tile_size,
             self.min_t,
+            0,
         );
 
         // Upload uniforms + ground truth

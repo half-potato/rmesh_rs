@@ -20,7 +20,7 @@ struct Uniforms {
     tile_size_u: u32,
     ray_mode: u32,
     min_t: f32,
-    _pad1c: u32,
+    sh_degree: u32,
     _pad2: vec4<u32>,
 };
 
@@ -45,6 +45,34 @@ struct DrawIndirectArgs {
 @group(0) @binding(10) var<storage, read_write> tiles_touched: array<u32>;
 @group(0) @binding(11) var<storage, read_write> compact_tet_ids: array<u32>;
 @group(0) @binding(12) var<storage, read> base_colors_buf: array<f32>;
+@group(0) @binding(13) var<storage, read> sh_coeffs: array<u32>;
+
+// --- SH constants ---
+const C0: f32 = 0.28209479177387814;
+const C1: f32 = 0.4886025119029199;
+const C2_0: f32 = 1.0925484305920792;
+const C2_1: f32 = -1.0925484305920792;
+const C2_2: f32 = 0.31539156525252005;
+const C2_3: f32 = -1.0925484305920792;
+const C2_4: f32 = 0.5462742152960396;
+const C3_0: f32 = -0.5900435899266435;
+const C3_1: f32 = 2.890611442640554;
+const C3_2: f32 = -0.4570457994644658;
+const C3_3: f32 = 0.3731763325901154;
+const C3_4: f32 = -0.4570457994644658;
+const C3_5: f32 = 1.445305721320277;
+const C3_6: f32 = -0.5900435899266435;
+
+fn softplus(x: f32) -> f32 {
+    if (x * 10.0 > 20.0) { return x; }
+    return 0.1 * log(1.0 + exp(10.0 * x));
+}
+
+fn read_sh_f16(base: u32, i: u32) -> f32 {
+    let word = sh_coeffs[base + i / 2u];
+    let unpacked = unpack2x16float(word);
+    return select(unpacked.x, unpacked.y, (i & 1u) != 0u);
+}
 
 fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
     let clip = vp * vec4<f32>(pos, 1.0);
@@ -233,10 +261,63 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     // --- 4. Color evaluation ---
-    // Pass through raw base colors to colors_buf.
-    // The tiled shader applies per-pixel ReLU clamping (max(0)) after
-    // adding the view-dependent gradient offset.
-    colors[tet_id * 3u] = base_colors_buf[tet_id * 3u];
-    colors[tet_id * 3u + 1u] = base_colors_buf[tet_id * 3u + 1u];
-    colors[tet_id * 3u + 2u] = base_colors_buf[tet_id * 3u + 2u];
+    if (uniforms.sh_degree > 0u) {
+        // Inline SH evaluation (only for visible tets, reuses already-loaded vertices)
+        let centroid = (v0 + v1 + v2 + v3) * 0.25;
+        let cam = uniforms.cam_pos_pad.xyz;
+        let raw_dir = centroid - cam;
+        let len = length(raw_dir);
+        var dir = vec3<f32>(0.0);
+        if (len > 0.0) { dir = raw_dir / len; }
+        let x = dir.x; let y = dir.y; let z = dir.z;
+
+        let nc = (uniforms.sh_degree + 1u) * (uniforms.sh_degree + 1u);
+        let stride = nc * 3u;
+        let sh_base = tet_id * ((stride + 1u) / 2u);
+
+        var rgb = vec3<f32>(0.0);
+        for (var c = 0u; c < 3u; c++) {
+            let ch_offset = c * nc;
+            var val = C0 * read_sh_f16(sh_base, ch_offset);
+
+            if (uniforms.sh_degree >= 1u) {
+                val -= C1 * y * read_sh_f16(sh_base, ch_offset + 1u);
+                val += C1 * z * read_sh_f16(sh_base, ch_offset + 2u);
+                val -= C1 * x * read_sh_f16(sh_base, ch_offset + 3u);
+            }
+            if (uniforms.sh_degree >= 2u) {
+                let xx = x * x; let yy = y * y; let zz = z * z;
+                let xy = x * y; let yz = y * z; let xz = x * z;
+                val += C2_0 * xy * read_sh_f16(sh_base, ch_offset + 4u);
+                val += C2_1 * yz * read_sh_f16(sh_base, ch_offset + 5u);
+                val += C2_2 * (2.0 * zz - xx - yy) * read_sh_f16(sh_base, ch_offset + 6u);
+                val += C2_3 * xz * read_sh_f16(sh_base, ch_offset + 7u);
+                val += C2_4 * (xx - yy) * read_sh_f16(sh_base, ch_offset + 8u);
+            }
+            if (uniforms.sh_degree >= 3u) {
+                let xx = x * x; let yy = y * y; let zz = z * z;
+                val += C3_0 * y * (3.0 * xx - yy) * read_sh_f16(sh_base, ch_offset + 9u);
+                val += C3_1 * x * y * z * read_sh_f16(sh_base, ch_offset + 10u);
+                val += C3_2 * y * (4.0 * zz - xx - yy) * read_sh_f16(sh_base, ch_offset + 11u);
+                val += C3_3 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * read_sh_f16(sh_base, ch_offset + 12u);
+                val += C3_4 * x * (4.0 * zz - xx - yy) * read_sh_f16(sh_base, ch_offset + 13u);
+                val += C3_5 * z * (xx - yy) * read_sh_f16(sh_base, ch_offset + 14u);
+                val += C3_6 * x * (xx - 3.0 * yy) * read_sh_f16(sh_base, ch_offset + 15u);
+            }
+            rgb[c] = val + 0.5;
+        }
+
+        let grad = vec3<f32>(color_grads[tet_id * 3u], color_grads[tet_id * 3u + 1u], color_grads[tet_id * 3u + 2u]);
+        let offset = dot(grad, v0 - centroid);
+        rgb += vec3<f32>(offset);
+
+        colors[tet_id * 3u]     = softplus(rgb.x);
+        colors[tet_id * 3u + 1u] = softplus(rgb.y);
+        colors[tet_id * 3u + 2u] = softplus(rgb.z);
+    } else {
+        // Training path: copy base_colors
+        colors[tet_id * 3u] = base_colors_buf[tet_id * 3u];
+        colors[tet_id * 3u + 1u] = base_colors_buf[tet_id * 3u + 1u];
+        colors[tet_id * 3u + 2u] = base_colors_buf[tet_id * 3u + 2u];
+    }
 }

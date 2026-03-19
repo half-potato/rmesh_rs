@@ -289,18 +289,20 @@ impl ForwardPipelines {
         device: &wgpu::Device,
         color_format: wgpu::TextureFormat,
     ) -> Self {
-        // ----- Compute pipeline (13 bindings) -----
+        // ----- Compute pipeline (14 bindings) -----
         // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
         // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
         // Binding 12: read-only storage (base_colors)
+        // Binding 13: read-only storage (sh_coeffs, f16-packed)
         let compute_read_only = [
             true, true, true, true, true, true, // 0-5 read-only
             false, false, false, false,          // 6-9 read-write
             false, false,                        // 10-11 read-write (tiles_touched, compact_tet_ids)
             true,                                // 12 read-only (base_colors)
+            true,                                // 13 read-only (sh_coeffs)
         ];
         let compute_entries = storage_entries(
-            13,
+            14,
             wgpu::ShaderStages::COMPUTE,
             &compute_read_only,
         );
@@ -329,17 +331,19 @@ impl ForwardPipelines {
                 cache: None,
             });
 
-        // ----- HW projection compute pipeline (9 bindings, no tile work) -----
+        // ----- HW projection compute pipeline (11 bindings, no tile work) -----
         // Bindings: uniforms(r), vertices(r), indices(r), circumdata(r),
         //           sort_keys(rw), sort_values(rw), indirect_args(rw),
-        //           colors(rw), base_colors(r)
+        //           colors(rw), base_colors(r), color_grads(r), sh_coeffs(r)
         let hw_compute_read_only = [
             true, true, true, true, // 0-3 read-only
             false, false, false,    // 4-6 read-write
             false, true,            // 7-8: colors(rw), base_colors(r)
+            true,                   // 9: color_grads(r)
+            true,                   // 10: sh_coeffs(r)
         ];
         let hw_compute_entries = storage_entries(
-            9,
+            11,
             wgpu::ShaderStages::COMPUTE,
             &hw_compute_read_only,
         );
@@ -1064,18 +1068,20 @@ pub fn record_tex_to_buffer(
 // Bind Groups
 // ---------------------------------------------------------------------------
 
-/// Create the compute bind group (12 bindings).
+/// Create the compute bind group (14 bindings).
 ///
 /// Binding order matches `project_compute.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: densities,
 ///   4: color_grads, 5: circumdata,
 ///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
-///   10: tiles_touched, 11: compact_tet_ids, 12: base_colors
+///   10: tiles_touched, 11: compact_tet_ids, 12: base_colors,
+///   13: sh_coeffs (f16-packed)
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
+    sh_coeffs_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_bind_group"),
@@ -1094,20 +1100,23 @@ pub fn create_compute_bind_group(
             buf_entry(10, &buffers.tiles_touched),
             buf_entry(11, &buffers.compact_tet_ids),
             buf_entry(12, &material.base_colors),
+            buf_entry(13, sh_coeffs_buf),
         ],
     })
 }
 
-/// Create the HW projection compute bind group (7 bindings, no tile data).
+/// Create the HW projection compute bind group (11 bindings, no tile data).
 ///
 /// Binding order matches `project_compute_hw.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: circumdata,
-///   4: sort_keys, 5: sort_values, 6: indirect_args
+///   4: sort_keys, 5: sort_values, 6: indirect_args,
+///   7: colors, 8: base_colors, 9: color_grads, 10: sh_coeffs
 pub fn create_hw_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
+    sh_coeffs_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hw_compute_bind_group"),
@@ -1122,6 +1131,8 @@ pub fn create_hw_compute_bind_group(
             buf_entry(6, &buffers.indirect_args),
             buf_entry(7, &material.colors),
             buf_entry(8, &material.base_colors),
+            buf_entry(9, &material.color_grads),
+            buf_entry(10, sh_coeffs_buf),
         ],
     })
 }
@@ -1584,7 +1595,7 @@ pub fn record_sorted_forward_pass(
     // project_compute dispatches n_pow2 threads; padding threads write
     // sort_keys = 0xFFFFFFFF which sorts to the end.
     let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(&sort_state.num_keys_buf, 0, bytemuck::bytes_of(&n_pow2));
+    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
     // Use lean HW projection shader when available (no tile counting work)
@@ -1791,7 +1802,7 @@ pub fn record_sorted_mesh_forward_pass(
     );
 
     let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(&sort_state.num_keys_buf, 0, bytemuck::bytes_of(&n_pow2));
+    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
     {
@@ -1952,7 +1963,14 @@ pub fn setup_forward(
     let pipelines = ForwardPipelines::new(device, color_format);
     let targets = RenderTargets::new(device, width, height);
 
-    let compute_bg = create_compute_bind_group(device, &pipelines, &buffers, &material);
+    // Dummy sh_coeffs buffer (sh_degree=0 path uses base_colors instead)
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let compute_bg = create_compute_bind_group(device, &pipelines, &buffers, &material, &dummy_sh);
     let render_bg = create_render_bind_group(device, &pipelines, &buffers, &material);
 
     (buffers, material, pipelines, targets, compute_bg, render_bg)
@@ -1970,6 +1988,7 @@ pub fn make_uniforms(
     step: u32,
     tile_size: u32,
     min_t: f32,
+    sh_degree: u32,
 ) -> Uniforms {
     Uniforms {
         vp_col0: vp.col(0).into(),
@@ -1988,7 +2007,8 @@ pub fn make_uniforms(
         tile_size_u: tile_size,
         ray_mode: 0,
         min_t,
-        _pad1: [0; 5],
+        sh_degree,
+        _pad1: [0; 4],
     }
 }
 

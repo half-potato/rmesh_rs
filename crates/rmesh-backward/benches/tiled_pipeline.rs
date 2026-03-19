@@ -123,17 +123,18 @@ fn create_bench_state() -> Option<BenchState> {
         0u32,
         TILE_SIZE,
         0.0,
+        0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Tiled pipeline
     let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
     let tile_buffers =
         rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, TILE_SIZE);
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
     let radix_state =
-        rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2);
+        rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
@@ -181,7 +182,7 @@ fn create_bench_state() -> Option<BenchState> {
         &buffers.circumdata,
         &buffers.tiles_touched,
         &scan_buffers,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
@@ -190,24 +191,24 @@ fn create_bench_state() -> Option<BenchState> {
         &tile_buffers.tile_sort_keys,
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
         &device,
         &tile_pipelines,
-        &radix_state.keys_b,
+        radix_state.keys_b(),
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
-        &radix_state.num_keys_buf,
+        radix_state.num_keys_buf(),
     );
 
     // HW raster sort infrastructure (sized for tet_count, not tile pairs — 32-bit keys)
-    let hw_radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1);
+    let hw_radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 1, rmesh_backward::SortBackend::Drs);
     let hw_n_pow2 = scene.tet_count.next_power_of_two();
-    let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32, 1);
+    let hw_sort_state = rmesh_backward::RadixSortState::new(&device, hw_n_pow2, 32, 1, rmesh_backward::SortBackend::Drs);
     hw_sort_state.upload_configs(&queue);
     let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
-        &device, &fwd_pipelines, &buffers, &material, &hw_sort_state.values_b,
+        &device, &fwd_pipelines, &buffers, &material, hw_sort_state.values_b(),
     );
 
     // Dummy depth texture for forward pass depth attachment
@@ -247,7 +248,7 @@ fn create_bench_state() -> Option<BenchState> {
         &material.colors,
         &buffers.densities,
         &material.color_grads,
-        &radix_state.values_b,
+        radix_state.values_b(),
         &tile_buffers.tile_ranges,
         &tile_buffers.tile_uniforms,
     );
@@ -316,7 +317,7 @@ fn create_bench_state() -> Option<BenchState> {
         &buffers.densities,
         &material.color_grads,
         &material.colors,
-        &radix_state.values_b,
+        radix_state.values_b(),
         &grad_buffers.d_vertices,
         &grad_buffers.d_densities,
         &mat_grad_buffers.d_color_grads,

@@ -60,7 +60,13 @@ fn test_project_compute_kernel() {
         &device,
         wgpu::TextureFormat::Rgba16Float,
     );
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material, &dummy_sh);
 
     // Camera looking at tet from outside
     let verts = load_tet_verts(&scene, 0);
@@ -69,7 +75,7 @@ fn test_project_compute_kernel() {
     let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
     let uniforms =
-        rmesh_render::make_uniforms(vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0);
+        rmesh_render::make_uniforms(vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0, 0);
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args

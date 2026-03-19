@@ -12,7 +12,6 @@ use rmesh_render::{
     MaterialBuffers, RenderTargets, SceneBuffers, Uniforms,
 };
 use rmesh_util::camera::Camera;
-use rmesh_util::sh_eval::{ShEvalPipeline, ShEvalUniforms};
 
 use glam::Vec3;
 
@@ -31,6 +30,21 @@ pub fn main() {
     console_log::init_with_level(log::Level::Info).ok();
 }
 
+/// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
+fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
+    let mut packed = vec![0u32; (coeffs.len() + 1) / 2];
+    for i in (0..coeffs.len()).step_by(2) {
+        let lo = half::f16::from_f32(coeffs[i]);
+        let hi = if i + 1 < coeffs.len() {
+            half::f16::from_f32(coeffs[i + 1])
+        } else {
+            half::f16::ZERO
+        };
+        packed[i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
+    }
+    packed
+}
+
 /// Internal state for a loaded scene (separated so `WebViewer` can exist without a scene).
 #[allow(dead_code)]
 struct SceneState {
@@ -41,9 +55,7 @@ struct SceneState {
     render_bg_b: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
     sort_state: rmesh_sort::RadixSortState,
-    sh_eval_bg: wgpu::BindGroup,
     sh_coeffs_buf: wgpu::Buffer,
-    sh_eval_uniforms_buf: wgpu::Buffer,
     sh_degree: u32,
     tet_count: u32,
 }
@@ -59,7 +71,6 @@ pub struct WebViewer {
     sort_pipelines: rmesh_sort::RadixSortPipelines,
     blit_pipeline: BlitPipeline,
     targets: RenderTargets,
-    sh_eval_pipeline: ShEvalPipeline,
     scene: Option<SceneState>,
     // Primitives
     primitive_geometry: PrimitiveGeometry,
@@ -148,8 +159,7 @@ impl WebViewer {
         log::info!("Compiling shader pipelines...");
         let pipelines = ForwardPipelines::new(&device, color_format);
         let blit_pipeline = BlitPipeline::new(&device, surface_format);
-        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1);
-        let sh_eval_pipeline = ShEvalPipeline::new(&device);
+        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Basic);
         let targets = RenderTargets::new(&device, width, height);
 
         let camera = Camera::new(Vec3::new(0.0, 3.0, -2.0));
@@ -171,7 +181,6 @@ impl WebViewer {
             sort_pipelines,
             blit_pipeline,
             targets,
-            sh_eval_pipeline,
             scene: None,
             primitive_geometry,
             primitive_pipeline,
@@ -262,24 +271,12 @@ impl WebViewer {
             tile_size_u: 12,
             ray_mode: 0,
             min_t: 0.0,
-            _pad1: [0; 5],
+            sh_degree: scene.sh_degree,
+            _pad1: [0; 4],
         };
 
         self.queue
             .write_buffer(&scene.buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
-
-        // SH eval uniforms
-        let sh_uniforms = ShEvalUniforms {
-            cam_pos: [pos[0], pos[1], pos[2], 0.0],
-            tet_count: scene.tet_count,
-            sh_degree: scene.sh_degree,
-            _pad: [0; 2],
-        };
-        self.queue.write_buffer(
-            &scene.sh_eval_uniforms_buf,
-            0,
-            bytemuck::bytes_of(&sh_uniforms),
-        );
 
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
@@ -299,10 +296,6 @@ impl WebViewer {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("web forward pass"),
             });
-
-        // GPU SH evaluation
-        self.sh_eval_pipeline
-            .record(&mut encoder, &scene.sh_eval_bg, scene.tet_count, None);
 
         // Primitive pass first: renders to volume color target + primitive depth target
         // (clears both even if no primitives, so forward pass can LoadOp::Load)
@@ -583,37 +576,22 @@ impl WebViewer {
             tet_count,
         );
 
+        // Pack SH coefficients as f16
+        let sh_coeffs_packed = pack_sh_coeffs_f16(&sh_coeffs.coeffs);
         let sh_coeffs_buf = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("sh_coeffs"),
-                contents: bytemuck::cast_slice(&sh_coeffs.coeffs),
+                contents: bytemuck::cast_slice(&sh_coeffs_packed),
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
-        let sh_eval_uniforms_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("sh_eval_uniforms"),
-            size: std::mem::size_of::<ShEvalUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let sh_eval_bg = self.sh_eval_pipeline.create_bind_group(
-            &self.device,
-            &sh_eval_uniforms_buf,
-            &buffers.vertices,
-            &buffers.indices,
-            &sh_coeffs_buf,
-            &material.color_grads,
-            &material.base_colors,
-        );
-
         let n_pow2 = (tet_count as u32).next_power_of_two();
-        let sort_state = rmesh_sort::RadixSortState::new(&self.device, n_pow2, 32, 1);
+        let sort_state = rmesh_sort::RadixSortState::new(&self.device, n_pow2, 32, 1, rmesh_sort::SortBackend::Basic);
         sort_state.upload_configs(&self.queue);
 
         let compute_bg =
-            create_compute_bind_group(&self.device, &self.pipelines, &buffers, &material);
+            create_compute_bind_group(&self.device, &self.pipelines, &buffers, &material, &sh_coeffs_buf);
         let render_bg =
             create_render_bind_group(&self.device, &self.pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
@@ -621,7 +599,7 @@ impl WebViewer {
             &self.pipelines,
             &buffers,
             &material,
-            &sort_state.values_b,
+            sort_state.values_b(),
         );
         let blit_bg = create_blit_bind_group(
             &self.device,
@@ -637,9 +615,7 @@ impl WebViewer {
             render_bg_b,
             blit_bg,
             sort_state,
-            sh_eval_bg,
             sh_coeffs_buf,
-            sh_eval_uniforms_buf,
             sh_degree: sh_coeffs.degree,
             tet_count,
         });
