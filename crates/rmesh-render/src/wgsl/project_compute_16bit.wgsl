@@ -166,14 +166,15 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     // --- 3. Linear 16-bit depth key from circumsphere distance ---
+    // Use algebraic identity: power(P) = (P-v0)·(P+v0-2C) to avoid catastrophic
+    // cancellation when circumcenter is far from camera (sliver tets).
     let cx = circumdata[tet_id * 4u];
     let cy = circumdata[tet_id * 4u + 1u];
     let cz = circumdata[tet_id * 4u + 2u];
-    let r2 = circumdata[tet_id * 4u + 3u];
 
     let cam = uniforms.cam_pos_pad.xyz;
-    let diff = vec3<f32>(cx, cy, cz) - cam;
-    let depth_raw = dot(diff, diff) - r2;
+    let center = vec3<f32>(cx, cy, cz);
+    let depth_raw = dot(cam - v0, cam + v0 - 2.0 * center);
     // Linear distance from squared circumsphere distance.
     // Negative values (camera inside circumsphere) clamp to 0 = closest = sorted last (back-to-front).
     let dist = sqrt(max(depth_raw, 0.0));

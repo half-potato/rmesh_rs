@@ -274,7 +274,7 @@ impl App {
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
             show_primitives: false,
-            sort_16bit: false,
+            sort_16bit: true,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
