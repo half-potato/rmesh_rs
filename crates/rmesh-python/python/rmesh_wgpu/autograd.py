@@ -20,7 +20,8 @@ class RMeshForward(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, renderer, cam_pos, vp, c2w_intrinsics, vertices, base_colors, densities, color_grads):
+    def forward(ctx, renderer, cam_pos, vp, c2w_intrinsics, vertices, base_colors,
+                densities, color_grads, render_mode="tiled"):
         # Upload current parameters to GPU
         renderer.update_params(
             vertices.detach().cpu().numpy().ravel(),
@@ -35,8 +36,12 @@ class RMeshForward(torch.autograd.Function):
         c2w_int_np = c2w_intrinsics.detach().cpu().numpy().ravel().astype(np.float32)
 
         # Run forward render
-        image_np = renderer.forward_tiled(cam_np, vp_np, c2w_int_np)
+        if render_mode == "interval_tiled":
+            image_np = renderer.forward_interval_tiled(cam_np, vp_np, c2w_int_np)
+        else:
+            image_np = renderer.forward_tiled(cam_np, vp_np, c2w_int_np)
 
+        ctx.render_mode = render_mode
         ctx.renderer = renderer
         ctx.save_for_backward(vertices, base_colors, densities, color_grads)
 
@@ -46,7 +51,10 @@ class RMeshForward(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         dl_d_image = grad_output.detach().cpu().numpy().astype(np.float32)
-        grads = ctx.renderer.backward(dl_d_image)
+        if ctx.render_mode == "interval_tiled":
+            grads = ctx.renderer.backward_interval_tiled(dl_d_image)
+        else:
+            grads = ctx.renderer.backward(dl_d_image)
 
         device = ctx.saved_tensors[0].device
 
@@ -64,6 +72,7 @@ class RMeshForward(torch.autograd.Function):
             d_base_colors,
             d_densities,
             d_color_grads,
+            None,  # render_mode
         )
 
 
@@ -117,13 +126,14 @@ class RMeshModule(nn.Module):
             height,
         )
 
-    def forward(self, cam_pos, vp, c2w_intrinsics):
+    def forward(self, cam_pos, vp, c2w_intrinsics, render_mode="tiled"):
         """Render an image from the given camera.
 
         Args:
             cam_pos: [3] tensor, camera position
             vp: [4, 4] tensor, view-projection matrix (column-major when flattened)
             c2w_intrinsics: [16] tensor, camera-to-world rotation + intrinsics
+            render_mode: "tiled" (default) or "interval_tiled"
 
         Returns:
             [H, W, 4] tensor (premultiplied RGBA)
@@ -137,4 +147,5 @@ class RMeshModule(nn.Module):
             self.base_colors,
             self.densities,
             self.color_grads,
+            render_mode,
         )

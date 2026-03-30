@@ -97,6 +97,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let c_back = max(in.base_color + vec3<f32>(in.color_offsets.y), vec3<f32>(0.0));
 
     // Volume rendering integral
+    // let od = clamp(in.density * dist, 0.0, 88.0);
     let od = clamp(in.density * dist, 0.0, 88.0);
 
     // Note: (c_back, c_front) -- exit color first, matching convention

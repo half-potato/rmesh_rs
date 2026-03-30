@@ -19,6 +19,10 @@ use rmesh_backward::{
     create_tile_ranges_bind_group_with_keys,
     BackwardTiledPipelines, GradientBuffers, MaterialGradBuffers, RadixSortPipelines, RadixSortState,
     ScanBuffers, ScanPipelines, SortBackend, TileBuffers, TilePipelines, TileUniforms,
+    // Interval tiled backward
+    IntervalGradBuffers, BackwardIntervalTiledPipeline, IntervalChainBackPipeline,
+    create_backward_interval_tiled_bind_groups, record_backward_interval_tiled,
+    create_interval_chain_back_bind_groups, record_interval_chain_back,
 };
 use rmesh_render::{
     build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
@@ -28,6 +32,10 @@ use rmesh_render::{
     record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms,
     RasterizeComputePipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
     SceneBuffers, TexToBufferPipeline,
+    // Interval tiled forward
+    IntervalTiledBuffers, IntervalGeneratePipeline, IntervalTiledRasterizePipeline,
+    create_interval_generate_bind_group, record_interval_generate,
+    create_interval_tiled_rasterize_bind_group, record_interval_tiled_rasterize,
 };
 use rmesh_error::{
     ErrorPipeline, ErrorBuffers, ErrorInputBuffers,
@@ -200,6 +208,29 @@ struct RMeshRenderer {
     error_bg0_b: wgpu::BindGroup,
     error_bg1: wgpu::BindGroup,
     last_sort_in_b: bool,
+    // Interval tiled forward infrastructure
+    interval_buffers: IntervalTiledBuffers,
+    interval_generate: IntervalGeneratePipeline,
+    interval_rasterize: IntervalTiledRasterizePipeline,
+    interval_generate_bg: wgpu::BindGroup,
+    interval_rasterize_bg: wgpu::BindGroup,
+    interval_rasterize_bg_b: wgpu::BindGroup,
+    // Backward interval tiled infrastructure
+    bwd_interval_tiled: BackwardIntervalTiledPipeline,
+    interval_chain_back: IntervalChainBackPipeline,
+    interval_grad_buffers: IntervalGradBuffers,
+    bwd_interval_tiled_bg0: wgpu::BindGroup,
+    bwd_interval_tiled_bg0_b: wgpu::BindGroup,
+    bwd_interval_tiled_bg1: wgpu::BindGroup,
+    interval_chain_back_bg0: wgpu::BindGroup,
+    interval_chain_back_bg1: wgpu::BindGroup,
+    // Xyzd/distortion gradient input buffers
+    dl_d_xyzd: wgpu::Buffer,
+    dl_d_distortion: wgpu::Buffer,
+    // Custom aux channel buffers
+    aux_dim: usize,
+    aux_data_buf: wgpu::Buffer,
+    dl_d_aux_buf: wgpu::Buffer,
     // Cached scene data for find_containing_tet and locate_tets
     cached_vertices: Vec<f32>,
     cached_indices: Vec<u32>,
@@ -230,7 +261,9 @@ impl RMeshRenderer {
     ///     circumdata: [M*4] f32 circumsphere data (cx, cy, cz, r^2)
     ///     width: render width
     ///     height: render height
+    ///     aux_dim: number of custom per-tet auxiliary channels (default 0)
     #[new]
+    #[pyo3(signature = (vertices, indices, base_colors, densities, color_grads, circumdata, width, height, aux_dim=0))]
     fn new(
         vertices: PyReadonlyArray1<f32>,
         indices: PyReadonlyArray1<u32>,
@@ -240,6 +273,7 @@ impl RMeshRenderer {
         circumdata: PyReadonlyArray1<f32>,
         width: u32,
         height: u32,
+        aux_dim: usize,
     ) -> PyResult<Self> {
         let vertices_slice = vertices.as_slice()?;
         let indices_slice = indices.as_slice()?;
@@ -283,7 +317,7 @@ impl RMeshRenderer {
                 label: Some("rmesh_renderer"),
                 required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffers_per_shader_stage: 20,
                     max_storage_buffer_binding_size: 1 << 30, // 1 GiB
                     max_buffer_size: 1 << 30,
                     ..wgpu::Limits::default()
@@ -648,6 +682,101 @@ impl RMeshRenderer {
             &error_input_buffers, &error_buffers,
         );
 
+        // Interval tiled forward pipelines
+        let interval_buffers = IntervalTiledBuffers::new(&device, tet_count);
+        let interval_generate = IntervalGeneratePipeline::new(&device);
+        let interval_rasterize = IntervalTiledRasterizePipeline::new(&device, width, height, aux_dim);
+        let interval_generate_bg = create_interval_generate_bind_group(
+            &device, &interval_generate, &scene_buffers, &material_buffers, &interval_buffers,
+        );
+
+        // Custom aux channel buffers
+        let n_pixels_u64 = (width as u64) * (height as u64);
+        let storage_rw = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let aux_buf_size = if aux_dim > 0 { (tet_count as u64) * (aux_dim as u64) * 4 } else { 4 };
+        let aux_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("aux_data"), size: aux_buf_size, usage: storage_rw, mapped_at_creation: false,
+        });
+        let dl_d_aux_size = if aux_dim > 0 { n_pixels_u64 * (aux_dim as u64) * 4 } else { 4 };
+        let dl_d_aux_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dl_d_aux"), size: dl_d_aux_size, usage: storage_rw, mapped_at_creation: false,
+        });
+
+        let interval_rasterize_bg = create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &scene_buffers.uniforms, &interval_buffers,
+            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &aux_data_buf, &interval_rasterize.aux_image,
+        );
+        let interval_rasterize_bg_b = create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &scene_buffers.uniforms, &interval_buffers,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &aux_data_buf, &interval_rasterize.aux_image,
+        );
+
+        // Backward interval tiled pipelines
+        let bwd_interval_tiled = BackwardIntervalTiledPipeline::new(&device, aux_dim);
+        let interval_chain_back = IntervalChainBackPipeline::new(&device);
+        let interval_grad_buffers = IntervalGradBuffers::new(&device, tet_count, vertex_count, tet_count, aux_dim);
+
+        // Gradient input buffers for xyzd/distortion backward
+        let dl_d_xyzd = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dl_d_xyzd"), size: n_pixels_u64 * 4 * 4, usage: storage_rw, mapped_at_creation: false,
+        });
+        let dl_d_distortion = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dl_d_distortion"), size: n_pixels_u64 * 5 * 4, usage: storage_rw, mapped_at_creation: false,
+        });
+
+        let (bwd_interval_tiled_bg0, bwd_interval_tiled_bg1) =
+            create_backward_interval_tiled_bind_groups(
+                &device, &bwd_interval_tiled,
+                &scene_buffers.uniforms, &loss_buffers.dl_d_image,
+                &interval_rasterize.rendered_image,
+                &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+                &interval_buffers.interval_meta,
+                &tile_buffers.tile_sort_values,
+                &interval_grad_buffers.d_interval_verts,
+                &interval_grad_buffers.d_interval_tet_data,
+                &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+                &dl_d_xyzd, &dl_d_distortion,
+                &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+                &aux_data_buf,
+                &dl_d_aux_buf,
+                &interval_grad_buffers.d_aux_data,
+            );
+        let (bwd_interval_tiled_bg0_b, _) =
+            create_backward_interval_tiled_bind_groups(
+                &device, &bwd_interval_tiled,
+                &scene_buffers.uniforms, &loss_buffers.dl_d_image,
+                &interval_rasterize.rendered_image,
+                &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+                &interval_buffers.interval_meta,
+                radix_state.values_b(),
+                &interval_grad_buffers.d_interval_verts,
+                &interval_grad_buffers.d_interval_tet_data,
+                &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+                &dl_d_xyzd, &dl_d_distortion,
+                &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+                &aux_data_buf,
+                &dl_d_aux_buf,
+                &interval_grad_buffers.d_aux_data,
+            );
+        let (interval_chain_back_bg0, interval_chain_back_bg1) =
+            create_interval_chain_back_bind_groups(
+                &device, &interval_chain_back,
+                &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
+                &material_buffers.color_grads,
+                &scene_buffers.compact_tet_ids, &scene_buffers.indirect_args,
+                &interval_buffers.interval_meta,
+                &interval_grad_buffers.d_interval_verts,
+                &interval_grad_buffers.d_interval_tet_data,
+                &scene_buffers.vertex_normals,
+                &grad_buffers.d_vertices, &grad_buffers.d_densities,
+                &mat_grad_buffers.d_color_grads, &mat_grad_buffers.d_base_colors,
+                &interval_grad_buffers.d_vertex_normals,
+            );
+
         Ok(Self {
             device,
             queue,
@@ -706,6 +835,25 @@ impl RMeshRenderer {
             error_bg0_b,
             error_bg1,
             last_sort_in_b: false,
+            interval_buffers,
+            interval_generate,
+            interval_rasterize,
+            interval_generate_bg,
+            interval_rasterize_bg,
+            interval_rasterize_bg_b,
+            bwd_interval_tiled,
+            interval_chain_back,
+            interval_grad_buffers,
+            bwd_interval_tiled_bg0,
+            bwd_interval_tiled_bg0_b,
+            bwd_interval_tiled_bg1,
+            interval_chain_back_bg0,
+            interval_chain_back_bg1,
+            dl_d_xyzd,
+            dl_d_distortion,
+            aux_dim,
+            aux_data_buf,
+            dl_d_aux_buf,
             cached_vertices: vertices_slice.to_vec(),
             cached_indices: indices_slice.to_vec(),
             cached_neighbors: neighbors,
@@ -724,6 +872,52 @@ impl RMeshRenderer {
     /// Set the minimum ray-origin offset along view direction (matches Slang camera.min_t).
     fn set_min_t(&mut self, min_t: f32) {
         self.min_t = min_t;
+    }
+
+    /// Upload per-vertex normals [N*3] f32 for interval tiled xyzd output.
+    fn set_vertex_normals(&mut self, normals: PyReadonlyArray1<f32>) -> PyResult<()> {
+        let data = normals.as_slice()?;
+        self.queue.write_buffer(
+            &self.scene_buffers.vertex_normals, 0, bytemuck::cast_slice(data),
+        );
+        Ok(())
+    }
+
+    /// Read back per-vertex normals [N*3] f32.
+    fn get_vertex_normals<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        let data = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.vertex_normals);
+        Ok(Array1::from_vec(data).into_pyarray(py))
+    }
+
+    /// Upload per-tet custom auxiliary data [M*aux_dim] f32.
+    fn set_aux_data(&mut self, aux_data: PyReadonlyArray1<f32>) -> PyResult<()> {
+        if self.aux_dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "aux_dim is 0; construct with aux_dim > 0 to use custom aux channels",
+            ));
+        }
+        let data = aux_data.as_slice()?;
+        let expected = self.tet_count as usize * self.aux_dim;
+        if data.len() != expected {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                format!("Expected {} elements (tet_count={} * aux_dim={}), got {}", expected, self.tet_count, self.aux_dim, data.len()),
+            ));
+        }
+        self.queue.write_buffer(
+            &self.aux_data_buf, 0, bytemuck::cast_slice(data),
+        );
+        Ok(())
+    }
+
+    /// Read back per-tet custom auxiliary data [M*aux_dim] f32.
+    fn get_aux_data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
+        if self.aux_dim == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "aux_dim is 0; no aux data to read",
+            ));
+        }
+        let data = read_buffer_f32(&self.device, &self.queue, &self.aux_data_buf);
+        Ok(Array1::from_vec(data).into_pyarray(py))
     }
 
     /// Run the forward rendering pipeline.
@@ -1007,6 +1201,192 @@ impl RMeshRenderer {
         } else {
             Ok(rgba.into_pyarray(py).into_any().unbind())
         }
+    }
+
+    /// Run the interval tiled forward rendering pipeline.
+    ///
+    /// Uses per-tet screen triangle decomposition (interval_generate) followed by
+    /// tiled rasterization (interval_tiled_rasterize). No mesh shaders required.
+    ///
+    /// Args:
+    ///     cam_pos: [3] f32 camera position
+    ///     vp: [16] f32 column-major view-projection matrix
+    ///     c2w_intrinsics: [16] f32 (c2w_col0[4], c2w_col1[4], c2w_col2[4], intrinsics[4])
+    ///
+    /// Returns:
+    ///     dict with keys 'image' [H,W,4], 'xyzd' [H,W,4], 'distortion' [H,W,5]
+    fn forward_interval_tiled<'py>(
+        &mut self,
+        py: Python<'py>,
+        cam_pos: PyReadonlyArray1<f32>,
+        vp: PyReadonlyArray1<f32>,
+        c2w_intrinsics: PyReadonlyArray1<f32>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let cam_pos_slice = cam_pos.as_slice()?;
+        let vp_slice = vp.as_slice()?;
+        let ci_slice = c2w_intrinsics.as_slice()?;
+
+        let cam = Vec3::new(cam_pos_slice[0], cam_pos_slice[1], cam_pos_slice[2]);
+        let vp_mat = mat4_from_flat(vp_slice);
+        let (c2w, intrinsics) = c2w_from_flat(ci_slice);
+
+        let uniforms = make_uniforms(
+            vp_mat,
+            c2w,
+            intrinsics,
+            cam,
+            self.width as f32,
+            self.height as f32,
+            self.tet_count,
+            self.step,
+            self.tile_size,
+            self.min_t,
+            0,
+            0.01,
+            1000.0,
+        );
+
+        // Upload uniforms
+        self.queue.write_buffer(
+            &self.scene_buffers.uniforms,
+            0,
+            bytemuck::bytes_of(&uniforms),
+        );
+
+        // Upload tile uniforms
+        let tile_uni = TileUniforms {
+            screen_width: self.width,
+            screen_height: self.height,
+            tile_size: self.tile_size,
+            tiles_x: self.tile_buffers.tiles_x,
+            tiles_y: self.tile_buffers.tiles_y,
+            num_tiles: self.tile_buffers.num_tiles,
+            visible_tet_count: 0,
+            _pad: [0; 5],
+        };
+        self.queue.write_buffer(
+            &self.tile_buffers.tile_uniforms,
+            0,
+            bytemuck::bytes_of(&tile_uni),
+        );
+
+        {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("forward_interval_tiled"),
+                });
+
+            // Clear tile ranges + output images
+            encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
+            encoder.clear_buffer(&self.interval_rasterize.rendered_image, 0, None);
+            encoder.clear_buffer(&self.interval_rasterize.xyzd_image, 0, None);
+            encoder.clear_buffer(&self.interval_rasterize.distortion_image, 0, None);
+            if self.aux_dim > 0 {
+                encoder.clear_buffer(&self.interval_rasterize.aux_image, 0, None);
+            }
+
+            // Forward compute (SH eval + cull + tiles_touched + compact_tet_ids)
+            record_project_compute(
+                &mut encoder,
+                &self.fwd_pipelines,
+                &self.scene_buffers,
+                &self.compute_bg,
+                self.tet_count,
+                &self.queue,
+            );
+
+            // Interval generate (per-tet screen triangle decomposition)
+            record_interval_generate(
+                &mut encoder,
+                &self.interval_generate,
+                &self.interval_generate_bg,
+                self.tet_count,
+            );
+
+            // RTS scan-based tile pipeline
+            rmesh_backward::record_scan_tile_pipeline(
+                &mut encoder,
+                &self.scan_pipelines,
+                &self.tile_pipelines,
+                &self.prepare_dispatch_bg,
+                &self.rts_bg,
+                &self.tile_fill_bg,
+                &self.tile_gen_scan_bg,
+                &self.scan_buffers,
+                &self.tile_buffers,
+            );
+
+            // Radix sort
+            let result_in_b = rmesh_backward::record_radix_sort(
+                &mut encoder,
+                &self.device,
+                &self.radix_pipelines,
+                &self.radix_state,
+                &self.tile_buffers.tile_sort_keys,
+                &self.tile_buffers.tile_sort_values,
+            );
+            self.last_sort_in_b = result_in_b;
+
+            let (ranges_bg, fwd_bg) = if result_in_b {
+                (&self.tile_ranges_bg_b, &self.interval_rasterize_bg_b)
+            } else {
+                (&self.tile_ranges_bg, &self.interval_rasterize_bg)
+            };
+
+            // Tile ranges
+            {
+                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("tile_ranges"),
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
+                pass.set_bind_group(0, ranges_bg, &[]);
+                let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+                if total <= 65535 {
+                    pass.dispatch_workgroups(total, 1, 1);
+                } else {
+                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                }
+            }
+
+            // Interval tiled rasterize
+            record_interval_tiled_rasterize(
+                &mut encoder,
+                &self.interval_rasterize,
+                fwd_bg,
+                self.tile_buffers.num_tiles,
+            );
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Read back rendered images
+        let rgba_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.rendered_image);
+        let xyzd_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.xyzd_image);
+        let dist_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.distortion_image);
+
+        let h = self.height as usize;
+        let w = self.width as usize;
+
+        let rgba = Array3::from_shape_vec((h, w, 4), rgba_data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let xyzd = Array3::from_shape_vec((h, w, 4), xyzd_data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let dist = Array3::from_shape_vec((h, w, 5), dist_data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+
+        let dict = PyDict::new(py);
+        dict.set_item("image", rgba.into_pyarray(py))?;
+        dict.set_item("xyzd", xyzd.into_pyarray(py))?;
+        dict.set_item("distortion", dist.into_pyarray(py))?;
+        if self.aux_dim > 0 {
+            let aux_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.aux_image);
+            let aux = Array3::from_shape_vec((h, w, self.aux_dim), aux_data)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+            dict.set_item("aux", aux.into_pyarray(py))?;
+        }
+        Ok(dict)
     }
 
     /// Run the ray tracing forward pipeline (adjacency traversal, no sorting).
@@ -1647,6 +2027,215 @@ impl RMeshRenderer {
             "d_color_grads",
             Array1::from_vec(d_grads).into_pyarray(py),
         )?;
+        Ok(dict)
+    }
+
+    /// Run the backward pass for the interval tiled forward path.
+    ///
+    /// Call after forward_interval_tiled(). Uses two-stage backward:
+    ///   1. backward_interval_tiled: per-tile backward → d_interval_verts, d_interval_tet_data
+    ///   2. interval_chain_back: per-tet chain rule → d_vertices, d_densities, d_color_grads, d_base_colors
+    ///
+    /// Args:
+    ///     dl_d_image: [H, W, 4] f32 gradient of loss w.r.t. rendered image
+    ///     dl_d_xyzd: optional [H, W, 4] f32 gradient of loss w.r.t. xyzd image
+    ///     dl_d_distortion: optional [H, W, 5] f32 gradient of loss w.r.t. distortion image
+    ///     dl_d_aux: optional [H, W, aux_dim] f32 gradient of loss w.r.t. aux image
+    ///
+    /// Returns:
+    ///     dict with keys 'd_vertices', 'd_densities', 'd_color_grads', 'd_base_colors',
+    ///     'd_vertex_normals', and optionally 'd_aux_data' (if aux_dim > 0), each a 1D numpy f32 array.
+    #[pyo3(signature = (dl_d_image, dl_d_xyzd=None, dl_d_distortion=None, dl_d_aux=None))]
+    fn backward_interval_tiled<'py>(
+        &mut self,
+        py: Python<'py>,
+        dl_d_image: PyReadonlyArray3<f32>,
+        dl_d_xyzd: Option<PyReadonlyArray3<f32>>,
+        dl_d_distortion: Option<PyReadonlyArray3<f32>>,
+        dl_d_aux: Option<PyReadonlyArray3<f32>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let dl_data = dl_d_image.as_slice()?;
+
+        // Upload gradient
+        self.queue.write_buffer(
+            &self.loss_buffers.dl_d_image,
+            0,
+            bytemuck::cast_slice(dl_data),
+        );
+
+        // Upload xyzd gradient (zero if not provided)
+        if let Some(ref xyzd_grad) = dl_d_xyzd {
+            self.queue.write_buffer(
+                &self.dl_d_xyzd, 0, bytemuck::cast_slice(xyzd_grad.as_slice()?),
+            );
+        } else {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            encoder.clear_buffer(&self.dl_d_xyzd, 0, None);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Upload distortion gradient (zero if not provided)
+        if let Some(ref dist_grad) = dl_d_distortion {
+            self.queue.write_buffer(
+                &self.dl_d_distortion, 0, bytemuck::cast_slice(dist_grad.as_slice()?),
+            );
+        } else {
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            encoder.clear_buffer(&self.dl_d_distortion, 0, None);
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        // Upload aux gradient (zero if not provided)
+        if self.aux_dim > 0 {
+            if let Some(ref aux_grad) = dl_d_aux {
+                self.queue.write_buffer(
+                    &self.dl_d_aux_buf, 0, bytemuck::cast_slice(aux_grad.as_slice()?),
+                );
+            } else {
+                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                encoder.clear_buffer(&self.dl_d_aux_buf, 0, None);
+                self.queue.submit(std::iter::once(encoder.finish()));
+            }
+        }
+
+        // Upload tile uniforms
+        let tile_uni = TileUniforms {
+            screen_width: self.width,
+            screen_height: self.height,
+            tile_size: self.tile_size,
+            tiles_x: self.tile_buffers.tiles_x,
+            tiles_y: self.tile_buffers.tiles_y,
+            num_tiles: self.tile_buffers.num_tiles,
+            visible_tet_count: 0,
+            _pad: [0; 5],
+        };
+        self.queue.write_buffer(
+            &self.tile_buffers.tile_uniforms,
+            0,
+            bytemuck::bytes_of(&tile_uni),
+        );
+
+        // Clear gradient buffers + tile ranges + interval grad buffers
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("backward_interval_tiled"),
+            });
+        encoder.clear_buffer(&self.grad_buffers.d_vertices, 0, None);
+        encoder.clear_buffer(&self.grad_buffers.d_densities, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_base_colors, 0, None);
+        encoder.clear_buffer(&self.mat_grad_buffers.d_color_grads, 0, None);
+        encoder.clear_buffer(&self.interval_grad_buffers.d_interval_verts, 0, None);
+        encoder.clear_buffer(&self.interval_grad_buffers.d_interval_tet_data, 0, None);
+        encoder.clear_buffer(&self.interval_grad_buffers.d_vertex_normals, 0, None);
+        if self.aux_dim > 0 {
+            encoder.clear_buffer(&self.interval_grad_buffers.d_aux_data, 0, None);
+        }
+        encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
+
+        // RTS scan-based tile pipeline
+        rmesh_backward::record_scan_tile_pipeline(
+            &mut encoder,
+            &self.scan_pipelines,
+            &self.tile_pipelines,
+            &self.prepare_dispatch_bg,
+            &self.rts_bg,
+            &self.tile_fill_bg,
+            &self.tile_gen_scan_bg,
+            &self.scan_buffers,
+            &self.tile_buffers,
+        );
+
+        // Radix sort
+        let result_in_b = rmesh_backward::record_radix_sort(
+            &mut encoder,
+            &self.device,
+            &self.radix_pipelines,
+            &self.radix_state,
+            &self.tile_buffers.tile_sort_keys,
+            &self.tile_buffers.tile_sort_values,
+        );
+
+        let (ranges_bg, bwd_bg0) = if result_in_b {
+            (&self.tile_ranges_bg_b, &self.bwd_interval_tiled_bg0_b)
+        } else {
+            (&self.tile_ranges_bg, &self.bwd_interval_tiled_bg0)
+        };
+
+        // Tile ranges
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tile_ranges"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
+            pass.set_bind_group(0, ranges_bg, &[]);
+            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            if total <= 65535 {
+                pass.dispatch_workgroups(total, 1, 1);
+            } else {
+                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+            }
+        }
+
+        // Stage 1: backward interval tiled (per-tile → d_interval_verts + d_interval_tet_data)
+        record_backward_interval_tiled(
+            &mut encoder,
+            &self.bwd_interval_tiled,
+            bwd_bg0,
+            &self.bwd_interval_tiled_bg1,
+            self.tile_buffers.num_tiles,
+        );
+
+        // Stage 2: interval chain back (per-tet → d_vertices + d_densities + d_color_grads + d_base_colors)
+        record_interval_chain_back(
+            &mut encoder,
+            &self.interval_chain_back,
+            &self.interval_chain_back_bg0,
+            &self.interval_chain_back_bg1,
+            self.tet_count,
+        );
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        // Read back gradients
+        let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
+        let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
+        let d_base_cols =
+            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
+        let d_grads =
+            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
+        let d_vnormals =
+            read_buffer_f32(&self.device, &self.queue, &self.interval_grad_buffers.d_vertex_normals);
+
+        let dict = PyDict::new(py);
+        dict.set_item(
+            "d_vertices",
+            Array1::from_vec(d_verts).into_pyarray(py),
+        )?;
+        dict.set_item(
+            "d_densities",
+            Array1::from_vec(d_dens).into_pyarray(py),
+        )?;
+        dict.set_item(
+            "d_base_colors",
+            Array1::from_vec(d_base_cols).into_pyarray(py),
+        )?;
+        dict.set_item(
+            "d_color_grads",
+            Array1::from_vec(d_grads).into_pyarray(py),
+        )?;
+        dict.set_item(
+            "d_vertex_normals",
+            Array1::from_vec(d_vnormals).into_pyarray(py),
+        )?;
+        if self.aux_dim > 0 {
+            let d_aux = read_buffer_f32(&self.device, &self.queue, &self.interval_grad_buffers.d_aux_data);
+            dict.set_item(
+                "d_aux_data",
+                Array1::from_vec(d_aux).into_pyarray(py),
+            )?;
+        }
         Ok(dict)
     }
 

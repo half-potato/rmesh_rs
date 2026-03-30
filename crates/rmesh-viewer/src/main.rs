@@ -429,7 +429,7 @@ impl App {
             }
 
             let mut limits = wgpu::Limits::default();
-            limits.max_storage_buffers_per_shader_stage = 16;
+            limits.max_storage_buffers_per_shader_stage = 20;
             limits.max_storage_buffer_binding_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
             limits.max_buffer_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
 

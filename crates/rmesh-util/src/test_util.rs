@@ -58,7 +58,7 @@ pub fn create_test_device(config: TestDeviceConfig) -> Option<(wgpu::Device, wgp
             .request_device(&wgpu::DeviceDescriptor {
                 required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC | config.extra_features,
                 required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 16,
+                    max_storage_buffers_per_shader_stage: 20,
                     max_storage_buffer_binding_size: 1 << 30,
                     max_buffer_size: 1 << 30,
                     ..config.base_limits

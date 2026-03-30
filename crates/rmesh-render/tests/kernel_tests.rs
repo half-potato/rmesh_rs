@@ -170,7 +170,7 @@ fn test_interval_pipeline_creation() {
 
         let supported = adapter.limits();
         let mut limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 16,
+            max_storage_buffers_per_shader_stage: 20,
             max_storage_buffer_binding_size: 1 << 30,
             max_buffer_size: 1 << 30,
             ..wgpu::Limits::default()

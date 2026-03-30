@@ -85,7 +85,7 @@ fn create_bench_state_with_bits(sorting_bits: u32) -> Option<ComputeIntervalBenc
 
         let supported_limits = adapter.limits();
         let limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 16,
+            max_storage_buffers_per_shader_stage: 20,
             ..supported_limits
         };
 

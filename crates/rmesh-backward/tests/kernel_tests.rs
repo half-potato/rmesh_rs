@@ -1905,3 +1905,665 @@ fn test_camera_ray_tet_intersection() {
     eprintln!("camera_ray_tet_intersection: {hits}/25 pixels around center hit the tet");
     assert!(hits > 0, "At least some pixels near center should hit the tet");
 }
+
+// ===========================================================================
+// Test: interval tiled forward end-to-end (subgroup)
+// ===========================================================================
+
+/// Runs the full interval tiled forward pipeline:
+///   project_compute → interval_generate → scan tile pipeline → radix_sort
+///   → tile_ranges → interval_tiled_rasterize
+///
+/// Uses the interval decomposition path (screen triangles with front/back NDC depths)
+/// instead of per-pixel ray-tet intersection.
+#[test]
+fn test_interval_tiled_forward_e2e() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_interval_tiled_forward_e2e (no GPU)");
+            return;
+        }
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.6);
+
+    let verts_arr = [
+        Vec3::new(scene.vertices[0], scene.vertices[1], scene.vertices[2]),
+        Vec3::new(scene.vertices[3], scene.vertices[4], scene.vertices[5]),
+        Vec3::new(scene.vertices[6], scene.vertices[7], scene.vertices[8]),
+        Vec3::new(scene.vertices[9], scene.vertices[10], scene.vertices[11]),
+    ];
+    let centroid = (verts_arr[0] + verts_arr[1] + verts_arr[2] + verts_arr[3]) * 0.25;
+    let eye = centroid + Vec3::new(1.0, 0.0, 0.0);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
+
+    // --- Forward compute ---
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(&device, &queue, &scene, &zero_base_colors, &scene.color_grads, W, H);
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    rmesh_render::record_project_compute(
+        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+    );
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // --- Interval tiled buffers + pipelines ---
+    let interval_buffers = rmesh_render::IntervalTiledBuffers::new(&device, scene.tet_count);
+    let interval_gen = rmesh_render::IntervalGeneratePipeline::new(&device);
+    let interval_gen_bg = rmesh_render::create_interval_generate_bind_group(
+        &device, &interval_gen, &buffers, &material, &interval_buffers,
+    );
+
+    // --- Tiled infrastructure ---
+    let tile_size = 12u32;
+    let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
+    let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, tile_size);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
+    radix_state.upload_configs(&queue);
+
+    let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
+
+    let tile_uni = rmesh_backward::TileUniforms {
+        screen_width: W, screen_height: H, tile_size,
+        tiles_x: tile_buffers.tiles_x, tiles_y: tile_buffers.tiles_y,
+        num_tiles: tile_buffers.num_tiles, visible_tet_count: 0,
+        _pad: [0; 5],
+    };
+    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+    let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = rmesh_backward::create_rts_bind_group(
+        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, radix_state.num_keys_buf(),
+    );
+
+    let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+    );
+    let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+    );
+
+    // --- Interval tiled rasterize ---
+    let interval_rasterize = rmesh_render::IntervalTiledRasterizePipeline::new(&device, W, H, 0);
+    let interval_rasterize_bg_a = rmesh_render::create_interval_tiled_rasterize_bind_group(
+        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    );
+    let interval_rasterize_bg_b = rmesh_render::create_interval_tiled_rasterize_bind_group(
+        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    );
+
+    // --- Dispatch ---
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    encoder.clear_buffer(&interval_rasterize.rendered_image, 0, None);
+    encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+    // 1. Interval generate
+    rmesh_render::record_interval_generate(
+        &mut encoder, &interval_gen, &interval_gen_bg, scene.tet_count,
+    );
+
+    // 2. Scan-based tile pipeline
+    rmesh_backward::record_scan_tile_pipeline(
+        &mut encoder, &scan_pipelines, &tile_pipelines,
+        &prepare_dispatch_bg, &rts_bg,
+        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+    );
+
+    // 3. Radix sort
+    let result_in_b = rmesh_backward::record_radix_sort(
+        &mut encoder, &device, &radix_pipelines, &radix_state,
+        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+    );
+
+    // 4. Tile ranges
+    {
+        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // 5. Interval tiled rasterize
+    {
+        let fwd_bg = if result_in_b { &interval_rasterize_bg_b } else { &interval_rasterize_bg_a };
+        rmesh_render::record_interval_tiled_rasterize(
+            &mut encoder, &interval_rasterize, fwd_bg, tile_buffers.num_tiles,
+        );
+    }
+
+    queue.submit(std::iter::once(encoder.finish()));
+
+    // Read back rendered image
+    let pixel_count = (W * H) as usize;
+    let image: Vec<f32> = read_buffer(&device, &queue, &interval_rasterize.rendered_image, pixel_count * 4);
+
+    let total_alpha: f32 = image.iter().skip(3).step_by(4).sum();
+    eprintln!("interval_tiled_forward: total_alpha = {total_alpha:.4}");
+    assert!(
+        total_alpha > 0.001,
+        "Interval tiled forward produced all-zero image (total_alpha={total_alpha})"
+    );
+
+    for (i, &v) in image.iter().enumerate() {
+        assert!(v.is_finite(), "Pixel value at index {i} is not finite: {v}");
+    }
+
+    eprintln!("interval_tiled_forward: subgroup pipeline ran successfully");
+}
+
+// ===========================================================================
+// Test: interval tiled finite-difference gradient verification
+// ===========================================================================
+
+/// Runs the full interval tiled pipeline (project_compute → interval_generate →
+/// scan tile pipeline → radix_sort → tile_ranges → interval_tiled_rasterize →
+/// loss → backward_interval_tiled → interval_chain_back) on a two-tet scene,
+/// then verifies every analytical gradient against a numerical finite-difference
+/// estimate.
+#[test]
+fn test_interval_tiled_gradient_finite_diff() {
+    let (device, queue) = match create_test_device(TestDeviceConfig {
+        backends: None,
+        base_limits: wgpu::Limits::downlevel_defaults(),
+        ..Default::default()
+    }) {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_interval_tiled_gradient_finite_diff (no GPU)");
+            return;
+        }
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = two_tet_scene(&mut rng);
+
+    let eye = Vec3::new(3.0, 0.4, 1.0);
+    let target = Vec3::new(0.5, 0.4, 0.0);
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+    let tile_size = 12u32;
+    let n_pixels = (W * H) as usize;
+
+    let gt_data: Vec<f32> = vec![0.5; n_pixels * 3];
+    let loss_type = 1u32; // L2
+    let base_colors_init = vec![0.5f32; scene.tet_count as usize * 3];
+
+    // -----------------------------------------------------------------------
+    // Helper: run full interval tiled forward+loss pipeline and return scalar loss
+    // -----------------------------------------------------------------------
+    let run_forward_loss = |scene_data: &SceneData, base_colors: &[f32]| -> f32 {
+        let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+            rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
+
+        let uniforms = rmesh_render::make_uniforms(
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
+        );
+        queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        rmesh_render::record_project_compute(
+            &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene_data.tet_count, &queue,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Interval tiled buffers + pipelines
+        let interval_buffers = rmesh_render::IntervalTiledBuffers::new(&device, scene_data.tet_count);
+        let interval_gen = rmesh_render::IntervalGeneratePipeline::new(&device);
+        let interval_gen_bg = rmesh_render::create_interval_generate_bind_group(
+            &device, &interval_gen, &buffers, &material, &interval_buffers,
+        );
+
+        // Tile infrastructure
+        let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
+        let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
+        radix_state.upload_configs(&queue);
+
+        let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
+        let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene_data.tet_count);
+
+        let tile_uni = rmesh_backward::TileUniforms {
+            screen_width: W, screen_height: H, tile_size,
+            tiles_x: tile_buffers.tiles_x, tiles_y: tile_buffers.tiles_y,
+            num_tiles: tile_buffers.num_tiles, visible_tet_count: 0,
+            _pad: [0; 5],
+        };
+        queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+        let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+            &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+        );
+        let rts_bg = rmesh_backward::create_rts_bind_group(
+            &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+        );
+        let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+        let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+            &device, &scan_pipelines, &tile_buffers,
+            &buffers.uniforms, &buffers.vertices, &buffers.indices,
+            &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+            &scan_buffers, radix_state.num_keys_buf(),
+        );
+
+        let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+            &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        );
+        let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+            &device, &tile_pipelines, radix_state.keys_b(),
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        );
+
+        let interval_rasterize = rmesh_render::IntervalTiledRasterizePipeline::new(&device, W, H, 0);
+        let interval_rasterize_bg_a = rmesh_render::create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+        );
+        let interval_rasterize_bg_b = rmesh_render::create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.clear_buffer(&interval_rasterize.rendered_image, 0, None);
+        encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+        rmesh_render::record_interval_generate(
+            &mut encoder, &interval_gen, &interval_gen_bg, scene_data.tet_count,
+        );
+        rmesh_backward::record_scan_tile_pipeline(
+            &mut encoder, &scan_pipelines, &tile_pipelines,
+            &prepare_dispatch_bg, &rts_bg,
+            &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+        );
+        let result_in_b = rmesh_backward::record_radix_sort(
+            &mut encoder, &device, &radix_pipelines, &radix_state,
+            &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+        );
+        {
+            let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tile_ranges"), timestamp_writes: None });
+            pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+            pass.set_bind_group(0, ranges_bg, &[]);
+            let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+            pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+        }
+        {
+            let fwd_bg = if result_in_b { &interval_rasterize_bg_b } else { &interval_rasterize_bg_a };
+            rmesh_render::record_interval_tiled_rasterize(&mut encoder, &interval_rasterize, fwd_bg, tile_buffers.num_tiles);
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // CPU L2 loss (avoids GPU atomic CAS non-determinism)
+        let rendered: Vec<f32> = read_buffer(&device, &queue, &interval_rasterize.rendered_image, n_pixels * 4);
+        let mut loss_sum = 0.0f64;
+        for i in 0..n_pixels {
+            for c in 0..3usize {
+                let diff = rendered[i * 4 + c] as f64 - gt_data[i * 3 + c] as f64;
+                loss_sum += diff * diff;
+            }
+        }
+        (loss_sum / n_pixels as f64) as f32
+    };
+
+    // -----------------------------------------------------------------------
+    // Helper: run full interval tiled pipeline + backward, return analytical gradients
+    // -----------------------------------------------------------------------
+    let run_backward = |scene_data: &SceneData, base_colors: &[f32]| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+        let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+            rmesh_render::setup_forward(&device, &queue, scene_data, base_colors, &scene_data.color_grads, W, H);
+
+        let uniforms = rmesh_render::make_uniforms(
+            vp, c2w, intrinsics, eye, W as f32, H as f32, scene_data.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
+        );
+        queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        rmesh_render::record_project_compute(
+            &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene_data.tet_count, &queue,
+        );
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Interval tiled buffers + pipelines
+        let interval_buffers = rmesh_render::IntervalTiledBuffers::new(&device, scene_data.tet_count);
+        let interval_gen = rmesh_render::IntervalGeneratePipeline::new(&device);
+        let interval_gen_bg = rmesh_render::create_interval_generate_bind_group(
+            &device, &interval_gen, &buffers, &material, &interval_buffers,
+        );
+
+        // Tile infrastructure
+        let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
+        let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
+        let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene_data.tet_count, W, H, tile_size);
+        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
+        radix_state.upload_configs(&queue);
+
+        let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
+        let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene_data.tet_count);
+
+        let tile_uni = rmesh_backward::TileUniforms {
+            screen_width: W, screen_height: H, tile_size,
+            tiles_x: tile_buffers.tiles_x, tiles_y: tile_buffers.tiles_y,
+            num_tiles: tile_buffers.num_tiles, visible_tet_count: 0,
+            _pad: [0; 5],
+        };
+        queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+        let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+            &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+        );
+        let rts_bg = rmesh_backward::create_rts_bind_group(
+            &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+        );
+        let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+        let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+            &device, &scan_pipelines, &tile_buffers,
+            &buffers.uniforms, &buffers.vertices, &buffers.indices,
+            &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+            &scan_buffers, radix_state.num_keys_buf(),
+        );
+
+        let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+            &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        );
+        let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+            &device, &tile_pipelines, radix_state.keys_b(),
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        );
+
+        let interval_rasterize = rmesh_render::IntervalTiledRasterizePipeline::new(&device, W, H, 0);
+        let interval_rasterize_bg_a = rmesh_render::create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+        );
+        let interval_rasterize_bg_b = rmesh_render::create_interval_tiled_rasterize_bind_group(
+            &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+        );
+
+        // Forward pass
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.clear_buffer(&interval_rasterize.rendered_image, 0, None);
+        encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
+
+        rmesh_render::record_interval_generate(
+            &mut encoder, &interval_gen, &interval_gen_bg, scene_data.tet_count,
+        );
+        rmesh_backward::record_scan_tile_pipeline(
+            &mut encoder, &scan_pipelines, &tile_pipelines,
+            &prepare_dispatch_bg, &rts_bg,
+            &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+        );
+        let result_in_b = rmesh_backward::record_radix_sort(
+            &mut encoder, &device, &radix_pipelines, &radix_state,
+            &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+        );
+        {
+            let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("tile_ranges"), timestamp_writes: None });
+            pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
+            pass.set_bind_group(0, ranges_bg, &[]);
+            let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
+            pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+        }
+        {
+            let fwd_bg = if result_in_b { &interval_rasterize_bg_b } else { &interval_rasterize_bg_a };
+            rmesh_render::record_interval_tiled_rasterize(&mut encoder, &interval_rasterize, fwd_bg, tile_buffers.num_tiles);
+        }
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Loss
+        let loss_pipeline = LossPipeline::new(&device);
+        let loss_buffers = LossBuffers::new(&device, W, H);
+        queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&gt_data));
+
+        let loss_uni = LossUniforms {
+            width: W, height: H, loss_type, lambda_ssim: 0.0,
+        };
+        queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
+        queue.write_buffer(&loss_buffers.loss_value, 0, &[0u8; 4]);
+
+        let loss_bg = create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &interval_rasterize.rendered_image);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        record_loss_pass(&mut encoder, &loss_pipeline, &loss_bg, W, H);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        // Backward: backward_interval_tiled + interval_chain_back
+        let interval_grad_buffers = rmesh_backward::IntervalGradBuffers::new(&device, scene_data.tet_count, scene_data.vertex_count, scene_data.tet_count, 0);
+        let grad_buffers = rmesh_backward::GradientBuffers::new(&device, scene_data.vertex_count, scene_data.tet_count);
+        let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(&device, scene_data.tet_count);
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        encoder.clear_buffer(&interval_grad_buffers.d_interval_verts, 0, None);
+        encoder.clear_buffer(&interval_grad_buffers.d_interval_tet_data, 0, None);
+        encoder.clear_buffer(&interval_grad_buffers.d_vertex_normals, 0, None);
+        encoder.clear_buffer(&grad_buffers.d_vertices, 0, None);
+        encoder.clear_buffer(&grad_buffers.d_densities, 0, None);
+        encoder.clear_buffer(&mat_grad_buffers.d_color_grads, 0, None);
+        encoder.clear_buffer(&mat_grad_buffers.d_base_colors, 0, None);
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let (tile_sort_values_sorted, _) = if result_in_b {
+            (radix_state.values_b(), radix_state.keys_b())
+        } else {
+            (&tile_buffers.tile_sort_values, &tile_buffers.tile_sort_keys)
+        };
+
+        // Zero-initialized gradient buffers for xyzd/distortion (no loss on these in this test)
+        let n_px = (W as u64) * (H as u64);
+        let zero_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let dl_d_xyzd = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dl_d_xyzd_zero"), size: n_px * 4 * 4, usage: zero_usage, mapped_at_creation: false,
+        });
+        let dl_d_distortion = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dl_d_distortion_zero"), size: n_px * 5 * 4, usage: zero_usage, mapped_at_creation: false,
+        });
+
+        // backward_interval_tiled
+        let bwd_interval_tiled = rmesh_backward::BackwardIntervalTiledPipeline::new(&device, 0);
+        let (bwd_it_bg0, bwd_it_bg1) = rmesh_backward::create_backward_interval_tiled_bind_groups(
+            &device, &bwd_interval_tiled,
+            &buffers.uniforms, &loss_buffers.dl_d_image, &interval_rasterize.rendered_image,
+            &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+            &interval_buffers.interval_meta, tile_sort_values_sorted,
+            &interval_grad_buffers.d_interval_verts, &interval_grad_buffers.d_interval_tet_data,
+            &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &dl_d_xyzd, &dl_d_distortion,
+            &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+            &interval_rasterize.aux_data_dummy, &dl_d_xyzd, &interval_grad_buffers.d_aux_data,
+        );
+
+        // interval_chain_back
+        let chain_back = rmesh_backward::IntervalChainBackPipeline::new(&device);
+        let (cb_bg0, cb_bg1) = rmesh_backward::create_interval_chain_back_bind_groups(
+            &device, &chain_back,
+            &buffers.uniforms, &buffers.vertices, &buffers.indices,
+            &material.color_grads, &buffers.compact_tet_ids, &buffers.indirect_args,
+            &interval_buffers.interval_meta,
+            &interval_grad_buffers.d_interval_verts, &interval_grad_buffers.d_interval_tet_data,
+            &buffers.vertex_normals,
+            &grad_buffers.d_vertices, &grad_buffers.d_densities,
+            &mat_grad_buffers.d_color_grads, &mat_grad_buffers.d_base_colors,
+            &interval_grad_buffers.d_vertex_normals,
+        );
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+        // backward_interval_tiled pass
+        rmesh_backward::record_backward_interval_tiled(
+            &mut encoder, &bwd_interval_tiled, &bwd_it_bg0, &bwd_it_bg1, tile_buffers.num_tiles,
+        );
+
+        // interval_chain_back pass
+        rmesh_backward::record_interval_chain_back(
+            &mut encoder, &chain_back, &cb_bg0, &cb_bg1, scene_data.tet_count,
+        );
+
+        queue.submit(std::iter::once(encoder.finish()));
+
+        let d_densities: Vec<f32> = read_buffer(&device, &queue, &grad_buffers.d_densities, scene_data.tet_count as usize);
+        let d_vertices: Vec<f32> = read_buffer(&device, &queue, &grad_buffers.d_vertices, (scene_data.vertex_count * 3) as usize);
+        let d_color_grads: Vec<f32> = read_buffer(&device, &queue, &mat_grad_buffers.d_color_grads, (scene_data.tet_count * 3) as usize);
+        let d_base_colors: Vec<f32> = read_buffer(&device, &queue, &mat_grad_buffers.d_base_colors, (scene_data.tet_count * 3) as usize);
+
+        (d_densities, d_vertices, d_color_grads, d_base_colors)
+    };
+
+    // -----------------------------------------------------------------------
+    // Run backward to get analytical gradients
+    // -----------------------------------------------------------------------
+    let (d_densities, d_vertices, d_color_grads, d_base_colors) = run_backward(&scene, &base_colors_init);
+    let base_loss = run_forward_loss(&scene, &base_colors_init);
+
+    eprintln!("\n=== Interval tiled finite-difference gradient test ===");
+    eprintln!("base_loss = {base_loss:.8}");
+    eprintln!("analytical d_densities = {:?}", d_densities);
+    eprintln!("analytical d_vertices = {:?}", d_vertices);
+    eprintln!("analytical d_color_grads = {:?}", d_color_grads);
+    eprintln!("analytical d_base_colors = {:?}", d_base_colors);
+
+    let eps = 1e-3f32;
+    let rel_tol = 0.10;
+    let abs_tol = 5e-5;
+
+    let check_grad_eps = |name: &str, analytical: f32, param_plus_loss: f32, param_minus_loss: f32, epsilon: f32| {
+        let numerical = (param_plus_loss - param_minus_loss) / (2.0 * epsilon);
+        let abs_err = (analytical - numerical).abs();
+        let denom = analytical.abs().max(numerical.abs()).max(1e-7);
+        let rel_err = abs_err / denom;
+        eprintln!(
+            "  {name}: analytical={analytical:.8}, numerical={numerical:.8}, rel_err={rel_err:.6}",
+        );
+        (rel_err, abs_err, analytical, numerical)
+    };
+
+    let mut any_failed = false;
+
+    // --- Density gradients ---
+    for i in 0..scene.densities.len() {
+        let mut scene_plus = scene.clone();
+        scene_plus.densities[i] += eps;
+        let loss_plus = run_forward_loss(&scene_plus, &base_colors_init);
+
+        let mut scene_minus = scene.clone();
+        scene_minus.densities[i] -= eps;
+        let loss_minus = run_forward_loss(&scene_minus, &base_colors_init);
+
+        let (rel_err, abs_err, analytical, numerical) = check_grad_eps(&format!("density[{i}]"), d_densities[i], loss_plus, loss_minus, eps);
+        if rel_err > rel_tol && abs_err > abs_tol && (analytical.abs() > 1e-7 || numerical.abs() > 1e-7) {
+            eprintln!("  FAIL: density[{i}] gradient rel_err={rel_err:.6} > {rel_tol}");
+            any_failed = true;
+        }
+    }
+
+    // --- Vertex gradients ---
+    // The interval path decomposes tets into screen-space triangles and interpolates
+    // attributes via barycentrics. The backward ignores d(bary)/d(vertex_screen_pos),
+    // which is the standard differentiable rasterization approximation. This means
+    // vertex gradients are inherently less accurate than the ray-tet intersection path
+    // (which directly computes entry/exit depths without screen-space interpolation).
+    // Use relaxed tolerances for vertex gradients accordingly.
+    let vertex_abs_tol = 0.015;
+    for i in 0..scene.vertices.len() {
+        let mut scene_plus = scene.clone();
+        scene_plus.vertices[i] += eps;
+        scene_plus.circumdata = compute_circumspheres(&scene_plus.vertices, &scene_plus.indices);
+        let loss_plus = run_forward_loss(&scene_plus, &base_colors_init);
+
+        let mut scene_minus = scene.clone();
+        scene_minus.vertices[i] -= eps;
+        scene_minus.circumdata = compute_circumspheres(&scene_minus.vertices, &scene_minus.indices);
+        let loss_minus = run_forward_loss(&scene_minus, &base_colors_init);
+
+        let (_rel_err, abs_err, analytical, numerical) = check_grad_eps(&format!("vertex[{i}]"), d_vertices[i], loss_plus, loss_minus, eps);
+        if abs_err > vertex_abs_tol && (analytical.abs() > 1e-7 || numerical.abs() > 1e-7) {
+            eprintln!("  FAIL: vertex[{i}] gradient abs_err={abs_err:.6} > {vertex_abs_tol}");
+            any_failed = true;
+        }
+    }
+
+    // --- Color gradient gradients ---
+    let eps_cg = 0.01f32;
+    for i in 0..scene.color_grads.len() {
+        let mut scene_plus = scene.clone();
+        scene_plus.color_grads[i] += eps_cg;
+        let loss_plus = run_forward_loss(&scene_plus, &base_colors_init);
+
+        let mut scene_minus = scene.clone();
+        scene_minus.color_grads[i] -= eps_cg;
+        let loss_minus = run_forward_loss(&scene_minus, &base_colors_init);
+
+        let (rel_err, abs_err, analytical, numerical) = check_grad_eps(&format!("color_grads[{i}]"), d_color_grads[i], loss_plus, loss_minus, eps_cg);
+        if rel_err > rel_tol && abs_err > abs_tol && (analytical.abs() > 1e-7 || numerical.abs() > 1e-7) {
+            eprintln!("  FAIL: color_grads[{i}] gradient rel_err={rel_err:.6} > {rel_tol}");
+            any_failed = true;
+        }
+    }
+
+    // --- Base color gradients ---
+    for i in 0..base_colors_init.len() {
+        let mut bc_plus = base_colors_init.clone();
+        bc_plus[i] += eps;
+        let loss_plus = run_forward_loss(&scene, &bc_plus);
+
+        let mut bc_minus = base_colors_init.clone();
+        bc_minus[i] -= eps;
+        let loss_minus = run_forward_loss(&scene, &bc_minus);
+
+        let (rel_err, abs_err, analytical, numerical) = check_grad_eps(&format!("base_colors[{i}]"), d_base_colors[i], loss_plus, loss_minus, eps);
+        if rel_err > rel_tol && abs_err > abs_tol && (analytical.abs() > 1e-7 || numerical.abs() > 1e-7) {
+            eprintln!("  FAIL: base_colors[{i}] gradient rel_err={rel_err:.6} > {rel_tol}");
+            any_failed = true;
+        }
+    }
+
+    if any_failed {
+        panic!("Some interval tiled gradients failed the finite-difference check! See output above.");
+    }
+
+    eprintln!("\nAll interval tiled gradients passed finite-difference check (rel_tol={rel_tol})");
+}

@@ -101,7 +101,7 @@ fn create_bench_device() -> Option<(wgpu::Device, wgpu::Queue)> {
 
         let supported_limits = adapter.limits();
         let limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 16,
+            max_storage_buffers_per_shader_stage: 20,
             ..supported_limits
         };
 
@@ -590,26 +590,42 @@ fn run_backward(s: &BenchState) {
 
 /// Run a single forward pass with GPU timestamps and print the breakdown.
 fn print_forward_timestamp_breakdown(s: &BenchState) {
-    let mut ts = TimestampRecorder::new(&s.device, &s.queue, 16);
+    let mut ts = TimestampRecorder::new(&s.device, &s.queue, 18);
 
     let mut encoder = s
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-    // We can't use record_project_compute directly since it creates its own
-    // passes without timestamp writes. Instead, replicate the logic with
-    // timestamps on the passes we can instrument.
+    // Inline project_compute with timestamp instrumentation
+    {
+        let reset_cmd = rmesh_render::DrawIndirectCommand {
+            vertex_count: 12,
+            instance_count: 0,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        s.queue.write_buffer(&s.buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+        encoder.clear_buffer(&s.buffers.tiles_touched, 0, None);
 
-    // For the scan pipeline and later stages, we instrument each pass.
-    // First, run project_compute without timestamps (it's a single pass).
-    rmesh_render::record_project_compute(
-        &mut encoder,
-        &s.fwd_pipelines,
-        &s.buffers,
-        &s.compute_bg,
-        s.tet_count,
-        &s.queue,
-    );
+        let (b, e) = ts.allocate("project_compute");
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        cpass.set_pipeline(&s.fwd_pipelines.compute_pipeline);
+        cpass.set_bind_group(0, &s.compute_bg, &[]);
+        let workgroup_size = 64u32;
+        let n_pow2 = s.tet_count.next_power_of_two();
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
 
     encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
@@ -976,21 +992,42 @@ fn bench_forward(c: &mut Criterion) {
 
 /// Run a single backward pass with GPU timestamps on each pass.
 fn print_backward_timestamp_breakdown(s: &BenchState) {
-    let mut ts = TimestampRecorder::new(&s.device, &s.queue, 20);
+    let mut ts = TimestampRecorder::new(&s.device, &s.queue, 22);
 
     let mut encoder = s
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
-    // Forward compute (no timestamp — creates its own passes)
-    rmesh_render::record_project_compute(
-        &mut encoder,
-        &s.fwd_pipelines,
-        &s.buffers,
-        &s.compute_bg,
-        s.tet_count,
-        &s.queue,
-    );
+    // Inline project_compute with timestamp instrumentation
+    {
+        let reset_cmd = rmesh_render::DrawIndirectCommand {
+            vertex_count: 12,
+            instance_count: 0,
+            first_vertex: 0,
+            first_instance: 0,
+        };
+        s.queue.write_buffer(&s.buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+        encoder.clear_buffer(&s.buffers.tiles_touched, 0, None);
+
+        let (b, e) = ts.allocate("project_compute");
+        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute"),
+            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                query_set: ts.query_set(),
+                beginning_of_pass_write_index: Some(b),
+                end_of_pass_write_index: Some(e),
+            }),
+        });
+        cpass.set_pipeline(&s.fwd_pipelines.compute_pipeline);
+        cpass.set_bind_group(0, &s.compute_bg, &[]);
+        let workgroup_size = 64u32;
+        let n_pow2 = s.tet_count.next_power_of_two();
+        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let max_per_dim = 65535u32;
+        let dispatch_x = total_workgroups.min(max_per_dim);
+        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    }
 
     // Clears
     encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
@@ -1217,7 +1254,7 @@ fn create_interval_bench_state() -> Option<IntervalBenchState> {
 
         let supported_limits = adapter.limits();
         let limits = wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 16,
+            max_storage_buffers_per_shader_stage: 20,
             ..supported_limits
         };
 
@@ -1392,6 +1429,383 @@ fn bench_interval(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Interval tiled benchmark (compute-only, no mesh shaders required)
+// ---------------------------------------------------------------------------
+
+/// GPU state for the interval tiled benchmark.
+#[allow(dead_code)]
+struct IntervalTiledBenchState {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    tet_count: u32,
+    // Forward
+    buffers: rmesh_render::SceneBuffers,
+    material: rmesh_render::MaterialBuffers,
+    fwd_pipelines: rmesh_render::ForwardPipelines,
+    compute_bg: wgpu::BindGroup,
+    // Interval tiled
+    interval_buffers: rmesh_render::IntervalTiledBuffers,
+    interval_gen: rmesh_render::IntervalGeneratePipeline,
+    interval_gen_bg: wgpu::BindGroup,
+    interval_rasterize: rmesh_render::IntervalTiledRasterizePipeline,
+    interval_rasterize_bg_a: wgpu::BindGroup,
+    interval_rasterize_bg_b: wgpu::BindGroup,
+    // Tile infrastructure
+    tile_pipelines: rmesh_backward::TilePipelines,
+    radix_pipelines: rmesh_backward::RadixSortPipelines,
+    tile_buffers: rmesh_backward::TileBuffers,
+    radix_state: rmesh_backward::RadixSortState,
+    scan_pipelines: rmesh_backward::ScanPipelines,
+    scan_buffers: rmesh_backward::ScanBuffers,
+    prepare_dispatch_bg: wgpu::BindGroup,
+    rts_bg: wgpu::BindGroup,
+    tile_fill_bg: wgpu::BindGroup,
+    tile_gen_scan_bg: wgpu::BindGroup,
+    tile_ranges_bg_a: wgpu::BindGroup,
+    tile_ranges_bg_b: wgpu::BindGroup,
+    // Loss
+    loss_pipeline: LossPipeline,
+    loss_buffers: LossBuffers,
+    loss_bg: wgpu::BindGroup,
+    // Backward interval tiled
+    bwd_interval_tiled: rmesh_backward::BackwardIntervalTiledPipeline,
+    interval_grad_buffers: rmesh_backward::IntervalGradBuffers,
+    bwd_it_bg0_a: wgpu::BindGroup,
+    bwd_it_bg0_b: wgpu::BindGroup,
+    bwd_it_bg1: wgpu::BindGroup,
+    // Chain-back
+    chain_back: rmesh_backward::IntervalChainBackPipeline,
+    chain_back_bg0: wgpu::BindGroup,
+    chain_back_bg1: wgpu::BindGroup,
+    // Final gradient buffers
+    grad_buffers: rmesh_backward::GradientBuffers,
+    mat_grad_buffers: rmesh_backward::MaterialGradBuffers,
+}
+
+fn create_interval_tiled_bench_state() -> Option<IntervalTiledBenchState> {
+    let (device, queue) = create_bench_device()?;
+
+    eprintln!("Generating interval tiled grid scene (grid_size={GRID_SIZE})...");
+    let scene = grid_tet_scene(GRID_SIZE);
+    eprintln!(
+        "Interval tiled scene: {} vertices, {} tets",
+        scene.vertex_count, scene.tet_count
+    );
+
+    let (vp, c2w, intrinsics, eye) = setup_camera();
+
+    let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
+        rmesh_render::setup_forward(&device, &queue, &scene, &base_colors, &scene.color_grads, W, H);
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp, c2w, intrinsics, eye, W as f32, H as f32,
+        scene.tet_count, 0u32, TILE_SIZE, 0.0, 0, 0.01, 100.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    // Interval tiled buffers + pipelines
+    let interval_buffers = rmesh_render::IntervalTiledBuffers::new(&device, scene.tet_count);
+    let interval_gen = rmesh_render::IntervalGeneratePipeline::new(&device);
+    let interval_gen_bg = rmesh_render::create_interval_generate_bind_group(
+        &device, &interval_gen, &buffers, &material, &interval_buffers,
+    );
+
+    // Tile infrastructure
+    let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
+    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
+    let tile_buffers = rmesh_backward::TileBuffers::new(&device, scene.tet_count, W, H, TILE_SIZE);
+    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+    let radix_state = rmesh_backward::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_backward::SortBackend::Drs);
+    radix_state.upload_configs(&queue);
+
+    let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
+
+    let tile_uni = TileUniforms {
+        screen_width: W, screen_height: H, tile_size: TILE_SIZE,
+        tiles_x: tile_buffers.tiles_x, tiles_y: tile_buffers.tiles_y,
+        num_tiles: tile_buffers.num_tiles, visible_tet_count: 0,
+        _pad: [0; 5],
+    };
+    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+
+    let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+    );
+    let rts_bg = rmesh_backward::create_rts_bind_group(
+        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+    );
+    let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+        &device, &scan_pipelines, &tile_buffers,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
+        &scan_buffers, radix_state.num_keys_buf(),
+    );
+
+    let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+    );
+    let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+        &device, &tile_pipelines, radix_state.keys_b(),
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+    );
+
+    // Interval tiled rasterize
+    let interval_rasterize = rmesh_render::IntervalTiledRasterizePipeline::new(&device, W, H, 0);
+    let interval_rasterize_bg_a = rmesh_render::create_interval_tiled_rasterize_bind_group(
+        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    );
+    let interval_rasterize_bg_b = rmesh_render::create_interval_tiled_rasterize_bind_group(
+        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
+        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    );
+
+    // Loss
+    let loss_pipeline = LossPipeline::new(&device);
+    let loss_buffers = LossBuffers::new(&device, W, H);
+    let n_pixels = (W * H) as usize;
+    let gt_data: Vec<f32> = vec![0.5; n_pixels * 3];
+    queue.write_buffer(&loss_buffers.ground_truth, 0, bytemuck::cast_slice(&gt_data));
+    let loss_uni = LossUniforms { width: W, height: H, loss_type: 1, lambda_ssim: 0.0 };
+    queue.write_buffer(&loss_buffers.loss_uniforms, 0, bytemuck::bytes_of(&loss_uni));
+    let loss_bg = create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &interval_rasterize.rendered_image);
+
+    // Backward interval tiled
+    let interval_grad_buffers = rmesh_backward::IntervalGradBuffers::new(&device, scene.tet_count, scene.vertex_count, scene.tet_count, 0);
+    let grad_buffers = rmesh_backward::GradientBuffers::new(&device, scene.vertex_count, scene.tet_count);
+    let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(&device, scene.tet_count);
+
+    let bwd_interval_tiled = rmesh_backward::BackwardIntervalTiledPipeline::new(&device, 0);
+    // Zero-initialized gradient buffers for xyzd/distortion (no loss on these in bench)
+    let n_px = (W as u64) * (H as u64);
+    let zero_usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+    let dl_d_xyzd = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dl_d_xyzd_zero"), size: n_px * 4 * 4, usage: zero_usage, mapped_at_creation: false,
+    });
+    let dl_d_distortion = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dl_d_distortion_zero"), size: n_px * 5 * 4, usage: zero_usage, mapped_at_creation: false,
+    });
+
+    let (bwd_it_bg0_a, bwd_it_bg1) = rmesh_backward::create_backward_interval_tiled_bind_groups(
+        &device, &bwd_interval_tiled,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &interval_rasterize.rendered_image,
+        &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+        &interval_buffers.interval_meta, &tile_buffers.tile_sort_values,
+        &interval_grad_buffers.d_interval_verts, &interval_grad_buffers.d_interval_tet_data,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &dl_d_xyzd, &dl_d_distortion,
+        &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+        &interval_rasterize.aux_data_dummy,
+        &interval_rasterize.aux_data_dummy,
+        &interval_grad_buffers.d_aux_data,
+    );
+    let (bwd_it_bg0_b, _) = rmesh_backward::create_backward_interval_tiled_bind_groups(
+        &device, &bwd_interval_tiled,
+        &buffers.uniforms, &loss_buffers.dl_d_image, &interval_rasterize.rendered_image,
+        &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+        &interval_buffers.interval_meta, radix_state.values_b(),
+        &interval_grad_buffers.d_interval_verts, &interval_grad_buffers.d_interval_tet_data,
+        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+        &dl_d_xyzd, &dl_d_distortion,
+        &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+        &interval_rasterize.aux_data_dummy,
+        &interval_rasterize.aux_data_dummy,
+        &interval_grad_buffers.d_aux_data,
+    );
+
+    // Chain-back
+    let chain_back = rmesh_backward::IntervalChainBackPipeline::new(&device);
+    let (chain_back_bg0, chain_back_bg1) = rmesh_backward::create_interval_chain_back_bind_groups(
+        &device, &chain_back,
+        &buffers.uniforms, &buffers.vertices, &buffers.indices,
+        &material.color_grads, &buffers.compact_tet_ids, &buffers.indirect_args,
+        &interval_buffers.interval_meta,
+        &interval_grad_buffers.d_interval_verts, &interval_grad_buffers.d_interval_tet_data,
+        &buffers.vertex_normals,
+        &grad_buffers.d_vertices, &grad_buffers.d_densities,
+        &mat_grad_buffers.d_color_grads, &mat_grad_buffers.d_base_colors,
+        &interval_grad_buffers.d_vertex_normals,
+    );
+
+    Some(IntervalTiledBenchState {
+        device, queue, tet_count: scene.tet_count,
+        buffers, material, fwd_pipelines, compute_bg,
+        interval_buffers, interval_gen, interval_gen_bg,
+        interval_rasterize, interval_rasterize_bg_a, interval_rasterize_bg_b,
+        tile_pipelines, radix_pipelines, tile_buffers, radix_state,
+        scan_pipelines, scan_buffers,
+        prepare_dispatch_bg, rts_bg, tile_fill_bg, tile_gen_scan_bg,
+        tile_ranges_bg_a, tile_ranges_bg_b,
+        loss_pipeline, loss_buffers, loss_bg,
+        bwd_interval_tiled, interval_grad_buffers,
+        bwd_it_bg0_a, bwd_it_bg0_b, bwd_it_bg1,
+        chain_back, chain_back_bg0, chain_back_bg1,
+        grad_buffers, mat_grad_buffers,
+    })
+}
+
+fn run_forward_interval_tiled(s: &IntervalTiledBenchState) {
+    let mut encoder = s.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // Forward compute
+    rmesh_render::record_project_compute(
+        &mut encoder, &s.fwd_pipelines, &s.buffers, &s.compute_bg, s.tet_count, &s.queue,
+    );
+
+    // Clear
+    encoder.clear_buffer(&s.interval_rasterize.rendered_image, 0, None);
+    encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
+
+    // Interval generate
+    rmesh_render::record_interval_generate(
+        &mut encoder, &s.interval_gen, &s.interval_gen_bg, s.tet_count,
+    );
+
+    // Scan tile pipeline
+    rmesh_backward::record_scan_tile_pipeline(
+        &mut encoder, &s.scan_pipelines, &s.tile_pipelines,
+        &s.prepare_dispatch_bg, &s.rts_bg,
+        &s.tile_fill_bg, &s.tile_gen_scan_bg, &s.scan_buffers, &s.tile_buffers,
+    );
+
+    // Radix sort
+    let result_in_b = rmesh_backward::record_radix_sort(
+        &mut encoder, &s.device, &s.radix_pipelines, &s.radix_state,
+        &s.tile_buffers.tile_sort_keys, &s.tile_buffers.tile_sort_values,
+    );
+
+    // Tile ranges
+    {
+        let ranges_bg = if result_in_b { &s.tile_ranges_bg_b } else { &s.tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&s.tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (s.tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // Interval tiled rasterize
+    {
+        let fwd_bg = if result_in_b { &s.interval_rasterize_bg_b } else { &s.interval_rasterize_bg_a };
+        rmesh_render::record_interval_tiled_rasterize(
+            &mut encoder, &s.interval_rasterize, fwd_bg, s.tile_buffers.num_tiles,
+        );
+    }
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+fn run_backward_interval_tiled(s: &IntervalTiledBenchState) {
+    let mut encoder = s.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+
+    // Forward compute
+    rmesh_render::record_project_compute(
+        &mut encoder, &s.fwd_pipelines, &s.buffers, &s.compute_bg, s.tet_count, &s.queue,
+    );
+
+    // Clear
+    encoder.clear_buffer(&s.interval_rasterize.rendered_image, 0, None);
+    encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);
+    encoder.clear_buffer(&s.interval_grad_buffers.d_interval_verts, 0, None);
+    encoder.clear_buffer(&s.interval_grad_buffers.d_interval_tet_data, 0, None);
+    encoder.clear_buffer(&s.grad_buffers.d_vertices, 0, None);
+    encoder.clear_buffer(&s.grad_buffers.d_densities, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_color_grads, 0, None);
+    encoder.clear_buffer(&s.mat_grad_buffers.d_base_colors, 0, None);
+    encoder.clear_buffer(&s.loss_buffers.loss_value, 0, None);
+
+    // Interval generate
+    rmesh_render::record_interval_generate(
+        &mut encoder, &s.interval_gen, &s.interval_gen_bg, s.tet_count,
+    );
+
+    // Scan tile pipeline
+    rmesh_backward::record_scan_tile_pipeline(
+        &mut encoder, &s.scan_pipelines, &s.tile_pipelines,
+        &s.prepare_dispatch_bg, &s.rts_bg,
+        &s.tile_fill_bg, &s.tile_gen_scan_bg, &s.scan_buffers, &s.tile_buffers,
+    );
+
+    // Radix sort
+    let result_in_b = rmesh_backward::record_radix_sort(
+        &mut encoder, &s.device, &s.radix_pipelines, &s.radix_state,
+        &s.tile_buffers.tile_sort_keys, &s.tile_buffers.tile_sort_values,
+    );
+
+    // Tile ranges
+    {
+        let ranges_bg = if result_in_b { &s.tile_ranges_bg_b } else { &s.tile_ranges_bg_a };
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("tile_ranges"), timestamp_writes: None,
+        });
+        pass.set_pipeline(&s.tile_pipelines.tile_ranges_pipeline);
+        pass.set_bind_group(0, ranges_bg, &[]);
+        let wgs = (s.tile_buffers.max_pairs_pow2 + 255) / 256;
+        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+    }
+
+    // Interval tiled rasterize
+    {
+        let fwd_bg = if result_in_b { &s.interval_rasterize_bg_b } else { &s.interval_rasterize_bg_a };
+        rmesh_render::record_interval_tiled_rasterize(
+            &mut encoder, &s.interval_rasterize, fwd_bg, s.tile_buffers.num_tiles,
+        );
+    }
+
+    // Loss
+    record_loss_pass(&mut encoder, &s.loss_pipeline, &s.loss_bg, W, H);
+
+    // Backward interval tiled
+    {
+        let bwd_bg0 = if result_in_b { &s.bwd_it_bg0_b } else { &s.bwd_it_bg0_a };
+        rmesh_backward::record_backward_interval_tiled(
+            &mut encoder, &s.bwd_interval_tiled, bwd_bg0, &s.bwd_it_bg1, s.tile_buffers.num_tiles,
+        );
+    }
+
+    // Chain-back
+    rmesh_backward::record_interval_chain_back(
+        &mut encoder, &s.chain_back, &s.chain_back_bg0, &s.chain_back_bg1, s.tet_count,
+    );
+
+    s.queue.submit(std::iter::once(encoder.finish()));
+    let _ = s.device.poll(wgpu::PollType::wait_indefinitely());
+}
+
+fn bench_interval_tiled(c: &mut Criterion) {
+    let state = match create_interval_tiled_bench_state() {
+        Some(s) => s,
+        None => {
+            eprintln!("Skipping bench_interval_tiled (no GPU with SUBGROUP + TIMESTAMP_QUERY)");
+            return;
+        }
+    };
+
+    // Warmup
+    run_forward_interval_tiled(&state);
+
+    c.bench_function("forward_interval_tiled_2M", |b| {
+        b.iter(|| run_forward_interval_tiled(&state));
+    });
+
+    // Full backward
+    run_backward_interval_tiled(&state);
+
+    c.bench_function("backward_interval_tiled_2M", |b| {
+        b.iter(|| run_backward_interval_tiled(&state));
+    });
+}
+
 criterion_group! {
     name = tiled_pipeline;
     config = Criterion::default().sample_size(20);
@@ -1402,4 +1816,9 @@ criterion_group! {
     config = Criterion::default().sample_size(20);
     targets = bench_interval
 }
-criterion_main!(tiled_pipeline, interval_pipeline);
+criterion_group! {
+    name = interval_tiled_pipeline;
+    config = Criterion::default().sample_size(20);
+    targets = bench_interval_tiled
+}
+criterion_main!(tiled_pipeline, interval_pipeline, interval_tiled_pipeline);
