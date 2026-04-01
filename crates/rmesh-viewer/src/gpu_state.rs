@@ -140,4 +140,15 @@ pub struct GpuState {
     pub cpu_times_ms: CpuTimings,
     pub instance_count_ready: Arc<AtomicBool>,
     pub instance_count_mapped: Arc<AtomicBool>,
+    // PBR aux data (per-tet material channels, uploaded when PBR data present)
+    pub aux_data_buf: Option<wgpu::Buffer>,
+    // Deferred PBR shading (only when PBR data is loaded)
+    pub deferred_pipeline: Option<rmesh_render::DeferredShadePipeline>,
+    pub deferred_bg: Option<wgpu::BindGroup>,
+    /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
+    pub deferred_output: Option<wgpu::Texture>,
+    pub deferred_output_view: Option<wgpu::TextureView>,
+    /// Blit bind group pointing to deferred output (swapped when deferred is active)
+    pub deferred_blit_bg: Option<wgpu::BindGroup>,
+    pub has_pbr_data: bool,
 }

@@ -51,6 +51,7 @@ const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl")
 const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
 const SHADOW_RAY_GEN_WGSL: &str = include_str!("wgsl/shadow_ray_gen.wgsl");
 const DEFERRED_SHADE_WGSL: &str = include_str!("wgsl/deferred_shade.wgsl");
+const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wgsl");
 
 // ---------------------------------------------------------------------------
 // PBR deferred shading types
@@ -58,7 +59,7 @@ const DEFERRED_SHADE_WGSL: &str = include_str!("wgsl/deferred_shade.wgsl");
 
 /// Per-light data for deferred shading (matches WGSL `Light` struct).
 #[repr(C)]
-#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuLight {
     pub position: [f32; 3],
     pub light_type: u32, // 0=point, 1=spot, 2=directional
@@ -4044,6 +4045,212 @@ pub fn record_blit(
         ..Default::default()
     });
     rpass.set_pipeline(&blit.pipeline);
+    rpass.set_bind_group(0, bind_group, &[]);
+    rpass.draw(0..3, 0..1); // fullscreen triangle
+}
+
+// ===========================================================================
+// Deferred Shading Pipeline
+// ===========================================================================
+
+/// Fullscreen render pass that reads MRT textures (plaster, aux0, normals, depth+albedo)
+/// and computes per-pixel lighting, writing the lit result to color_view.
+pub struct DeferredShadePipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub uniforms_buf: wgpu::Buffer,
+    pub light_buf: wgpu::Buffer,
+}
+
+impl DeferredShadePipeline {
+    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("deferred_shade_frag.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(DEFERRED_SHADE_FRAG_WGSL.into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("deferred_shade_bgl"),
+            entries: &[
+                // 0: DeferredUniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // 1-4: MRT textures
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // 5: lights storage buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("deferred_shade_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("deferred_shade_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: color_format,
+                    blend: None, // Overwrite — not blending
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let uniforms_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred_uniforms"),
+            size: std::mem::size_of::<DeferredUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let light_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("deferred_lights"),
+            size: (MAX_LIGHTS * std::mem::size_of::<GpuLight>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self { pipeline, bind_group_layout, uniforms_buf, light_buf }
+    }
+}
+
+/// Create the deferred shading bind group from MRT texture views.
+pub fn create_deferred_bind_group(
+    device: &wgpu::Device,
+    deferred: &DeferredShadePipeline,
+    targets: &RenderTargets,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("deferred_shade_bg"),
+        layout: &deferred.bind_group_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: deferred.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&targets.color_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(&targets.aux0_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(&targets.normals_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(&targets.depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: deferred.light_buf.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+/// Record the deferred shading render pass: reads MRT textures, writes lit color to `target_view`.
+pub fn record_deferred_shade(
+    encoder: &mut wgpu::CommandEncoder,
+    deferred: &DeferredShadePipeline,
+    bind_group: &wgpu::BindGroup,
+    target_view: &wgpu::TextureView,
+) {
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("deferred_shade"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: None,
+        ..Default::default()
+    });
+    rpass.set_pipeline(&deferred.pipeline);
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.draw(0..3, 0..1); // fullscreen triangle
 }
