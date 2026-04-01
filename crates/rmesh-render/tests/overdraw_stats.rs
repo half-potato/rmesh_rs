@@ -235,7 +235,7 @@ fn overdraw_stats_rmesh() {
     };
 
     let data = std::fs::read(&path).expect("Failed to read .rmesh file");
-    let (scene, _sh) = rmesh_data::load_rmesh(&data).expect("Failed to parse .rmesh file");
+    let (scene, _sh, _pbr) = rmesh_data::load_rmesh(&data).expect("Failed to parse .rmesh file");
     println!("Loaded scene: {} verts, {} tets", scene.vertices.len() / 3, scene.tet_count);
 
     let eye = Vec3::new(0.0, -3.0, 1.5);

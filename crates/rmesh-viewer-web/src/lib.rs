@@ -194,7 +194,7 @@ impl WebViewer {
 
     /// Load a `.rmesh` file from a `Uint8Array`. Call after construction.
     pub fn load_rmesh(&mut self, data: &[u8]) -> Result<(), JsValue> {
-        let (scene_data, sh_coeffs) = rmesh_data::load_rmesh(data)
+        let (scene_data, sh_coeffs, _pbr) = rmesh_data::load_rmesh(data)
             .or_else(|_| rmesh_data::load_rmesh_raw(data))
             .map_err(|e| format!("parse error: {e}"))?;
 
@@ -211,7 +211,7 @@ impl WebViewer {
 
     /// Load a `.ply` file from a `Uint8Array`.
     pub fn load_ply(&mut self, data: &[u8]) -> Result<(), JsValue> {
-        let (scene_data, sh_coeffs) =
+        let (scene_data, sh_coeffs, _pbr) =
             rmesh_data::load_ply(data).map_err(|e| format!("PLY parse error: {e}"))?;
 
         log::info!(

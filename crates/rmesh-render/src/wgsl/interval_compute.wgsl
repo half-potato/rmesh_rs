@@ -211,7 +211,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if any_behind {
         // Write degenerate triangles
         for (var i = 0u; i < 5u; i++) { write_degenerate_vertex(v_base + i); }
-        out_tet_data[tid] = vec4<f32>(0.0);
+        out_tet_data[tid * 2u] = vec4<f32>(0.0);
+        out_tet_data[tid * 2u + 1u] = vec4<f32>(0.0);
         return;
     }
 
@@ -233,8 +234,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cam_pos = uniforms.cam_pos_pad.xyz;
     let base_color = color + vec3<f32>(dot(grad, cam_pos - v_world[0]));
 
-    // Write per-tet flat data (base_color.rgb, density) once
-    out_tet_data[tid] = vec4<f32>(base_color, tet_density);
+    // Write per-tet flat data: slot 0 = (base_color.rgb, density), slot 1 = (tet_id, 0, 0, 0)
+    out_tet_data[tid * 2u] = vec4<f32>(base_color, tet_density);
+    out_tet_data[tid * 2u + 1u] = vec4<f32>(bitcast<f32>(tet_id), 0.0, 0.0, 0.0);
 
     // Skip degenerate tets
     let z_range = max(max(ndc_z[0], ndc_z[1]), max(ndc_z[2], ndc_z[3]))

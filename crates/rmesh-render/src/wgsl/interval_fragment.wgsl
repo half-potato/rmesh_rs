@@ -3,7 +3,11 @@
 // Linearizes interpolated NDC depths to view-space Z, computes ray segment
 // distance, and evaluates the volume rendering integral.
 //
-// Single color output (premultiplied alpha) — no MRT aux/normals/depth.
+// MRT outputs (all Rgba16Float):
+//   location(0): premultiplied color (RGBA) — plaster/diffuse
+//   location(1): roughness, env_feature[0..2] (premul alpha)
+//   location(2): normal.xyz, env_feature[3] (premul alpha)
+//   location(3): depth, albedo.rgb (premul alpha)
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -29,16 +33,25 @@ struct Uniforms {
 };
 
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
+@group(0) @binding(3) var<storage, read> aux_data: array<f32>;        // [M * AUX_DIM]
+@group(0) @binding(4) var<storage, read> vertex_normals: array<f32>;  // [V * 3]
+@group(0) @binding(5) var<storage, read> tet_indices: array<u32>;     // [M * 4]
+
+const AUX_DIM: u32 = 8u;
 
 struct FragmentInput {
     @location(0) depths: vec2<f32>,                  // (z_front_ndc, z_back_ndc)
     @location(1) color_offsets: vec2<f32>,            // (offset_front, offset_back)
     @location(2) @interpolate(flat) density: f32,
     @location(3) @interpolate(flat) base_color: vec3<f32>,
+    @location(4) @interpolate(flat) tet_id: u32,
 };
 
 struct FragmentOutput {
     @location(0) color: vec4<f32>,
+    @location(1) aux0: vec4<f32>,
+    @location(2) normals: vec4<f32>,
+    @location(3) depth_albedo: vec4<f32>,
 };
 
 // phi(x) = (1 - exp(-x)) / x
@@ -67,11 +80,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let near = uniforms.near_plane;
     let far = uniforms.far_plane;
 
-    // Linearize interpolated NDC depths → view-space Z (positive = into screen)
-    // NDC depth in wgpu is [0, 1] with reverse-Z:
-    //   z_ndc = far*(z_view - near) / (z_view*(far - near))
-    // Solving for z_view:
-    //   z_view = near*far / (far - z_ndc*(far - near))
+    // Linearize interpolated NDC depths -> view-space Z (positive = into screen)
     let range = far - near;
     let z_front_clamped = clamp(in.depths.x, 0.0, 1.0);
     let z_back_clamped = clamp(in.depths.y, 0.0, 1.0);
@@ -84,7 +93,6 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let cx = uniforms.intrinsics.z;
     let cy = uniforms.intrinsics.w;
 
-    // Pixel to normalized camera-space direction components
     let x_cam = (frag_coord.x - cx) / fx;
     let y_cam = (frag_coord.y - cy) / fy;
     let ray_scale = length(vec3<f32>(x_cam, y_cam, 1.0));
@@ -97,11 +105,39 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let c_back = max(in.base_color + vec3<f32>(in.color_offsets.y), vec3<f32>(0.0));
 
     // Volume rendering integral
-    // let od = clamp(in.density * dist, 0.0, 88.0);
     let od = clamp(in.density * dist, 0.0, 88.0);
-
-    // Note: (c_back, c_front) -- exit color first, matching convention
     out.color = compute_integral(c_back, c_front, od);
+
+    let alpha = out.color.a;
+
+    // --- MRT: G-buffer outputs ---
+
+    // Per-tet aux channels lookup
+    let aux_base = in.tet_id * AUX_DIM;
+    let roughness = aux_data[aux_base + 0u];
+    let env_f0 = aux_data[aux_base + 1u];
+    let env_f1 = aux_data[aux_base + 2u];
+    let env_f2 = aux_data[aux_base + 3u];
+    let env_f3 = aux_data[aux_base + 4u];
+    let alb_r = aux_data[aux_base + 5u];
+    let alb_g = aux_data[aux_base + 6u];
+    let alb_b = aux_data[aux_base + 7u];
+
+    // Average vertex normals for this tet
+    let i0 = tet_indices[in.tet_id * 4u];
+    let i1 = tet_indices[in.tet_id * 4u + 1u];
+    let i2 = tet_indices[in.tet_id * 4u + 2u];
+    let i3 = tet_indices[in.tet_id * 4u + 3u];
+    let n0 = vec3f(vertex_normals[i0*3u], vertex_normals[i0*3u+1u], vertex_normals[i0*3u+2u]);
+    let n1 = vec3f(vertex_normals[i1*3u], vertex_normals[i1*3u+1u], vertex_normals[i1*3u+2u]);
+    let n2 = vec3f(vertex_normals[i2*3u], vertex_normals[i2*3u+1u], vertex_normals[i2*3u+2u]);
+    let n3 = vec3f(vertex_normals[i3*3u], vertex_normals[i3*3u+1u], vertex_normals[i3*3u+2u]);
+    let normal = normalize(n0 + n1 + n2 + n3);
+
+    // Premultiply by alpha for correct back-to-front blending
+    out.aux0 = vec4f(roughness, env_f0, env_f1, env_f2) * alpha;
+    out.normals = vec4f(normal * alpha, env_f3 * alpha);
+    out.depth_albedo = vec4f(z_f * alpha, alb_r * alpha, alb_g * alpha, alb_b * alpha);
 
     return out;
 }

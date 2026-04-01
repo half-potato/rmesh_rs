@@ -31,6 +31,7 @@ pub enum PrimitiveKind {
     Sphere,
     Plane,
     Cylinder,
+    PointLight,
 }
 
 impl PrimitiveKind {
@@ -40,6 +41,7 @@ impl PrimitiveKind {
             Self::Sphere => "Sphere",
             Self::Plane => "Plane",
             Self::Cylinder => "Cylinder",
+            Self::PointLight => "Point Light",
         }
     }
 
@@ -49,6 +51,7 @@ impl PrimitiveKind {
             Self::Sphere => 1,
             Self::Plane => 2,
             Self::Cylinder => 3,
+            Self::PointLight => 1, // Render as sphere gizmo
         }
     }
 }

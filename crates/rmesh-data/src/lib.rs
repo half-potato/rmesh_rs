@@ -93,14 +93,52 @@ impl ShCoeffs {
     }
 }
 
+// ---------------------------------------------------------------------------
+// PBR tagged extension types
+// ---------------------------------------------------------------------------
+
+/// Magic bytes for tagged extension sections: "RMTX" as u32 LE.
+const TAGGED_MAGIC: u32 = 0x524D5458;
+
+/// A single MLP layer's weights.
+#[derive(Clone, Debug)]
+pub struct MlpLayer {
+    pub in_dim: u32,
+    pub out_dim: u32,
+    pub has_bias: bool,
+    /// Row-major weight matrix [out_dim × in_dim] as f32.
+    pub weights: Vec<f32>,
+    /// Bias vector [out_dim] as f32, empty if no bias.
+    pub bias: Vec<f32>,
+}
+
+/// PBR material data loaded from tagged .rmesh extension sections.
+#[derive(Clone, Debug)]
+pub struct PbrData {
+    /// Per-tet roughness [M] f32 (pre-activated sigmoid).
+    pub roughness: Vec<f32>,
+    /// Per-tet specular features [M × 4] f32 (pre-activated tanh).
+    pub env_feature: Vec<f32>,
+    /// Per-tet diffuse albedo [M × 3] f32 (pre-activated sigmoid).
+    pub albedo: Vec<f32>,
+    /// Learned vertex normals [V × 3] f32.
+    pub vertex_normals: Vec<f32>,
+    /// MLPBRDF layers (typically 4 linear layers).
+    pub brdf_layers: Vec<MlpLayer>,
+    /// RetroHead linear weights [4] f32.
+    pub retro_weights: Vec<f32>,
+    /// RetroHead bias [1] f32.
+    pub retro_bias: Vec<f32>,
+}
+
 /// Load a .rmesh file (gzip-compressed binary).
-pub fn load_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
+pub fn load_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let decompressed = decompress_gzip(data)?;
     parse_rmesh(&decompressed)
 }
 
 /// Load a raw (uncompressed) .rmesh binary.
-pub fn load_rmesh_raw(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
+pub fn load_rmesh_raw(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     parse_rmesh(data)
 }
 
@@ -199,7 +237,7 @@ fn read_f32_val(data: &[u8], off: &mut usize) -> f32 {
 // Main parser
 // ---------------------------------------------------------------------------
 
-fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
+fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let t_total = std::time::Instant::now();
     let mut offset = 0usize;
 
@@ -287,6 +325,12 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
     let circumdata = compute_circumspheres_parallel(&vertices, &indices, tet_count as usize);
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 
+    // --- Parse tagged extension sections (if present) ---
+    let pbr_data = parse_tagged_extensions(data, &mut offset);
+    if pbr_data.is_some() {
+        log::info!("Found PBR tagged extension sections");
+    }
+
     log::info!("Total parse time: {:.2}s", t_total.elapsed().as_secs_f64());
 
     let sh = ShCoeffs {
@@ -306,7 +350,201 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
             tet_count,
         },
         sh,
+        pbr_data,
     ))
+}
+
+// ---------------------------------------------------------------------------
+// Tagged extension section parser
+// ---------------------------------------------------------------------------
+
+/// Try to parse PBR tagged extensions from remaining data after gradients.
+fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
+    // Align to 4 bytes
+    *offset = (*offset + 3) & !3;
+
+    // Need at least 8 bytes for magic + section count
+    if *offset + 8 > data.len() {
+        return None;
+    }
+
+    let magic = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);
+    if magic != TAGGED_MAGIC {
+        return None;
+    }
+    *offset += 4;
+
+    let num_sections = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?) as usize;
+    *offset += 4;
+
+    log::info!("Parsing {} tagged extension sections...", num_sections);
+
+    let mut roughness = Vec::new();
+    let mut env_feature = Vec::new();
+    let mut albedo = Vec::new();
+    let mut vertex_normals = Vec::new();
+    let mut brdf_layers = Vec::new();
+    let mut retro_weights = Vec::new();
+    let mut retro_bias = Vec::new();
+
+    for _ in 0..num_sections {
+        if *offset + 16 > data.len() {
+            log::warn!("Truncated tagged section header");
+            break;
+        }
+
+        // Tag: 16 bytes null-padded ASCII
+        let tag_bytes = &data[*offset..*offset + 16];
+        let tag = std::str::from_utf8(tag_bytes)
+            .unwrap_or("")
+            .trim_end_matches('\0')
+            .to_string();
+        *offset += 16;
+
+        let dtype = read_u32_val(data, offset);
+        let shape_rank = read_u32_val(data, offset) as usize;
+        let mut shape = Vec::with_capacity(shape_rank);
+        for _ in 0..shape_rank {
+            shape.push(read_u32_val(data, offset));
+        }
+        let data_bytes = read_u32_val(data, offset) as usize;
+
+        if *offset + data_bytes > data.len() {
+            log::warn!("Truncated tagged section payload for '{}'", tag);
+            break;
+        }
+
+        let payload = &data[*offset..*offset + data_bytes];
+        *offset += data_bytes;
+        // Align to 4 bytes
+        *offset = (*offset + 3) & !3;
+
+        log::info!(
+            "  section '{}': dtype={}, shape={:?}, {} bytes",
+            tag, dtype, shape, data_bytes
+        );
+
+        match tag.as_str() {
+            "roughness" => {
+                roughness = f16_payload_to_f32(payload, dtype);
+            }
+            "env_feature" => {
+                env_feature = f16_payload_to_f32(payload, dtype);
+            }
+            "albedo" => {
+                albedo = f16_payload_to_f32(payload, dtype);
+            }
+            "vertex_normals" => {
+                vertex_normals = f16_payload_to_f32(payload, dtype);
+            }
+            "brdf_mlp" => {
+                brdf_layers = parse_mlp_payload(payload);
+            }
+            "retro_head" => {
+                let vals = f16_payload_to_f32(payload, dtype);
+                if vals.len() >= 5 {
+                    retro_weights = vals[..4].to_vec();
+                    retro_bias = vals[4..5].to_vec();
+                } else {
+                    retro_weights = vals;
+                }
+            }
+            other => {
+                log::info!("  skipping unknown section '{}'", other);
+            }
+        }
+    }
+
+    // Only return PbrData if we got at least the material channels
+    if roughness.is_empty() && env_feature.is_empty() && albedo.is_empty() {
+        return None;
+    }
+
+    Some(PbrData {
+        roughness,
+        env_feature,
+        albedo,
+        vertex_normals,
+        brdf_layers,
+        retro_weights,
+        retro_bias,
+    })
+}
+
+/// Convert tagged section payload to f32 based on dtype code.
+fn f16_payload_to_f32(payload: &[u8], dtype: u32) -> Vec<f32> {
+    match dtype {
+        0 => {
+            // f16
+            let _count = payload.len() / 2;
+            payload
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                .collect()
+        }
+        1 => {
+            // f32
+            payload
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Parse MLP binary payload into layers.
+fn parse_mlp_payload(payload: &[u8]) -> Vec<MlpLayer> {
+    let mut off = 0usize;
+    if payload.len() < 4 {
+        return Vec::new();
+    }
+
+    let num_layers = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
+    off += 4;
+
+    let mut layers = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        if off + 9 > payload.len() {
+            break;
+        }
+        let in_dim = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        off += 4;
+        let out_dim = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
+        off += 4;
+        let has_bias = payload[off] != 0;
+        off += 1;
+
+        let weight_count = (out_dim * in_dim) as usize;
+        let weight_bytes = weight_count * 2; // f16
+        let weights: Vec<f32> = payload[off..off + weight_bytes]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+            .collect();
+        off += weight_bytes;
+
+        let bias = if has_bias {
+            let bias_bytes = out_dim as usize * 2;
+            let b: Vec<f32> = payload[off..off + bias_bytes]
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
+                .collect();
+            off += bias_bytes;
+            b
+        } else {
+            Vec::new()
+        };
+
+        layers.push(MlpLayer {
+            in_dim,
+            out_dim,
+            has_bias,
+            weights,
+            bias,
+        });
+    }
+
+    layers
 }
 
 /// Parallel circumsphere computation using rayon.
@@ -421,7 +659,7 @@ fn compute_circumspheres_parallel(
 ///   [sh_0_r, sh_0_g, sh_0_b, sh_1_r, sh_1_g, sh_1_b, ...]
 /// but the viewer/renderer expects **planar by channel**:
 ///   [sh_0_r, sh_1_r, ..., sh_N_r, sh_0_g, sh_1_g, ..., sh_N_g, sh_0_b, ...]
-pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
+pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let t_total = std::time::Instant::now();
 
     // --- Parse ASCII header ---
@@ -559,6 +797,7 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs)> {
             tet_count,
         },
         sh,
+        None, // PLY files don't have tagged extensions
     ))
 }
 

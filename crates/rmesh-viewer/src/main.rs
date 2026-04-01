@@ -29,15 +29,16 @@ use rmesh_sim::{FluidParams, FluidSim};
 use rmesh_util::camera::Camera;
 use wgpu::util::DeviceExt;
 
-use rayon::prelude::*;
 use rmesh_render::{
-    create_compute_bind_group, create_hw_compute_bind_group, create_render_bind_group,
-    create_render_bind_group_with_sort_values, BlitPipeline, ForwardPipelines, MaterialBuffers,
+    BlitPipeline, ForwardPipelines, MaterialBuffers,
     MeshForwardPipelines, IntervalPipelines, ComputeIntervalPipelines, RenderTargets,
     SceneBuffers, Uniforms,
+    record_blit,
+    create_compute_bind_group, create_hw_compute_bind_group, create_render_bind_group,
+    create_render_bind_group_with_sort_values,
     create_blit_bind_group,
     create_indirect_convert_bind_group, create_mesh_render_bind_group,
-    create_mesh_render_bind_group_with_sort_values, record_blit,
+    create_mesh_render_bind_group_with_sort_values,
     create_prepass_bind_group, create_quad_render_bind_group,
     create_interval_render_bind_group, create_interval_render_bind_group_with_sort_values,
     create_interval_indirect_convert_bind_group,
@@ -51,165 +52,8 @@ use rmesh_compositor::{
     record_primitive_pass,
 };
 
-// SH basis function constants — kept for CPU reference fallback (evaluate_sh_colors).
-#[allow(dead_code)]
-const C0: f32 = 0.28209479;
-#[allow(dead_code)]
-const C1: f32 = 0.48860251;
-#[allow(dead_code)]
-const C2: [f32; 5] = [
-    1.0925484305920792,
-    -1.0925484305920792,
-    0.31539156525252005,
-    -1.0925484305920792,
-    0.5462742152960396,
-];
-#[allow(dead_code)]
-const C3: [f32; 7] = [
-    -0.5900435899266435,
-    2.890611442640554,
-    -0.4570457994644658,
-    0.3731763325901154,
-    -0.4570457994644658,
-    1.445305721320277,
-    -0.5900435899266435,
-];
-
-#[derive(Clone, Copy, PartialEq)]
-enum RenderMode {
-    Regular,
-    Quad,
-    MeshShader,
-    IntervalShader,
-}
-
-impl std::fmt::Display for RenderMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RenderMode::Regular => write!(f, "Regular"),
-            RenderMode::Quad => write!(f, "Quad"),
-            RenderMode::MeshShader => write!(f, "Mesh Shader"),
-            RenderMode::IntervalShader => write!(f, "Interval Shader"),
-        }
-    }
-}
-
-/// Per-frame GPU timing breakdown from timestamp queries.
-/// Indices: 0,1=project  2,3=prepass/indirect  4,5=render  6,7=SH eval
-#[derive(Clone, Default)]
-struct GpuTimings {
-    sh_eval_ms: f32,
-    project_ms: f32,
-    sort_ms: f32,
-    prepass_ms: f32,
-    render_ms: f32,
-    total_ms: f32,
-}
-
-/// Per-frame CPU timing breakdown (rolling average).
-#[derive(Clone, Default)]
-struct CpuTimings {
-    poll_readback_ms: f32,
-    acquire_ms: f32,
-    egui_ms: f32,
-    encode_ms: f32,
-    submit_ms: f32,
-    present_ms: f32,
-    total_ms: f32,
-}
-
-const TS_QUERY_COUNT: u32 = 8;
-
-/// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
-fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
-    let mut packed = vec![0u32; (coeffs.len() + 1) / 2];
-    for i in (0..coeffs.len()).step_by(2) {
-        let lo = half::f16::from_f32(coeffs[i]);
-        let hi = if i + 1 < coeffs.len() {
-            half::f16::from_f32(coeffs[i + 1])
-        } else {
-            half::f16::ZERO
-        };
-        packed[i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
-    }
-    packed
-}
-
-struct GpuState {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface: wgpu::Surface<'static>,
-    surface_config: wgpu::SurfaceConfiguration,
-    pipelines: ForwardPipelines,
-    blit_pipeline: BlitPipeline,
-    sort_pipelines: rmesh_sort::RadixSortPipelines,
-    sort_state: rmesh_sort::RadixSortState,
-    sort_state_16bit: rmesh_sort::RadixSortState,
-    sort_backend: rmesh_sort::SortBackend,
-    buffers: SceneBuffers,
-    material_buffers: MaterialBuffers,
-    targets: RenderTargets,
-    compute_bg: wgpu::BindGroup,
-    hw_compute_bg: wgpu::BindGroup,
-    render_bg: wgpu::BindGroup,
-    render_bg_b: wgpu::BindGroup,
-    blit_bg: wgpu::BindGroup,
-    tet_count: u32,
-    // SH coefficients (f16-packed, bound to project_compute)
-    sh_coeffs_buf: wgpu::Buffer,
-    sh_degree: u32,
-    pending_reconfigure: bool,
-    // Mesh shader (optional)
-    mesh_pipelines: Option<MeshForwardPipelines>,
-    mesh_render_bg_a: Option<wgpu::BindGroup>,
-    mesh_render_bg_b: Option<wgpu::BindGroup>,
-    indirect_convert_bg: Option<wgpu::BindGroup>,
-    // Interval shading (optional, requires mesh shader support)
-    interval_pipelines: Option<IntervalPipelines>,
-    interval_render_bg_a: Option<wgpu::BindGroup>,
-    interval_render_bg_b: Option<wgpu::BindGroup>,
-    interval_indirect_convert_bg: Option<wgpu::BindGroup>,
-    // Compute-based interval shading (always available, no mesh shader needed)
-    compute_interval_pipelines: ComputeIntervalPipelines,
-    compute_interval_gen_bg_a: wgpu::BindGroup,
-    compute_interval_gen_bg_b: wgpu::BindGroup,
-    // 16-bit sort: gen bind groups using sort_state_16bit's values_b
-    compute_interval_gen_bg_a_16bit: wgpu::BindGroup,
-    compute_interval_gen_bg_b_16bit: wgpu::BindGroup,
-    compute_interval_render_bg: wgpu::BindGroup,
-    compute_interval_convert_bg: wgpu::BindGroup,
-    // Quad prepass bind groups (A/B for sort result location)
-    prepass_bg_a: wgpu::BindGroup,
-    prepass_bg_b: wgpu::BindGroup,
-    // Quad render bind group (no A/B needed — only reads uniforms + precomputed)
-    quad_render_bg: wgpu::BindGroup,
-    // Fluid simulation
-    fluid_sim: Option<FluidSim>,
-    tet_neighbors_buf: Option<wgpu::Buffer>,
-    // Primitives (depth-first compositing via hardware early-z)
-    primitive_geometry: PrimitiveGeometry,
-    primitive_pipeline: PrimitivePipeline,
-    primitive_targets: PrimitiveTargets,
-    // egui
-    egui_renderer: egui_wgpu::Renderer,
-    egui_state: egui_winit::State,
-    // Instance count readback (for debugging)
-    instance_count_readback: wgpu::Buffer,
-    visible_instance_count: u32,
-    // GPU timestamp profiling (double-buffered readback)
-    ts_query_set: wgpu::QuerySet,
-    ts_resolve_buf: wgpu::Buffer,
-    ts_readback: [wgpu::Buffer; 2],
-    ts_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
-    ts_readback_mapped: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
-    ts_frame: usize,
-    ts_period_ns: f32,
-    gpu_times_ms: GpuTimings,
-    cpu_times_ms: CpuTimings,
-    instance_count_ready: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// True from map_async call until unmap — prevents copy_buffer_to_buffer to a mapped buffer
-    instance_count_mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
+mod gpu_state;
+use gpu_state::*;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -279,111 +123,6 @@ impl App {
             primitives: Vec::new(),
             next_primitive_id: 1,
         }
-    }
-
-    /// CPU reference SH evaluation (kept as fallback, not called per-frame).
-    #[allow(dead_code)]
-    fn evaluate_sh_colors(&self) -> Vec<f32> {
-        let t_count = self.scene_data.tet_count as usize;
-        let degree = self.sh_coeffs.degree as usize;
-        let nc = (degree + 1) * (degree + 1); // numCoeffs per channel
-        let stride = nc * 3; // total floats per tet
-        let cam_pos = self.camera.position;
-        let sh = &self.sh_coeffs.coeffs;
-        let verts = &self.scene_data.vertices;
-        let indices = &self.scene_data.indices;
-        let grads = &self.scene_data.color_grads;
-
-        let mut base_colors = vec![0.0f32; t_count * 3];
-        base_colors
-            .par_chunks_mut(3)
-            .enumerate()
-            .for_each(|(t, rgb)| {
-                let sh_base = t * stride;
-                if sh_base + stride > sh.len() {
-                    rgb[0] = 0.5;
-                    rgb[1] = 0.5;
-                    rgb[2] = 0.5;
-                    return;
-                }
-
-                // Load v0 and centroid for gradient offset (matching webrm)
-                let i0 = indices[t * 4] as usize;
-                let i1 = indices[t * 4 + 1] as usize;
-                let i2 = indices[t * 4 + 2] as usize;
-                let i3 = indices[t * 4 + 3] as usize;
-                let v0 = Vec3::new(verts[i0*3], verts[i0*3+1], verts[i0*3+2]);
-                let v1 = Vec3::new(verts[i1*3], verts[i1*3+1], verts[i1*3+2]);
-                let v2 = Vec3::new(verts[i2*3], verts[i2*3+1], verts[i2*3+2]);
-                let v3 = Vec3::new(verts[i3*3], verts[i3*3+1], verts[i3*3+2]);
-                let centroid = (v0 + v1 + v2 + v3) * 0.25;
-
-                // Direction: centroid - camPos (matches webrm convention)
-                let dir = (centroid - cam_pos).normalize_or_zero();
-                let (x, y, z) = (dir.x, dir.y, dir.z);
-
-                // Planar layout: sh[sh_base + channel * nc + coeff]
-                // Evaluate per-channel SH
-                for c in 0..3usize {
-                    let ch_base = sh_base + c * nc;
-
-                    // Degree 0: C0 * sh_dc
-                    let mut val = C0 * sh[ch_base];
-
-                    // Degree 1: -C1*y, +C1*z, -C1*x
-                    if degree >= 1 {
-                        val -= C1 * y * sh[ch_base + 1];
-                        val += C1 * z * sh[ch_base + 2];
-                        val -= C1 * x * sh[ch_base + 3];
-                    }
-
-                    // Degree 2
-                    if degree >= 2 {
-                        let xx = x * x;
-                        let yy = y * y;
-                        let zz = z * z;
-                        let xy = x * y;
-                        let yz = y * z;
-                        let xz = x * z;
-                        val += C2[0] * xy * sh[ch_base + 4];
-                        val += C2[1] * yz * sh[ch_base + 5];
-                        val += C2[2] * (2.0 * zz - xx - yy) * sh[ch_base + 6];
-                        val += C2[3] * xz * sh[ch_base + 7];
-                        val += C2[4] * (xx - yy) * sh[ch_base + 8];
-                    }
-
-                    // Degree 3
-                    if degree >= 3 {
-                        let xx = x * x;
-                        let yy = y * y;
-                        let zz = z * z;
-                        val += C3[0] * y * (3.0 * xx - yy) * sh[ch_base + 9];
-                        val += C3[1] * x * y * z * sh[ch_base + 10];
-                        val += C3[2] * y * (4.0 * zz - xx - yy) * sh[ch_base + 11];
-                        val += C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh[ch_base + 12];
-                        val += C3[4] * x * (4.0 * zz - xx - yy) * sh[ch_base + 13];
-                        val += C3[5] * z * (xx - yy) * sh[ch_base + 14];
-                        val += C3[6] * x * (xx - 3.0 * yy) * sh[ch_base + 15];
-                    }
-
-                    rgb[c] = val + 0.5;
-                }
-
-                // Add gradient offset at v0 (matching webrm: dot(grad, v0 - centroid))
-                let grad = Vec3::new(grads[t*3], grads[t*3+1], grads[t*3+2]);
-                let offset = grad.dot(v0 - centroid);
-                rgb[0] += offset;
-                rgb[1] += offset;
-                rgb[2] += offset;
-
-                // Softplus activation (beta=10), matching webrm:
-                //   sp = 0.1 * log(1.0 + exp(10.0 * x))
-                for c in 0..3usize {
-                    rgb[c] = 0.1 * (1.0 + (10.0 * rgb[c]).exp()).ln();
-                }
-            });
-
-        base_colors
     }
 
     fn init_gpu(&mut self, window: Arc<Window>) {
@@ -1495,7 +1234,7 @@ impl App {
             .extension()
             .map_or(false, |ext| ext.eq_ignore_ascii_case("ply"));
 
-        let (scene, sh) = if is_ply {
+        let (scene, sh, _pbr) = if is_ply {
             match rmesh_data::load_ply(&file_data) {
                 Ok(r) => r,
                 Err(e) => {
@@ -1963,7 +1702,7 @@ fn main() -> Result<()> {
         .extension()
         .map_or(false, |ext| ext.eq_ignore_ascii_case("ply"));
 
-    let (scene, sh) = if is_ply {
+    let (scene, sh, _pbr) = if is_ply {
         rmesh_data::load_ply(&file_data).context("Failed to parse PLY file")?
     } else {
         rmesh_data::load_rmesh(&file_data)

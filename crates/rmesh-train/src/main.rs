@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     // Load scene
     let file_data = std::fs::read(&input_path)
         .with_context(|| format!("Failed to read {}", input_path.display()))?;
-    let (scene, _sh) = rmesh_data::load_rmesh(&file_data)
+    let (scene, _sh, _pbr) = rmesh_data::load_rmesh(&file_data)
         .or_else(|_| rmesh_data::load_rmesh_raw(&file_data))
         .context("Failed to parse scene file")?;
 

@@ -49,6 +49,42 @@ const INTERVAL_INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/interval_indirec
 const PROJECT_COMPUTE_16BIT_WGSL: &str = include_str!("wgsl/project_compute_16bit.wgsl");
 const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl");
 const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
+const SHADOW_RAY_GEN_WGSL: &str = include_str!("wgsl/shadow_ray_gen.wgsl");
+const DEFERRED_SHADE_WGSL: &str = include_str!("wgsl/deferred_shade.wgsl");
+
+// ---------------------------------------------------------------------------
+// PBR deferred shading types
+// ---------------------------------------------------------------------------
+
+/// Per-light data for deferred shading (matches WGSL `Light` struct).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuLight {
+    pub position: [f32; 3],
+    pub light_type: u32, // 0=point, 1=spot, 2=directional
+    pub color: [f32; 3],
+    pub intensity: f32,
+    pub direction: [f32; 3],
+    pub inner_angle: f32,
+    pub outer_angle: f32,
+    pub _pad: [f32; 3],
+}
+
+/// Uniforms for deferred shading and shadow ray generation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct DeferredUniforms {
+    pub inv_vp: [[f32; 4]; 4],
+    pub cam_pos: [f32; 3],
+    pub num_lights: u32,
+    pub width: u32,
+    pub height: u32,
+    pub ambient: f32,
+    pub debug_mode: u32,
+}
+
+/// Maximum number of lights supported.
+pub const MAX_LIGHTS: usize = 16;
 
 // ---------------------------------------------------------------------------
 // GPU Buffers
@@ -206,10 +242,11 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
-        // Compute-interval per-tet flat data: 1 vec4 × 16 bytes = 16 bytes/tet
+        // Compute-interval per-tet flat data: 2 vec4 × 16 bytes = 32 bytes/tet
+        // Slot 0: (base_color.rgb, density), Slot 1: (tet_id, 0, 0, 0)
         let interval_tet_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interval_tet_data_buf"),
-            size: m * 16,
+            size: m * 32,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -1100,11 +1137,12 @@ impl ComputeIntervalPipelines {
             cache: None,
         });
 
-        // ----- Render pipeline (3 read-only storage bindings) -----
+        // ----- Render pipeline (6 read-only storage bindings) -----
         // 0: uniforms, 1: interval_vertex_buf, 2: interval_tet_data_buf
-        let render_read_only = [true; 3];
+        // 3: aux_data, 4: vertex_normals, 5: tet_indices
+        let render_read_only = [true; 6];
         let render_entries = storage_entries(
-            3,
+            6,
             wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             &render_read_only,
         );
@@ -1170,6 +1208,25 @@ impl ComputeIntervalPipelines {
                 module: &fragment_shader,
                 entry_point: Some("main"),
                 targets: &[
+                    // location(0): color (plaster RGBA)
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // location(1): aux0 (roughness, env_feat[0..2])
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // location(2): normals (normal.xyz, env_feat[3])
+                    Some(wgpu::ColorTargetState {
+                        format: color_format,
+                        blend: Some(premul_blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // location(3): depth_albedo (depth, albedo.rgb)
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
@@ -1892,6 +1949,13 @@ pub fn create_compute_interval_render_bind_group(
     pipelines: &ComputeIntervalPipelines,
     buffers: &SceneBuffers,
 ) -> wgpu::BindGroup {
+    // Dummy buffers for aux_data, vertex_normals, tet_indices when no PBR data
+    let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ci_render_dummy"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_interval_render_bg"),
         layout: &pipelines.render_bg_layout,
@@ -1899,6 +1963,31 @@ pub fn create_compute_interval_render_bind_group(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.interval_vertex_buf),
             buf_entry(2, &buffers.interval_tet_data_buf),
+            buf_entry(3, &dummy),               // aux_data
+            buf_entry(4, &buffers.vertex_normals), // vertex_normals
+            buf_entry(5, &dummy),               // tet_indices (use dummy, tet_id will be 0)
+        ],
+    })
+}
+
+/// Create the compute-interval render bind group with PBR material buffers.
+pub fn create_compute_interval_render_bind_group_pbr(
+    device: &wgpu::Device,
+    pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+    aux_data: &wgpu::Buffer,
+    indices: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_interval_render_bg_pbr"),
+        layout: &pipelines.render_bg_layout,
+        entries: &[
+            buf_entry(0, &buffers.uniforms),
+            buf_entry(1, &buffers.interval_vertex_buf),
+            buf_entry(2, &buffers.interval_tet_data_buf),
+            buf_entry(3, aux_data),
+            buf_entry(4, &buffers.vertex_normals),
+            buf_entry(5, indices),
         ],
     })
 }
@@ -2795,18 +2884,37 @@ pub fn record_sorted_compute_interval_forward_pass(
         cpass.dispatch_workgroups_indirect(&buffers.interval_args_buf, 0);
     }
 
-    // ----- 6. Render pass (single color output) -----
+    // ----- 6. Render pass (MRT: color + aux0 + normals + depth_albedo) -----
     {
+        let mrt_ops = wgpu::Operations {
+            load: wgpu::LoadOp::Load,
+            store: wgpu::StoreOp::Store,
+        };
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("compute_interval_render"),
             color_attachments: &[
                 Some(wgpu::RenderPassColorAttachment {
                     view: &targets.color_view,
                     resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
+                    ops: mrt_ops,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.aux0_view,
+                    resolve_target: None,
+                    ops: mrt_ops,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.normals_view,
+                    resolve_target: None,
+                    ops: mrt_ops,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.depth_view,
+                    resolve_target: None,
+                    ops: mrt_ops,
                     depth_slice: None,
                 }),
             ],
