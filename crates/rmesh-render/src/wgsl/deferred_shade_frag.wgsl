@@ -38,7 +38,7 @@ struct Light {
 @group(0) @binding(0) var<uniform> uniforms: DeferredUniforms;
 @group(0) @binding(1) var color_tex: texture_2d<f32>;     // plaster RGBA
 @group(0) @binding(2) var aux0_tex: texture_2d<f32>;      // roughness, env_f0, env_f1, alpha
-@group(0) @binding(3) var normals_tex: texture_2d<f32>;   // oct_normal.xy, env_f2f3_packed, alpha
+@group(0) @binding(3) var normals_tex: texture_2d<f32>;   // raw field gradient.xyz * alpha, alpha
 @group(0) @binding(4) var albedo_tex: texture_2d<f32>;    // albedo.rgb, alpha
 @group(0) @binding(5) var<storage, read> lights: array<Light>;
 @group(0) @binding(6) var hw_depth_tex: texture_depth_2d; // hardware depth buffer
@@ -58,23 +58,6 @@ const DBG_RETRO:       u32 = 10u;
 const DBG_LAMBDA:      u32 = 11u;
 const DBG_PLASTER:     u32 = 12u;
 const DBG_ALPHA:       u32 = 13u;
-
-// Octahedral normal decoding: [0,1]^2 → unit sphere
-fn oct_decode(e: vec2f) -> vec3f {
-    let p = e * 2.0 - 1.0;
-    var n = vec3f(p.xy, 1.0 - abs(p.x) - abs(p.y));
-    if (n.z < 0.0) {
-        n = vec3f((1.0 - abs(n.yx)) * sign(n.xy), n.z);
-    }
-    return normalize(n);
-}
-
-// Unpack two [0,1] values from one float (inverse of pack_2f)
-fn unpack_2f(v: f32) -> vec2f {
-    let a = floor(v) / 255.0;
-    let b = v - floor(v);
-    return vec2f(a, b);
-}
 
 struct VsOut {
     @builtin(position) pos: vec4f,
@@ -114,14 +97,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let env_f0 = aux0_raw.g * inv_alpha;
     let env_f1 = aux0_raw.b * inv_alpha;
 
-    // Decode octahedral normal
-    let oct_n = normals_raw.rg * inv_alpha;
-    let normal = oct_decode(oct_n);
+    // Un-premultiply and normalize raw field gradient to get surface normal.
+    // Gradient was composited unnormalized across all tets — normalize here.
+    let raw_gradient = normals_raw.rgb * inv_alpha;
+    let normal = normalize(raw_gradient);
 
-    // Unpack env_f2 + env_f3
-    let env_packed = normals_raw.b * inv_alpha;
-    let env_23 = unpack_2f(env_packed);
-    let env_feat = vec4f(env_f0, env_f1, env_23.x, env_23.y);
+    // env_f2/f3 not stored in MRT (gradient uses all 3 channels). Set to 0 for now.
+    let env_feat = vec4f(env_f0, env_f1, 0.0, 0.0);
 
     let raw_albedo = albedo_raw.rgb * inv_alpha;
 

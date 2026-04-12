@@ -44,6 +44,7 @@ struct DrawIndirectArgs {
 @group(0) @binding(7) var<storage, read> indirect_args: DrawIndirectArgs;
 @group(0) @binding(8) var<storage, read_write> out_vertices: array<vec4<f32>>;
 @group(0) @binding(9) var<storage, read_write> out_tet_data: array<vec4<f32>>;
+@group(0) @binding(10) var<storage, read> vertex_normals: array<f32>; // [V * 3]
 
 fn load_f32x3(buf_base: u32) -> vec3<f32> {
     return vec3<f32>(vertices[buf_base], vertices[buf_base + 1u], vertices[buf_base + 2u]);
@@ -55,6 +56,15 @@ fn load_color(idx: u32) -> vec3<f32> {
 
 fn load_grad(idx: u32) -> vec3<f32> {
     return vec3<f32>(color_grads[idx * 3u], color_grads[idx * 3u + 1u], color_grads[idx * 3u + 2u]);
+}
+
+fn load_vnormal(vi: u32) -> vec3<f32> {
+    return vec3<f32>(vertex_normals[vi * 3u], vertex_normals[vi * 3u + 1u], vertex_normals[vi * 3u + 2u]);
+}
+
+// Barycentric interpolation of field gradients on a face.
+fn interp_gradient_3(n: array<vec3f, 4>, face: vec4u, bary: vec3f) -> vec3f {
+    return bary.x * n[face[0]] + bary.y * n[face[1]] + bary.z * n[face[2]];
 }
 
 // Maps vertex index -> TET_FACES index where that vertex is face[3] (opposite)
@@ -156,18 +166,21 @@ fn find_crossing_edges(p: array<vec2<f32>, 4>) -> vec2<u32> {
     return pairs[0];
 }
 
-// Write a vertex as 2 packed vec4s at the given slot.
-// Layout: [i*2+0] = (ndc_xy, z_front, z_back), [i*2+1] = (off_front, off_back, 0, 0)
+// Write a vertex as 3 packed vec4s at the given slot.
+// Layout: [i*3+0] = (ndc_xy, z_front, z_back)
+//         [i*3+1] = (off_front, off_back, 0, 0)
+//         [i*3+2] = (gradient.xyz, 0) — raw field gradient at entry point
 fn write_vertex(slot: u32, ndc_xy: vec2<f32>, z_front: f32, z_back: f32,
-                off_front: f32, off_back: f32) {
-    out_vertices[slot * 2u + 0u] = vec4<f32>(ndc_xy, z_front, z_back);
-    out_vertices[slot * 2u + 1u] = vec4<f32>(off_front, off_back, 0.0, 0.0);
+                off_front: f32, off_back: f32, gradient: vec3f) {
+    out_vertices[slot * 3u + 0u] = vec4<f32>(ndc_xy, z_front, z_back);
+    out_vertices[slot * 3u + 1u] = vec4<f32>(off_front, off_back, 0.0, 0.0);
+    out_vertices[slot * 3u + 2u] = vec4<f32>(gradient, 0.0);
 }
 
-// Write a degenerate vertex (zero position, zero data).
 fn write_degenerate_vertex(slot: u32) {
-    out_vertices[slot * 2u + 0u] = vec4<f32>(0.0);
-    out_vertices[slot * 2u + 1u] = vec4<f32>(0.0);
+    out_vertices[slot * 3u + 0u] = vec4<f32>(0.0);
+    out_vertices[slot * 3u + 1u] = vec4<f32>(0.0);
+    out_vertices[slot * 3u + 2u] = vec4<f32>(0.0);
 }
 
 @compute @workgroup_size(64)
@@ -209,7 +222,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                   || clip[2].w <= 0.0 || clip[3].w <= 0.0;
 
     if any_behind {
-        // Write degenerate triangles
         for (var i = 0u; i < 5u; i++) { write_degenerate_vertex(v_base + i); }
         out_tet_data[tid * 2u] = vec4<f32>(0.0);
         out_tet_data[tid * 2u + 1u] = vec4<f32>(0.0);
@@ -233,6 +245,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let cam_pos = uniforms.cam_pos_pad.xyz;
     let base_color = color + vec3<f32>(dot(grad, cam_pos - v_world[0]));
+
+    // Load per-vertex normals for this tet
+    var vn: array<vec3f, 4>;
+    vn[0] = load_vnormal(i0);
+    vn[1] = load_vnormal(i1);
+    vn[2] = load_vnormal(i2);
+    vn[3] = load_vnormal(i3);
 
     // Write per-tet flat data: slot 0 = (base_color.rgb, density), slot 1 = (tet_id, 0, 0, 0)
     out_tet_data[tid * 2u] = vec4<f32>(base_color, tet_density);
@@ -282,19 +301,30 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             offset_back = face_offset;
         }
 
-        // Slots 0-2: silhouette vertices
+        // Compute gradient at center's front intersection point.
+        // Front is on the face → interpolate with barycentrics. Back is the interior vertex.
+        var grad_center: vec3f;
+        if z_face <= z_center {
+            grad_center = interp_gradient_3(vn, face, bary);
+        } else {
+            grad_center = vn[center];
+        }
+
+        // Slots 0-2: silhouette vertices (on tet boundary, raw vertex gradient)
         for (var i = 0u; i < 3u; i++) {
             write_vertex(v_base + u32(i), ndc_xy[sv_idx[i]],
                          ndc_z[sv_idx[i]], ndc_z[sv_idx[i]],
-                         sv_offset[i], sv_offset[i]);
+                         sv_offset[i], sv_offset[i],
+                         vn[sv_idx[i]]);
         }
         // Slot 3: copy of vert 0 (wraps fan, makes tri 3 degenerate)
         write_vertex(v_base + 3u, ndc_xy[sv_idx[0]],
                      ndc_z[sv_idx[0]], ndc_z[sv_idx[0]],
-                     sv_offset[0], sv_offset[0]);
-        // Slot 4: center vertex
+                     sv_offset[0], sv_offset[0],
+                     vn[sv_idx[0]]);
+        // Slot 4: center vertex (gradient at entry point)
         write_vertex(v_base + 4u, ndc_xy[center], z_front, z_back,
-                     offset_front, offset_back);
+                     offset_front, offset_back, grad_center);
 
     } else {
         // Case 2: two opposite edges cross -> 4 silhouette verts + center
@@ -332,18 +362,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             offset_back = off_a;
         }
 
-        // Slots 0-3: 4 silhouette vertices: ea.x, eb.x, ea.y, eb.y
-        // Reuse offsets already computed above for center interpolation.
+        // Slots 0-3: 4 silhouette vertices (raw vertex gradients)
         let sv = array<u32, 4>(ea.x, eb.x, ea.y, eb.y);
         let sv_off = array<f32, 4>(off_ea_x, off_eb_x, off_ea_y, off_eb_y);
         for (var i = 0u; i < 4u; i++) {
             write_vertex(v_base + u32(i), ndc_xy[sv[i]],
                          ndc_z[sv[i]], ndc_z[sv[i]],
-                         sv_off[i], sv_off[i]);
+                         sv_off[i], sv_off[i],
+                         vn[sv[i]]);
+        }
+
+        // Center: interpolate gradients along edges, use front intersection
+        let g_a = mix(vn[ea.x], vn[ea.y], ta);
+        let g_b = mix(vn[eb.x], vn[eb.y], tb);
+        var grad_center: vec3f;
+        if z_a <= z_b {
+            grad_center = g_a;
+        } else {
+            grad_center = g_b;
         }
 
         // Slot 4: center vertex (intersection point)
         write_vertex(v_base + 4u, center_xy, z_front, z_back,
-                     offset_front, offset_back);
+                     offset_front, offset_back, grad_center);
     }
 }

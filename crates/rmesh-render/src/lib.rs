@@ -120,7 +120,7 @@ pub struct SceneBuffers {
     pub mesh_indirect_args: wgpu::Buffer,
     /// Precomputed per-tet data for quad renderer [M × 8] vec4<f32> (128 bytes/tet)
     pub precomputed: wgpu::Buffer,
-    /// Compute-interval vertex buffer [M × 5 × 2] vec4<f32> (160 bytes/tet)
+    /// Compute-interval vertex buffer [M × 5 × 3] vec4<f32> (240 bytes/tet)
     pub interval_vertex_buf: wgpu::Buffer,
     /// Compute-interval per-tet flat data [M] vec4<f32> (16 bytes/tet)
     pub interval_tet_data_buf: wgpu::Buffer,
@@ -238,10 +238,10 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
-        // Compute-interval vertex buffer: 5 verts × 2 vec4s × 16 bytes = 160 bytes/tet
+        // Compute-interval vertex buffer: 5 verts × 3 vec4s × 16 bytes = 240 bytes/tet
         let interval_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interval_vertex_buf"),
-            size: m * 5 * 2 * 16,
+            size: m * 5 * 3 * 16,
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -1257,13 +1257,14 @@ pub struct ComputeIntervalPipelines {
 
 impl ComputeIntervalPipelines {
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
-        // ----- Gen compute pipeline (10 bindings) -----
-        // Bindings 0-7: read-only, 8-9: read-write
+        // ----- Gen compute pipeline (11 bindings) -----
+        // Bindings 0-7: read-only, 8-9: read-write, 10: read-only (vertex_normals)
         let gen_read_only = [
             true, true, true, true, true, true, true, true, // 0-7 read-only
             false, false, // 8-9 read-write (out_vertices, out_tet_data)
+            true,         // 10 read-only (vertex_normals)
         ];
-        let gen_entries = storage_entries(10, wgpu::ShaderStages::COMPUTE, &gen_read_only);
+        let gen_entries = storage_entries(11, wgpu::ShaderStages::COMPUTE, &gen_read_only);
         let gen_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute_interval_gen_bg_layout"),
             entries: &gen_entries,
@@ -2107,6 +2108,7 @@ pub fn create_compute_interval_gen_bind_group(
             buf_entry(7, &buffers.indirect_args),
             buf_entry(8, &buffers.interval_vertex_buf),
             buf_entry(9, &buffers.interval_tet_data_buf),
+            buf_entry(10, &buffers.vertex_normals),
         ],
     })
 }
@@ -2133,6 +2135,7 @@ pub fn create_compute_interval_gen_bind_group_with_sort_values(
             buf_entry(7, &buffers.indirect_args),
             buf_entry(8, &buffers.interval_vertex_buf),
             buf_entry(9, &buffers.interval_tet_data_buf),
+            buf_entry(10, &buffers.vertex_normals),
         ],
     })
 }

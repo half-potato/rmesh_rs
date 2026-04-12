@@ -6,7 +6,7 @@
 // MRT outputs (all Rgba16Float, .a = alpha for correct hardware blend):
 //   location(0): plaster.rgb * a, a
 //   location(1): roughness * a, env_f0 * a, env_f1 * a, a
-//   location(2): oct_normal.xy * a, pack(env_f2,env_f3) * a, a
+//   location(2): field_gradient.xyz * a, a  — raw, normalized only in deferred
 //   location(3): albedo.rgb * a, a
 
 struct Uniforms {
@@ -45,6 +45,7 @@ struct FragmentInput {
     @location(2) @interpolate(flat) density: f32,
     @location(3) @interpolate(flat) base_color: vec3<f32>,
     @location(4) @interpolate(flat) tet_id: u32,
+    @location(5) field_gradient: vec3<f32>,          // interpolated raw gradient, normalize in pixel
 };
 
 struct FragmentOutput {
@@ -53,21 +54,6 @@ struct FragmentOutput {
     @location(2) normals: vec4<f32>,
     @location(3) albedo: vec4<f32>,
 };
-
-// Octahedral normal encoding: unit sphere → [0,1]^2
-fn oct_encode(n: vec3f) -> vec2f {
-    let s = abs(n.x) + abs(n.y) + abs(n.z);
-    var p = n.xy / s;
-    if (n.z < 0.0) {
-        p = (1.0 - abs(p.yx)) * sign(p);
-    }
-    return p * 0.5 + 0.5;
-}
-
-// Pack two [0,1] values into one float: a gets 8-bit integer part, b gets fractional part
-fn pack_2f(a: f32, b: f32) -> f32 {
-    return floor(clamp(a, 0.0, 1.0) * 255.0) + clamp(b, 0.0, 1.0);
-}
 
 // phi(x) = (1 - exp(-x)) / x
 // Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
@@ -138,24 +124,11 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let alb_g = aux_data[aux_base + 6u];
     let alb_b = aux_data[aux_base + 7u];
 
-    // Average vertex normals for this tet
-    let i0 = tet_indices[in.tet_id * 4u];
-    let i1 = tet_indices[in.tet_id * 4u + 1u];
-    let i2 = tet_indices[in.tet_id * 4u + 2u];
-    let i3 = tet_indices[in.tet_id * 4u + 3u];
-    let n0 = vec3f(vertex_normals[i0*3u], vertex_normals[i0*3u+1u], vertex_normals[i0*3u+2u]);
-    let n1 = vec3f(vertex_normals[i1*3u], vertex_normals[i1*3u+1u], vertex_normals[i1*3u+2u]);
-    let n2 = vec3f(vertex_normals[i2*3u], vertex_normals[i2*3u+1u], vertex_normals[i2*3u+2u]);
-    let n3 = vec3f(vertex_normals[i3*3u], vertex_normals[i3*3u+1u], vertex_normals[i3*3u+2u]);
-    let normal = normalize(n0 + n1 + n2 + n3);
-
-    // Octahedral-encode normal, pack env_f2+f3 into single channel
-    let oct_n = oct_encode(normal);
-    let env_packed = pack_2f(env_f2, env_f3);
-
-    // Premultiply by alpha — .a = alpha for correct hardware OneMinusSrcAlpha blend
+    // Premultiply by alpha — .a = alpha for correct hardware OneMinusSrcAlpha blend.
+    // Field gradient stored raw (unnormalized) — normalization happens in deferred shader
+    // after alpha compositing across all tets.
     out.aux0 = vec4f(roughness * alpha, env_f0 * alpha, env_f1 * alpha, alpha);
-    out.normals = vec4f(oct_n * alpha, env_packed * alpha, alpha);
+    out.normals = vec4f(in.field_gradient * alpha, alpha);
     out.albedo = vec4f(alb_r * alpha, alb_g * alpha, alb_b * alpha, alpha);
 
     return out;

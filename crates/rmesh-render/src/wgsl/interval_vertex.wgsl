@@ -2,7 +2,7 @@
 //
 // Uses draw_indexed_indirect with a static fan index buffer.
 // vertex_index = tet*5 + local_vert (from index buffer).
-// Reads 2 vec4s per vertex from storage + 1 vec4 per tet flat data.
+// Reads 3 vec4s per vertex from storage + 2 vec4s per tet flat data.
 // Output struct matches interval_fragment.wgsl's FragmentInput exactly.
 
 struct Uniforms {
@@ -39,6 +39,7 @@ struct IntervalVertexOutput {
     @location(2) @interpolate(flat) density: f32,
     @location(3) @interpolate(flat) base_color: vec3<f32>,
     @location(4) @interpolate(flat) tet_id: u32,
+    @location(5) field_gradient: vec3<f32>,  // interpolated per-pixel, normalize in fragment
 };
 
 @vertex
@@ -48,9 +49,10 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     let tet = vid / 5u;
     let slot = vid;
 
-    // Read 2 vec4s per vertex
-    let pos_depth = verts[slot * 2u + 0u];   // (ndc_x, ndc_y, z_front, z_back)
-    let offsets = verts[slot * 2u + 1u];      // (off_front, off_back, 0, 0)
+    // Read 3 vec4s per vertex
+    let pos_depth = verts[slot * 3u + 0u];   // (ndc_x, ndc_y, z_front, z_back)
+    let offsets = verts[slot * 3u + 1u];      // (off_front, off_back, 0, 0)
+    let grad_data = verts[slot * 3u + 2u];   // (gradient.xyz, 0)
 
     // Read per-tet flat data (2 vec4s per tet: [color+density, tet_id+pad])
     let td = tet_data[tet * 2u];              // (base_r, base_g, base_b, density)
@@ -60,6 +62,7 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     out.position = vec4<f32>(pos_depth.xy, 0.0, 1.0);
     out.depths = pos_depth.zw;
     out.color_offsets = offsets.xy;
+    out.field_gradient = grad_data.xyz;
     out.density = td.w;
     out.base_color = td.xyz;
     out.tet_id = bitcast<u32>(td1.x);
