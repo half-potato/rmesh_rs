@@ -64,7 +64,7 @@ fn fs_main(in: VsOut) -> FragmentOutput {
     var out: FragmentOutput;
     out.color = vec4<f32>(plaster, 1.0);
     out.aux0 = vec4<f32>(0.5, 0.0, 0.0, 1.0);  // roughness=0.5, env_f0=0, env_f1=0
-    out.normals = vec4<f32>(n, 1.0);              // world normal (deferred normalizes)
+    out.normals = vec4<f32>(-n, 1.0);             // negated to match volume normal convention
     out.albedo = vec4<f32>(u.color.rgb, 1.0);     // base albedo = primitive color
     return out;
 }
