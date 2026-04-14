@@ -248,7 +248,7 @@ impl App {
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
                                 "Roughness", "Env Feature", "Depth", "Specular",
                                 "Diffuse", "Shadow", "Retro", "Lambda",
-                                "Plaster", "Alpha",
+                                "Plaster", "Alpha", "Primitives",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
@@ -596,7 +596,8 @@ impl App {
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        match self.render_mode {
+        let skip_volume = self.deferred_enabled && self.deferred_debug_mode == 14;
+        if !skip_volume { match self.render_mode {
             RenderMode::IntervalShader => {
                 let (sort_st, gen_a, gen_b) = if self.sort_16bit {
                     (&gpu.sort_state_16bit, &gpu.compute_interval_gen_bg_a_16bit, &gpu.compute_interval_gen_bg_b_16bit)
@@ -748,7 +749,7 @@ impl App {
                     mrt_enabled,
                 );
             }
-        }
+        } } // end skip_volume
 
         // Copy instance_count to readback — skip if buffer has a pending/completed map
         if !gpu.instance_count_mapped.load(std::sync::atomic::Ordering::Acquire) {

@@ -60,7 +60,7 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     let td1 = tet_data[tet * 2u + 1u];        // (bitcast tet_id, 0, 0, 0)
 
     var out: IntervalVertexOutput;
-    out.position = vec4<f32>(pos_depth.xy, 0.0, 1.0);
+    out.position = vec4<f32>(pos_depth.xy, pos_depth.z, 1.0);
     out.depths = pos_depth.zw;
     out.color_offsets = offsets.xy;
     out.field_gradient = grad_data.xyz;

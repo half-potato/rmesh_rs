@@ -59,6 +59,7 @@ const DBG_RETRO:       u32 = 10u;
 const DBG_LAMBDA:      u32 = 11u;
 const DBG_PLASTER:     u32 = 12u;
 const DBG_ALPHA:       u32 = 13u;
+const DBG_PRIMITIVES:  u32 = 14u;
 
 /// Evaluate the monotonic piecewise-linear tone curve loaded from the .rmesh file.
 /// Layout: [y_knots..., slope, intercept, intercept_bias], n_knots = len - 3.
@@ -195,6 +196,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     else if (dm == DBG_LAMBDA)      { final_color = vec3f(0.0); }
     else if (dm == DBG_PLASTER)     { final_color = plaster; }
     else if (dm == DBG_ALPHA)       { final_color = vec3f(alpha); }
+    else if (dm == DBG_PRIMITIVES)  { /* final_color already correct — volume pass skipped on CPU */ }
 
     return vec4f(max(final_color, vec3f(0.0)), alpha);
 }

@@ -400,7 +400,7 @@ fn main(
         // Silhouette vertices: z_front = z_back = own Z, offset_front = offset_back = own offset
         for (var i = 0u; i < 3u; i++) {
             var out: IntervalVertexOutput;
-            out.position = vec4<f32>(ndc_xy[sv_idx[i]], 0.0, 1.0);
+            out.position = vec4<f32>(ndc_xy[sv_idx[i]], ndc_z[sv_idx[i]], 1.0);
             out.depths = vec2<f32>(ndc_z[sv_idx[i]], ndc_z[sv_idx[i]]);
             out.color_offsets = vec2<f32>(sv_offset[i], sv_offset[i]);
             out.density = tet_density;
@@ -410,7 +410,7 @@ fn main(
 
         // Center vertex
         var out_c: IntervalVertexOutput;
-        out_c.position = vec4<f32>(ndc_xy[center], 0.0, 1.0);
+        out_c.position = vec4<f32>(ndc_xy[center], z_front, 1.0);
         out_c.depths = vec2<f32>(z_front, z_back);
         out_c.color_offsets = vec2<f32>(offset_front, offset_back);
         out_c.density = tet_density;
@@ -471,7 +471,7 @@ fn main(
             let vi = sv[i];
             let off = dot(grad, v_world[vi] - cam_pos);
             var out: IntervalVertexOutput;
-            out.position = vec4<f32>(ndc_xy[vi], 0.0, 1.0);
+            out.position = vec4<f32>(ndc_xy[vi], ndc_z[vi], 1.0);
             out.depths = vec2<f32>(ndc_z[vi], ndc_z[vi]);
             out.color_offsets = vec2<f32>(off, off);
             out.density = tet_density;
@@ -481,7 +481,7 @@ fn main(
 
         // Center vertex (intersection point)
         var out_c: IntervalVertexOutput;
-        out_c.position = vec4<f32>(center_xy, 0.0, 1.0);
+        out_c.position = vec4<f32>(center_xy, z_front, 1.0);
         out_c.depths = vec2<f32>(z_front, z_back);
         out_c.color_offsets = vec2<f32>(offset_front, offset_back);
         out_c.density = tet_density;
