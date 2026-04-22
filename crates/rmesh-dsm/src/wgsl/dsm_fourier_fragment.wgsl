@@ -81,36 +81,22 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierO
     let od = clamp(in.density * dist, 0.0, 88.0);
     let alpha = 1.0 - exp(-od);
 
-    // Normalized depths [0,1]
+    // Normalize view-space Z to [0,1] (same as forward pass)
     let za = clamp((z_f - near) / range, 0.0, 1.0);
     let zb = clamp((z_b - near) / range, 0.0, 1.0);
 
-    // Volume rendering weights (same as forward_fragment.wgsl / interval_fragment.wgsl):
-    //   w0 = phi(od) - exp(-od)   → weight for back depth (zb)
-    //   w1 = 1 - phi(od)          → weight for front depth (za)
-    // These are the exact Beer-Lambert quadrature weights.
-    // w0 + w1 = alpha = 1 - exp(-od)
+    // Expected termination depth (volume-rendering weighted, same as forward pass)
     let alpha_t = exp(-od);
     let phi_val = phi(od);
     let w0 = phi_val - alpha_t;  // back weight
     let w1 = 1.0 - phi_val;     // front weight
+    let depth_premul = w0 * zb + w1 * za;
 
-    // Power moments using the same quadrature:
-    //   m_k = w0 * zb^k + w1 * za^k
-    // This is already premultiplied by alpha (since w0 + w1 = alpha).
-    let za2 = za * za; let zb2 = zb * zb;
-    let za3 = za2 * za; let zb3 = zb2 * zb;
-    let za4 = za3 * za; let zb4 = zb3 * zb;
-
-    let mk0 = w0 + w1;                    // = alpha
-    let mk1 = w0 * zb + w1 * za;          // = expected depth (premul)
-    let mk2 = w0 * zb2 + w1 * za2;
-    let mk3 = w0 * zb3 + w1 * za3;
-    let mk4 = w0 * zb4 + w1 * za4;
-
+    // RT0: expected depth (premul-alpha composited via hardware blend)
+    // RT1/RT2: unused
     var out: FourierOutput;
-    out.rt0 = vec4<f32>(mk0, mk1, mk2, mk3);
-    out.rt1 = vec4<f32>(mk4, 0.0, 0.0, 0.0);
+    out.rt0 = vec4<f32>(depth_premul, depth_premul, depth_premul, alpha);
+    out.rt1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }

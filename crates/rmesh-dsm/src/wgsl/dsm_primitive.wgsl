@@ -42,19 +42,16 @@ struct FourierOutput {
 
 @fragment
 fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> FourierOutput {
-    // Convert NDC depth to linear, then normalize to [0,1]
+    // Convert NDC depth to linear view-space Z, normalize to [0,1]
     let near = u.color.x;
     let far = u.color.y;
     let z_linear = near * far / (far - frag_coord.z * (far - near));
     let z = clamp((z_linear - near) / (far - near), 0.0, 1.0);
 
-    // Power moments for alpha=1 (fully opaque): m_k = z^k
-    let z2 = z * z;
-    let z3 = z2 * z;
-    let z4 = z3 * z;
+    // Opaque surface: depth with alpha=1
     var out: FourierOutput;
-    out.rt0 = vec4<f32>(1.0, z, z2, z3);  // m0, m1, m2, m3
-    out.rt1 = vec4<f32>(z4, 0.0, 0.0, 0.0);  // m4
+    out.rt0 = vec4<f32>(z, z, z, 1.0);
+    out.rt1 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     return out;
 }

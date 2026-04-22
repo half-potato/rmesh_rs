@@ -101,7 +101,27 @@ impl DsmPipeline {
             source: wgpu::ShaderSource::Wgsl(DSM_FOURIER_FRAGMENT_WGSL.into()),
         });
 
-        // Additive blending for Fourier coefficient accumulation
+        // Premultiplied alpha blend for expected depth compositing (same as forward pass)
+        let premul_blend = wgpu::BlendState {
+            color: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+            alpha: wgpu::BlendComponent {
+                src_factor: wgpu::BlendFactor::One,
+                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                operation: wgpu::BlendOperation::Add,
+            },
+        };
+
+        let premul_target = Some(wgpu::ColorTargetState {
+            format: color_format,
+            blend: Some(premul_blend),
+            write_mask: wgpu::ColorWrites::ALL,
+        });
+
+        // Additive blend for unused MRTs (kept for compatibility)
         let additive_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -151,9 +171,9 @@ impl DsmPipeline {
                 module: &fragment_shader,
                 entry_point: Some("main"),
                 targets: &[
-                    additive_target.clone(), // RT0: a0, a1, b1, a2
-                    additive_target.clone(), // RT1: b2, a3, b3, a4
-                    additive_target,         // RT2: b4, 0, 0, 0
+                    premul_target,           // RT0: expected depth (premul-alpha)
+                    additive_target.clone(), // RT1: unused
+                    additive_target,         // RT2: unused
                 ],
                 compilation_options: Default::default(),
             }),
@@ -441,7 +461,7 @@ pub fn record_dsm_primitive_pass(
         let u = DsmPrimUniform {
             vp: vp_cols,
             model: model.to_cols_array_2d(),
-            color: [near, far, 0.0, 0.0],
+            color: [near, far, width as f32, 0.0],
             _pad: [0.0; 28],
         };
         queue.write_buffer(
@@ -759,14 +779,26 @@ pub fn record_dsm_resolve(
 // Per-Light DSM Cache
 // ---------------------------------------------------------------------------
 
-/// Cubemap face directions: +X, -X, +Y, -Y, +Z, -Z.
+/// Cubemap face view matrices for look_to_rh, matching WebGPU cubemap sampler.
+///
+/// Standard cubemap face coordinates (OpenGL/WebGPU):
+///   Face +X: sc=-z, tc=-y    Face -X: sc=+z, tc=-y
+///   Face +Y: sc=+x, tc=+z   Face -Y: sc=+x, tc=-z
+///   Face +Z: sc=+x, tc=-y   Face -Z: sc=-x, tc=-y
+///
+/// For look_to_rh(pos, forward, up):
+///   right = normalize(cross(up, -forward))
+///   actual_up = cross(-forward, right)
+///
+/// We need: right aligns with sc direction, actual_up aligns with -tc direction
+/// (because tc increases downward in texture, but actual_up points upward in view).
 const CUBEMAP_DIRS: [(Vec3, Vec3); 6] = [
-    (Vec3::X,     Vec3::NEG_Y),   // +X, up = -Y
-    (Vec3::NEG_X, Vec3::NEG_Y),   // -X, up = -Y
-    (Vec3::Y,     Vec3::Z),       // +Y, up = +Z
-    (Vec3::NEG_Y, Vec3::NEG_Z),   // -Y, up = -Z
-    (Vec3::Z,     Vec3::NEG_Y),   // +Z, up = -Y
-    (Vec3::NEG_Z, Vec3::NEG_Y),   // -Z, up = -Y
+    (Vec3::X,     Vec3::NEG_Y),   // +X: right=-Z(sc=-z✓), up=-Y → actual_up=-Y(tc=-y✓)
+    (Vec3::NEG_X, Vec3::NEG_Y),   // -X: right=+Z(sc=+z✓), up=-Y → actual_up=-Y(tc=-y✓)
+    (Vec3::Y,     Vec3::Z),       // +Y: right=+X(sc=+x✓), up=+Z → actual_up=+Z(tc=+z✓)
+    (Vec3::NEG_Y, Vec3::NEG_Z),   // -Y: right=+X(sc=+x✓), up=-Z → actual_up=-Z(tc=-z✓)
+    (Vec3::Z,     Vec3::NEG_Y),   // +Z: right=+X(sc=+x✓), up=-Y → actual_up=-Y(tc=-y✓)
+    (Vec3::NEG_Z, Vec3::NEG_Y),   // -Z: right=-X(sc=-x✓), up=-Y → actual_up=-Y(tc=-y✓)
 ];
 
 /// Per-light shadow metadata for the deferred shader (matches WGSL `ShadowLight`).
@@ -997,11 +1029,8 @@ pub fn build_light_vp(
         }
     };
 
-    // Flip Y in the VP to match cubemap convention.
-    // look_to_rh with up=-Y gives correct horizontal (sc=-Z) but inverted vertical.
-    // The cubemap sampler expects Y-up per face, but our rendering is Y-down.
-    // Flipping clip.y fixes this. clip.w (depth) is unaffected.
-    let y_flip = Mat4::from_cols(
+    // Flip Y in clip space: look_to_rh renders Y-down, cubemap expects Y-up.
+    let flip = Mat4::from_cols(
         glam::Vec4::X,
         -glam::Vec4::Y,
         glam::Vec4::Z,
@@ -1016,7 +1045,7 @@ pub fn build_light_vp(
     );
     let c2w = view3.transpose();
 
-    (y_flip * proj * view, c2w)
+    (flip * proj * view, c2w)
 }
 
 /// Generate deep shadow maps for all active lights.
@@ -1086,41 +1115,12 @@ pub fn generate_dsm_for_lights(
             bytemuck::bytes_of(&uniforms),
         );
 
-        // For DSM (OIT additive blending), no sort needed — just identity mapping.
-        if render_tets {
-            // sort_values = [0, 1, 2, ..., tet_count-1]
-            let identity: Vec<u32> = (0..tet_count).collect();
-            queue.write_buffer(&buffers.sort_values, 0, bytemuck::cast_slice(&identity));
-
-            // Set up indirect_args (for forward compute compatibility)
-            let args = DrawIndirectCommand {
-                vertex_count: 12,
-                instance_count: tet_count,
-                first_vertex: 0,
-                first_instance: 0,
-            };
-            queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&args));
-
-            // Set up interval_args_buf with 2D dispatch for large tet counts
-            let wg_size = 64u32;
-            let total_wg = (tet_count + wg_size - 1) / wg_size;
-            let dispatch_x = total_wg.min(65535);
-            let dispatch_y = (total_wg + 65534) / 65535;
-            let interval_args: [u32; 8] = [
-                dispatch_x, dispatch_y, 1,         // compute dispatch args (2D)
-                tet_count * 12, 1, 0, 0, 0,        // draw-indexed-indirect args
-            ];
-            queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&interval_args));
-        }
-
-        // --- Per-face: primitive pre-pass + optional tet DSM render ---
-        // Submit + recreate encoder between faces because queue.write_buffer
-        // for scratch_uniforms must take effect before the next face's GPU work.
+        // --- Per-face: forward compute + sort + interval gen + DSM render ---
+        // Each face needs its own sort from the light's perspective for correct
+        // back-to-front compositing of expected termination depth.
         for fi in 0..face_count {
-            let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
 
-            // For 90° FOV cubemap faces, fx = fy = half (tan(45°) = 1).
-            // Don't extract from VP matrix — it's only correct for Z-forward cameras.
+            let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
             let face_intrinsics = [half, half, half, half];
 
             let face_uniforms = rmesh_render::make_uniforms(
@@ -1149,31 +1149,64 @@ pub fn generate_dsm_for_lights(
                 bytemuck::bytes_of(&face_uniforms),
             );
 
-            // Re-initialize buffers for this face (interval gen modifies them)
+            let mut result_in_b = false;
             if render_tets {
-                // Reset indirect_args (instance_count = all tets)
-                let args = DrawIndirectCommand {
+                // Reset indirect args for forward compute
+                let reset_cmd = DrawIndirectCommand {
                     vertex_count: 12,
-                    instance_count: tet_count,
+                    instance_count: 0,
                     first_vertex: 0,
                     first_instance: 0,
                 };
-                queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&args));
+                queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+                queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&[0u32; 8]));
+                queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
-                // Reset interval_args_buf with 2D dispatch for large tet counts
-                let wg_size = 64u32;
-                let total_wg = (tet_count + wg_size - 1) / wg_size;
-                let dispatch_x = total_wg.min(65535);
-                let dispatch_y = (total_wg + 65534) / 65535;
-                let interval_args: [u32; 8] = [
-                    dispatch_x, dispatch_y, 1,
-                    tet_count * 12, 1, 0, 0, 0,
-                ];
-                queue.write_buffer(&buffers.interval_args_buf, 0, bytemuck::cast_slice(&interval_args));
+                // Forward compute: project tets from light VP, generate sort keys
+                let compute_bg = create_dsm_hw_compute_bg(
+                    device, fwd_pipelines, buffers, material, sh_coeffs_buf,
+                    &atlas.scratch_uniforms,
+                );
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("dsm_project_compute"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+                    cpass.set_bind_group(0, &compute_bg, &[]);
+                    let workgroup_size = 64u32;
+                    let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+                    let (dx, dy) = dispatch_2d(total_workgroups);
+                    cpass.dispatch_workgroups(dx, dy, 1);
+                }
 
-                // Reset sort_values to identity
-                let identity: Vec<u32> = (0..tet_count).collect();
-                queue.write_buffer(&buffers.sort_values, 0, bytemuck::cast_slice(&identity));
+                // Radix sort by depth from light
+                result_in_b = rmesh_sort::record_radix_sort(
+                    encoder, device, sort_pipelines, sort_state,
+                    &buffers.sort_keys, &buffers.sort_values,
+                );
+
+                // Indirect convert: set up dispatch/draw args from visible count
+                let convert_bg = create_dsm_indirect_convert_bg(device, ci_pipelines, buffers);
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("dsm_indirect_convert"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
+                    cpass.set_bind_group(0, &convert_bg, &[]);
+                    cpass.dispatch_workgroups(1, 1, 1);
+                }
+
+                // Submit sort work, then write uniforms for interval gen
+                let sort_encoder = std::mem::replace(encoder, device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("dsm_face_post_sort") },
+                ));
+                queue.submit(std::iter::once(sort_encoder.finish()));
+                queue.write_buffer(
+                    &atlas.scratch_uniforms, 0,
+                    bytemuck::bytes_of(&face_uniforms),
+                );
             }
 
             // Render to staging textures
@@ -1199,12 +1232,17 @@ pub fn generate_dsm_for_lights(
 
             // DSM tet render pass (loads color+depth from primitive pass)
             if render_tets {
+                let sort_vals = if result_in_b {
+                    sort_state.values_b()
+                } else {
+                    &buffers.sort_values
+                };
                 let gen_bg = create_dsm_interval_gen_bg(
                     device,
                     ci_pipelines,
                     buffers,
                     material,
-                    &buffers.sort_values,
+                    sort_vals,
                     &atlas.scratch_uniforms,
                 );
                 {

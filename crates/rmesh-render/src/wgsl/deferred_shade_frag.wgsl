@@ -116,7 +116,7 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
     }
 }
 
-/// Evaluate transmittance T(world_pos) for a given light using cubemap shadow map.
+/// Evaluate transmittance T(world_pos) for a given light using expected-depth shadow map.
 fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let sm = shadow_meta[li];
 
@@ -125,64 +125,32 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32, NdotL: f32) -> f32 {
     let dist = length(dir);
     if dist < 1e-6 { return 1.0; }
 
-    // Select cubemap face for depth computation (still need VP for linear depth)
+    // Select cubemap face for depth computation (view-space Z is face-dependent)
     let face = select_cubemap_face(dir);
     let vp = get_shadow_vp(sm, face);
     let clip = vp * vec4f(world_pos, 1.0);
     if clip.w <= 0.0 { return 1.0; }
 
-    // Sample moments from cubemap — hardware handles face selection + seamless filtering
+    // Sample expected termination depth from cubemap
     let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
-    let c1 = textureSample(dsm_rt1, dsm_sampler, dir);
-    let c2 = textureSample(dsm_rt2, dsm_sampler, dir);
+    let shadow_alpha = c0.a;
 
-    // Power moments stored directly: m0, m1, m2, m3, m4
-    let m0 = c0.x;
-    let m1 = c0.y;
-    let m2 = c0.z;
-    let m3 = c0.w;
-    let m4 = c1.x;
+    // No shadow data at this direction
+    if shadow_alpha < 0.01 { return 1.0; }
 
-    // clip.w is linear view-space depth; normalize to [0,1] matching DSM generation
-    let z_raw = (clip.w - sm.near) / (sm.far - sm.near);
+    // Un-premultiply to get expected termination depth in [0,1] (view-space Z)
+    let shadow_depth = c0.r / shadow_alpha;
 
-    // Slope-scale bias to avoid self-shadowing
+    // Query depth: view-space Z normalized to [0,1] (matches DSM storage)
+    let z = (clip.w - sm.near) / (sm.far - sm.near);
+
+    // Slope-scale bias
     let slope_val = sqrt(1.0 - NdotL * NdotL) / max(NdotL, 0.001);
     let bias = 0.002 + 0.005 * min(slope_val, 10.0);
-    let z = clamp(z_raw - bias, 0.0, 1.0);
 
-    // Early out: no opacity or very high opacity
-    if m0 < 1e-6 { return 1.0; }
-    if m0 > 20.0 { return exp(-m0); } // fully opaque, distribution doesn't matter
-
-    // Chebyshev shadow reconstruction from power moments.
-    // Mean and variance of the opacity depth distribution.
-    let inv_m0 = 1.0 / m0;
-    let mu = m1 * inv_m0;
-    let sigma2 = max(m2 * inv_m0 - mu * mu, 1e-8);
-
-    // One-sided Chebyshev (Cantelli) inequality:
-    // P(t >= z) <= sigma2 / (sigma2 + (z - mu)^2)  when z > mu
-    // G(z) = P(t <= z) = 1 - P(t >= z)
-    let d = z - mu;
-    var G: f32;
-    if d <= 0.0 {
-        // Query depth is before the mean — little to no opacity accumulated yet
-        // Use a smooth ramp based on how far before the mean we are
-        G = max(0.0, 0.5 + d / (2.0 * sqrt(sigma2) + 1e-6));
-    } else {
-        // Query depth is past the mean — Cantelli gives upper bound on remaining opacity
-        G = 1.0 - sigma2 / (sigma2 + d * d);
-    }
-
-    // Higher-moment skewness correction (from m3):
-    // Positive skew = opacity concentrated toward near depths → more shadow at far depths
-    let mu3 = m3 * inv_m0;
-    let skew = (mu3 - 3.0 * mu * sigma2 - mu * mu * mu) / max(sigma2 * sqrt(sigma2), 1e-10);
-    // Adjust G based on skewness: positive skew pushes CDF earlier
-    G = clamp(G + 0.05 * skew * G * (1.0 - G), 0.0, 1.0);
-
-    return exp(-m0 * G);
+    // Binary shadow
+    if z > shadow_depth + bias { return 0.0; }
+    return 1.0;
 }
 
 // ---------------------------------------------------------------------------
@@ -324,22 +292,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         }
     }
     else if (dm == DBG_RETRO) {
-        // Debug: R=m0 (total opacity), G=normalized depth z, B=transmittance T
+        // Debug: view cubemap shadow map — sample using direction from light to surface
         if uniforms.dsm_enabled != 0u && uniforms.num_lights > 0u {
             let dir = world_pos - lights[0u].position;
-            let sm = shadow_meta[0u];
-            let face = select_cubemap_face(dir);
-            let vp = get_shadow_vp(sm, face);
-            let clip = vp * vec4f(world_pos, 1.0);
-            if clip.w > 0.0 {
-                let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
-                let m0 = c0.x;
-                let z = clamp((clip.w - sm.near) / (sm.far - sm.near), 0.0, 1.0);
-                let T = evaluate_transmittance(world_pos, 0u, 1.0);
-                final_color = vec3f(clamp(m0 * 0.5, 0.0, 1.0), z, T);
-            } else {
-                final_color = vec3f(1.0, 0.0, 1.0);
-            }
+            let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
+            let shadow_alpha = c0.a;
+            let shadow_depth = select(0.0, c0.r / shadow_alpha, shadow_alpha > 0.01);
+            final_color = vec3f(shadow_depth);
         } else {
             final_color = vec3f(0.5);
         }
