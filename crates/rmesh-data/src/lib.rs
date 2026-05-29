@@ -100,18 +100,6 @@ impl ShCoeffs {
 /// Magic bytes for tagged extension sections: "RMTX" as u32 LE.
 const TAGGED_MAGIC: u32 = 0x524D5458;
 
-/// A single MLP layer's weights.
-#[derive(Clone, Debug)]
-pub struct MlpLayer {
-    pub in_dim: u32,
-    pub out_dim: u32,
-    pub has_bias: bool,
-    /// Row-major weight matrix [out_dim × in_dim] as f32.
-    pub weights: Vec<f32>,
-    /// Bias vector [out_dim] as f32, empty if no bias.
-    pub bias: Vec<f32>,
-}
-
 /// PBR material data loaded from tagged .rmesh extension sections.
 #[derive(Clone, Debug)]
 pub struct PbrData {
@@ -123,12 +111,6 @@ pub struct PbrData {
     pub albedo: Vec<f32>,
     /// Learned vertex normals [V × 3] f32.
     pub vertex_normals: Vec<f32>,
-    /// MLPBRDF layers (typically 4 linear layers).
-    pub brdf_layers: Vec<MlpLayer>,
-    /// RetroHead linear weights [4] f32.
-    pub retro_weights: Vec<f32>,
-    /// RetroHead bias [1] f32.
-    pub retro_bias: Vec<f32>,
     /// Monotonic spline tone curve [y_knots..., slope, intercept, intercept_bias] f32.
     /// n_knots = len - 3. X knots are implicit linspace(0, 1, n_knots).
     pub tone_curve: Vec<f32>,
@@ -413,9 +395,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
     let mut env_feature = Vec::new();
     let mut albedo = Vec::new();
     let mut vertex_normals = Vec::new();
-    let mut brdf_layers = Vec::new();
-    let mut retro_weights = Vec::new();
-    let mut retro_bias = Vec::new();
     let mut tone_curve = Vec::new();
 
     for _ in 0..num_sections {
@@ -468,18 +447,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
             "vertex_normals" => {
                 vertex_normals = f16_payload_to_f32(payload, dtype);
             }
-            "brdf_mlp" => {
-                brdf_layers = parse_mlp_payload(payload);
-            }
-            "retro_head" => {
-                let vals = f16_payload_to_f32(payload, dtype);
-                if vals.len() >= 5 {
-                    retro_weights = vals[..4].to_vec();
-                    retro_bias = vals[4..5].to_vec();
-                } else {
-                    retro_weights = vals;
-                }
-            }
             "tone_curve" => {
                 tone_curve = f16_payload_to_f32(payload, dtype);
             }
@@ -499,9 +466,6 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
         env_feature,
         albedo,
         vertex_normals,
-        brdf_layers,
-        retro_weights,
-        retro_bias,
         tone_curve,
     })
 }
@@ -526,60 +490,6 @@ fn f16_payload_to_f32(payload: &[u8], dtype: u32) -> Vec<f32> {
         }
         _ => Vec::new(),
     }
-}
-
-/// Parse MLP binary payload into layers.
-fn parse_mlp_payload(payload: &[u8]) -> Vec<MlpLayer> {
-    let mut off = 0usize;
-    if payload.len() < 4 {
-        return Vec::new();
-    }
-
-    let num_layers = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap()) as usize;
-    off += 4;
-
-    let mut layers = Vec::with_capacity(num_layers);
-    for _ in 0..num_layers {
-        if off + 9 > payload.len() {
-            break;
-        }
-        let in_dim = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
-        off += 4;
-        let out_dim = u32::from_le_bytes(payload[off..off + 4].try_into().unwrap());
-        off += 4;
-        let has_bias = payload[off] != 0;
-        off += 1;
-
-        let weight_count = (out_dim * in_dim) as usize;
-        let weight_bytes = weight_count * 2; // f16
-        let weights: Vec<f32> = payload[off..off + weight_bytes]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
-            .collect();
-        off += weight_bytes;
-
-        let bias = if has_bias {
-            let bias_bytes = out_dim as usize * 2;
-            let b: Vec<f32> = payload[off..off + bias_bytes]
-                .chunks_exact(2)
-                .map(|c| f16::from_le_bytes(c.try_into().unwrap()).to_f32())
-                .collect();
-            off += bias_bytes;
-            b
-        } else {
-            Vec::new()
-        };
-
-        layers.push(MlpLayer {
-            in_dim,
-            out_dim,
-            has_bias,
-            weights,
-            bias,
-        });
-    }
-
-    layers
 }
 
 /// Parallel circumsphere computation using rayon.

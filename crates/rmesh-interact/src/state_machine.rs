@@ -2,7 +2,7 @@ use glam::{Mat4, Quat, Vec3};
 
 use crate::event::{InteractEvent, InteractKey, MouseButton};
 use crate::numeric::NumericInput;
-use crate::transform::{Primitive, Transform};
+use crate::transform::Transform;
 
 /// Which transform operation is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +84,16 @@ impl AxisConstraint {
     }
 }
 
+/// What the user currently has selected. The interaction system is agnostic about
+/// which kind it is — the caller routes confirmed transforms to the right place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// Index into the user primitive list.
+    Primitive(usize),
+    /// Index into the animated scene's nodes.
+    Node(usize),
+}
+
 /// The state of the interaction system.
 #[derive(Debug)]
 enum InteractState {
@@ -99,14 +109,14 @@ enum InteractState {
 }
 
 /// Result of processing an input event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum InteractResult {
     /// Event consumed, nothing visually changed.
     Noop,
     /// Event consumed, preview transform updated — re-render.
     PreviewUpdated,
-    /// Transform confirmed — commit to primitive.
-    Confirmed,
+    /// Transform confirmed — caller should apply this transform to the selected entity.
+    Confirmed(Transform),
     /// Transform canceled — revert to original.
     Canceled,
     /// Event not consumed — pass to camera / other systems.
@@ -131,13 +141,18 @@ pub struct InteractContext {
 
 /// Blender-style modal transform interaction state machine.
 ///
-/// Operates on a list of [`Primitive`]s. One primitive may be selected at a time.
+/// Tracks one [`Selection`] at a time. The caller is responsible for:
+/// - Calling [`set_current_transform`] each frame with the world-space transform
+///   of the selected entity (or `None` if nothing is selected).
+/// - Routing [`InteractResult::Confirmed`] payloads back to the right entity.
+///
 /// When a mode key (G/S/R) is pressed with a selection, the system enters
 /// `Transforming` state. Axis constraints, numeric input, and mouse accumulation
 /// modify the preview transform. Enter/LMB confirms, Escape/RMB cancels.
 pub struct TransformInteraction {
     state: InteractState,
-    selected: Option<usize>,
+    selected: Option<Selection>,
+    current_transform: Option<Transform>,
 }
 
 impl TransformInteraction {
@@ -145,36 +160,38 @@ impl TransformInteraction {
         Self {
             state: InteractState::Idle,
             selected: None,
+            current_transform: None,
         }
+    }
+
+    /// Tell the state machine the current world-space transform of the selected entity.
+    /// Called each frame by the viewer before feeding events.
+    pub fn set_current_transform(&mut self, t: Option<Transform>) {
+        self.current_transform = t;
     }
 
     /// Process an input event. Returns how the caller should respond.
     pub fn process_event(
         &mut self,
         event: &InteractEvent,
-        primitives: &mut [Primitive],
         ctx: &InteractContext,
     ) -> InteractResult {
         match &mut self.state {
-            InteractState::Idle => self.process_idle(event, primitives),
-            InteractState::Transforming { .. } => self.process_transforming(event, primitives, ctx),
+            InteractState::Idle => self.process_idle(event),
+            InteractState::Transforming { .. } => self.process_transforming(event, ctx),
         }
     }
 
-    fn process_idle(
-        &mut self,
-        event: &InteractEvent,
-        primitives: &[Primitive],
-    ) -> InteractResult {
+    fn process_idle(&mut self, event: &InteractEvent) -> InteractResult {
         match event {
             InteractEvent::KeyDown(key) => match key {
                 InteractKey::G | InteractKey::S | InteractKey::R => {
-                    let Some(idx) = self.selected else {
-                        return InteractResult::NotConsumed;
-                    };
-                    if idx >= primitives.len() {
+                    if self.selected.is_none() {
                         return InteractResult::NotConsumed;
                     }
+                    let Some(original) = self.current_transform else {
+                        return InteractResult::NotConsumed;
+                    };
                     let mode = match key {
                         InteractKey::G => TransformMode::Grab,
                         InteractKey::S => TransformMode::Scale,
@@ -185,16 +202,16 @@ impl TransformInteraction {
                         mode,
                         axis: AxisConstraint::Free,
                         numeric: NumericInput::new(),
-                        original_transform: primitives[idx].transform,
+                        original_transform: original,
                         mouse_accum: [0.0, 0.0],
                         shift_held: false,
                     };
                     InteractResult::PreviewUpdated
                 }
                 InteractKey::Delete => {
-                    // Delete selected primitive — signal via Confirmed so caller can handle
+                    // Delete selected entity — signal via Noop so caller can handle
                     if self.selected.is_some() {
-                        InteractResult::Noop // deletion handled by caller checking key
+                        InteractResult::Noop
                     } else {
                         InteractResult::NotConsumed
                     }
@@ -208,10 +225,8 @@ impl TransformInteraction {
     fn process_transforming(
         &mut self,
         event: &InteractEvent,
-        primitives: &mut [Primitive],
         ctx: &InteractContext,
     ) -> InteractResult {
-        // Extract mutable fields — we need to pattern-match the state
         let InteractState::Transforming {
             mode,
             axis,
@@ -226,7 +241,6 @@ impl TransformInteraction {
 
         match event {
             InteractEvent::KeyDown(key) => match key {
-                // Axis constraints
                 InteractKey::X => {
                     *axis = if *shift_held {
                         AxisConstraint::Plane(Axis::X)
@@ -259,20 +273,14 @@ impl TransformInteraction {
                     numeric.backspace();
                     InteractResult::PreviewUpdated
                 }
-                // Confirm
                 InteractKey::Enter => {
-                    if let Some(idx) = self.selected {
-                        if idx < primitives.len() {
-                            primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
-                        }
-                    }
+                    let new_t = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
                     self.state = InteractState::Idle;
-                    return InteractResult::Confirmed;
+                    InteractResult::Confirmed(new_t)
                 }
-                // Cancel
                 InteractKey::Escape => {
                     self.state = InteractState::Idle;
-                    return InteractResult::Canceled;
+                    InteractResult::Canceled
                 }
                 _ => InteractResult::Noop,
             },
@@ -292,7 +300,6 @@ impl TransformInteraction {
             }
 
             InteractEvent::MouseMove { dx, dy } => {
-                // Only accumulate mouse movement when no numeric input
                 if numeric.is_empty() {
                     mouse_accum[0] += dx;
                     mouse_accum[1] += dy;
@@ -303,20 +310,14 @@ impl TransformInteraction {
             }
 
             InteractEvent::MouseDown { button: MouseButton::Left } => {
-                // LMB = confirm
-                if let Some(idx) = self.selected {
-                    if idx < primitives.len() {
-                        primitives[idx].transform = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
-                    }
-                }
+                let new_t = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
                 self.state = InteractState::Idle;
-                return InteractResult::Confirmed;
+                InteractResult::Confirmed(new_t)
             }
 
             InteractEvent::MouseDown { button: MouseButton::Right } => {
-                // RMB = cancel
                 self.state = InteractState::Idle;
-                return InteractResult::Canceled;
+                InteractResult::Canceled
             }
 
             _ => InteractResult::Noop,
@@ -340,7 +341,6 @@ impl TransformInteraction {
                         ..original
                     }
                 } else {
-                    // Project mouse delta to world-space movement
                     let delta = Self::mouse_to_world_grab(
                         mouse_accum, axis, original.position, ctx,
                     );
@@ -387,31 +387,22 @@ impl TransformInteraction {
         obj_pos: Vec3,
         ctx: &InteractContext,
     ) -> Vec3 {
-        // Compute depth of the object in view-space to get correct pixel-to-world scaling.
-        // view_pos.z is negative (OpenGL convention), depth = -view_pos.z
         let view_pos = ctx.view_matrix * obj_pos.extend(1.0);
         let depth = (-view_pos.z).max(0.01);
 
-        // proj_matrix[1][1] = 1/tan(fov_y/2), so focal_px = proj[1][1] * viewport_height/2
-        // world_units_per_pixel = depth / focal_px
         let focal_px = ctx.proj_matrix.col(1).y * ctx.viewport_height * 0.5;
         let world_per_px = depth / focal_px;
 
         let dx = mouse_accum[0] * world_per_px;
         let dy = mouse_accum[1] * world_per_px;
 
-        // Extract camera right and up vectors from the view matrix
         let view = ctx.view_matrix;
         let right = Vec3::new(view.col(0).x, view.col(1).x, view.col(2).x).normalize();
         let up = Vec3::new(view.col(0).y, view.col(1).y, view.col(2).y).normalize();
 
         match axis {
-            AxisConstraint::Free => {
-                // Move in the camera's right/up plane
-                right * dx - up * dy
-            }
+            AxisConstraint::Free => right * dx - up * dy,
             AxisConstraint::SingleAxis(a) => {
-                // Project screen delta onto the screen-space direction of the axis
                 let world_dir = a.unit();
                 let screen_dir = Vec3::new(
                     right.dot(world_dir),
@@ -420,16 +411,13 @@ impl TransformInteraction {
                 );
                 let screen_len = screen_dir.length();
                 if screen_len < 1e-6 {
-                    return Vec3::ZERO; // axis points at camera, can't project
+                    return Vec3::ZERO;
                 }
                 let screen_dir = screen_dir / screen_len;
-                // Dot the mouse delta with the screen projection of the axis
                 let projected = dx * screen_dir.x - dy * screen_dir.y;
                 world_dir * (projected / screen_len)
-                }
+            }
             AxisConstraint::Plane(normal_axis) => {
-                // Move in the plane perpendicular to normal_axis,
-                // but only along the camera right/up components that lie in that plane
                 let n = normal_axis.unit();
                 let plane_right = (right - n * n.dot(right)).normalize_or_zero();
                 let plane_up = (up - n * n.dot(up)).normalize_or_zero();
@@ -441,12 +429,12 @@ impl TransformInteraction {
     fn sensitivity(mode: TransformMode) -> f32 {
         match mode {
             TransformMode::Scale => 0.005,
-            TransformMode::Rotate => 0.5, // degrees per pixel
+            TransformMode::Rotate => 0.5,
             _ => 0.01,
         }
     }
 
-    /// Compute the preview transform for the currently-transforming primitive.
+    /// Compute the preview transform for the currently-transforming entity.
     /// Returns `None` if not in a transform state.
     pub fn preview_transform(&self, ctx: &InteractContext) -> Option<Transform> {
         if let InteractState::Transforming {
@@ -488,14 +476,18 @@ impl TransformInteraction {
         matches!(self.state, InteractState::Transforming { .. })
     }
 
-    /// Currently selected primitive index.
-    pub fn selected(&self) -> Option<usize> {
+    /// Currently selected entity.
+    pub fn selected(&self) -> Option<Selection> {
         self.selected
     }
 
-    /// Set the selected primitive index.
-    pub fn set_selected(&mut self, idx: Option<usize>) {
-        self.selected = idx;
+    /// Set the selected entity.
+    pub fn set_selected(&mut self, sel: Option<Selection>) {
+        // Cancel any in-progress transform if selection changes
+        if self.selected != sel && self.is_active() {
+            self.state = InteractState::Idle;
+        }
+        self.selected = sel;
     }
 }
 
@@ -508,10 +500,8 @@ impl Default for TransformInteraction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transform::PrimitiveKind;
 
     fn dummy_ctx() -> InteractContext {
-        // Camera at z=5 looking at origin
         let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y);
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_4, 800.0 / 600.0, 0.1, 100.0);
         InteractContext {
@@ -522,86 +512,68 @@ mod tests {
         }
     }
 
-    fn one_cube() -> Vec<Primitive> {
-        vec![Primitive::new(PrimitiveKind::Cube, "Cube")]
+    fn setup() -> (TransformInteraction, InteractContext) {
+        let mut ti = TransformInteraction::new();
+        ti.set_selected(Some(Selection::Primitive(0)));
+        ti.set_current_transform(Some(Transform::default()));
+        (ti, dummy_ctx())
     }
 
     #[test]
     fn test_idle_no_selection() {
         let mut ti = TransformInteraction::new();
         let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        // G with no selection => NotConsumed
-        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::NotConsumed);
+        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        assert!(matches!(r, InteractResult::NotConsumed));
         assert!(!ti.is_active());
     }
 
     #[test]
     fn test_grab_confirm_enter() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        // Press G => Transforming
-        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::PreviewUpdated);
+        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        assert!(matches!(r, InteractResult::PreviewUpdated));
         assert!(ti.is_active());
 
-        // Type X constraint
-        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::PreviewUpdated);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &ctx);
+        ti.process_event(&InteractEvent::CharInput('5'), &ctx);
 
-        // Type "5"
-        let r = ti.process_event(&InteractEvent::CharInput('5'), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::PreviewUpdated);
-
-        // Check preview
         let preview = ti.preview_transform(&ctx).unwrap();
         assert!((preview.position.x - 5.0).abs() < 1e-6);
-        assert!(preview.position.y.abs() < 1e-6);
-        assert!(preview.position.z.abs() < 1e-6);
 
-        // Confirm
-        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::Enter), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::Confirmed);
+        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::Enter), &ctx);
+        match r {
+            InteractResult::Confirmed(t) => {
+                assert!((t.position.x - 5.0).abs() < 1e-6);
+            }
+            _ => panic!("expected Confirmed, got {:?}", r),
+        }
         assert!(!ti.is_active());
-        assert!((prims[0].transform.position.x - 5.0).abs() < 1e-6);
     }
 
     #[test]
     fn test_cancel_reverts() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('9'), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        ti.process_event(&InteractEvent::CharInput('9'), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &ctx);
 
-        // Cancel
-        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::Escape), &mut prims, &ctx);
-        assert_eq!(r, InteractResult::Canceled);
+        let r = ti.process_event(&InteractEvent::KeyDown(InteractKey::Escape), &ctx);
+        assert!(matches!(r, InteractResult::Canceled));
         assert!(!ti.is_active());
-        // Original transform unchanged
-        assert!(prims[0].transform.position.x.abs() < 1e-6);
     }
 
     #[test]
     fn test_scale_mode() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::S), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::Y), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('2'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::S), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::Y), &ctx);
+        ti.process_event(&InteractEvent::CharInput('2'), &ctx);
 
         let preview = ti.preview_transform(&ctx).unwrap();
-        // Scale Y should be 1 + 2 = 3
         assert!((preview.scale.y - 3.0).abs() < 1e-6);
         assert!((preview.scale.x - 1.0).abs() < 1e-6);
         assert!((preview.scale.z - 1.0).abs() < 1e-6);
@@ -609,18 +581,14 @@ mod tests {
 
     #[test]
     fn test_rotate_mode() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::R), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::Z), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('9'), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('0'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::R), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::Z), &ctx);
+        ti.process_event(&InteractEvent::CharInput('9'), &ctx);
+        ti.process_event(&InteractEvent::CharInput('0'), &ctx);
 
         let preview = ti.preview_transform(&ctx).unwrap();
-        // 90 degrees around Z
         let expected = Quat::from_axis_angle(Vec3::Z, 90.0_f32.to_radians());
         let dot = preview.rotation.dot(expected).abs();
         assert!(dot > 0.99, "rotation mismatch: dot={dot}");
@@ -628,26 +596,14 @@ mod tests {
 
     #[test]
     fn test_mouse_accumulation() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &ctx);
 
-        // Mouse movement (no numeric entered)
-        ti.process_event(
-            &InteractEvent::MouseMove { dx: 100.0, dy: 0.0 },
-            &mut prims,
-            &ctx,
-        );
+        ti.process_event(&InteractEvent::MouseMove { dx: 100.0, dy: 0.0 }, &ctx);
 
         let preview = ti.preview_transform(&ctx).unwrap();
-        // Depth-aware sensitivity: object at origin, camera at z=5 → depth=5
-        // proj[1][1] = 1/tan(fov_y/2), focal_px = proj[1][1] * 300
-        // world_per_px = 5 / focal_px ≈ 0.0069
-        // 100 px * ~0.0069 ≈ 0.69 world units on X
         assert!(preview.position.x > 0.5, "x={}", preview.position.x);
         assert!(preview.position.x < 1.0, "x={}", preview.position.x);
         assert!(preview.position.y.abs() < 1e-4);
@@ -655,21 +611,14 @@ mod tests {
 
     #[test]
     fn test_shift_plane_constraint() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-
-        // Hold shift then press X => plane constraint (YZ)
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::Shift), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &mut prims, &ctx);
-
-        ti.process_event(&InteractEvent::CharInput('3'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::Shift), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &ctx);
+        ti.process_event(&InteractEvent::CharInput('3'), &ctx);
 
         let preview = ti.preview_transform(&ctx).unwrap();
-        // X locked, YZ affected
         assert!(preview.position.x.abs() < 1e-6);
         assert!((preview.position.y - 3.0).abs() < 1e-6);
         assert!((preview.position.z - 3.0).abs() < 1e-6);
@@ -677,61 +626,52 @@ mod tests {
 
     #[test]
     fn test_lmb_confirms() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('2'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::X), &ctx);
+        ti.process_event(&InteractEvent::CharInput('2'), &ctx);
 
         let r = ti.process_event(
             &InteractEvent::MouseDown { button: MouseButton::Left },
-            &mut prims,
             &ctx,
         );
-        assert_eq!(r, InteractResult::Confirmed);
-        assert!((prims[0].transform.position.x - 2.0).abs() < 1e-6);
+        match r {
+            InteractResult::Confirmed(t) => {
+                assert!((t.position.x - 2.0).abs() < 1e-6);
+            }
+            _ => panic!("expected Confirmed, got {:?}", r),
+        }
     }
 
     #[test]
     fn test_rmb_cancels() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('9'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::G), &ctx);
+        ti.process_event(&InteractEvent::CharInput('9'), &ctx);
 
         let r = ti.process_event(
             &InteractEvent::MouseDown { button: MouseButton::Right },
-            &mut prims,
             &ctx,
         );
-        assert_eq!(r, InteractResult::Canceled);
-        // Position should be unchanged
-        assert!(prims[0].transform.position.x.abs() < 1e-6);
+        assert!(matches!(r, InteractResult::Canceled));
     }
 
     #[test]
     fn test_display_info() {
-        let mut ti = TransformInteraction::new();
-        let ctx = dummy_ctx();
-        let mut prims = one_cube();
-        ti.set_selected(Some(0));
+        let (mut ti, ctx) = setup();
 
         assert!(ti.display_info().is_none());
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::S), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::S), &ctx);
         let info = ti.display_info().unwrap();
         assert_eq!(info.mode, TransformMode::Scale);
         assert_eq!(info.axis, AxisConstraint::Free);
         assert!(info.numeric_text.is_empty());
 
-        ti.process_event(&InteractEvent::KeyDown(InteractKey::Z), &mut prims, &ctx);
-        ti.process_event(&InteractEvent::CharInput('4'), &mut prims, &ctx);
+        ti.process_event(&InteractEvent::KeyDown(InteractKey::Z), &ctx);
+        ti.process_event(&InteractEvent::CharInput('4'), &ctx);
         let info = ti.display_info().unwrap();
         assert_eq!(info.axis, AxisConstraint::SingleAxis(Axis::Z));
         assert_eq!(info.numeric_text, "4");

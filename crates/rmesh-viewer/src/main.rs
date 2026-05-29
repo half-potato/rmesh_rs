@@ -25,6 +25,7 @@ use rmesh_interact::{
     InteractContext, InteractEvent, InteractKey, InteractResult, Primitive,
     TransformInteraction,
 };
+use rmesh_anim::{AnimatedScene, AnimationClock};
 use rmesh_sim::{FluidParams, FluidSim};
 use rmesh_util::camera::Camera;
 use wgpu::util::DeviceExt;
@@ -48,8 +49,10 @@ use rmesh_render::{
 };
 use rmesh_compositor::{PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
 
+mod flare;
 mod gpu_state;
 mod render;
+use flare::FlareSystem;
 use gpu_state::*;
 
 /// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
@@ -99,6 +102,9 @@ struct App {
     interaction: TransformInteraction,
     primitives: Vec<Primitive>,
     next_primitive_id: u32,
+    // Animation
+    anim_clock: AnimationClock,
+    animated_scene: Option<AnimatedScene>,
     // Deferred PBR shading
     deferred_enabled: bool,
     deferred_debug_mode: u32,
@@ -112,6 +118,8 @@ struct App {
     rt_neighbors_cpu: Vec<i32>,
     rt_start_tet_hint: i32,
     rt_locate_ms: f32,
+    // Flare gun
+    flare_system: FlareSystem,
 }
 
 impl App {
@@ -150,6 +158,8 @@ impl App {
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
+            anim_clock: AnimationClock::new(),
+            animated_scene: None,
             deferred_enabled: pbr.is_some(),
             deferred_debug_mode: 0,
             ambient: 0.00,
@@ -160,6 +170,7 @@ impl App {
             rt_neighbors_cpu: Vec::new(),
             rt_start_tet_hint: -1,
             rt_locate_ms: 0.0,
+            flare_system: FlareSystem::default(),
         }
     }
 
@@ -444,7 +455,8 @@ impl App {
 
         // Primitive setup (depth used for hardware early-z culling in forward pass)
         let primitive_geometry = PrimitiveGeometry::new(&device);
-        let primitive_pipeline = PrimitivePipeline::new(&device);
+        let material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
+        let primitive_pipeline = PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
         let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
 
         // Instance count readback buffer
@@ -667,6 +679,7 @@ impl App {
             fluid_sim: None,
             tet_neighbors_buf: None,
             primitive_geometry,
+            material_registry,
             primitive_pipeline,
             primitive_targets,
             egui_renderer,
@@ -1142,6 +1155,68 @@ impl App {
             gpu.rt_texture_view = rt_view;
         }
     }
+
+    /// World-space transform of whatever is currently selected, or None.
+    fn current_selected_transform(&self) -> Option<rmesh_interact::Transform> {
+        use rmesh_interact::Selection;
+        match self.interaction.selected() {
+            Some(Selection::Primitive(i)) => self.primitives.get(i).map(|p| p.transform),
+            Some(Selection::Node(i)) => self
+                .animated_scene
+                .as_ref()
+                .and_then(|s| s.nodes.get(i))
+                .map(|n| n.world_transform),
+            None => None,
+        }
+    }
+
+    /// Apply a confirmed world-space transform back to the selected entity.
+    /// For scene nodes, the world transform is converted to the node's local space
+    /// (by composing with the inverse of the parent's world matrix) and the scene's
+    /// world transforms are recomputed so children follow.
+    fn apply_committed_transform(&mut self, world_t: rmesh_interact::Transform) {
+        use rmesh_interact::Selection;
+        match self.interaction.selected() {
+            Some(Selection::Primitive(i)) => {
+                if let Some(p) = self.primitives.get_mut(i) {
+                    p.transform = world_t;
+                }
+            }
+            Some(Selection::Node(i)) => {
+                if let Some(ref mut scene) = self.animated_scene {
+                    if i < scene.nodes.len() {
+                        let parent_world = scene.parent_world_matrix(i);
+                        let local_mat = parent_world.inverse() * world_t.model_matrix();
+                        let (scale, rotation, translation) =
+                            local_mat.to_scale_rotation_translation();
+                        scene.nodes[i].local_transform = rmesh_interact::Transform {
+                            position: translation,
+                            rotation,
+                            scale,
+                        };
+                        scene.compute_world_transforms();
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Sync the current selection's transform into the interaction state machine,
+    /// dispatch the event, and route a Confirmed transform back to the entity.
+    fn process_interact_event(
+        &mut self,
+        ie: &InteractEvent,
+        ctx: &InteractContext,
+    ) -> InteractResult {
+        let cur_t = self.current_selected_transform();
+        self.interaction.set_current_transform(cur_t);
+        let result = self.interaction.process_event(ie, ctx);
+        if let InteractResult::Confirmed(new_t) = result {
+            self.apply_committed_transform(new_t);
+        }
+        result
+    }
 }
 
 /// Map winit KeyCode to InteractKey.
@@ -1235,12 +1310,8 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => InteractEvent::KeyDown(ikey),
                         ElementState::Released => InteractEvent::KeyUp(ikey),
                     };
-                    let result = self.interaction.process_event(
-                        &ie,
-                        &mut self.primitives,
-                        &interact_ctx,
-                    );
-                    consumed = result != InteractResult::NotConsumed;
+                    let result = self.process_interact_event(&ie, &interact_ctx);
+                    consumed = !matches!(result, InteractResult::NotConsumed);
                 }
 
                 // CharInput for numeric entry (only on press)
@@ -1249,17 +1320,28 @@ impl ApplicationHandler for App {
                         for ch in text.chars() {
                             if matches!(ch, '0'..='9' | '.' | '-') {
                                 let ie = InteractEvent::CharInput(ch);
-                                let result = self.interaction.process_event(
-                                    &ie,
-                                    &mut self.primitives,
-                                    &interact_ctx,
-                                );
-                                if result != InteractResult::NotConsumed {
+                                let result = self.process_interact_event(&ie, &interact_ctx);
+                                if !matches!(result, InteractResult::NotConsumed) {
                                     consumed = true;
                                 }
                             }
                         }
                     }
+                }
+
+                // Flare gun: L key shoots a flare from camera
+                if !consumed
+                    && code == KeyCode::KeyL
+                    && key_event.state == ElementState::Pressed
+                {
+                    let fwd = (self.camera.orbit_target - self.camera.position).normalize();
+                    self.flare_system.shoot(
+                        self.camera.position,
+                        fwd,
+                        &mut self.primitives,
+                        &mut self.next_primitive_id,
+                    );
+                    consumed = true;
                 }
 
                 // Fallback: Escape quits if not consumed by interaction
@@ -1288,12 +1370,8 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => InteractEvent::MouseDown { button: mb },
                         ElementState::Released => InteractEvent::MouseUp { button: mb },
                     };
-                    let result = self.interaction.process_event(
-                        &ie,
-                        &mut self.primitives,
-                        &interact_ctx,
-                    );
-                    if result == InteractResult::NotConsumed {
+                    let result = self.process_interact_event(&ie, &interact_ctx);
+                    if matches!(result, InteractResult::NotConsumed) {
                         // Only update camera button state if not consumed
                         match button {
                             MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
@@ -1316,11 +1394,7 @@ impl ApplicationHandler for App {
                             dx: dx as f32,
                             dy: dy as f32,
                         };
-                        self.interaction.process_event(
-                            &ie,
-                            &mut self.primitives,
-                            &interact_ctx,
-                        );
+                        self.process_interact_event(&ie, &interact_ctx);
                     } else {
                         if self.left_pressed && self.shift_pressed {
                             self.camera.pan(dx as f32, dy as f32);

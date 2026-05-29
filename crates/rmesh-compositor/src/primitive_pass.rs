@@ -2,20 +2,26 @@
 
 use bytemuck::{Pod, Zeroable};
 use crate::geometry::{PrimitiveGeometry, PrimitiveVertex};
+use crate::material::MaterialRegistry;
 use rmesh_interact::Primitive;
 
 const PRIMITIVE_WGSL: &str = include_str!("wgsl/primitive.wgsl");
 const PRIMITIVE_MRT_WGSL: &str = include_str!("wgsl/primitive_mrt.wgsl");
 
 /// Uniform data for one primitive draw call, padded to 256 bytes for dynamic offsets.
-/// Layout: vp(64) + model(64) + color(16) + pad(112) = 256 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct PrimitiveUniformsPadded {
-    pub vp: [[f32; 4]; 4],    // 64 bytes
-    pub model: [[f32; 4]; 4], // 64 bytes
-    pub color: [f32; 4],      // 16 bytes
-    pub _pad: [f32; 28],      // 112 bytes → total 256
+    pub vp: [[f32; 4]; 4],          // 64 bytes
+    pub model: [[f32; 4]; 4],       // 64 bytes
+    pub color: [f32; 4],            // 16 bytes (base_color_factor RGBA)
+    pub roughness_factor: f32,      // 4 bytes
+    pub metallic_factor: f32,       // 4 bytes
+    pub occlusion_strength: f32,    // 4 bytes
+    pub normal_scale: f32,          // 4 bytes
+    pub tex_flags: u32,             // 4 bytes (bit0=base_color, bit1=metal_rough, bit2=normal, bit3=occlusion)
+    pub _pad2: u32,                 // 4 bytes (alignment)
+    pub _pad: [f32; 22],            // 88 bytes → total 256
 }
 
 const UNIFORM_ALIGN: u64 = 256;
@@ -84,7 +90,7 @@ pub struct PrimitivePipeline {
 }
 
 impl PrimitivePipeline {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, material_bgl: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("primitive.wgsl"),
             source: wgpu::ShaderSource::Wgsl(PRIMITIVE_WGSL.into()),
@@ -110,9 +116,11 @@ impl PrimitivePipeline {
             }],
         });
 
+        // Both pipelines share the same 2-bind-group layout:
+        // group 0 = uniforms (dynamic offset), group 1 = material textures
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("prim_layout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&bind_group_layout, material_bgl],
             immediate_size: 0,
         });
 
@@ -125,12 +133,22 @@ impl PrimitivePipeline {
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
                     offset: 0,
-                    shader_location: 0,
+                    shader_location: 0, // position
                 },
                 wgpu::VertexAttribute {
                     format: wgpu::VertexFormat::Float32x3,
                     offset: 12,
-                    shader_location: 1,
+                    shader_location: 1, // normal
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x2,
+                    offset: 24,
+                    shader_location: 2, // uv
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32x4,
+                    offset: 32,
+                    shader_location: 3, // tangent
                 },
             ],
         };
@@ -196,10 +214,10 @@ impl PrimitivePipeline {
                 module: &shader_mrt,
                 entry_point: Some("fs_main"),
                 targets: &[
-                    opaque_target.clone(), // location(0): color/plaster
-                    opaque_target.clone(), // location(1): aux0
+                    opaque_target.clone(), // location(0): albedo
+                    opaque_target.clone(), // location(1): roughness, 0, metallic
                     opaque_target.clone(), // location(2): normals
-                    opaque_target,         // location(3): albedo
+                    opaque_target,         // location(3): depth, occlusion, 0
                 ],
                 compilation_options: Default::default(),
             }),
@@ -238,7 +256,7 @@ impl PrimitivePipeline {
 
 /// Record a primitive render pass.
 ///
-/// When `mrt_views` is `Some`, renders to 4 MRT targets (color + aux0 + normals + albedo)
+/// When `mrt_views` is `Some`, renders to 4 MRT targets (color + aux0 + normals + depth)
 /// for deferred shading. Otherwise renders to a single color target.
 pub fn record_primitive_pass(
     encoder: &mut wgpu::CommandEncoder,
@@ -250,6 +268,7 @@ pub fn record_primitive_pass(
     primitives: &[Primitive],
     vp: &glam::Mat4,
     mrt_views: Option<MrtViews>,
+    material_registry: Option<&MaterialRegistry>,
 ) {
     let clear_ops = wgpu::Operations {
         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -316,16 +335,35 @@ pub fn record_primitive_pass(
     let vp_cols = vp.to_cols_array_2d();
     let count = primitives.len().min(MAX_PRIMITIVES as usize);
 
+    use rmesh_interact::PrimitiveKind;
+
     for (i, prim) in primitives.iter().take(count).enumerate() {
         let model = prim.transform.model_matrix();
         let model_cols = model.to_cols_array_2d();
-        let color = PRIMITIVE_COLORS[prim.kind.index()];
+        let color = prim.color.unwrap_or_else(|| {
+            if prim.kind.is_custom_mesh() {
+                [0.7, 0.7, 0.7, 1.0]
+            } else {
+                PRIMITIVE_COLORS[prim.kind.index()]
+            }
+        });
+
+        // Get material properties for texture flags
+        let mat_props = material_registry
+            .and_then(|reg| prim.material_index.map(|i| reg.properties_for(Some(i))))
+            .unwrap_or_default();
 
         let u = PrimitiveUniformsPadded {
             vp: vp_cols,
             model: model_cols,
             color,
-            _pad: [0.0; 28],
+            roughness_factor: prim.roughness,
+            metallic_factor: prim.metallic,
+            occlusion_strength: mat_props.occlusion_strength,
+            normal_scale: mat_props.normal_scale,
+            tex_flags: mat_props.tex_flags(),
+            _pad2: 0,
+            _pad: [0.0; 22],
         };
 
         queue.write_buffer(
@@ -357,12 +395,99 @@ pub fn record_primitive_pass(
     };
     rpass.set_pipeline(active_pipeline);
     rpass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+    let mut using_custom_vb = false;
 
     for (i, prim) in primitives.iter().take(count).enumerate() {
         let offset = (i as u64 * UNIFORM_ALIGN) as u32;
         rpass.set_bind_group(0, &pipeline.bind_group, &[offset]);
 
-        let slice = &geometry.kinds[prim.kind.index()];
-        rpass.draw(slice.offset..(slice.offset + slice.count), 0..1);
+        // Set material bind group (group 1)
+        if let Some(reg) = material_registry {
+            rpass.set_bind_group(1, reg.bind_group_for(prim.material_index), &[]);
+        }
+
+        if let PrimitiveKind::CustomMesh(mesh_id) = prim.kind {
+            if let (Some(ref cvb), Some(slice)) =
+                (&geometry.custom_vertex_buffer, geometry.custom_meshes.get(mesh_id))
+            {
+                if !using_custom_vb {
+                    rpass.set_vertex_buffer(0, cvb.slice(..));
+                    using_custom_vb = true;
+                }
+                rpass.draw(slice.offset..(slice.offset + slice.count), 0..1);
+            }
+        } else {
+            if using_custom_vb {
+                rpass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+                using_custom_vb = false;
+            }
+            let slice = &geometry.kinds[prim.kind.index()];
+            rpass.draw(slice.offset..(slice.offset + slice.count), 0..1);
+        }
     }
+}
+
+/// Render the collision debug mesh as a single draw with identity transform and fixed color.
+/// Renders into an existing color+depth target using LoadOp::Load (preserves prior content).
+pub fn record_collision_debug_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    queue: &wgpu::Queue,
+    pipeline: &PrimitivePipeline,
+    geometry: &PrimitiveGeometry,
+    color_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+    vp: &glam::Mat4,
+) {
+    let vb = match geometry.collision_vertex_buffer {
+        Some(ref vb) => vb,
+        None => return,
+    };
+    if geometry.collision_vertex_count == 0 {
+        return;
+    }
+
+    let model = glam::Mat4::IDENTITY;
+    let u = PrimitiveUniformsPadded {
+        vp: vp.to_cols_array_2d(),
+        model: model.to_cols_array_2d(),
+        color: [0.0, 1.0, 0.5, 0.4], // semi-transparent green
+        roughness_factor: 1.0,
+        metallic_factor: 0.0,
+        occlusion_strength: 1.0,
+        normal_scale: 1.0,
+        tex_flags: 0,
+        _pad2: 0,
+        _pad: [0.0; 22],
+    };
+
+    // Write to the last uniform slot to avoid conflicts with regular primitives
+    let offset = (MAX_PRIMITIVES - 1) * UNIFORM_ALIGN;
+    queue.write_buffer(&pipeline.uniform_buffer, offset, bytemuck::bytes_of(&u));
+
+    let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("collision_debug"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: color_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        })],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        ..Default::default()
+    });
+
+    rpass.set_pipeline(&pipeline.pipeline);
+    rpass.set_vertex_buffer(0, vb.slice(..));
+    rpass.set_bind_group(0, &pipeline.bind_group, &[offset as u32]);
+    rpass.draw(0..geometry.collision_vertex_count, 0..1);
 }

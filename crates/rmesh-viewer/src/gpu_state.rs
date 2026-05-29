@@ -8,7 +8,7 @@ use rmesh_render::{
     MeshForwardPipelines, IntervalPipelines, ComputeIntervalPipelines, RenderTargets,
     SceneBuffers,
 };
-use rmesh_compositor::{PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
+use rmesh_compositor::{MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
 use rmesh_sim::FluidSim;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -137,6 +137,7 @@ pub struct GpuState {
     pub tet_neighbors_buf: Option<wgpu::Buffer>,
     // Primitives
     pub primitive_geometry: PrimitiveGeometry,
+    pub material_registry: MaterialRegistry,
     pub primitive_pipeline: PrimitivePipeline,
     pub primitive_targets: PrimitiveTargets,
     // egui

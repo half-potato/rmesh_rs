@@ -391,26 +391,24 @@ impl WebViewer {
     /// Process a key down event from JS. Returns a string describing the result.
     pub fn on_key_down(&mut self, key: &str) -> String {
         let ctx = self.interact_ctx();
-        // Try InteractKey first
         if let Some(ikey) = js_key_to_interact(key) {
-            let result = self.interaction.process_event(
-                &InteractEvent::KeyDown(ikey),
-                &mut self.primitives,
-                &ctx,
-            );
-            if result != InteractResult::NotConsumed {
+            self.sync_current_transform();
+            let result = self.interaction.process_event(&InteractEvent::KeyDown(ikey), &ctx);
+            if let InteractResult::Confirmed(t) = result {
+                self.apply_committed_transform(t);
+            }
+            if !matches!(result, InteractResult::NotConsumed) {
                 return format!("{:?}", result);
             }
         }
-        // Try CharInput for digits
         if key.len() == 1 {
             let ch = key.chars().next().unwrap();
             if matches!(ch, '0'..='9' | '.' | '-') {
-                let result = self.interaction.process_event(
-                    &InteractEvent::CharInput(ch),
-                    &mut self.primitives,
-                    &ctx,
-                );
+                self.sync_current_transform();
+                let result = self.interaction.process_event(&InteractEvent::CharInput(ch), &ctx);
+                if let InteractResult::Confirmed(t) = result {
+                    self.apply_committed_transform(t);
+                }
                 return format!("{:?}", result);
             }
         }
@@ -421,22 +419,16 @@ impl WebViewer {
     pub fn on_key_up(&mut self, key: &str) {
         if let Some(ikey) = js_key_to_interact(key) {
             let ctx = self.interact_ctx();
-            self.interaction.process_event(
-                &InteractEvent::KeyUp(ikey),
-                &mut self.primitives,
-                &ctx,
-            );
+            self.sync_current_transform();
+            self.interaction.process_event(&InteractEvent::KeyUp(ikey), &ctx);
         }
     }
 
     /// Feed mouse movement to the interaction system (when active).
     pub fn on_interact_mouse_move(&mut self, dx: f32, dy: f32) {
         let ctx = self.interact_ctx();
-        self.interaction.process_event(
-            &InteractEvent::MouseMove { dx, dy },
-            &mut self.primitives,
-            &ctx,
-        );
+        self.sync_current_transform();
+        self.interaction.process_event(&InteractEvent::MouseMove { dx, dy }, &ctx);
     }
 
     /// Feed mouse button to interaction. button: 0=left, 1=middle, 2=right.
@@ -448,11 +440,13 @@ impl WebViewer {
             _ => return "NotConsumed".to_string(),
         };
         let ctx = self.interact_ctx();
-        let result = self.interaction.process_event(
-            &InteractEvent::MouseDown { button: mb },
-            &mut self.primitives,
-            &ctx,
-        );
+        self.sync_current_transform();
+        let result = self
+            .interaction
+            .process_event(&InteractEvent::MouseDown { button: mb }, &ctx);
+        if let InteractResult::Confirmed(t) = result {
+            self.apply_committed_transform(t);
+        }
         format!("{:?}", result)
     }
 
@@ -469,23 +463,32 @@ impl WebViewer {
         self.next_primitive_id += 1;
         self.primitives.push(Primitive::new(pk, name));
         let idx = self.primitives.len() - 1;
-        self.interaction.set_selected(Some(idx));
+        self.interaction
+            .set_selected(Some(rmesh_interact::Selection::Primitive(idx)));
         idx as i32
     }
 
     /// Set the selected primitive index (-1 for none).
     pub fn set_selected(&mut self, idx: i32) {
-        self.interaction.set_selected(if idx < 0 { None } else { Some(idx as usize) });
+        let sel = if idx < 0 {
+            None
+        } else {
+            Some(rmesh_interact::Selection::Primitive(idx as usize))
+        };
+        self.interaction.set_selected(sel);
     }
 
-    /// Get the selected primitive index (-1 for none).
+    /// Get the selected primitive index (-1 for none). Returns -1 for non-primitive selections too.
     pub fn get_selected(&self) -> i32 {
-        self.interaction.selected().map_or(-1, |i| i as i32)
+        match self.interaction.selected() {
+            Some(rmesh_interact::Selection::Primitive(i)) => i as i32,
+            _ => -1,
+        }
     }
 
     /// Delete the selected primitive.
     pub fn delete_selected(&mut self) {
-        if let Some(idx) = self.interaction.selected() {
+        if let Some(rmesh_interact::Selection::Primitive(idx)) = self.interaction.selected() {
             if idx < self.primitives.len() {
                 self.primitives.remove(idx);
                 self.interaction.set_selected(None);
@@ -545,6 +548,24 @@ fn js_key_to_interact(key: &str) -> Option<InteractKey> {
 
 // Private helpers (not exported to JS)
 impl WebViewer {
+    fn sync_current_transform(&mut self) {
+        let cur = match self.interaction.selected() {
+            Some(rmesh_interact::Selection::Primitive(i)) => {
+                self.primitives.get(i).map(|p| p.transform)
+            }
+            _ => None,
+        };
+        self.interaction.set_current_transform(cur);
+    }
+
+    fn apply_committed_transform(&mut self, t: rmesh_interact::Transform) {
+        if let Some(rmesh_interact::Selection::Primitive(i)) = self.interaction.selected() {
+            if let Some(p) = self.primitives.get_mut(i) {
+                p.transform = t;
+            }
+        }
+    }
+
     fn interact_ctx(&mut self) -> InteractContext {
         let w = self.surface_config.width;
         let h = self.surface_config.height;

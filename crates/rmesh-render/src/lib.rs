@@ -84,7 +84,7 @@ pub struct DeferredUniforms {
     pub near_plane: f32,
     pub far_plane: f32,
     pub dsm_enabled: u32,
-    pub _pad: f32,
+    pub _pad: u32,
 }
 
 /// Maximum number of lights supported.

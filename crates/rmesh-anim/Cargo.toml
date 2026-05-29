@@ -1,0 +1,10 @@
+[package]
+name = "rmesh-anim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+glam = { workspace = true }
+anyhow = { workspace = true }
+gltf = "1"
+rmesh-interact = { path = "../rmesh-interact" }

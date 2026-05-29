@@ -29,6 +29,15 @@ impl App {
     pub(crate) fn render(&mut self) {
         self.update_fps();
 
+        // Tick animation clock and update animated scene
+        let anim_dt = self.anim_clock.tick();
+        if let Some(ref mut scene) = self.animated_scene {
+            scene.update(anim_dt);
+        }
+
+        // Tick flare physics
+        self.flare_system.tick(anim_dt, &mut self.primitives, &self.scene_data);
+
         if self.gpu.is_none() {
             return;
         }
@@ -194,10 +203,17 @@ impl App {
         let fluid_params = &mut self.fluid_params;
         let interact_display = self.interaction.display_info();
         let interact_selected = self.interaction.selected();
-        let mut new_selected = interact_selected;
+        let mut new_selected: Option<rmesh_interact::Selection> = interact_selected;
         let mut add_primitive: Option<PrimitiveKind> = None;
         let mut delete_selected = false;
         let mut add_shadow_test_scene = false;
+        let mut shoot_flare = false;
+        let mut clear_flares = false;
+        let mut density_threshold = self.flare_system.density_threshold;
+        let mut force_dsm_recompute = self.flare_system.force_dsm_recompute;
+        let mut show_collision_mesh = self.flare_system.show_collision_mesh;
+        let flare_count = self.flare_system.flare_count();
+        let collision_tri_count = self.flare_system.collision_triangle_count();
         let primitives_ref = &self.primitives;
         let has_pbr = gpu.has_pbr_data;
         let rt_locate_ms = self.rt_locate_ms;
@@ -205,6 +221,26 @@ impl App {
         let mut ambient = self.ambient;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
+        let mut load_glb = false;
+        // Animation playback state (read from scene, written back after egui)
+        let mut anim_playing = self.animated_scene.as_ref().map_or(false, |s| s.playback.playing);
+        let mut anim_looping = self.animated_scene.as_ref().map_or(true, |s| s.playback.looping);
+        let mut anim_speed = self.animated_scene.as_ref().map_or(1.0, |s| s.playback.speed);
+        let mut anim_time = self.animated_scene.as_ref().map_or(0.0, |s| s.playback.time);
+        let anim_duration = self.animated_scene.as_ref().map_or(0.0, |s| s.current_duration());
+        let mut anim_clip_index = self.animated_scene.as_ref().and_then(|s| s.playback.clip_index);
+        let anim_clip_names: Vec<String> = self.animated_scene.as_ref().map_or(Vec::new(), |s| {
+            s.clips.iter().map(|c| c.name.clone()).collect()
+        });
+        let anim_scene_name = self.animated_scene.as_ref().map(|s| s.name.clone());
+        let anim_nodes: Vec<(String, usize, bool, Option<usize>)> = self.animated_scene.as_ref().map_or(Vec::new(), |s| {
+            s.nodes.iter().enumerate().map(|(i, n)| {
+                (n.name.clone(), i, n.mesh_kind.is_some(), n.parent)
+            }).collect()
+        });
+        let mut anim_goto_start = false;
+        let mut anim_goto_end = false;
+        let mut unload_scene = false;
         // Get mesh bbox for dynamic slider ranges
         let (fluid_bbox_min, fluid_bbox_max) = if let Some(ref sim) = gpu.fluid_sim {
             (sim.mesh_bbox_min, sim.mesh_bbox_max)
@@ -223,8 +259,12 @@ impl App {
             egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
                 egui::menu::bar(ui, |ui| {
                     ui.menu_button("File", |ui| {
-                        if ui.button("Open...").clicked() {
+                        if ui.button("Open Scene...").clicked() {
                             open_file = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Load Animation (.glb)...").clicked() {
+                            load_glb = true;
                             ui.close_menu();
                         }
                     });
@@ -251,8 +291,9 @@ impl App {
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
                                 "Roughness", "Env Feature", "Depth", "Specular",
-                                "Diffuse", "Shadow", "Retro", "Lambda",
+                                "Diffuse", "Shadow", "Metallic", "Occlusion",
                                 "Plaster", "Alpha", "Primitives", "DSM",
+                                "DSM Depth", "DSM Face", "DSM UV",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
@@ -266,6 +307,11 @@ impl App {
                                     .text("DSM Depth"));
                             }
                         }
+                        ui.separator();
+                        ui.label("Flare Gun");
+                        ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
+                        ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
+                        ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let rt_info = if render_mode == RenderMode::RayTrace {
@@ -325,14 +371,25 @@ impl App {
                 if ui.button("Add Shadow Test Scene").clicked() {
                     add_shadow_test_scene = true;
                 }
+                ui.horizontal(|ui| {
+                    if ui.button("Shoot Flare (L)").clicked() {
+                        shoot_flare = true;
+                    }
+                    if flare_count > 0 {
+                        if ui.button(format!("Clear Flares ({})", flare_count)).clicked() {
+                            clear_flares = true;
+                        }
+                    }
+                });
                 ui.separator();
                 for (i, prim) in primitives_ref.iter().enumerate() {
-                    let selected = new_selected == Some(i);
+                    let sel = rmesh_interact::Selection::Primitive(i);
+                    let selected = new_selected == Some(sel);
                     if ui.selectable_label(selected, &prim.name).clicked() {
-                        new_selected = if selected { None } else { Some(i) };
+                        new_selected = if selected { None } else { Some(sel) };
                     }
                 }
-                if new_selected.is_some() {
+                if matches!(new_selected, Some(rmesh_interact::Selection::Primitive(_))) {
                     ui.separator();
                     if ui.button("Delete").clicked() {
                         delete_selected = true;
@@ -340,7 +397,111 @@ impl App {
                 }
             });
 
-            // Transform HUD overlay (centered at bottom)
+            // Animated scene hierarchy panel (right side, only shown when a scene is loaded)
+            if let Some(ref scene_name) = anim_scene_name {
+                egui::SidePanel::right("anim_scene_panel").default_width(180.0).show(ctx, |ui| {
+                    ui.heading("Animation");
+                    ui.label(format!("Scene: {}", scene_name));
+                    if ui.small_button("Unload").clicked() {
+                        unload_scene = true;
+                    }
+                    ui.separator();
+
+                    // Clip selector
+                    if !anim_clip_names.is_empty() {
+                        ui.label("Clip:");
+                        let current_label = anim_clip_index
+                            .and_then(|i| anim_clip_names.get(i))
+                            .map_or("(none)", |s| s.as_str());
+                        egui::ComboBox::from_id_salt("anim_clip")
+                            .selected_text(current_label)
+                            .show_ui(ui, |ui| {
+                                for (i, name) in anim_clip_names.iter().enumerate() {
+                                    if ui.selectable_value(&mut anim_clip_index, Some(i), name).clicked() {
+                                        anim_time = 0.0;
+                                    }
+                                }
+                            });
+                    }
+                    ui.separator();
+
+                    // Node hierarchy tree
+                    ui.label("Nodes:");
+                    egui::ScrollArea::vertical().max_height(400.0).show(ui, |ui| {
+                        for (name, idx, has_mesh, parent) in &anim_nodes {
+                            let depth = {
+                                let mut d = 0usize;
+                                let mut cur: Option<usize> = *parent;
+                                while let Some(p) = cur {
+                                    d += 1;
+                                    cur = anim_nodes.get(p).and_then(|n| n.3);
+                                }
+                                d
+                            };
+                            let indent = "  ".repeat(depth);
+                            let icon = if *has_mesh { "\u{25A0}" } else { "\u{25CB}" };
+                            let sel = rmesh_interact::Selection::Node(*idx);
+                            let selected = new_selected == Some(sel);
+                            if ui
+                                .selectable_label(selected, format!("{}{} {}", indent, icon, name))
+                                .clicked()
+                            {
+                                new_selected = if selected { None } else { Some(sel) };
+                            }
+                        }
+                    });
+                    if matches!(new_selected, Some(rmesh_interact::Selection::Node(_))) {
+                        ui.separator();
+                        if ui.button("Delete Node").clicked() {
+                            delete_selected = true;
+                        }
+                    }
+                });
+            }
+
+            // Animation timeline (bottom panel, shown when a scene is loaded with clips)
+            if anim_scene_name.is_some() && !anim_clip_names.is_empty() {
+                egui::TopBottomPanel::bottom("anim_timeline").show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        // Go to start
+                        if ui.small_button("\u{23EE}").on_hover_text("Go to start").clicked() {
+                            anim_goto_start = true;
+                        }
+                        // Play/Pause toggle
+                        let play_label = if anim_playing { "\u{23F8}" } else { "\u{25B6}" };
+                        if ui.small_button(play_label).on_hover_text(if anim_playing { "Pause" } else { "Play" }).clicked() {
+                            anim_playing = !anim_playing;
+                        }
+                        // Go to end
+                        if ui.small_button("\u{23ED}").on_hover_text("Go to end").clicked() {
+                            anim_goto_end = true;
+                        }
+                        // Loop toggle
+                        let loop_label = if anim_looping { "\u{1F501}" } else { "\u{27A1}" };
+                        if ui.small_button(loop_label).on_hover_text(if anim_looping { "Looping" } else { "Play once" }).clicked() {
+                            anim_looping = !anim_looping;
+                        }
+                        ui.separator();
+                        // Time scrubber
+                        let max_t = if anim_duration > 0.0 { anim_duration } else { 1.0 };
+                        ui.add(
+                            egui::Slider::new(&mut anim_time, 0.0..=max_t)
+                                .text("")
+                                .show_value(false)
+                                .min_decimals(2)
+                                .max_decimals(2),
+                        );
+                        // Time display
+                        ui.label(format!("{:.2}s / {:.2}s", anim_time, anim_duration));
+                        ui.separator();
+                        // Speed
+                        ui.label("Speed:");
+                        ui.add(egui::DragValue::new(&mut anim_speed).range(0.0..=5.0).speed(0.05).suffix("x"));
+                    });
+                });
+            }
+
+            // Transform HUD overlay (centered at bottom, below timeline if present)
             if let Some(ref info) = interact_display {
                 egui::TopBottomPanel::bottom("interact_hud").show(ctx, |ui| {
                     ui.horizontal_centered(|ui| {
@@ -420,6 +581,135 @@ impl App {
         self.ambient = ambient;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
+        self.flare_system.density_threshold = density_threshold;
+        self.flare_system.force_dsm_recompute = force_dsm_recompute;
+        self.flare_system.show_collision_mesh = show_collision_mesh;
+
+        // Build/rebuild collision mesh if threshold changed (or first time showing)
+        if show_collision_mesh || self.flare_system.flare_count() > 0 {
+            self.flare_system.ensure_collision_mesh(&self.scene_data);
+        }
+
+        // Upload collision debug mesh to GPU if dirty
+        if self.flare_system.collision_mesh_dirty {
+            if let Some(verts) = self.flare_system.collision_debug_vertices() {
+                gpu.primitive_geometry.set_collision_mesh(&gpu.device, &verts);
+            } else {
+                gpu.primitive_geometry.set_collision_mesh(&gpu.device, &[]);
+            }
+            self.flare_system.collision_mesh_dirty = false;
+        }
+
+        if shoot_flare {
+            let fwd = (self.camera.orbit_target - self.camera.position).normalize();
+            self.flare_system.shoot(
+                self.camera.position,
+                fwd,
+                &mut self.primitives,
+                &mut self.next_primitive_id,
+            );
+        }
+        if clear_flares {
+            self.flare_system.clear(&mut self.primitives);
+        }
+
+        // Write back animation playback state
+        if let Some(ref mut scene) = self.animated_scene {
+            scene.playback.playing = anim_playing;
+            scene.playback.looping = anim_looping;
+            scene.playback.speed = anim_speed;
+            scene.playback.time = anim_time;
+            scene.playback.clip_index = anim_clip_index;
+            if anim_goto_start {
+                scene.playback.time = 0.0;
+            }
+            if anim_goto_end {
+                scene.playback.time = scene.current_duration();
+                scene.playback.playing = false;
+            }
+        }
+        if unload_scene {
+            self.animated_scene = None;
+            gpu.primitive_geometry.set_custom_meshes(&gpu.device, &[]);
+            gpu.material_registry.clear();
+        }
+
+        // Handle .glb file load dialog
+        if load_glb {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("glTF", &["glb", "gltf"])
+                .pick_file()
+            {
+                log::info!("Loading animation file: {}", path.display());
+                match rmesh_anim::gltf_loader::load_gltf(&path) {
+                    Ok(gltf_scene) => {
+                        // Upload custom meshes to GPU (with UVs and tangents)
+                        let prim_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
+                            .meshes
+                            .iter()
+                            .map(|m| {
+                                (0..m.vertices.len())
+                                    .map(|i| rmesh_compositor::PrimitiveVertex {
+                                        position: m.vertices[i],
+                                        normal: m.normals[i],
+                                        uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
+                                        tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        gpu.primitive_geometry
+                            .set_custom_meshes(&gpu.device, &prim_verts);
+
+                        // Upload material textures
+                        let tex_data: Vec<rmesh_compositor::TextureData> = gltf_scene
+                            .textures
+                            .iter()
+                            .map(|t| rmesh_compositor::TextureData {
+                                width: t.width,
+                                height: t.height,
+                                pixels: t.pixels.clone(),
+                            })
+                            .collect();
+                        let mat_defs: Vec<rmesh_compositor::MaterialDef> = gltf_scene
+                            .materials
+                            .iter()
+                            .map(|m| rmesh_compositor::MaterialDef {
+                                base_color_factor: m.base_color_factor,
+                                roughness_factor: m.roughness_factor,
+                                metallic_factor: m.metallic_factor,
+                                occlusion_strength: m.occlusion_strength,
+                                normal_scale: m.normal_scale,
+                                base_color_texture: m.base_color_texture,
+                                metallic_roughness_texture: m.metallic_roughness_texture,
+                                normal_texture: m.normal_texture,
+                                occlusion_texture: m.occlusion_texture,
+                            })
+                            .collect();
+                        gpu.material_registry.upload(
+                            &gpu.device,
+                            &gpu.queue,
+                            &tex_data,
+                            &mat_defs,
+                        );
+
+                        let mesh_count = gltf_scene.meshes.len();
+                        let node_count = gltf_scene.scene.nodes.len();
+                        let clip_count = gltf_scene.scene.clips.len();
+                        let tex_count = gltf_scene.textures.len();
+                        let mat_count = gltf_scene.materials.len();
+                        log::info!(
+                            "Loaded glTF: {} meshes, {} nodes, {} clips, {} textures, {} materials",
+                            mesh_count, node_count, clip_count, tex_count, mat_count,
+                        );
+                        self.animated_scene = Some(gltf_scene.scene);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to load glTF: {}", e);
+                    }
+                }
+            }
+        }
 
         // Handle shadow test scene
         if add_shadow_test_scene {
@@ -464,13 +754,22 @@ impl App {
             self.next_primitive_id += 1;
             self.primitives.push(Primitive::new(kind, name));
             let idx = self.primitives.len() - 1;
-            self.interaction.set_selected(Some(idx));
+            self.interaction.set_selected(Some(rmesh_interact::Selection::Primitive(idx)));
         } else if delete_selected {
-            if let Some(idx) = self.interaction.selected() {
-                if idx < self.primitives.len() {
-                    self.primitives.remove(idx);
-                    self.interaction.set_selected(None);
+            match self.interaction.selected() {
+                Some(rmesh_interact::Selection::Primitive(idx)) => {
+                    if idx < self.primitives.len() {
+                        self.primitives.remove(idx);
+                        self.interaction.set_selected(None);
+                    }
                 }
+                Some(rmesh_interact::Selection::Node(idx)) => {
+                    if let Some(ref mut scene) = self.animated_scene {
+                        scene.remove_node_and_descendants(idx);
+                        self.interaction.set_selected(None);
+                    }
+                }
+                None => {}
             }
         } else {
             self.interaction.set_selected(new_selected);
@@ -596,25 +895,35 @@ impl App {
         // 1. Primitive pass first: renders to volume color target + primitive depth target
         //    (clears both even if no primitives, so forward pass can use LoadOp::Load)
         {
-            // Temporarily apply preview transform so the grabbed object follows the mouse
-            let preview_restore = if self.show_primitives {
-                if let Some(idx) = self.interaction.selected() {
-                    let ctx = InteractContext {
-                        view_matrix: view_mat,
-                        proj_matrix: proj_mat,
-                        viewport_width: w as f32,
-                        viewport_height: h as f32,
-                    };
-                    if let Some(preview) = self.interaction.preview_transform(&ctx) {
-                        if idx < self.primitives.len() {
+            // Temporarily apply preview transform so the grabbed entity follows the mouse.
+            // For primitives we patch in place and restore after the pass.
+            // For scene nodes we patch world_transform; it gets overwritten by the next
+            // animated_scene.update() call, so no explicit restore is needed.
+            let preview_restore: Option<(usize, rmesh_interact::Transform)> = if self.show_primitives {
+                let ctx = InteractContext {
+                    view_matrix: view_mat,
+                    proj_matrix: proj_mat,
+                    viewport_width: w as f32,
+                    viewport_height: h as f32,
+                };
+                if let Some(preview) = self.interaction.preview_transform(&ctx) {
+                    match self.interaction.selected() {
+                        Some(rmesh_interact::Selection::Primitive(idx))
+                            if idx < self.primitives.len() =>
+                        {
                             let original = self.primitives[idx].transform;
                             self.primitives[idx].transform = preview;
                             Some((idx, original))
-                        } else {
+                        }
+                        Some(rmesh_interact::Selection::Node(idx)) => {
+                            if let Some(ref mut scene) = self.animated_scene {
+                                if idx < scene.nodes.len() {
+                                    scene.nodes[idx].world_transform = preview;
+                                }
+                            }
                             None
                         }
-                    } else {
-                        None
+                        _ => None,
                     }
                 } else {
                     None
@@ -633,6 +942,20 @@ impl App {
                 None
             };
 
+            // Build combined primitive list: manual primitives + animated scene nodes
+            let combined_primitives: Vec<Primitive>;
+            let render_prims: &[Primitive] = if self.show_primitives {
+                let mut prims = self.primitives.clone();
+                if let Some(ref scene) = self.animated_scene {
+                    prims.extend(scene.render_primitives());
+                }
+                combined_primitives = prims;
+                &combined_primitives
+            } else {
+                combined_primitives = Vec::new();
+                &combined_primitives
+            };
+
             record_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
@@ -640,10 +963,24 @@ impl App {
                 &gpu.primitive_geometry,
                 &gpu.targets.color_view,
                 &gpu.primitive_targets.depth_view,
-                if self.show_primitives { &self.primitives } else { &[] },
+                render_prims,
                 &vp,
                 mrt_views,
+                Some(&gpu.material_registry),
             );
+
+            // Collision debug mesh overlay
+            if self.flare_system.show_collision_mesh {
+                rmesh_compositor::record_collision_debug_pass(
+                    &mut encoder,
+                    &gpu.queue,
+                    &gpu.primitive_pipeline,
+                    &gpu.primitive_geometry,
+                    &gpu.primitive_targets.color_view,
+                    &gpu.primitive_targets.depth_view,
+                    &vp,
+                );
+            }
 
             // Restore original transform after rendering
             if let Some((idx, original)) = preview_restore {
@@ -862,8 +1199,8 @@ impl App {
                             gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
                                 position: prim.transform.position.to_array(),
                                 light_type: 0, // point
-                                color: [1.0, 1.0, 1.0],
-                                intensity: 1.0,
+                                color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
+                                intensity: prim.color.map_or(1.0, |c| c[3]),
                                 direction: [0.0, 0.0, -1.0],
                                 inner_angle: 0.0,
                                 outer_angle: 0.0,
@@ -876,8 +1213,8 @@ impl App {
                             gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
                                 position: prim.transform.position.to_array(),
                                 light_type: 1, // spot
-                                color: [1.0, 1.0, 1.0],
-                                intensity: 1.0,
+                                color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
+                                intensity: prim.color.map_or(1.0, |c| c[3]),
                                 direction: forward.to_array(),
                                 inner_angle: 20.0_f32.to_radians(),
                                 outer_angle: 35.0_f32.to_radians(),
@@ -892,7 +1229,9 @@ impl App {
                 // DSM shadows only for actual scene lights (before adding default camera light)
                 let scene_light_count = num_lights;
                 let scene_lights = &gpu_lights[..scene_light_count as usize];
-                let lights_changed = scene_light_count != self.cached_dsm_num_lights
+                let lights_changed = self.flare_system.force_dsm_recompute
+                    || self.flare_system.has_moving_flares()
+                    || scene_light_count != self.cached_dsm_num_lights
                     || scene_lights != &self.cached_dsm_lights[..];
 
                 if lights_changed {
@@ -1010,7 +1349,7 @@ impl App {
                     near_plane: self.camera.near_z,
                     far_plane: self.camera.far_z,
                     dsm_enabled,
-                    _pad: 0.0,
+                    _pad: 0,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,

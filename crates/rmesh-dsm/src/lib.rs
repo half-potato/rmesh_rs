@@ -492,12 +492,30 @@ pub fn record_dsm_primitive_pass(
     rpass.set_scissor_rect(0, 0, width, height);
     rpass.set_pipeline(&pipeline.render_pipeline);
     rpass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+    let mut using_custom_vb = false;
 
     for (i, prim) in primitives.iter().take(count).enumerate() {
         let offset = i as u32 * DSM_PRIM_UNIFORM_ALIGN as u32;
         rpass.set_bind_group(0, &pipeline.bind_group, &[offset]);
-        let slice = geometry.kinds[prim.kind.index()];
-        rpass.draw(slice.offset..slice.offset + slice.count, 0..1);
+
+        if let rmesh_interact::PrimitiveKind::CustomMesh(mesh_id) = prim.kind {
+            if let (Some(ref cvb), Some(slice)) =
+                (&geometry.custom_vertex_buffer, geometry.custom_meshes.get(mesh_id))
+            {
+                if !using_custom_vb {
+                    rpass.set_vertex_buffer(0, cvb.slice(..));
+                    using_custom_vb = true;
+                }
+                rpass.draw(slice.offset..slice.offset + slice.count, 0..1);
+            }
+        } else {
+            if using_custom_vb {
+                rpass.set_vertex_buffer(0, geometry.vertex_buffer.slice(..));
+                using_custom_vb = false;
+            }
+            let slice = geometry.kinds[prim.kind.index()];
+            rpass.draw(slice.offset..slice.offset + slice.count, 0..1);
+        }
     }
 }
 

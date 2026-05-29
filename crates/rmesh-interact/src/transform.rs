@@ -33,6 +33,8 @@ pub enum PrimitiveKind {
     Cylinder,
     PointLight,
     SpotLight,
+    /// Custom mesh loaded from glTF. The `usize` indexes into the compositor's custom mesh registry.
+    CustomMesh(usize),
 }
 
 impl PrimitiveKind {
@@ -44,9 +46,11 @@ impl PrimitiveKind {
             Self::Cylinder => "Cylinder",
             Self::PointLight => "Point Light",
             Self::SpotLight => "Spot Light",
+            Self::CustomMesh(_) => "Mesh",
         }
     }
 
+    /// Index into the built-in geometry kinds array. Panics for `CustomMesh`.
     pub fn index(self) -> usize {
         match self {
             Self::Cube => 0,
@@ -55,16 +59,36 @@ impl PrimitiveKind {
             Self::Cylinder => 3,
             Self::PointLight => 1, // Render as sphere gizmo
             Self::SpotLight => 1,  // Render as sphere gizmo
+            Self::CustomMesh(_) => panic!("CustomMesh has no built-in geometry index"),
+        }
+    }
+
+    pub fn is_custom_mesh(self) -> bool {
+        matches!(self, Self::CustomMesh(_))
+    }
+
+    pub fn custom_mesh_index(self) -> Option<usize> {
+        match self {
+            Self::CustomMesh(i) => Some(i),
+            _ => None,
         }
     }
 }
 
-/// A named primitive with a transform.
+/// A named primitive with a transform and material properties.
 #[derive(Debug, Clone)]
 pub struct Primitive {
     pub kind: PrimitiveKind,
     pub transform: Transform,
     pub name: String,
+    /// Per-instance color override. `None` uses the default color for the primitive kind.
+    pub color: Option<[f32; 4]>,
+    /// PBR roughness factor (0.0 = mirror, 1.0 = fully rough). Default 1.0.
+    pub roughness: f32,
+    /// PBR metallic factor (0.0 = dielectric, 1.0 = metal). Default 0.0.
+    pub metallic: f32,
+    /// Index into the compositor's MaterialRegistry for texture lookups.
+    pub material_index: Option<usize>,
 }
 
 impl Primitive {
@@ -73,6 +97,10 @@ impl Primitive {
             kind,
             transform: Transform::default(),
             name: name.into(),
+            color: None,
+            roughness: 1.0,
+            metallic: 0.0,
+            material_index: None,
         }
     }
 }
