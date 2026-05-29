@@ -4,10 +4,14 @@
 // distance, and evaluates the volume rendering integral.
 //
 // MRT outputs (all Rgba16Float, .a = alpha for correct hardware blend):
-//   location(0): plaster.rgb * a, a
-//   location(1): roughness * a, env_f0 * a, env_f1 * a, a
+//   location(0): albedo.rgb * a, a
+//   location(1): roughness * a, f0_dielectric * a, metallic * a, a
 //   location(2): field_gradient.xyz * a, a  — raw, normalized only in deferred
-//   location(3): albedo.rgb * a, a
+//   location(3): expected_depth * a, 0, expected_z2 * a, a
+//
+// Channel order in slot 1 matches the glTF primitive_mrt convention so the
+// deferred shader can read metallic from .b uniformly across volumes and
+// primitives.
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -37,7 +41,7 @@ struct Uniforms {
 @group(0) @binding(4) var<storage, read> vertex_normals: array<f32>;  // [V * 3]
 @group(0) @binding(5) var<storage, read> tet_indices: array<u32>;     // [M * 4]
 
-const AUX_DIM: u32 = 8u;
+const AUX_DIM: u32 = 6u;
 
 struct FragmentInput {
     @location(0) depths: vec2<f32>,                  // (z_front_ndc, z_back_ndc)
@@ -110,33 +114,62 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let alpha_t = exp(-od);
     let alpha = 1.0 - alpha_t;
 
-    // Per-tet aux channels lookup
+    // Per-tet aux channels lookup (parametric BRDF layout, AUX_DIM=6).
     let aux_base = in.tet_id * AUX_DIM;
-    let roughness = aux_data[aux_base + 0u];
-    let env_f0 = aux_data[aux_base + 1u];
-    let env_f1 = aux_data[aux_base + 2u];
-    let env_f2 = aux_data[aux_base + 3u];
-    let env_f3 = aux_data[aux_base + 4u];
-    let alb_r = aux_data[aux_base + 5u];
-    let alb_g = aux_data[aux_base + 6u];
-    let alb_b = aux_data[aux_base + 7u];
+    let roughness     = aux_data[aux_base + 0u];
+    let metallic      = aux_data[aux_base + 1u];
+    let f0_dielectric = aux_data[aux_base + 2u];
+    let alb_r         = aux_data[aux_base + 3u];
+    let alb_g         = aux_data[aux_base + 4u];
+    let alb_b         = aux_data[aux_base + 5u];
 
     // Slot 0: albedo (flat per tet, premultiplied alpha)
     let albedo = vec3f(alb_r, alb_g, alb_b);
     out.color = vec4f(albedo * alpha, alpha);
 
-    // Slot 1: aux (roughness, env features)
-    out.aux0 = vec4f(roughness * alpha, env_f0 * alpha, env_f1 * alpha, alpha);
+    // Slot 1: PBR material (roughness, f0_dielectric, metallic) — metallic in
+    // .b to match primitive_mrt's glTF convention.
+    out.aux0 = vec4f(roughness * alpha, f0_dielectric * alpha, metallic * alpha, alpha);
 
     // Slot 2: normals (raw gradient, normalized in deferred)
     out.normals = vec4f(in.field_gradient * alpha, alpha);
 
-    // Slot 3: expected termination depth + env_f2/f3
-    let phi_val = phi(od);
-    let w0 = phi_val - alpha_t;   // weight for back (z_b)
-    let w1 = 1.0 - phi_val;       // weight for front (z_f)
-    let depth_premul = w0 * z_b + w1 * z_f;
-    out.expected_depth = vec4f(depth_premul, env_f2 * alpha, env_f3 * alpha, alpha);
+    // Slot 3: expected termination depth + E[z²] (for std). .g is unused
+    // (formerly retro * alpha; left at 0). .b holds the second-moment
+    // contribution, composited via the same premul-alpha blend as .r.
+    //
+    // Exact within-segment α·E[z²] for the exponential termination distribution
+    // on [z_f, z_b] (PDF f(z) = σ_eff · exp(−σ_eff(z−z_f))):
+    //   α·E[z²] = w0·z_b² + w1·z_f² − L² · correction(od)
+    // where correction(od) = w0 + α_t − 2·w0/od ≥ 0 measures how much the
+    // 2-point upper bound at the extremes overshoots the true exponential.
+    // For small od the direct form has catastrophic cancellation; Taylor:
+    //   correction(od) ≈ od/6 − od²/12 + od³/40
+    //
+    // Thin-tet filter: emit (0,0,0,0) when fragment α is below threshold so
+    // premul-alpha blending becomes a pass-through (dst·(1-0) = dst). Slot 3
+    // therefore tracks "thick tets only" — its α lags color's α at pixels
+    // covered by thin haze, and consumers (pixel_std, the deferred shader's
+    // depth normalization) must divide by depth_raw.a, NOT color's alpha.
+    if (alpha > 0.002) {
+        let phi_val = phi(od);
+        let w0 = phi_val - alpha_t;   // weight for back (z_b)
+        let w1 = 1.0 - phi_val;       // weight for front (z_f)
+        let depth_premul = w0 * z_b + w1 * z_f;
+
+        var correction: f32;
+        if (abs(od) < 0.02) {
+            correction = od * ((1.0/6.0) - od * ((1.0/12.0) - od * (1.0/40.0)));
+        } else {
+            correction = w0 + alpha_t - 2.0 * w0 / od;
+        }
+        let L = z_b - z_f;
+        let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
+
+        out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
+    } else {
+        out.expected_depth = vec4f(0.0, 0.0, 0.0, 0.0);
+    }
 
     return out;
 }

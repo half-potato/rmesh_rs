@@ -114,6 +114,10 @@ pub struct PbrData {
     /// Monotonic spline tone curve [y_knots..., slope, intercept, intercept_bias] f32.
     /// n_knots = len - 3. X knots are implicit linspace(0, 1, n_knots).
     pub tone_curve: Vec<f32>,
+    /// Per-tet metallic factor [M] f32 in [0,1] (parametric BRDF).
+    pub metallic: Vec<f32>,
+    /// Per-tet F0 for dielectrics [M] f32 (parametric BRDF, typically ~0.04).
+    pub f0_dielectric: Vec<f32>,
 }
 
 /// Load a .rmesh file (gzip-compressed binary).
@@ -396,6 +400,8 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
     let mut albedo = Vec::new();
     let mut vertex_normals = Vec::new();
     let mut tone_curve = Vec::new();
+    let mut metallic = Vec::new();
+    let mut f0_dielectric = Vec::new();
 
     for _ in 0..num_sections {
         if *offset + 16 > data.len() {
@@ -450,6 +456,12 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
             "tone_curve" => {
                 tone_curve = f16_payload_to_f32(payload, dtype);
             }
+            "metallic" => {
+                metallic = f16_payload_to_f32(payload, dtype);
+            }
+            "f0_dielectric" => {
+                f0_dielectric = f16_payload_to_f32(payload, dtype);
+            }
             other => {
                 log::info!("  skipping unknown section '{}'", other);
             }
@@ -467,6 +479,8 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
         albedo,
         vertex_normals,
         tone_curve,
+        metallic,
+        f0_dielectric,
     })
 }
 

@@ -163,6 +163,40 @@ pub struct GpuState {
     // Deferred PBR shading (only when PBR data is loaded)
     pub deferred_pipeline: Option<rmesh_render::DeferredShadePipeline>,
     pub deferred_bg: Option<wgpu::BindGroup>,
+    /// GTAO ambient-occlusion pass (always created; AO target lives in `targets`).
+    pub gtao_pipeline: rmesh_render::GtaoPipeline,
+    pub gtao_bg: wgpu::BindGroup,
+    /// Hi-Z mip pyramid (linear view-space Z fused from hw + volume depth).
+    /// Built each frame before GTAO; will also feed SSGI.
+    pub hiz_pipelines: rmesh_render::HizPipelines,
+    pub hiz_texture: rmesh_render::HizTexture,
+    pub hiz_linearize_bg: wgpu::BindGroup,
+    pub hiz_downsample_bgs: Vec<wgpu::BindGroup>,
+    /// AO bilateral blur (depth+normal aware). Two passes (H, V) using one
+    /// pipeline; ping-pongs between `targets.ao_view` and `ao_blur_temp_view`.
+    pub ao_blur_pipeline: rmesh_render::AoBlurPipeline,
+    pub ao_blur_bg_h: wgpu::BindGroup,
+    pub ao_blur_bg_v: wgpu::BindGroup,
+    /// SSGI compute (Hi-Z ray-march, samples lit_history) + bilateral denoise.
+    pub ssgi_pipeline: rmesh_render::SsgiPipeline,
+    pub ssgi_bg: wgpu::BindGroup,
+    pub ssgi_blur_pipeline: rmesh_render::SsgiBlurPipeline,
+    pub ssgi_blur_bg_h: wgpu::BindGroup,
+    pub ssgi_blur_bg_v: wgpu::BindGroup,
+    /// Temporal accumulation pipelines for SSGI (Rgba16Float) and AO (R8Unorm).
+    /// One shared shader, two pipelines per output format.
+    pub ssgi_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssgi_temporal_bg: wgpu::BindGroup,
+    pub ao_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ao_temporal_bg: wgpu::BindGroup,
+    /// SSR (specular reflections via Hi-Z reflection-direction ray-march) +
+    /// its temporal pipeline (third instance of TemporalPipeline, Rgba16Float).
+    pub ssr_pipeline: rmesh_render::SsrPipeline,
+    pub ssr_bg: wgpu::BindGroup,
+    pub ssr_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssr_temporal_bg: wgpu::BindGroup,
+    /// Frame counter for SSGI per-pixel jitter rotation.
+    pub frame_counter: u32,
     /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
     pub deferred_output: Option<wgpu::Texture>,
     pub deferred_output_view: Option<wgpu::TextureView>,

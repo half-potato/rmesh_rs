@@ -52,6 +52,9 @@ impl App {
         let view_mat = self.camera.view_matrix();
         let proj_mat = self.camera.projection_matrix(aspect);
         let vp = proj_mat * view_mat;
+        // Snapshot the previous frame's view-projection BEFORE any state
+        // update — the temporal pass needs it to reproject the history sample.
+        let prev_vp_snapshot = self.prev_view_proj;
 
         let inv_view = view_mat.inverse();
         let cam_right = inv_view.col(0).truncate();
@@ -96,7 +99,13 @@ impl App {
                     (ts[4].wrapping_sub(ts[1])) as f64 * p
                 };
                 let render = (ts[5].wrapping_sub(ts[4])) as f64 * p;
-                let sh = (ts[7].wrapping_sub(ts[6])) as f64 * p;
+                // SH eval queries (slots 6..8) are only written when sh_degree > 0;
+                // see comment near resolve_query_set.
+                let sh = if gpu.sh_degree > 0 && ts.len() >= 8 {
+                    (ts[7].wrapping_sub(ts[6])) as f64 * p
+                } else {
+                    0.0
+                };
                 let total = sh + project + sort + prepass + render;
 
                 gpu.gpu_times_ms = GpuTimings {
@@ -149,7 +158,7 @@ impl App {
                 return;
             }
             Err(e) => {
-                log::error!("Surface error: {:?}", e);
+                log::error!("Surface error: {:?} (waited {:.1}ms)", e, t_before_acquire.elapsed().as_secs_f64() * 1000.0);
                 return;
             }
         };
@@ -219,6 +228,16 @@ impl App {
         let rt_locate_ms = self.rt_locate_ms;
         let mut deferred_enabled = self.deferred_enabled;
         let mut ambient = self.ambient;
+        let mut sky_color = self.sky_color;
+        let mut ground_color = self.ground_color;
+        let mut exposure = self.exposure;
+        let mut ao_strength = self.ao_strength;
+        let mut gtao_radius = self.gtao_radius;
+        let mut ssgi_strength = self.ssgi_strength;
+        let mut ssgi_radius = self.ssgi_radius;
+        let mut ssgi_temporal_alpha = self.ssgi_temporal_alpha;
+        let mut ao_temporal_alpha = self.ao_temporal_alpha;
+        let mut ssr_temporal_alpha = self.ssr_temporal_alpha;
         let mut deferred_debug_mode = self.deferred_debug_mode;
         let mut dsm_query_depth = self.dsm_query_depth;
         let mut load_glb = false;
@@ -288,19 +307,34 @@ impl App {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
                             ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient"));
+                            ui.add(egui::Slider::new(&mut exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
+                            ui.add(egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
+                            ui.add(egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
+                            ui.add(egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
+                            ui.add(egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
+                            ui.add(egui::Slider::new(&mut ao_temporal_alpha, 0.0..=1.0).text("AO Temporal α"));
+                            ui.add(egui::Slider::new(&mut ssgi_temporal_alpha, 0.0..=1.0).text("SSGI Temporal α"));
+                            ui.add(egui::Slider::new(&mut ssr_temporal_alpha, 0.0..=1.0).text("SSR Temporal α"));
+                            ui.horizontal(|ui| {
+                                ui.label("Sky");
+                                ui.color_edit_button_rgb(&mut sky_color);
+                                ui.label("Ground");
+                                ui.color_edit_button_rgb(&mut ground_color);
+                            });
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
-                                "Roughness", "Env Feature", "Depth", "Specular",
-                                "Diffuse", "Shadow", "Metallic", "Occlusion",
+                                "Roughness", "PBR (R/M/F0)", "Depth", "Specular",
+                                "Diffuse", "Shadow", "Lambda",
                                 "Plaster", "Alpha", "Primitives", "DSM",
-                                "DSM Depth", "DSM Face", "DSM UV",
+                                "AO", "SSGI", "Lit History", "SSR",
+                                "Depth Std",
                             ];
                             ui.separator();
                             ui.label("Debug Layer");
                             for (i, label) in debug_labels.iter().enumerate() {
                                 ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
                             }
-                            if deferred_debug_mode == 15 {
+                            if deferred_debug_mode == 14 {
                                 ui.separator();
                                 ui.add(egui::Slider::new(&mut dsm_query_depth, self.camera.near_z..=self.camera.far_z)
                                     .logarithmic(true)
@@ -579,6 +613,18 @@ impl App {
         self.sort_16bit = sort_16bit;
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
+        self.sky_color = sky_color;
+        self.ground_color = ground_color;
+        self.exposure = exposure;
+        self.ao_strength = ao_strength;
+        self.gtao_radius = gtao_radius;
+        self.ssgi_strength = ssgi_strength;
+        self.ssgi_radius = ssgi_radius;
+        self.ssgi_temporal_alpha = ssgi_temporal_alpha;
+        self.ao_temporal_alpha = ao_temporal_alpha;
+        self.ssr_temporal_alpha = ssr_temporal_alpha;
+        // Track current vp so next frame's temporal pass can reproject.
+        self.prev_view_proj = vp;
         self.deferred_debug_mode = deferred_debug_mode;
         self.dsm_query_depth = dsm_query_depth;
         self.flare_system.density_threshold = density_threshold;
@@ -991,7 +1037,7 @@ impl App {
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 14);
+        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 13);
         if skip_volume && mrt_enabled {
             // Clear MRT targets when volume is skipped to avoid ghosting
             let clear_ops = wgpu::Operations {
@@ -1349,25 +1395,346 @@ impl App {
                     near_plane: self.camera.near_z,
                     far_plane: self.camera.far_z,
                     dsm_enabled,
-                    _pad: 0,
+                    exposure: self.exposure,
+                    sky_color: self.sky_color,
+                    ao_strength: self.ao_strength,
+                    ground_color: self.ground_color,
+                    ssgi_strength: self.ssgi_strength,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf, 0,
                     bytemuck::bytes_of(&deferred_uniforms),
                 );
 
-                // Record deferred shade pass — writes to separate output texture
+                // GTAO uniforms — driven from the same camera matrices.
+                let proj_cols = proj_mat.to_cols_array_2d();
+                let proj_scale = proj_cols[1][1] * (h as f32) * 0.5;
+                let gtao_uniforms = rmesh_render::GtaoUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    radius_world: self.gtao_radius,
+                    thickness: self.gtao_radius * 4.0,
+                    proj_scale,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.gtao_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&gtao_uniforms),
+                );
+
+                // Hi-Z build: linearize fused depth into mip 0, then min-down each mip.
+                let hiz_uniforms = rmesh_render::HizUniforms {
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.hiz_pipelines.uniforms_buf, 0,
+                    bytemuck::bytes_of(&hiz_uniforms),
+                );
+                rmesh_render::record_hiz_pass(
+                    &mut encoder, &gpu.hiz_pipelines, &gpu.hiz_texture,
+                    &gpu.hiz_linearize_bg, &gpu.hiz_downsample_bgs,
+                );
+
+                // GTAO pass: Hi-Z + normals + volume depth → AO texture
+                rmesh_render::record_gtao_pass(
+                    &mut encoder, &gpu.gtao_pipeline, &gpu.gtao_bg, &gpu.targets.ao_view,
+                );
+
+                // Per-frame matrices for the temporal pass: current inv_vp +
+                // previous-frame view-projection (inline camera motion vectors).
+                let cur_vp = vp;
+                let cur_inv_vp = cur_vp.inverse();
+                let prev_vp_mat = prev_vp_snapshot;
+
+                // AO temporal: ao_view + ao_history → ao_temporal_view
+                let ao_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ao_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ao_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ao_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ao_temporal_pipeline, &gpu.ao_temporal_bg,
+                    &gpu.targets.ao_temporal_view,
+                );
+
+                // Bilateral AO blur — H reads ao_temporal_view, V writes ao_view.
+                let blur_h = rmesh_render::AoBlurUniforms {
+                    dir_x: 1, dir_y: 0,
+                    sigma_z: self.gtao_radius * 0.25,
+                    sigma_n: 8.0,
+                };
+                let blur_v = rmesh_render::AoBlurUniforms {
+                    dir_x: 0, dir_y: 1,
+                    sigma_z: self.gtao_radius * 0.25,
+                    sigma_n: 8.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ao_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&blur_h),
+                );
+                gpu.queue.write_buffer(
+                    &gpu.ao_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&blur_v),
+                );
+                // H: ao_temporal_view → ao_blur_temp_view
+                rmesh_render::record_ao_blur_pass(
+                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_h,
+                    &gpu.targets.ao_blur_temp_view,
+                );
+                // V: ao_blur_temp_view → ao_view (final, deferred reads this)
+                rmesh_render::record_ao_blur_pass(
+                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_v,
+                    &gpu.targets.ao_view,
+                );
+
+                // Copy ao_view → ao_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ao_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ao_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
+                // The ssgi_radius bounds ray length in world units; the
+                // bilateral's sigma_z follows (depth-stop scales with the AO
+                // sampling radius for consistency).
+                gpu.frame_counter = gpu.frame_counter.wrapping_add(1);
+                let ssgi_uniforms = rmesh_render::SsgiUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    proj: proj_mat.to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    inv_view: view_mat.inverse().to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    frame: gpu.frame_counter,
+                    radius_world: self.ssgi_radius,
+                    thickness: self.ssgi_radius * 0.5,
+                    sky_color: self.sky_color,
+                    _pad0: 0.0,
+                    ground_color: self.ground_color,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssgi_uniforms),
+                );
+                rmesh_render::record_ssgi_pass(
+                    &mut encoder, &gpu.ssgi_pipeline, &gpu.ssgi_bg,
+                    &gpu.targets.ssgi_view,
+                );
+
+                // SSGI temporal: ssgi_view + ssgi_history → ssgi_temporal_view
+                let ssgi_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ssgi_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssgi_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ssgi_temporal_pipeline, &gpu.ssgi_temporal_bg,
+                    &gpu.targets.ssgi_temporal_view,
+                );
+
+                let ssgi_blur_h = rmesh_render::SsgiBlurUniforms {
+                    dir_x: 1, dir_y: 0,
+                    sigma_z: self.ssgi_radius * 0.5,
+                    sigma_n: 8.0,
+                };
+                let ssgi_blur_v = rmesh_render::SsgiBlurUniforms {
+                    dir_x: 0, dir_y: 1,
+                    sigma_z: self.ssgi_radius * 0.5,
+                    sigma_n: 8.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&ssgi_blur_h),
+                );
+                gpu.queue.write_buffer(
+                    &gpu.ssgi_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&ssgi_blur_v),
+                );
+                // H: ssgi_temporal_view → ssgi_blur_temp_view
+                rmesh_render::record_ssgi_blur_pass(
+                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_h,
+                    &gpu.targets.ssgi_blur_temp_view,
+                );
+                // V: ssgi_blur_temp_view → ssgi_view (deferred reads this)
+                rmesh_render::record_ssgi_blur_pass(
+                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_v,
+                    &gpu.targets.ssgi_view,
+                );
+
+                // Copy ssgi_view → ssgi_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssgi_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssgi_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // -------- SSR (specular reflections) --------
+                // Single Hi-Z ray-march along reflect(view, N). Same matrices /
+                // dimensions as SSGI; per-pixel jitter on the start step is
+                // the only randomness (no Monte Carlo over a lobe).
+                let ssr_uniforms = rmesh_render::SsrUniforms {
+                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                    proj: proj_mat.to_cols_array_2d(),
+                    view: view_mat.to_cols_array_2d(),
+                    inv_view: view_mat.inverse().to_cols_array_2d(),
+                    width: w,
+                    height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    frame: gpu.frame_counter,
+                    radius_world: self.ssgi_radius,
+                    thickness: self.ssgi_radius * 0.5,
+                    sky_color: self.sky_color,
+                    _pad0: 0.0,
+                    ground_color: self.ground_color,
+                    _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssr_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssr_uniforms),
+                );
+                rmesh_render::record_ssr_pass(
+                    &mut encoder, &gpu.ssr_pipeline, &gpu.ssr_bg,
+                    &gpu.targets.ssr_view,
+                );
+
+                // SSR temporal: ssr_view (current) + ssr_history → ssr_temporal_view
+                let ssr_temporal_uniforms = rmesh_render::TemporalUniforms {
+                    inv_vp: cur_inv_vp.to_cols_array_2d(),
+                    prev_vp: prev_vp_mat.to_cols_array_2d(),
+                    width: w, height: h,
+                    near: self.camera.near_z,
+                    far: self.camera.far_z,
+                    max_mip: gpu.hiz_texture.mip_count - 1,
+                    alpha: self.ssr_temporal_alpha,
+                    _pad0: 0.0, _pad1: 0.0,
+                };
+                gpu.queue.write_buffer(
+                    &gpu.ssr_temporal_pipeline.uniforms_buf, 0,
+                    bytemuck::bytes_of(&ssr_temporal_uniforms),
+                );
+                rmesh_render::record_temporal_pass(
+                    &mut encoder, &gpu.ssr_temporal_pipeline, &gpu.ssr_temporal_bg,
+                    &gpu.targets.ssr_temporal_view,
+                );
+
+                // Copy ssr_temporal_view → ssr_view (final readable form for deferred).
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_temporal_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // Copy ssr_view → ssr_history for next frame's temporal pass.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.ssr_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                );
+
+                // Record deferred shade pass — writes display to deferred_output
+                // (location 0) and the true lit value to lit_current (location 1).
+                // location-1 is immune to debug-mode override, so SSGI's feedback
+                // chain stays valid even while the user is staring at a debug
+                // visualization. We render to lit_current rather than lit_history
+                // because lit_history is sampled in the same pass (binding 9 for
+                // DBG_LIT_HISTORY) and wgpu disallows that combination.
                 let dsm_bg = gpu.deferred_dsm_bg.as_ref()
                     .or(gpu.deferred_dsm_dummy_bg.as_ref())
                     .unwrap();
                 rmesh_render::record_deferred_shade(
                     &mut encoder, deferred, bg, dsm_bg, out_view,
+                    &gpu.targets.lit_current_view,
+                );
+
+                // Copy lit_current → lit_history for next frame's SSGI to sample.
+                encoder.copy_texture_to_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.lit_current_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &gpu.targets.lit_history_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 );
             }
         }
 
         // 3b. DSM debug view
-        let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 15;
+        let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 14;
         if use_dsm_debug {
             // Camera-perspective DSM debug (original mode 15)
             let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
@@ -1457,16 +1824,21 @@ impl App {
         let cur_rb = gpu.ts_frame % 2;
         let ts_buf_free = !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
         if ts_buf_free {
+            // Only resolve slots that are actually written this frame. Slots 6..8 are
+            // SH-eval timestamps and are NOT written when sh_degree == 0 (no SH compute
+            // pass runs). Resolving never-written queries is undefined behavior on Vulkan
+            // and wedges the NVIDIA Linux driver.
+            let written_count: u32 = if gpu.sh_degree > 0 { TS_QUERY_COUNT } else { 6 };
             encoder.resolve_query_set(
                 &gpu.ts_query_set,
-                0..TS_QUERY_COUNT,
+                0..written_count,
                 &gpu.ts_resolve_buf,
                 0,
             );
             encoder.copy_buffer_to_buffer(
                 &gpu.ts_resolve_buf, 0,
                 &gpu.ts_readback[cur_rb], 0,
-                (TS_QUERY_COUNT as u64) * 8,
+                (written_count as u64) * 8,
             );
         }
 
