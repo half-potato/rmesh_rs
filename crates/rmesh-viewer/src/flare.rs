@@ -4,7 +4,8 @@
 //! builds a BVH for fast ray-segment collision, and renders a debug overlay.
 
 use std::collections::HashMap;
-use glam::Vec3;
+use std::path::Path;
+use glam::{Quat, Vec3};
 use rmesh_interact::{Primitive, PrimitiveKind};
 
 const GRAVITY: Vec3 = Vec3::new(0.0, 0.0, 9.81); // +Z is down in COLMAP coords (-Z up)
@@ -15,6 +16,9 @@ const FADE_DURATION: f32 = 5.0;
 const FLARE_COLOR: [f32; 3] = [1.0, 0.85, 0.5];
 const FLARE_INTENSITY: f32 = 2.0;
 const FLARE_RADIUS: f32 = 0.2;
+/// The model is ~17 units tall along its local axis.
+const FLARE_MODEL_HEIGHT: f32 = 17.0;
+const FLARE_MODEL_SCALE: f32 = 2.0 * FLARE_RADIUS / FLARE_MODEL_HEIGHT;
 const BVH_MAX_LEAF: usize = 4;
 
 // -----------------------------------------------------------------------
@@ -372,10 +376,12 @@ fn ray_triangle(origin: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option
 struct Flare {
     position: Vec3,
     velocity: Vec3,
+    /// Normalized velocity direction (preserved when stuck, for model orientation).
+    last_dir: Vec3,
     lifetime: f32,
     stuck: bool,
-    /// Index into the App's primitives vec.
-    primitive_idx: usize,
+    /// Indices into the App's primitives vec (one per mesh in the model).
+    primitive_indices: Vec<usize>,
 }
 
 // -----------------------------------------------------------------------
@@ -388,10 +394,16 @@ pub struct FlareSystem {
     pub force_dsm_recompute: bool,
     pub show_collision_mesh: bool,
     collision_mesh: Option<CollisionMesh>,
-    /// Threshold at which the collision mesh was last built.
     last_built_threshold: f32,
-    /// Whether the debug mesh GPU buffer is stale.
     pub collision_mesh_dirty: bool,
+    /// Number of custom meshes that belong to the flare model.
+    pub flare_mesh_count: usize,
+    /// Base custom mesh index for the flare model meshes.
+    pub flare_mesh_base: usize,
+    /// True when a flare model has been loaded.
+    pub has_flare_model: bool,
+    /// Material indices for each mesh in the flare model.
+    pub flare_material_indices: Vec<usize>,
 }
 
 impl Default for FlareSystem {
@@ -404,6 +416,10 @@ impl Default for FlareSystem {
             collision_mesh: None,
             last_built_threshold: -1.0,
             collision_mesh_dirty: false,
+            flare_mesh_count: 0,
+            flare_mesh_base: 0,
+            has_flare_model: false,
+            flare_material_indices: Vec::new(),
         }
     }
 }
@@ -416,23 +432,41 @@ impl FlareSystem {
         primitives: &mut Vec<Primitive>,
         next_id: &mut u32,
     ) {
-        let name = format!("Flare.{:03}", *next_id);
+        let flare_id = *next_id;
         *next_id += 1;
 
-        let mut prim = Primitive::new(PrimitiveKind::PointLight, name);
-        prim.transform.position = camera_pos;
-        prim.transform.scale = Vec3::splat(FLARE_RADIUS);
-        prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], FLARE_INTENSITY]);
+        let mesh_count = if self.has_flare_model { self.flare_mesh_count.max(1) } else { 1 };
+        let mut indices = Vec::with_capacity(mesh_count);
 
-        let idx = primitives.len();
-        primitives.push(prim);
+        for mesh_i in 0..mesh_count {
+            let name = format!("Flare.{:03}.{}", flare_id, mesh_i);
+            let kind = if self.has_flare_model {
+                PrimitiveKind::CustomMesh(self.flare_mesh_base + mesh_i)
+            } else {
+                PrimitiveKind::PointLight
+            };
+
+            let mut prim = Primitive::new(kind, name);
+            prim.transform.position = camera_pos;
+            prim.transform.scale = Vec3::splat(FLARE_MODEL_SCALE);
+            prim.transform.rotation = dir_to_rotation(camera_forward);
+            prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], FLARE_INTENSITY]);
+
+            if mesh_i < self.flare_material_indices.len() {
+                prim.material_index = Some(self.flare_material_indices[mesh_i]);
+            }
+
+            indices.push(primitives.len());
+            primitives.push(prim);
+        }
 
         self.flares.push(Flare {
             position: camera_pos,
             velocity: camera_forward * INITIAL_SPEED,
+            last_dir: camera_forward,
             lifetime: MAX_LIFETIME,
             stuck: false,
-            primitive_idx: idx,
+            primitive_indices: indices,
         });
     }
 
@@ -469,6 +503,11 @@ impl FlareSystem {
                 let new_vel = flare.velocity + GRAVITY * dt;
                 let new_pos = flare.position + new_vel * dt;
 
+                // Track direction for model orientation
+                if new_vel.length_squared() > 1e-8 {
+                    flare.last_dir = new_vel.normalize();
+                }
+
                 // Ray-segment collision: test from old position toward new position
                 let segment = new_pos - flare.position;
                 let seg_len = segment.length();
@@ -483,7 +522,6 @@ impl FlareSystem {
                 };
 
                 if let Some(t) = hit {
-                    // Place flare back along its arc so it hovers in front of the surface
                     let dir = segment / seg_len;
                     flare.position = flare.position + dir * (t - FLARE_RADIUS).max(0.0);
                     flare.velocity = Vec3::ZERO;
@@ -497,17 +535,21 @@ impl FlareSystem {
             // Decay lifetime
             flare.lifetime -= dt;
 
-            // Update primitive position and fade intensity
-            if let Some(prim) = primitives.get_mut(flare.primitive_idx) {
-                prim.transform.position = flare.position;
+            // Update all primitive transforms and fade intensity
+            let fade = if flare.lifetime < FADE_DURATION {
+                (flare.lifetime / FADE_DURATION).max(0.0)
+            } else {
+                1.0
+            };
+            let intensity = FLARE_INTENSITY * fade;
+            let rotation = dir_to_rotation(flare.last_dir);
 
-                let fade = if flare.lifetime < FADE_DURATION {
-                    (flare.lifetime / FADE_DURATION).max(0.0)
-                } else {
-                    1.0
-                };
-                let intensity = FLARE_INTENSITY * fade;
-                prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], intensity]);
+            for &prim_idx in &flare.primitive_indices {
+                if let Some(prim) = primitives.get_mut(prim_idx) {
+                    prim.transform.position = flare.position;
+                    prim.transform.rotation = rotation;
+                    prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], intensity]);
+                }
             }
         }
 
@@ -521,14 +563,20 @@ impl FlareSystem {
 
         to_remove.sort_unstable();
         for &flare_idx in to_remove.iter().rev() {
-            let prim_idx = self.flares[flare_idx].primitive_idx;
+            // Remove primitives in reverse order to keep indices stable within this flare
+            let mut prim_indices = self.flares[flare_idx].primitive_indices.clone();
+            prim_indices.sort_unstable();
+            for &prim_idx in prim_indices.iter().rev() {
+                if prim_idx < primitives.len() {
+                    primitives.remove(prim_idx);
 
-            if prim_idx < primitives.len() {
-                primitives.remove(prim_idx);
-
-                for f in &mut self.flares {
-                    if f.primitive_idx > prim_idx {
-                        f.primitive_idx -= 1;
+                    // Adjust all other flare primitive indices
+                    for f in &mut self.flares {
+                        for idx in &mut f.primitive_indices {
+                            if *idx > prim_idx {
+                                *idx -= 1;
+                            }
+                        }
                     }
                 }
             }
@@ -538,8 +586,11 @@ impl FlareSystem {
     }
 
     pub fn clear(&mut self, primitives: &mut Vec<Primitive>) {
-        let mut prim_indices: Vec<usize> = self.flares.iter().map(|f| f.primitive_idx).collect();
+        let mut prim_indices: Vec<usize> = self.flares.iter()
+            .flat_map(|f| f.primitive_indices.iter().copied())
+            .collect();
         prim_indices.sort_unstable();
+        prim_indices.dedup();
         for &idx in prim_indices.iter().rev() {
             if idx < primitives.len() {
                 primitives.remove(idx);
@@ -564,6 +615,47 @@ impl FlareSystem {
     pub fn collision_triangle_count(&self) -> usize {
         self.collision_mesh.as_ref().map_or(0, |m| m.triangle_count())
     }
+
+    /// Load the flare 3D model from a glTF file. Returns the converted mesh vertices
+    /// and material data for upload to the GPU. Call this once at startup.
+    pub fn load_model(
+        &mut self,
+        path: &Path,
+    ) -> Option<rmesh_anim::gltf_loader::GltfScene> {
+        match rmesh_anim::gltf_loader::load_gltf(path) {
+            Ok(scene) => {
+                self.flare_mesh_count = scene.meshes.len();
+                self.has_flare_model = true;
+                // Each mesh maps to a material by index (matching the glTF primitive order)
+                self.flare_material_indices = (0..scene.meshes.len())
+                    .map(|i| if i < scene.materials.len() { i } else { 0 })
+                    .collect();
+                log::info!(
+                    "Loaded flare model: {} meshes, {} textures, {} materials",
+                    scene.meshes.len(),
+                    scene.textures.len(),
+                    scene.materials.len(),
+                );
+                Some(scene)
+            }
+            Err(e) => {
+                log::error!("Failed to load flare model from {:?}: {}", path, e);
+                None
+            }
+        }
+    }
+}
+
+/// Compute a rotation quaternion that orients the model's -Z axis (its long axis
+/// in COLMAP coords after yup_to_colmap) along the given direction vector.
+fn dir_to_rotation(dir: Vec3) -> Quat {
+    if dir.length_squared() < 1e-8 {
+        return Quat::IDENTITY;
+    }
+    let dir = dir.normalize();
+    // Model long axis is -Z in COLMAP; flip to +Z so the head faces forward.
+    let from = Vec3::Z;
+    Quat::from_rotation_arc(from, dir)
 }
 
 // -----------------------------------------------------------------------

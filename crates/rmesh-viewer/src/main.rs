@@ -514,8 +514,8 @@ impl App {
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
 
         // Primitive setup (depth used for hardware early-z culling in forward pass)
-        let primitive_geometry = PrimitiveGeometry::new(&device);
-        let material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
+        let mut primitive_geometry = PrimitiveGeometry::new(&device);
+        let mut material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
         let primitive_pipeline = PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
         let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
 
@@ -803,6 +803,71 @@ impl App {
             &device, &dsm_resolve_pipeline, &dsm_fourier_view_refs,
         );
         let dsm_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &dsm_resolve_output_view);
+
+        // Load flare 3D model and upload its meshes/materials
+        {
+            let exe_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+            let candidates = [
+                std::path::PathBuf::from("assets/flare/scene.gltf"),
+                std::path::PathBuf::from("../assets/flare/scene.gltf"),
+            ];
+            let extra: Vec<std::path::PathBuf> = exe_dir
+                .iter()
+                .map(|d| d.join("assets/flare/scene.gltf"))
+                .collect();
+            let flare_path = candidates.iter().chain(extra.iter()).find(|p| p.exists());
+            if let Some(path) = flare_path {
+                if let Some(gltf_scene) = self.flare_system.load_model(path) {
+                    let prim_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
+                        .meshes
+                        .iter()
+                        .map(|m| {
+                            (0..m.vertices.len())
+                                .map(|i| rmesh_compositor::PrimitiveVertex {
+                                    position: m.vertices[i],
+                                    normal: m.normals[i],
+                                    uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
+                                    tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    self.flare_system.flare_mesh_base = 0;
+                    primitive_geometry.set_custom_meshes(&device, &prim_verts);
+
+                    // Upload flare material textures
+                    let tex_data: Vec<rmesh_compositor::TextureData> = gltf_scene
+                        .textures
+                        .iter()
+                        .map(|t| rmesh_compositor::TextureData {
+                            width: t.width,
+                            height: t.height,
+                            pixels: t.pixels.clone(),
+                        })
+                        .collect();
+                    let mat_defs: Vec<rmesh_compositor::MaterialDef> = gltf_scene
+                        .materials
+                        .iter()
+                        .map(|m| rmesh_compositor::MaterialDef {
+                            base_color_factor: m.base_color_factor,
+                            roughness_factor: m.roughness_factor,
+                            metallic_factor: m.metallic_factor,
+                            occlusion_strength: m.occlusion_strength,
+                            normal_scale: m.normal_scale,
+                            base_color_texture: m.base_color_texture,
+                            metallic_roughness_texture: m.metallic_roughness_texture,
+                            normal_texture: m.normal_texture,
+                            occlusion_texture: m.occlusion_texture,
+                        })
+                        .collect();
+                    material_registry.upload(&device, &queue, &tex_data, &mat_defs);
+                }
+            } else {
+                log::warn!("Flare model not found, using default sphere");
+            }
+        }
 
         log::info!("GPU init total: {:.2}s", t_total.elapsed().as_secs_f64());
 

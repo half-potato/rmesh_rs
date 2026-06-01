@@ -688,9 +688,10 @@ impl App {
             {
                 log::info!("Loading animation file: {}", path.display());
                 match rmesh_anim::gltf_loader::load_gltf(&path) {
-                    Ok(gltf_scene) => {
-                        // Upload custom meshes to GPU (with UVs and tangents)
-                        let prim_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
+                    Ok(mut gltf_scene) => {
+                        // Upload custom meshes: flare model meshes first, then scene meshes
+                        let flare_base = self.flare_system.flare_mesh_count;
+                        let scene_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
                             .meshes
                             .iter()
                             .map(|m| {
@@ -704,34 +705,101 @@ impl App {
                                     .collect()
                             })
                             .collect();
-                        gpu.primitive_geometry
-                            .set_custom_meshes(&gpu.device, &prim_verts);
 
-                        // Upload material textures
-                        let tex_data: Vec<rmesh_compositor::TextureData> = gltf_scene
-                            .textures
-                            .iter()
-                            .map(|t| rmesh_compositor::TextureData {
+                        // Combine: flare model meshes (from existing GPU data) + scene meshes
+                        // Reload flare mesh verts from existing custom meshes or just
+                        // prepend empty slots if flare model is loaded
+                        let mut combined = Vec::new();
+                        // Re-extract flare verts from the current custom buffer is complex;
+                        // instead, reload from disk if needed
+                        if self.flare_system.has_flare_model {
+                            // Reload flare model to get vertex data
+                            let flare_path = std::path::PathBuf::from("assets/flare/scene.gltf");
+                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path) {
+                                for m in &flare_gltf.meshes {
+                                    combined.push((0..m.vertices.len()).map(|i| rmesh_compositor::PrimitiveVertex {
+                                        position: m.vertices[i],
+                                        normal: m.normals[i],
+                                        uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
+                                        tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
+                                    }).collect());
+                                }
+                            }
+                        }
+                        // Offset scene mesh IDs by the number of flare meshes
+                        let offset = combined.len();
+                        if offset > 0 {
+                            for node in &mut gltf_scene.scene.nodes {
+                                if let Some(PrimitiveKind::CustomMesh(id)) = node.mesh_kind {
+                                    node.mesh_kind = Some(PrimitiveKind::CustomMesh(id + offset));
+                                }
+                            }
+                        }
+                        combined.extend(scene_verts);
+                        gpu.primitive_geometry
+                            .set_custom_meshes(&gpu.device, &combined);
+
+                        // Upload material textures: prepend flare materials if flare model is loaded
+                        let mut tex_data: Vec<rmesh_compositor::TextureData> = Vec::new();
+                        let mut mat_defs: Vec<rmesh_compositor::MaterialDef> = Vec::new();
+
+                        if self.flare_system.has_flare_model {
+                            let flare_path = std::path::PathBuf::from("assets/flare/scene.gltf");
+                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path) {
+                                let flare_tex_offset = 0;
+                                for t in &flare_gltf.textures {
+                                    tex_data.push(rmesh_compositor::TextureData {
+                                        width: t.width,
+                                        height: t.height,
+                                        pixels: t.pixels.clone(),
+                                    });
+                                }
+                                for m in &flare_gltf.materials {
+                                    mat_defs.push(rmesh_compositor::MaterialDef {
+                                        base_color_factor: m.base_color_factor,
+                                        roughness_factor: m.roughness_factor,
+                                        metallic_factor: m.metallic_factor,
+                                        occlusion_strength: m.occlusion_strength,
+                                        normal_scale: m.normal_scale,
+                                        base_color_texture: m.base_color_texture.map(|i| i + flare_tex_offset),
+                                        metallic_roughness_texture: m.metallic_roughness_texture.map(|i| i + flare_tex_offset),
+                                        normal_texture: m.normal_texture.map(|i| i + flare_tex_offset),
+                                        occlusion_texture: m.occlusion_texture.map(|i| i + flare_tex_offset),
+                                    });
+                                }
+                            }
+                        }
+
+                        let scene_tex_offset = tex_data.len();
+                        let scene_mat_offset = mat_defs.len();
+                        for t in &gltf_scene.textures {
+                            tex_data.push(rmesh_compositor::TextureData {
                                 width: t.width,
                                 height: t.height,
                                 pixels: t.pixels.clone(),
-                            })
-                            .collect();
-                        let mat_defs: Vec<rmesh_compositor::MaterialDef> = gltf_scene
-                            .materials
-                            .iter()
-                            .map(|m| rmesh_compositor::MaterialDef {
+                            });
+                        }
+                        for m in &gltf_scene.materials {
+                            mat_defs.push(rmesh_compositor::MaterialDef {
                                 base_color_factor: m.base_color_factor,
                                 roughness_factor: m.roughness_factor,
                                 metallic_factor: m.metallic_factor,
                                 occlusion_strength: m.occlusion_strength,
                                 normal_scale: m.normal_scale,
-                                base_color_texture: m.base_color_texture,
-                                metallic_roughness_texture: m.metallic_roughness_texture,
-                                normal_texture: m.normal_texture,
-                                occlusion_texture: m.occlusion_texture,
-                            })
-                            .collect();
+                                base_color_texture: m.base_color_texture.map(|i| i + scene_tex_offset),
+                                metallic_roughness_texture: m.metallic_roughness_texture.map(|i| i + scene_tex_offset),
+                                normal_texture: m.normal_texture.map(|i| i + scene_tex_offset),
+                                occlusion_texture: m.occlusion_texture.map(|i| i + scene_tex_offset),
+                            });
+                        }
+                        // Offset scene node material indices
+                        if scene_mat_offset > 0 {
+                            for node in &mut gltf_scene.scene.nodes {
+                                if let Some(ref mut idx) = node.material_index {
+                                    *idx += scene_mat_offset;
+                                }
+                            }
+                        }
                         gpu.material_registry.upload(
                             &gpu.device,
                             &gpu.queue,
@@ -1233,42 +1301,42 @@ impl App {
             if let (Some(ref deferred), Some(ref bg), Some(ref out_view)) =
                 (&gpu.deferred_pipeline, &gpu.deferred_bg, &gpu.deferred_output_view)
             {
-                // Collect lights from PointLight primitives
+                // Collect lights from PointLight/SpotLight primitives and flare CustomMesh primitives
                 let mut gpu_lights = [rmesh_render::GpuLight::default(); rmesh_render::MAX_LIGHTS];
                 let mut num_lights = 0u32;
+                let is_flare_light = |p: &Primitive| p.name.starts_with("Flare.") && p.name.ends_with(".0");
                 for prim in &self.primitives {
                     if (num_lights as usize) >= rmesh_render::MAX_LIGHTS {
                         break;
                     }
-                    match prim.kind {
-                        PrimitiveKind::PointLight => {
-                            gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
-                                position: prim.transform.position.to_array(),
-                                light_type: 0, // point
-                                color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
-                                intensity: prim.color.map_or(1.0, |c| c[3]),
-                                direction: [0.0, 0.0, -1.0],
-                                inner_angle: 0.0,
-                                outer_angle: 0.0,
-                                _pad: [0.0; 3],
-                            };
-                            num_lights += 1;
-                        }
-                        PrimitiveKind::SpotLight => {
-                            let forward = prim.transform.rotation * glam::Vec3::NEG_Z;
-                            gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
-                                position: prim.transform.position.to_array(),
-                                light_type: 1, // spot
-                                color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
-                                intensity: prim.color.map_or(1.0, |c| c[3]),
-                                direction: forward.to_array(),
-                                inner_angle: 20.0_f32.to_radians(),
-                                outer_angle: 35.0_f32.to_radians(),
-                                _pad: [0.0; 3],
-                            };
-                            num_lights += 1;
-                        }
-                        _ => {}
+                    // Flare CustomMesh primitives also emit point lights
+                    let acts_as_point_light = matches!(prim.kind, PrimitiveKind::PointLight)
+                        || (prim.kind.is_custom_mesh() && is_flare_light(prim));
+                    if acts_as_point_light {
+                        gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
+                            position: prim.transform.position.to_array(),
+                            light_type: 0, // point
+                            color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
+                            intensity: prim.color.map_or(1.0, |c| c[3]),
+                            direction: [0.0, 0.0, -1.0],
+                            inner_angle: 0.0,
+                            outer_angle: 0.0,
+                            _pad: [0.0; 3],
+                        };
+                        num_lights += 1;
+                    } else if matches!(prim.kind, PrimitiveKind::SpotLight) {
+                        let forward = prim.transform.rotation * glam::Vec3::NEG_Z;
+                        gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
+                            position: prim.transform.position.to_array(),
+                            light_type: 1, // spot
+                            color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
+                            intensity: prim.color.map_or(1.0, |c| c[3]),
+                            direction: forward.to_array(),
+                            inner_angle: 20.0_f32.to_radians(),
+                            outer_angle: 35.0_f32.to_radians(),
+                            _pad: [0.0; 3],
+                        };
+                        num_lights += 1;
                     }
                 }
 
