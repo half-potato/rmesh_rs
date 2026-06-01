@@ -3415,7 +3415,10 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "half",
+ "pollster",
  "rmesh-compositor",
+ "rmesh-data",
  "rmesh-interact",
  "rmesh-render",
  "rmesh-sort",

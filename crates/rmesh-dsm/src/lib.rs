@@ -1,9 +1,21 @@
 //! Deep shadow map rendering for tetrahedral radiance meshes.
 //!
-//! Produces a per-pixel transmittance map by rasterizing the interval
-//! decomposition of each visible tet using a minimal fragment shader that
-//! only evaluates the volume rendering alpha. Hardware premultiplied-alpha
-//! blending (back-to-front) accumulates the total transmittance.
+//! Produces a per-light cubemap of the two depth moments of the alpha-weighted
+//! light-side termination distribution, stored in a single `Rgba16Float`
+//! target per face:
+//!
+//! ```text
+//!   .r = alpha * E[z]    (mean depth,    normalized to [0,1] over [near,far])
+//!   .g = alpha * E[z^2]  (second moment)
+//!   .b = unused
+//!   .a = alpha           (occlusion; accumulates to 1 - T_total)
+//! ```
+//!
+//! Hardware premultiplied-alpha blending (back-to-front) accumulates each
+//! channel. The deferred shading pass reconstructs transmittance `T(z)` from
+//! these moments via a Cantelli/Chebyshev bound (see `evaluate_transmittance`
+//! in `deferred_shade_frag.wgsl`); [`DsmResolvePipeline`] does the same for
+//! debug visualization.
 //!
 //! # Pipeline flow
 //!
@@ -13,12 +25,7 @@
 //!
 //! 1. `interval_compute.wgsl` — tet → screen triangles (reused)
 //! 2. `interval_indirect_convert.wgsl` — dispatch/draw args (reused)
-//! 3. `dsm_fragment.wgsl` — alpha-only volume integral (this crate)
-//!
-//! # Output
-//!
-//! The output texture's alpha channel holds `1 - T`, where `T` is the total
-//! transmittance. Read `T = 1 - alpha` for shadow attenuation.
+//! 3. `dsm_moment_fragment.wgsl` — depth-moment volume integral (this crate)
 
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat3, Mat4, Vec3};
@@ -30,15 +37,9 @@ use rmesh_render::{
 };
 
 const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
-const DSM_FRAGMENT_WGSL: &str = include_str!("wgsl/dsm_fragment.wgsl");
-const DSM_FOURIER_FRAGMENT_WGSL: &str = include_str!("wgsl/dsm_fourier_fragment.wgsl");
+const DSM_MOMENT_FRAGMENT_WGSL: &str = include_str!("wgsl/dsm_moment_fragment.wgsl");
 const DSM_PRIMITIVE_WGSL: &str = include_str!("wgsl/dsm_primitive.wgsl");
 const DSM_RESOLVE_WGSL: &str = include_str!("wgsl/dsm_resolve.wgsl");
-
-/// Number of Fourier terms (N=4 → 9 coefficients → 3 RGBA targets).
-pub const FOURIER_N: u32 = 4;
-/// Number of MRT targets for Fourier coefficient storage.
-pub const FOURIER_MRT_COUNT: usize = 3;
 
 /// DSM output format.
 const DSM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -53,8 +54,9 @@ fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
 
 /// Render pipeline for deep shadow map generation.
 ///
-/// Uses `interval_vertex.wgsl` (shared with the full interval pipeline) and a
-/// stripped-down `dsm_fragment.wgsl` that outputs only alpha.
+/// Uses `interval_vertex.wgsl` (shared with the full interval pipeline) and
+/// `dsm_moment_fragment.wgsl`, which writes the two depth moments + alpha into
+/// a single premultiplied-alpha-blended target.
 pub struct DsmPipeline {
     pub render_pipeline: wgpu::RenderPipeline,
     pub render_bg_layout: wgpu::BindGroupLayout,
@@ -66,7 +68,7 @@ impl DsmPipeline {
     /// `color_format` should match the output texture (e.g. `Rgba16Float`).
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         // 3 read-only storage bindings: uniforms, verts, tet_data
-        let render_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3)
+        let render_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -97,11 +99,11 @@ impl DsmPipeline {
         });
 
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("dsm_fourier_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_FOURIER_FRAGMENT_WGSL.into()),
+            label: Some("dsm_moment_fragment.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(DSM_MOMENT_FRAGMENT_WGSL.into()),
         });
 
-        // Premultiplied alpha blend for expected depth compositing (same as forward pass)
+        // Premultiplied alpha blend for moment compositing (same as forward pass)
         let premul_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -115,35 +117,9 @@ impl DsmPipeline {
             },
         };
 
-        let premul_target = Some(wgpu::ColorTargetState {
+        let moment_target = Some(wgpu::ColorTargetState {
             format: color_format,
             blend: Some(premul_blend),
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-
-        // Additive blend for unused MRTs (kept for compatibility)
-        let additive_blend = wgpu::BlendState {
-            color: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-            alpha: wgpu::BlendComponent {
-                src_factor: wgpu::BlendFactor::One,
-                dst_factor: wgpu::BlendFactor::One,
-                operation: wgpu::BlendOperation::Add,
-            },
-        };
-
-        let premul_target_1 = Some(wgpu::ColorTargetState {
-            format: color_format,
-            blend: Some(premul_blend),
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-
-        let additive_target = Some(wgpu::ColorTargetState {
-            format: color_format,
-            blend: Some(additive_blend),
             write_mask: wgpu::ColorWrites::ALL,
         });
 
@@ -176,11 +152,7 @@ impl DsmPipeline {
             fragment: Some(wgpu::FragmentState {
                 module: &fragment_shader,
                 entry_point: Some("main"),
-                targets: &[
-                    premul_target,   // RT0: expected depth (premul-alpha)
-                    premul_target_1, // RT1: expected depth² (premul-alpha)
-                    additive_target, // RT2: unused
-                ],
+                targets: &[moment_target], // (alpha*E[z], alpha*E[z²], _, alpha)
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
@@ -218,14 +190,14 @@ pub fn create_dsm_render_bind_group(
 
 /// Record a DSM render pass.
 ///
-/// Clears the output to zero (full transmittance) and draws the interval
-/// triangles with premultiplied-alpha blending. After the pass, the alpha
-/// channel of `output_view` contains `1 - T_total`.
+/// Draws the interval triangles with premultiplied-alpha blending into the
+/// moment target (loading over the primitive pre-pass). After the pass, the
+/// alpha channel of `moment_view` contains `1 - T_total`.
 ///
 /// * `index_buf` — the static fan index buffer (`interval_fan_index_buf`, 12 u32s)
 /// * `indirect_args_buf` — the `interval_args_buf`; draw-indexed-indirect args
 ///   start at byte offset 12 (skipping the 3 dispatch u32s)
-/// * `output_view` — texture view for the DSM output
+/// * `moment_view` — texture view for the DSM moment output
 /// * `width`, `height` — output dimensions (for viewport/scissor)
 pub fn record_dsm_render(
     encoder: &mut wgpu::CommandEncoder,
@@ -233,26 +205,20 @@ pub fn record_dsm_render(
     bind_group: &wgpu::BindGroup,
     index_buf: &wgpu::Buffer,
     indirect_args_buf: &wgpu::Buffer,
-    fourier_views: &[&wgpu::TextureView; FOURIER_MRT_COUNT],
+    moment_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
     width: u32,
     height: u32,
 ) {
     let load_ops = wgpu::Operations {
-        load: wgpu::LoadOp::Load, // preserve primitive coefficients
+        load: wgpu::LoadOp::Load, // preserve primitive moments
         store: wgpu::StoreOp::Store,
     };
     let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
         label: Some("dsm_render"),
         color_attachments: &[
             Some(wgpu::RenderPassColorAttachment {
-                view: fourier_views[0], resolve_target: None, ops: load_ops, depth_slice: None,
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: fourier_views[1], resolve_target: None, ops: load_ops, depth_slice: None,
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: fourier_views[2], resolve_target: None, ops: load_ops, depth_slice: None,
+                view: moment_view, resolve_target: None, ops: load_ops, depth_slice: None,
             }),
         ],
         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -360,8 +326,6 @@ impl DsmPrimitivePipeline {
                 entry_point: Some("fs_main"),
                 targets: &[
                     Some(wgpu::ColorTargetState { format: DSM_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
-                    Some(wgpu::ColorTargetState { format: DSM_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
-                    Some(wgpu::ColorTargetState { format: DSM_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL }),
                 ],
                 compilation_options: Default::default(),
             }),
@@ -417,7 +381,7 @@ pub fn record_dsm_primitive_pass(
     queue: &wgpu::Queue,
     pipeline: &DsmPrimitivePipeline,
     geometry: &PrimitiveGeometry,
-    fourier_views: &[&wgpu::TextureView; FOURIER_MRT_COUNT],
+    moment_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
     primitives: &[Primitive],
     light_vp: &Mat4,
@@ -435,14 +399,12 @@ pub fn record_dsm_primitive_pass(
         store: wgpu::StoreOp::Store,
     };
 
-    let color_attachments: [Option<wgpu::RenderPassColorAttachment>; FOURIER_MRT_COUNT] = std::array::from_fn(|i| {
-        Some(wgpu::RenderPassColorAttachment {
-            view: fourier_views[i],
-            resolve_target: None,
-            ops: clear_color,
-            depth_slice: None,
-        })
-    });
+    let color_attachments = [Some(wgpu::RenderPassColorAttachment {
+        view: moment_view,
+        resolve_target: None,
+        ops: clear_color,
+        depth_slice: None,
+    })];
 
     if primitives.is_empty() {
         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -520,7 +482,7 @@ pub fn record_dsm_primitive_pass(
 }
 
 // ---------------------------------------------------------------------------
-// DSM Resolve Pipeline (Fourier → T(z_query))
+// DSM Resolve Pipeline (moments → T(z_query))
 // ---------------------------------------------------------------------------
 
 /// Uniform for the resolve pass: just a query depth.
@@ -533,7 +495,7 @@ pub struct DsmResolveUniforms {
     pub _pad: f32,
 }
 
-/// Fullscreen resolve pass: reads 3 Fourier textures, reconstructs T(z_query).
+/// Fullscreen resolve pass: reads the moment texture, reconstructs T(z_query).
 pub struct DsmResolvePipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
@@ -563,29 +525,9 @@ impl DsmResolvePipeline {
                     },
                     count: None,
                 },
-                // 1-3: Fourier textures
+                // 1: moment texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
@@ -640,11 +582,11 @@ impl DsmResolvePipeline {
     }
 }
 
-/// Create the resolve bind group (uniform + 3 Fourier textures).
+/// Create the resolve bind group (uniform + moment texture).
 pub fn create_dsm_resolve_bind_group(
     device: &wgpu::Device,
     resolve: &DsmResolvePipeline,
-    fourier_views: &[&wgpu::TextureView; FOURIER_MRT_COUNT],
+    moment_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dsm_resolve_bg"),
@@ -656,15 +598,7 @@ pub fn create_dsm_resolve_bind_group(
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(fourier_views[0]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(fourier_views[1]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: wgpu::BindingResource::TextureView(fourier_views[2]),
+                resource: wgpu::BindingResource::TextureView(moment_view),
             },
         ],
     })
@@ -673,7 +607,7 @@ pub fn create_dsm_resolve_bind_group(
 /// Record resolve passes for all 6 cubemap faces in a cross layout.
 ///
 /// Layout (4×3 grid, each cell = face_size × face_size):
-/// ```
+/// ```text
 ///        [+Y]
 ///  [-X]  [+Z]  [+X]  [-Z]
 ///        [-Y]
@@ -716,7 +650,7 @@ pub fn record_dsm_resolve_cubemap_cross(
 
     // Clear output
     {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("dsm_cross_clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
@@ -734,19 +668,15 @@ pub fn record_dsm_resolve_cubemap_cross(
 
     // Render each face into its cross position
     for fi in 0..face_count.min(6) {
-        // Create per-face D2 views from the cubemap texture
-        let face_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            atlas.cubemaps[light_index][m].create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2),
-                base_array_layer: fi as u32,
-                array_layer_count: Some(1),
-                ..Default::default()
-            })
+        // Create a per-face D2 view from the cubemap texture
+        let face_view = atlas.cubemaps[light_index].create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_array_layer: fi as u32,
+            array_layer_count: Some(1),
+            ..Default::default()
         });
-        let layer_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] =
-            std::array::from_fn(|m| &face_views[m]);
 
-        let resolve_bg = create_dsm_resolve_bind_group(device, resolve, &layer_views);
+        let resolve_bg = create_dsm_resolve_bind_group(device, resolve, &face_view);
 
         let (col, row) = positions[fi];
         let x = col * face_w;
@@ -773,7 +703,7 @@ pub fn record_dsm_resolve_cubemap_cross(
     }
 }
 
-/// Record the resolve pass: reads Fourier textures, writes T(z_query) to output.
+/// Record the resolve pass: reads the moment texture, writes T(z_query) to output.
 pub fn record_dsm_resolve(
     encoder: &mut wgpu::CommandEncoder,
     resolve: &DsmResolvePipeline,
@@ -839,20 +769,20 @@ pub struct ShadowLightMeta {
     pub _pad: [u32; 3],
 }
 
-/// Cached DSM atlas: texture arrays for all light faces + per-light metadata.
+/// Cached DSM atlas: one moment cubemap per light + per-light metadata.
 ///
-/// Fourier coefficients are stored in 3 `texture_2d_array` textures (one per MRT).
-/// Each layer corresponds to one face of one light (point lights have 6 faces,
-/// spot/directional have 1). DSM generation renders directly into per-layer views.
+/// Each cubemap stores the depth moments `(α·E[z], α·E[z²], _, α)` with one
+/// `Rgba16Float` layer per face (point lights use 6 faces; spot/directional use
+/// face 0). DSM generation renders into the staging texture one face at a time,
+/// then copies into the cubemap layer.
 pub struct DsmAtlas {
-    /// 3 cubemap textures (one per moment MRT), 6 faces each per light.
-    /// For multiple lights, each light gets its own set of cubemaps.
-    pub cubemaps: Vec<[wgpu::Texture; FOURIER_MRT_COUNT]>,
-    /// Cube views for shader binding (one per light per MRT).
-    pub cubemap_views: Vec<[wgpu::TextureView; FOURIER_MRT_COUNT]>,
-    /// Staging textures for rendering one face at a time (then copied into cubemap faces).
-    pub staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT],
-    pub staging_fourier_views: [wgpu::TextureView; FOURIER_MRT_COUNT],
+    /// One moment cubemap (6 faces) per light.
+    pub cubemaps: Vec<wgpu::Texture>,
+    /// Cube views for shader binding (one per light).
+    pub cubemap_views: Vec<wgpu::TextureView>,
+    /// Staging texture for rendering one face at a time (then copied into a cubemap face).
+    pub staging: wgpu::Texture,
+    pub staging_view: wgpu::TextureView,
     pub staging_depth: wgpu::Texture,
     pub staging_depth_view: wgpu::TextureView,
     /// Per-light shadow metadata storage buffer.
@@ -870,59 +800,52 @@ impl DsmAtlas {
     pub fn new(device: &wgpu::Device, resolution: u32, light_types: &[u32]) -> Self {
         let num_lights = light_types.len() as u32;
 
-        // One cubemap (6 faces) per light per MRT
+        // One moment cubemap (6 faces) per light.
         let mut cubemaps = Vec::with_capacity(light_types.len());
         let mut cubemap_views = Vec::with_capacity(light_types.len());
         for i in 0..light_types.len() {
-            let textures: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-                device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("dsm_cube_light{i}_mrt{m}")),
-                    size: wgpu::Extent3d {
-                        width: resolution,
-                        height: resolution,
-                        depth_or_array_layers: 6,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: DSM_FORMAT,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                })
-            });
-            let views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-                textures[m].create_view(&wgpu::TextureViewDescriptor {
-                    dimension: Some(wgpu::TextureViewDimension::Cube),
-                    ..Default::default()
-                })
-            });
-            cubemaps.push(textures);
-            cubemap_views.push(views);
-        }
-
-        // Staging textures: single 2D textures for rendering one face at a time
-        let staging_fourier: [wgpu::Texture; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(&format!("dsm_staging_mrt{m}")),
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("dsm_cube_light{i}")),
                 size: wgpu::Extent3d {
                     width: resolution,
                     height: resolution,
-                    depth_or_array_layers: 1,
+                    depth_or_array_layers: 6,
                 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: DSM_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::COPY_SRC
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
-            })
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::Cube),
+                ..Default::default()
+            });
+            cubemaps.push(texture);
+            cubemap_views.push(view);
+        }
+
+        // Staging texture: a single 2D texture for rendering one face at a time.
+        let staging = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("dsm_staging"),
+            size: wgpu::Extent3d {
+                width: resolution,
+                height: resolution,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DSM_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
         });
-        let staging_fourier_views: [wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-            staging_fourier[m].create_view(&wgpu::TextureViewDescriptor::default())
-        });
+        let staging_view = staging.create_view(&wgpu::TextureViewDescriptor::default());
         let staging_depth = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dsm_staging_depth"),
             size: wgpu::Extent3d {
@@ -956,8 +879,8 @@ impl DsmAtlas {
         Self {
             cubemaps,
             cubemap_views,
-            staging_fourier,
-            staging_fourier_views,
+            staging,
+            staging_view,
             staging_depth,
             staging_depth_view,
             meta_buf,
@@ -1233,18 +1156,13 @@ pub fn generate_dsm_for_lights(
                 );
             }
 
-            // Render to staging textures
-            let staging_views: [&wgpu::TextureView; FOURIER_MRT_COUNT] = std::array::from_fn(|m| {
-                &atlas.staging_fourier_views[m]
-            });
-
             // Primitive pre-pass: clear color+depth, draw opaque primitives
             record_dsm_primitive_pass(
                 encoder,
                 queue,
                 dsm_prim_pipeline,
                 prim_geometry,
-                &staging_views,
+                &atlas.staging_view,
                 &atlas.staging_depth_view,
                 primitives,
                 &face_vp,
@@ -1292,25 +1210,25 @@ pub fn generate_dsm_for_lights(
                     &render_bg,
                     &buffers.interval_fan_index_buf,
                     &buffers.interval_args_buf,
-                    &staging_views,
+                    &atlas.staging_view,
                     &atlas.staging_depth_view,
                     res,
                     res,
                 );
             }
 
-            // Copy staging textures into cubemap face
+            // Copy staging texture into the cubemap face
             let copy_size = wgpu::Extent3d { width: res, height: res, depth_or_array_layers: 1 };
-            for m in 0..FOURIER_MRT_COUNT {
+            {
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
-                        texture: &atlas.staging_fourier[m],
+                        texture: &atlas.staging,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {
-                        texture: &atlas.cubemaps[li as usize][m],
+                        texture: &atlas.cubemaps[li as usize],
                         mip_level: 0,
                         origin: wgpu::Origin3d { x: 0, y: 0, z: fi as u32 },
                         aspect: wgpu::TextureAspect::All,

@@ -1,12 +1,16 @@
-// Fourier deep shadow map fragment shader.
+// Deep-shadow-map moment fragment shader (tet intervals).
 //
-// Outputs Fourier coefficients of the opacity density into 3 MRT targets,
-// accumulated via additive blending (ONE, ONE). See TMSM.md for math.
+// Accumulates the two depth moments of the alpha-weighted light-side
+// termination distribution into a single RGBA16Float target, composited via
+// hardware premultiplied-alpha blending (back-to-front). The deferred pass
+// reconstructs transmittance from these via a Cantelli/Chebyshev bound — see
+// `evaluate_transmittance` in deferred_shade_frag.wgsl.
 //
-// MRT layout (N=4, 9 coefficients):
-//   RT0: (a0, a1, b1, a2)
-//   RT1: (b2, a3, b3, a4)
-//   RT2: (b4, 0, 0, 0)
+// Output channel layout (premultiplied by per-fragment alpha):
+//   .r = alpha * E[z]    (mean depth,    normalized to [0,1] over [near,far])
+//   .g = alpha * E[z^2]  (second moment, same normalization)
+//   .b = unused
+//   .a = alpha           (occlusion; accumulates to 1 - T_total)
 
 struct Uniforms {
     vp_col0: vec4<f32>,
@@ -41,15 +45,6 @@ struct FragmentInput {
     @location(4) @interpolate(flat) tet_id: u32,
 };
 
-struct FourierOutput {
-    @location(0) rt0: vec4<f32>,
-    @location(1) rt1: vec4<f32>,
-    @location(2) rt2: vec4<f32>,
-};
-
-const PI: f32 = 3.14159265358979323846;
-const TWO_PI: f32 = 6.28318530717958647692;
-
 // phi(x) = (1 - exp(-x)) / x
 // Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
 fn phi(x: f32) -> f32 {
@@ -60,7 +55,7 @@ fn phi(x: f32) -> f32 {
 }
 
 @fragment
-fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierOutput {
+fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> @location(0) vec4<f32> {
     let near = uniforms.near_plane;
     let far = uniforms.far_plane;
     let range = far - near;
@@ -89,18 +84,9 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FourierO
     let alpha_t = exp(-od);
     let phi_val = phi(od);
     let w0 = phi_val - alpha_t;  // back weight
-    let w1 = 1.0 - phi_val;     // front weight
-    let depth_premul = w0 * zb + w1 * za;
+    let w1 = 1.0 - phi_val;      // front weight
+    let depth_premul = w0 * zb + w1 * za;          // alpha * E[z]
+    let depth_sq_premul = w0 * zb * zb + w1 * za * za; // alpha * E[z^2]
 
-    // Second moment: E[z²] premultiplied by alpha (same weights as first moment)
-    let depth_sq_premul = w0 * zb * zb + w1 * za * za;
-
-    // RT0: expected depth (premul-alpha composited via hardware blend)
-    // RT1: expected depth² (premul-alpha composited via hardware blend)
-    // RT2: unused
-    var out: FourierOutput;
-    out.rt0 = vec4<f32>(depth_premul, depth_premul, depth_premul, alpha);
-    out.rt1 = vec4<f32>(depth_sq_premul, depth_sq_premul, depth_sq_premul, alpha);
-    out.rt2 = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    return out;
+    return vec4<f32>(depth_premul, depth_sq_premul, 0.0, alpha);
 }

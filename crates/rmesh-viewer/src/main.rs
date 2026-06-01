@@ -208,8 +208,8 @@ impl App {
             deferred_enabled: pbr.is_some(),
             deferred_debug_mode: 0,
             ambient: 0.3,
-            sky_color: [0.55, 0.7, 0.95],
-            ground_color: [0.25, 0.22, 0.18],
+            sky_color: [0.0, 0.0, 0.0],
+            ground_color: [0.0, 0.0, 0.0],
             exposure: 1.0,
             ao_strength: 1.0,
             gtao_radius: 0.5,
@@ -745,30 +745,24 @@ impl App {
         let rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&device, &rt_blit_pipeline, &rt_texture_view);
         log::info!("Ray trace data: {:.2}s", t0.elapsed().as_secs_f64());
 
-        // DSM debug view (Fourier deep shadow map from camera perspective)
+        // DSM debug view (moment deep shadow map from camera perspective)
         let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
         let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
         let dsm_resolve_pipeline = rmesh_dsm::DsmResolvePipeline::new(&device, color_format);
-        let (dsm_fourier_textures, dsm_fourier_views, dsm_depth_texture, dsm_depth_view,
+        let (dsm_moment_texture, dsm_moment_view, dsm_depth_texture, dsm_depth_view,
              dsm_resolve_output, dsm_resolve_output_view) = {
             let w = size.width.max(1);
             let h = size.height.max(1);
-            let make_fourier_tex = |idx: usize| {
-                let tex = device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some(&format!("dsm_fourier_{idx}")),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-                (tex, view)
-            };
-            let (ft0, fv0) = make_fourier_tex(0);
-            let (ft1, fv1) = make_fourier_tex(1);
-            let (ft2, fv2) = make_fourier_tex(2);
+            let moment_tex = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("dsm_moment"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1, sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: color_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            });
+            let moment_view = moment_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let dtex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dsm_debug_depth"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -789,7 +783,7 @@ impl App {
                 view_formats: &[],
             });
             let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            ([ft0, ft1, ft2], [fv0, fv1, fv2], dtex, dview, resolve_tex, resolve_view)
+            (moment_tex, moment_view, dtex, dview, resolve_tex, resolve_view)
         };
         let dsm_render_bg = rmesh_dsm::create_dsm_render_bind_group(
             &device, &dsm_pipeline,
@@ -797,10 +791,8 @@ impl App {
             &buffers.interval_vertex_buf,
             &buffers.interval_tet_data_buf,
         );
-        let dsm_fourier_view_refs: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
-            std::array::from_fn(|i| &dsm_fourier_views[i]);
         let dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-            &device, &dsm_resolve_pipeline, &dsm_fourier_view_refs,
+            &device, &dsm_resolve_pipeline, &dsm_moment_view,
         );
         let dsm_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &dsm_resolve_output_view);
 
@@ -966,8 +958,8 @@ impl App {
             dsm_pipeline,
             dsm_prim_pipeline,
             dsm_resolve_pipeline,
-            dsm_fourier_textures,
-            dsm_fourier_views,
+            dsm_moment_texture,
+            dsm_moment_view,
             dsm_depth_texture,
             dsm_depth_view,
             dsm_resolve_output,
@@ -1036,6 +1028,10 @@ impl App {
         self.scene_data = scene;
         self.sh_coeffs = sh;
         self.pbr_data = pbr;
+
+        // Cache the flare collision mesh up front for the new scene (drops the
+        // stale mesh from the previous scene and avoids a first-flare hitch).
+        self.flare_system.rebuild_collision_mesh(&self.scene_data);
         self.deferred_enabled = self.pbr_data.is_some();
         self.loaded_path = Some(path.to_path_buf());
 
@@ -1459,18 +1455,16 @@ impl App {
                 let w = new_size.width;
                 let h = new_size.height;
                 let color_format = wgpu::TextureFormat::Rgba16Float;
-                for i in 0..rmesh_dsm::FOURIER_MRT_COUNT {
-                    gpu.dsm_fourier_textures[i] = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some(&format!("dsm_fourier_{i}")),
-                        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                        mip_level_count: 1, sample_count: 1,
-                        dimension: wgpu::TextureDimension::D2,
-                        format: color_format,
-                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-                        view_formats: &[],
-                    });
-                    gpu.dsm_fourier_views[i] = gpu.dsm_fourier_textures[i].create_view(&wgpu::TextureViewDescriptor::default());
-                }
+                gpu.dsm_moment_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("dsm_moment"),
+                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    mip_level_count: 1, sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: color_format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                });
+                gpu.dsm_moment_view = gpu.dsm_moment_texture.create_view(&wgpu::TextureViewDescriptor::default());
                 gpu.dsm_depth_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dsm_debug_depth"),
                     size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1497,10 +1491,8 @@ impl App {
                     &gpu.buffers.interval_vertex_buf,
                     &gpu.buffers.interval_tet_data_buf,
                 );
-                let fv_refs: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
-                    std::array::from_fn(|i| &gpu.dsm_fourier_views[i]);
                 gpu.dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-                    &gpu.device, &gpu.dsm_resolve_pipeline, &fv_refs,
+                    &gpu.device, &gpu.dsm_resolve_pipeline, &gpu.dsm_moment_view,
                 );
                 gpu.dsm_blit_bg = create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &gpu.dsm_resolve_output_view);
             }
@@ -1616,6 +1608,11 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.init_gpu(window.clone());
         self.window = Some(window);
+
+        // Cache the flare collision mesh on load so the BVH is ready before the
+        // first flare is fired or the collision mesh is toggled on.
+        self.flare_system.rebuild_collision_mesh(&self.scene_data);
+
         log::info!(
             "Viewer initialized: {} tets, {} vertices (SH degree {})",
             self.scene_data.tet_count,

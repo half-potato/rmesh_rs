@@ -304,6 +304,12 @@ impl App {
                             ui.checkbox(&mut sort_16bit, "16-bit Sort");
                         }
                         ui.separator();
+                        ui.label("Flare Gun");
+                        ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
+                        ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
+                        ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
+                    });
+                    ui.menu_button("Deferred Shading", |ui| {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
                             ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient"));
@@ -321,6 +327,12 @@ impl App {
                                 ui.label("Ground");
                                 ui.color_edit_button_rgb(&mut ground_color);
                             });
+                        } else if !has_pbr {
+                            ui.label("Scene has no PBR data");
+                        }
+                    });
+                    ui.menu_button("Debug View", |ui| {
+                        if deferred_enabled && has_pbr {
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
                                 "Roughness", "PBR (R/M/F0)", "Depth", "Specular",
@@ -329,7 +341,6 @@ impl App {
                                 "AO", "SSGI", "Lit History", "SSR",
                                 "Depth Std",
                             ];
-                            ui.separator();
                             ui.label("Debug Layer");
                             for (i, label) in debug_labels.iter().enumerate() {
                                 ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
@@ -340,12 +351,9 @@ impl App {
                                     .logarithmic(true)
                                     .text("DSM Depth"));
                             }
+                        } else {
+                            ui.label("Enable Deferred Shading to access debug layers");
                         }
-                        ui.separator();
-                        ui.label("Flare Gun");
-                        ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
-                        ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
-                        ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let rt_info = if render_mode == RenderMode::RayTrace {
@@ -1805,15 +1813,12 @@ impl App {
         let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 14;
         if use_dsm_debug {
             // Camera-perspective DSM debug (original mode 15)
-            let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
-                std::array::from_fn(|i| &gpu.dsm_fourier_views[i]);
-
             rmesh_dsm::record_dsm_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
                 &gpu.dsm_prim_pipeline,
                 &gpu.primitive_geometry,
-                &fourier_views,
+                &gpu.dsm_moment_view,
                 &gpu.dsm_depth_view,
                 if self.show_primitives { &self.primitives } else { &[] },
                 &vp,
@@ -1829,7 +1834,7 @@ impl App {
                 &gpu.dsm_render_bg,
                 &gpu.buffers.interval_fan_index_buf,
                 &gpu.buffers.interval_args_buf,
-                &fourier_views,
+                &gpu.dsm_moment_view,
                 &gpu.dsm_depth_view,
                 w,
                 h,

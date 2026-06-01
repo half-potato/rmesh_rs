@@ -4872,12 +4872,12 @@ impl DeferredShadePipeline {
             ],
         });
 
-        // Group 1: DSM shadow atlas (3 Fourier texture arrays + metadata buffer)
+        // Group 1: DSM shadow atlas (moment cubemap + metadata buffer + sampler)
         let dsm_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("deferred_dsm_bgl"),
                 entries: &[
-                    // 0-2: Fourier MRT texture arrays
+                    // 0: moment cubemap (.r=α·E[z], .g=α·E[z²], .a=α)
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -4888,29 +4888,9 @@ impl DeferredShadePipeline {
                         },
                         count: None,
                     },
+                    // 1: per-light shadow metadata
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::Cube,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::Cube,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 3: per-light shadow metadata
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -4919,9 +4899,9 @@ impl DeferredShadePipeline {
                         },
                         count: None,
                     },
-                    // 4: bilinear sampler for moment textures
+                    // 2: bilinear sampler for the moment texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -5066,7 +5046,7 @@ pub fn create_deferred_bind_group(
 pub fn create_deferred_dsm_bind_group(
     device: &wgpu::Device,
     deferred: &DeferredShadePipeline,
-    cubemap_views: &[wgpu::TextureView; 3],
+    moment_view: &wgpu::TextureView,
     meta_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -5081,22 +5061,14 @@ pub fn create_deferred_dsm_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[0]),
+                resource: wgpu::BindingResource::TextureView(moment_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[1]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[2]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: meta_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 4,
+                binding: 2,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],
