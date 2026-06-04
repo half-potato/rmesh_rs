@@ -397,12 +397,28 @@ impl MaterialBuffers {
 // Pipelines
 // ---------------------------------------------------------------------------
 
+/// A pair of bind groups for the forward project_compute shader.
+/// Group 0 holds the 8 read-only inputs; group 1 holds the 6 read-write buffers.
+/// Split because WebGPU caps `maxStorageBuffersPerShaderStage` at 10.
+pub struct ForwardComputeBindGroups {
+    pub bg0: wgpu::BindGroup,
+    pub bg1: wgpu::BindGroup,
+}
+
+/// Bind group for the HW-only project_compute_hw shader.
+/// Held in a struct rather than a bare `wgpu::BindGroup` for symmetry with
+/// `ForwardComputeBindGroups` and so callers can store a single field.
+pub struct ForwardHwComputeBindGroups {
+    pub bg: wgpu::BindGroup,
+}
+
 /// Compiled pipelines for the forward pass.
 pub struct ForwardPipelines {
     pub compute_pipeline: wgpu::ComputePipeline,
     /// 16-bit linear sort key variant of compute_pipeline (same layout).
     pub compute_pipeline_16bit: wgpu::ComputePipeline,
-    pub compute_bind_group_layout: wgpu::BindGroupLayout,
+    pub compute_bg0_layout: wgpu::BindGroupLayout,
+    pub compute_bg1_layout: wgpu::BindGroupLayout,
     /// Lean HW-only projection compute (no tile counting)
     pub hw_compute_pipeline: wgpu::ComputePipeline,
     pub hw_compute_bind_group_layout: wgpu::BindGroupLayout,
@@ -449,28 +465,37 @@ impl ForwardPipelines {
     /// `color_format`: texture format for all color attachments (Rgba16Float).
     /// Total bytes per sample must not exceed 32 bytes (4 * 8 = 32 for Rgba16Float).
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
-        // ----- Compute pipeline (14 bindings) -----
-        // Bindings 0-5: read-only storage (uniforms, vertices, indices, densities, color_grads, circumdata)
-        // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
-        // Binding 12: read-only storage (base_colors)
-        // Binding 13: read-only storage (sh_coeffs, f16-packed)
-        let compute_read_only = [
-            true, true, true, true, true, true, // 0-5 read-only
-            false, false, false, false, // 6-9 read-write
-            false, false, // 10-11 read-write (tiles_touched, compact_tet_ids)
-            true,  // 12 read-only (base_colors)
-            true,  // 13 read-only (sh_coeffs)
-        ];
-        let compute_entries = storage_entries(14, wgpu::ShaderStages::COMPUTE, &compute_read_only);
-        let compute_bind_group_layout =
+        // ----- Compute pipeline (split into 2 bind groups, 14 storage total) -----
+        // Split along read-only / read-write boundary for code organization:
+        //   group 0 (8 read-only): uniforms, vertices, indices, densities,
+        //                          color_grads, circumdata, base_colors_buf, sh_coeffs
+        //   group 1 (6 read-write): colors, sort_keys, sort_values, indirect_args,
+        //                           tiles_touched, compact_tet_ids
+        //
+        // Note: WebGPU's maxStorageBuffersPerShaderStage is 10 in Chrome and the
+        // per-stage cap is checked across ALL bind groups, so this pipeline is
+        // INVALID on web (14 > 10). The web viewer dodges by passing
+        // `hw_compute_bg = Some(...)` to `record_sorted_forward_pass`, which
+        // uses `hw_compute_pipeline` (10 storage total via uniform-buffer trick)
+        // instead of `compute_pipeline`.
+        let compute_bg0_entries =
+            storage_entries(8, wgpu::ShaderStages::COMPUTE, &[true; 8]);
+        let compute_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("compute_bind_group_layout"),
-                entries: &compute_entries,
+                label: Some("compute_bg0_layout"),
+                entries: &compute_bg0_entries,
+            });
+        let compute_bg1_entries =
+            storage_entries(6, wgpu::ShaderStages::COMPUTE, &[false; 6]);
+        let compute_bg1_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("compute_bg1_layout"),
+                entries: &compute_bg1_entries,
             });
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute_pipeline_layout"),
-                bind_group_layouts: &[&compute_bind_group_layout],
+                bind_group_layouts: &[&compute_bg0_layout, &compute_bg1_layout],
                 immediate_size: 0,
             });
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -501,16 +526,16 @@ impl ForwardPipelines {
                 cache: None,
             });
 
-        // ----- HW projection compute pipeline (11 bindings, no tile work) -----
+        // ----- HW projection compute pipeline (11 bindings, single group) -----
         // Bindings: uniforms(r), vertices(r), indices(r), circumdata(r),
         //           sort_keys(rw), sort_values(rw), indirect_args(rw),
         //           colors(rw), base_colors(r), color_grads(r), sh_coeffs(r)
+        // 11 > 10 so this pipeline is invalid on WebGPU; the web viewer doesn't
+        // use it — it dispatches `compute_pipeline` via a separate code path.
         let hw_compute_read_only = [
-            true, true, true, true, // 0-3 read-only
-            false, false, false, // 4-6 read-write
-            false, true, // 7-8: colors(rw), base_colors(r)
-            true, // 9: color_grads(r)
-            true, // 10: sh_coeffs(r)
+            true, true, true, true,   // 0-3 read-only
+            false, false, false,      // 4-6 read-write (sort_keys, sort_values, indirect_args)
+            false, true, true, true,  // 7=colors(rw), 8=base_colors(r), 9=color_grads(r), 10=sh_coeffs(r)
         ];
         let hw_compute_entries =
             storage_entries(11, wgpu::ShaderStages::COMPUTE, &hw_compute_read_only);
@@ -850,7 +875,8 @@ impl ForwardPipelines {
         Self {
             compute_pipeline,
             compute_pipeline_16bit,
-            compute_bind_group_layout,
+            compute_bg0_layout,
+            compute_bg1_layout,
             hw_compute_pipeline,
             hw_compute_bind_group_layout,
             render_pipeline,
@@ -1939,24 +1965,23 @@ pub fn record_tex_to_buffer(encoder: &mut wgpu::CommandEncoder, ttb: &TexToBuffe
 // Bind Groups
 // ---------------------------------------------------------------------------
 
-/// Create the compute bind group (14 bindings).
+/// Create the compute bind groups (split 8 read-only + 6 read-write).
 ///
 /// Binding order matches `project_compute.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: densities,
-///   4: color_grads, 5: circumdata,
-///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
-///   10: tiles_touched, 11: compact_tet_ids, 12: base_colors,
-///   13: sh_coeffs (f16-packed)
+///   group 0: 0=uniforms, 1=vertices, 2=indices, 3=densities,
+///            4=color_grads, 5=circumdata, 6=base_colors_buf, 7=sh_coeffs
+///   group 1: 0=colors, 1=sort_keys, 2=sort_values, 3=indirect_args,
+///            4=tiles_touched, 5=compact_tet_ids
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("compute_bind_group"),
-        layout: &pipelines.compute_bind_group_layout,
+) -> ForwardComputeBindGroups {
+    let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_bind_group_0"),
+        layout: &pipelines.compute_bg0_layout,
         entries: &[
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
@@ -1964,32 +1989,39 @@ pub fn create_compute_bind_group(
             buf_entry(3, &buffers.densities),
             buf_entry(4, &material.color_grads),
             buf_entry(5, &buffers.circumdata),
-            buf_entry(6, &material.colors),
-            buf_entry(7, &buffers.sort_keys),
-            buf_entry(8, &buffers.sort_values),
-            buf_entry(9, &buffers.indirect_args),
-            buf_entry(10, &buffers.tiles_touched),
-            buf_entry(11, &buffers.compact_tet_ids),
-            buf_entry(12, &material.base_colors),
-            buf_entry(13, sh_coeffs_buf),
+            buf_entry(6, &material.base_colors),
+            buf_entry(7, sh_coeffs_buf),
         ],
-    })
+    });
+    let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("compute_bind_group_1"),
+        layout: &pipelines.compute_bg1_layout,
+        entries: &[
+            buf_entry(0, &material.colors),
+            buf_entry(1, &buffers.sort_keys),
+            buf_entry(2, &buffers.sort_values),
+            buf_entry(3, &buffers.indirect_args),
+            buf_entry(4, &buffers.tiles_touched),
+            buf_entry(5, &buffers.compact_tet_ids),
+        ],
+    });
+    ForwardComputeBindGroups { bg0, bg1 }
 }
 
-/// Create the HW projection compute bind group (11 bindings, no tile data).
+/// Create the HW projection compute bind group (11 bindings, single group).
 ///
 /// Binding order matches `project_compute_hw.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: circumdata,
-///   4: sort_keys, 5: sort_values, 6: indirect_args,
-///   7: colors, 8: base_colors, 9: color_grads, 10: sh_coeffs
+///   0=uniforms, 1=vertices, 2=indices, 3=circumdata,
+///   4=sort_keys, 5=sort_values, 6=indirect_args, 7=colors,
+///   8=base_colors, 9=color_grads, 10=sh_coeffs
 pub fn create_hw_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+) -> ForwardHwComputeBindGroups {
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hw_compute_bind_group"),
         layout: &pipelines.hw_compute_bind_group_layout,
         entries: &[
@@ -2005,7 +2037,8 @@ pub fn create_hw_compute_bind_group(
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
         ],
-    })
+    });
+    ForwardHwComputeBindGroups { bg }
 }
 
 /// Create the render bind group (7 bindings).
@@ -2396,7 +2429,7 @@ pub fn record_project_compute(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     tet_count: u32,
     queue: &wgpu::Queue,
 ) {
@@ -2417,7 +2450,8 @@ pub fn record_project_compute(
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
-        cpass.set_bind_group(0, compute_bg, &[]);
+        cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+        cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
         let workgroup_size = 64u32;
         let n_pow2 = tet_count.next_power_of_two();
@@ -2438,7 +2472,7 @@ pub fn record_project_compute_and_sort(
     encoder: &mut wgpu::CommandEncoder,
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     tet_count: u32,
     queue: &wgpu::Queue,
 ) {
@@ -2458,7 +2492,8 @@ pub fn record_project_compute_and_sort(
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
-        cpass.set_bind_group(0, compute_bg, &[]);
+        cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+        cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
         let workgroup_size = 64u32;
         let n_pow2 = tet_count.next_power_of_two();
@@ -2484,7 +2519,7 @@ pub fn record_forward_pass(
     pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
     targets: &RenderTargets,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     render_bg: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
@@ -2507,7 +2542,8 @@ pub fn record_forward_pass(
             timestamp_writes: None,
         });
         cpass.set_pipeline(&pipelines.compute_pipeline);
-        cpass.set_bind_group(0, compute_bg, &[]);
+        cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+        cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
         // Dispatch for n_pow2 threads: tet_count threads do real work,
         // padding threads (tet_count..n_pow2-1) initialize sort buffers.
@@ -2633,13 +2669,13 @@ pub fn record_sorted_forward_pass(
     sort_state: &rmesh_sort::RadixSortState,
     buffers: &SceneBuffers,
     targets: &RenderTargets,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     render_bg_a: &wgpu::BindGroup,
     render_bg_b: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
-    hw_compute_bg: Option<&wgpu::BindGroup>,
+    hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
     use_quad: bool,
     prepass_bg_a: Option<&wgpu::BindGroup>,
     prepass_bg_b: Option<&wgpu::BindGroup>,
@@ -2675,10 +2711,11 @@ pub fn record_sorted_forward_pass(
         });
         if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, hw_bg, &[]);
+            cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
             cpass.set_pipeline(&pipelines.compute_pipeline);
-            cpass.set_bind_group(0, compute_bg, &[]);
+            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
 
         let workgroup_size = 64u32;
@@ -2844,14 +2881,14 @@ pub fn record_sorted_mesh_forward_pass(
     sort_state: &rmesh_sort::RadixSortState,
     buffers: &SceneBuffers,
     targets: &RenderTargets,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     mesh_render_bg_a: &wgpu::BindGroup,
     mesh_render_bg_b: &wgpu::BindGroup,
     indirect_convert_bg: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
-    hw_compute_bg: Option<&wgpu::BindGroup>,
+    hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
     profiler: Option<&wgpu::QuerySet>,
     mrt_enabled: bool,
 ) {
@@ -2885,10 +2922,11 @@ pub fn record_sorted_mesh_forward_pass(
         });
         if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, hw_bg, &[]);
+            cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
             cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
-            cpass.set_bind_group(0, compute_bg, &[]);
+            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
 
         let workgroup_size = 64u32;
@@ -3035,14 +3073,14 @@ pub fn record_sorted_interval_forward_pass(
     sort_state: &rmesh_sort::RadixSortState,
     buffers: &SceneBuffers,
     targets: &RenderTargets,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     interval_render_bg_a: &wgpu::BindGroup,
     interval_render_bg_b: &wgpu::BindGroup,
     indirect_convert_bg: &wgpu::BindGroup,
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
-    hw_compute_bg: Option<&wgpu::BindGroup>,
+    hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
     profiler: Option<&wgpu::QuerySet>,
 ) {
     // ----- 1. Reset indirect args -----
@@ -3074,10 +3112,11 @@ pub fn record_sorted_interval_forward_pass(
         });
         if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, hw_bg, &[]);
+            cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
             cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
-            cpass.set_bind_group(0, compute_bg, &[]);
+            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
 
         let workgroup_size = 64u32;
@@ -3185,7 +3224,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     sort_state: &rmesh_sort::RadixSortState,
     buffers: &SceneBuffers,
     targets: &RenderTargets,
-    compute_bg: &wgpu::BindGroup,
+    compute_bg: &ForwardComputeBindGroups,
     gen_bg_a: &wgpu::BindGroup,
     gen_bg_b: &wgpu::BindGroup,
     ci_render_bg: &wgpu::BindGroup,
@@ -3193,7 +3232,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     tet_count: u32,
     queue: &wgpu::Queue,
     depth_view: &wgpu::TextureView,
-    hw_compute_bg: Option<&wgpu::BindGroup>,
+    hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
     profiler: Option<&wgpu::QuerySet>,
     use_16bit_sort: bool,
     mrt_enabled: bool,
@@ -3226,15 +3265,17 @@ pub fn record_sorted_compute_interval_forward_pass(
             }),
         });
         if use_16bit_sort {
-            // 16-bit linear key shader needs full 14-binding layout (accesses far_plane)
+            // 16-bit linear key shader uses the same split compute layout
             cpass.set_pipeline(&fwd_pipelines.compute_pipeline_16bit);
-            cpass.set_bind_group(0, compute_bg, &[]);
+            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         } else if let Some(hw_bg) = hw_compute_bg {
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, hw_bg, &[]);
+            cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
             cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
-            cpass.set_bind_group(0, compute_bg, &[]);
+            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
 
         let workgroup_size = 64u32;
@@ -3395,7 +3436,7 @@ pub fn setup_forward(
     MaterialBuffers,
     ForwardPipelines,
     RenderTargets,
-    wgpu::BindGroup,
+    ForwardComputeBindGroups,
     wgpu::BindGroup,
 ) {
     let color_format = wgpu::TextureFormat::Rgba16Float;

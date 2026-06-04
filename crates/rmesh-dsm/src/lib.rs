@@ -949,7 +949,12 @@ impl DsmAtlas {
         let scratch_uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dsm_scratch_uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            // UNIFORM so this buffer can bind as `var<uniform>` in
+            // project_compute_hw (the binding required to stay under WebGPU's
+            // 10 storage-buffers-per-stage cap).
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
@@ -1197,7 +1202,7 @@ pub fn generate_dsm_for_lights(
                         timestamp_writes: None,
                     });
                     cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-                    cpass.set_bind_group(0, &compute_bg, &[]);
+                    cpass.set_bind_group(0, &compute_bg.bg, &[]);
                     let workgroup_size = 64u32;
                     let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
                     let (dx, dy) = dispatch_2d(total_workgroups);
@@ -1322,10 +1327,14 @@ pub fn generate_dsm_for_lights(
     }
 }
 
-/// Create a HW projection compute bind group with scratch uniforms.
+/// Create the pair of HW projection compute bind groups with scratch uniforms.
 ///
 /// Mirrors `rmesh_render::create_hw_compute_bind_group` but uses a custom
-/// uniforms buffer instead of `buffers.uniforms`.
+/// uniforms buffer instead of `buffers.uniforms`. Layout matches
+/// `project_compute_hw.wgsl`:
+///   group 0: 0=uniforms (uniform buffer), 1=vertices, 2=indices, 3=circumdata,
+///            4=base_colors, 5=color_grads, 6=sh_coeffs
+///   group 1: 0=sort_keys, 1=sort_values, 2=indirect_args, 3=colors
 fn create_dsm_hw_compute_bg(
     device: &wgpu::Device,
     fwd_pipelines: &ForwardPipelines,
@@ -1333,8 +1342,8 @@ fn create_dsm_hw_compute_bg(
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
     scratch_uniforms: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
+) -> rmesh_render::ForwardHwComputeBindGroups {
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dsm_hw_compute_bg"),
         layout: &fwd_pipelines.hw_compute_bind_group_layout,
         entries: &[
@@ -1350,7 +1359,8 @@ fn create_dsm_hw_compute_bg(
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
         ],
-    })
+    });
+    rmesh_render::ForwardHwComputeBindGroups { bg }
 }
 
 /// Create the indirect-convert bind group.

@@ -95,7 +95,8 @@ fn test_project_compute_kernel() {
             timestamp_writes: None,
         });
         pass.set_pipeline(&pipelines.compute_pipeline);
-        pass.set_bind_group(0, &compute_bg, &[]);
+        pass.set_bind_group(0, &compute_bg.bg0, &[]);
+        pass.set_bind_group(1, &compute_bg.bg1, &[]);
         let n_pow2 = scene.tet_count.next_power_of_two();
         pass.dispatch_workgroups((n_pow2 + 63) / 64, 1, 1);
     }

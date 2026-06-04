@@ -31,21 +31,25 @@ struct DrawIndirectArgs {
     first_instance: u32,
 };
 
+// Bindings are split across two groups so the read-only group stays under
+// WebGPU's per-stage storage-buffer cap (10). Group 0 = 8 read-only inputs,
+// group 1 = 6 read-write working buffers.
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> densities: array<f32>;
 @group(0) @binding(4) var<storage, read> color_grads: array<f32>;
 @group(0) @binding(5) var<storage, read> circumdata: array<f32>;
-@group(0) @binding(6) var<storage, read_write> colors: array<f32>;
-@group(0) @binding(7) var<storage, read_write> sort_keys: array<u32>;
-@group(0) @binding(8) var<storage, read_write> sort_values: array<u32>;
-@group(0) @binding(9) var<storage, read_write> indirect_args: DrawIndirectArgs;
+@group(0) @binding(6) var<storage, read> base_colors_buf: array<f32>;
+@group(0) @binding(7) var<storage, read> sh_coeffs: array<u32>;
+
+@group(1) @binding(0) var<storage, read_write> colors: array<f32>;
+@group(1) @binding(1) var<storage, read_write> sort_keys: array<u32>;
+@group(1) @binding(2) var<storage, read_write> sort_values: array<u32>;
+@group(1) @binding(3) var<storage, read_write> indirect_args: DrawIndirectArgs;
 // Compact outputs for tiled path (indexed by vis_idx from atomicAdd)
-@group(0) @binding(10) var<storage, read_write> tiles_touched: array<u32>;
-@group(0) @binding(11) var<storage, read_write> compact_tet_ids: array<u32>;
-@group(0) @binding(12) var<storage, read> base_colors_buf: array<f32>;
-@group(0) @binding(13) var<storage, read> sh_coeffs: array<u32>;
+@group(1) @binding(4) var<storage, read_write> tiles_touched: array<u32>;
+@group(1) @binding(5) var<storage, read_write> compact_tet_ids: array<u32>;
 
 // --- SH constants ---
 const C0: f32 = 0.28209479177387814;

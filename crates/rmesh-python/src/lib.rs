@@ -168,7 +168,7 @@ struct RMeshRenderer {
     rasterize_bg: wgpu::BindGroup,
     rasterize_bg_b: wgpu::BindGroup,
     // Bind groups
-    compute_bg: wgpu::BindGroup,
+    compute_bg: rmesh_render::ForwardComputeBindGroups,
     render_bg: wgpu::BindGroup,
     // Loss bind group using rasterize.rendered_image (for train_step)
     loss_bg_tiled: wgpu::BindGroup,

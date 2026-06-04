@@ -134,7 +134,7 @@ pub fn load_rmesh_raw(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrDat
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>> {
     if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
         log::info!("Decompressing gzip ({:.1} MB)...", data.len() as f64 / 1e6);
-        let t0 = std::time::Instant::now();
+        let t0 = web_time::Instant::now();
         let mut decoder = GzDecoder::new(data);
         let mut decompressed = Vec::new();
         decoder
@@ -227,7 +227,7 @@ fn read_f32_val(data: &[u8], off: &mut usize) -> f32 {
 // ---------------------------------------------------------------------------
 
 fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
-    let t_total = std::time::Instant::now();
+    let t_total = web_time::Instant::now();
     let mut offset = 0usize;
 
     // Header
@@ -249,7 +249,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let _pad = read_f32_val(data, &mut offset);
 
     // Vertices [N × 3] f32 — zero-copy
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let vertices = slice_f32(data, &mut offset, (vertex_count * 3) as usize);
     let indices = slice_u32(data, &mut offset, (tet_count * 4) as usize);
     log::info!(
@@ -259,7 +259,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     );
 
     // Densities [M] u8, log-encoded → parallel decode
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     log::debug!("Parse offsets: after verts+indices = {} / {} bytes", offset, data.len());
     let densities_u8 = &data[offset..offset + tet_count as usize];
     offset += tet_count as usize;
@@ -319,7 +319,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         "Decompressing PCA ({} tets × {} dims × {} components)...",
         tet_count, total_dims, effective_k
     );
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let k = effective_k;
     let mut sh_coeffs = vec![0.0f32; tet_count as usize * total_dims];
 
@@ -337,7 +337,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     // --- Parallel circumsphere computation ---
     log::info!("Computing circumspheres ({} tets)...", tet_count);
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let circumdata = compute_circumspheres_parallel(&vertices, &indices, tet_count as usize);
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -619,7 +619,7 @@ fn compute_circumspheres_parallel(
 /// but the viewer/renderer expects **planar by channel**:
 ///   [sh_0_r, sh_1_r, ..., sh_N_r, sh_0_g, sh_1_g, ..., sh_N_g, sh_0_b, ...]
 pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
-    let t_total = std::time::Instant::now();
+    let t_total = web_time::Instant::now();
 
     // --- Parse ASCII header ---
     let header_end = find_header_end(data).context("Missing end_header in PLY")?;
@@ -663,7 +663,7 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let mut offset = header_end;
 
     // --- Read vertices: N × 12 bytes (contiguous f32 x,y,z) ---
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let vertices = slice_f32(data, &mut offset, (vertex_count * 3) as usize);
     log::info!("Vertices: {:.2}s", t0.elapsed().as_secs_f64());
 
@@ -680,7 +680,7 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         tet_data.len() as f64 / 1e6,
         tet_stride,
     );
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
 
     let nc_usize = nc as usize;
     let total_dims = nc_usize * 3; // SH floats per tet in planar layout
@@ -733,7 +733,7 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     // --- Compute circumspheres ---
     log::info!("Computing circumspheres ({} tets)...", tet_count);
-    let t0 = std::time::Instant::now();
+    let t0 = web_time::Instant::now();
     let circumdata = compute_circumspheres_parallel(&vertices, &indices, tet_count as usize);
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 

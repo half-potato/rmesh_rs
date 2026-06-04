@@ -7,8 +7,9 @@ use wasm_bindgen::prelude::*;
 use wgpu::util::DeviceExt;
 
 use rmesh_render::{
-    create_blit_bind_group, create_compute_bind_group, create_render_bind_group,
-    create_render_bind_group_with_sort_values, record_blit, BlitPipeline, ForwardPipelines,
+    create_blit_bind_group, create_compute_bind_group, create_hw_compute_bind_group,
+    create_render_bind_group, create_render_bind_group_with_sort_values, record_blit,
+    BlitPipeline, ForwardComputeBindGroups, ForwardHwComputeBindGroups, ForwardPipelines,
     MaterialBuffers, RenderTargets, SceneBuffers, Uniforms,
 };
 use rmesh_util::camera::Camera;
@@ -20,7 +21,7 @@ use rmesh_interact::{
     TransformInteraction,
 };
 use rmesh_compositor::{
-    PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
+    MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
     record_primitive_pass,
 };
 
@@ -50,7 +51,11 @@ fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
 struct SceneState {
     buffers: SceneBuffers,
     material: MaterialBuffers,
-    compute_bg: wgpu::BindGroup,
+    compute_bg: ForwardComputeBindGroups,
+    /// HW projection compute bindings (10 storage buffers — fits WebGPU's
+    /// per-stage cap). The web viewer uses this in place of the full
+    /// compute_pipeline (14 buffers, exceeds cap and stays invalid on web).
+    hw_compute_bg: ForwardHwComputeBindGroups,
     render_bg: wgpu::BindGroup,
     render_bg_b: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
@@ -76,6 +81,7 @@ pub struct WebViewer {
     primitive_geometry: PrimitiveGeometry,
     primitive_pipeline: PrimitivePipeline,
     primitive_targets: PrimitiveTargets,
+    material_registry: MaterialRegistry,
     show_primitives: bool,
     // Interaction
     interaction: TransformInteraction,
@@ -123,6 +129,13 @@ impl WebViewer {
         log::info!("GPU: {:?}", adapter.get_info().name);
 
         let adapter_limits = adapter.limits();
+        log::info!(
+            "Adapter limits: storage_buffers/stage={}, bind_groups={}, storage_buffer_max={}, workgroup_storage={}",
+            adapter_limits.max_storage_buffers_per_shader_stage,
+            adapter_limits.max_bind_groups,
+            adapter_limits.max_storage_buffer_binding_size,
+            adapter_limits.max_compute_workgroup_storage_size,
+        );
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -166,7 +179,8 @@ impl WebViewer {
 
         // Primitive setup
         let primitive_geometry = PrimitiveGeometry::new(&device);
-        let primitive_pipeline = PrimitivePipeline::new(&device);
+        let material_registry = MaterialRegistry::new(&device, &queue);
+        let primitive_pipeline = PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
         let primitive_targets = PrimitiveTargets::new(&device, width, height);
 
         log::info!("WebViewer initialized ({width}×{height})");
@@ -185,6 +199,7 @@ impl WebViewer {
             primitive_geometry,
             primitive_pipeline,
             primitive_targets,
+            material_registry,
             show_primitives: false,
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
@@ -311,6 +326,7 @@ impl WebViewer {
             if self.show_primitives { &self.primitives } else { &[] },
             &vp,
             None,
+            Some(&self.material_registry),
         );
 
         // Sorted forward pass: compute → radix sort → HW render
@@ -329,7 +345,7 @@ impl WebViewer {
             scene.tet_count,
             &self.queue,
             &self.primitive_targets.depth_view,
-            None,
+            Some(&scene.hw_compute_bg),
             false,
             None, None, None,
             None,
@@ -617,6 +633,13 @@ impl WebViewer {
 
         let compute_bg =
             create_compute_bind_group(&self.device, &self.pipelines, &buffers, &material, &sh_coeffs_buf);
+        let hw_compute_bg = create_hw_compute_bind_group(
+            &self.device,
+            &self.pipelines,
+            &buffers,
+            &material,
+            &sh_coeffs_buf,
+        );
         let render_bg =
             create_render_bind_group(&self.device, &self.pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
@@ -636,6 +659,7 @@ impl WebViewer {
             buffers,
             material,
             compute_bg,
+            hw_compute_bg,
             render_bg,
             render_bg_b,
             blit_bg,

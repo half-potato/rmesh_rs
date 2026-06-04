@@ -1208,7 +1208,8 @@ impl App {
                         }),
                     });
                     cpass.set_pipeline(&gpu.pipelines.compute_pipeline);
-                    cpass.set_bind_group(0, &gpu.compute_bg, &[]);
+                    cpass.set_bind_group(0, &gpu.compute_bg.bg0, &[]);
+                    cpass.set_bind_group(1, &gpu.compute_bg.bg1, &[]);
                     let n_pow2 = gpu.tet_count.next_power_of_two();
                     let wgs = (n_pow2 + 63) / 64;
                     cpass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);

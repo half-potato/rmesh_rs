@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>rmesh-viewer-web smoke test</title></head>
+<body style="background:#111;color:#eee;font:13px monospace;padding:8px;">
+<h3>rmesh-viewer-web smoke test</h3>
+<pre id="log"></pre>
+<canvas id="canvas" width="320" height="240" style="border:1px solid #444;display:block;"></canvas>
+
+<script type="module">
+const logEl = document.getElementById('log');
+const lines = [];
+function log(msg) {
+  console.log('[smoketest]', msg);
+  lines.push(msg);
+  logEl.textContent = lines.join('\n');
+}
+window.__smoketest = { lines, done: false, ok: false, error: null };
+
+// Hook GPUDevice to push validation error scopes around every async dispatch boundary.
+// We'll just check unhandlederror events instead — they're emitted async by the browser.
+let gpuErrors = [];
+window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' + e.reason));
+
+(async () => {
+  try {
+    log('navigator.gpu: ' + (navigator.gpu ? 'present' : 'MISSING'));
+    if (!navigator.gpu) throw new Error('WebGPU unavailable');
+
+    const adapter = await navigator.gpu.requestAdapter();
+    log('adapter: ' + (adapter ? (adapter.info?.description || adapter.info?.architecture || 'present') : 'NULL'));
+    if (!adapter) throw new Error('no GPU adapter');
+    const lim = adapter.limits;
+    log('  maxStorageBuffersPerShaderStage=' + lim.maxStorageBuffersPerShaderStage
+      + ' maxBindGroups=' + lim.maxBindGroups
+      + ' maxComputeWorkgroupStorageSize=' + lim.maxComputeWorkgroupStorageSize);
+    // Probe: try requesting a device with raised limits to see what the adapter REALLY allows.
+    try {
+      const probe = await adapter.requestDevice({
+        requiredLimits: { maxStorageBuffersPerShaderStage: 20 },
+      });
+      log('  PROBE: device with maxStorageBuffersPerShaderStage=20 succeeded');
+      probe.destroy && probe.destroy();
+    } catch (e) {
+      log('  PROBE: maxStorageBuffersPerShaderStage=20 rejected: ' + String(e).split('\n')[0]);
+    }
+
+    log('importing pkg/rmesh_viewer_web.js...');
+    const mod = await import('./pkg/rmesh_viewer_web.js');
+    log('init()...');
+    await mod.default();
+
+    // Patch GPUAdapter.requestDevice to wrap the returned device with an error capture.
+    // We patch on the prototype, after init() — so the WebViewer.create call uses it.
+    const origReq = GPUAdapter.prototype.requestDevice;
+    GPUAdapter.prototype.requestDevice = async function(desc) {
+      const dev = await origReq.call(this, desc);
+      dev.addEventListener('uncapturederror', ev => {
+        const msg = ev.error?.message || String(ev.error);
+        gpuErrors.push(msg);
+        log('GPU UNCAPTURED ERROR: ' + msg.split('\n')[0]);
+      });
+      // Wrap onerror via pushErrorScope/popErrorScope for the entire run
+      dev.pushErrorScope('validation');
+      dev.pushErrorScope('internal');
+      window.__smoketest.device = dev;
+      return dev;
+    };
+
+    log('WebViewer.create("canvas")...');
+    const viewer = await mod.WebViewer.create('canvas');
+    log('viewer created. has_scene=' + viewer.has_scene());
+
+    const params = new URLSearchParams(location.search);
+    const skipLoad = params.has('init') || params.has('skipload');
+
+    if (!skipLoad) {
+      log('fetching test.rmesh...');
+      const resp = await fetch('./test.rmesh');
+      if (!resp.ok) throw new Error('fetch test.rmesh: HTTP ' + resp.status);
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      log('test.rmesh bytes: ' + buf.length);
+      log('viewer.load_rmesh()...');
+      viewer.load_rmesh(buf);
+      log('has_scene=' + viewer.has_scene());
+
+      log('resize(320,240) + render() x 5...');
+      viewer.resize(320, 240);
+      for (let i = 0; i < 5; i++) viewer.render();
+    } else {
+      log('?init mode — skipping rmesh load');
+      viewer.resize(320, 240);
+    }
+
+    // Wait for queue to flush — runs in real time even under --virtual-time-budget.
+    const dev = window.__smoketest.device;
+    log('queue.onSubmittedWorkDone()...');
+    await dev.queue.onSubmittedWorkDone();
+    log('GPU work done. popping error scopes...');
+    const internalErr = await dev.popErrorScope();
+    const validationErr = await dev.popErrorScope();
+    if (internalErr) log('INTERNAL ERROR: ' + internalErr.message.split('\n')[0]);
+    if (validationErr) log('VALIDATION ERROR: ' + validationErr.message.split('\n')[0]);
+    // One more render after error scope pop so the next frame goes through cleanly
+    if (!skipLoad) viewer.render();
+    await dev.queue.onSubmittedWorkDone();
+
+    // Don't try to read pixels from JS — drawImage() on a WebGPU canvas doesn't
+    // reliably round-trip in Chrome headless. test.sh uses DevTools'
+    // Page.captureScreenshot for the actual pixel check.
+    log('OK — JS workflow completed without exception');
+    window.__smoketest.ok = true;
+  } catch (e) {
+    log('FAIL: ' + (e && e.stack ? e.stack : e));
+    window.__smoketest.error = String(e);
+    window.__smoketest.ok = false;
+  } finally {
+    window.__smoketest.done = true;
+    document.title = window.__smoketest.ok ? 'PASS' : 'FAIL';
+  }
+})();
+</script>
+</body>
+</html>
