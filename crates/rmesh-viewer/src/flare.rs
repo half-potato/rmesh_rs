@@ -7,6 +7,7 @@ use glam::{Quat, Vec3};
 use rmesh_interact::{Primitive, PrimitiveKind};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::mpsc;
 
 const GRAVITY: Vec3 = Vec3::new(0.0, 0.0, 9.81); // +Z is down in COLMAP coords (-Z up)
 const INITIAL_SPEED: f32 = 15.0;
@@ -15,10 +16,21 @@ const MAX_LIFETIME: f32 = 30.0;
 const FADE_DURATION: f32 = 5.0;
 const FLARE_COLOR: [f32; 3] = [1.0, 0.85, 0.5];
 const FLARE_INTENSITY: f32 = 2.0;
-const FLARE_RADIUS: f32 = 0.2;
+const FLARE_RADIUS: f32 = 0.25;
 /// The model is ~17 units tall along its local axis.
 const FLARE_MODEL_HEIGHT: f32 = 17.0;
 const FLARE_MODEL_SCALE: f32 = 2.0 * FLARE_RADIUS / FLARE_MODEL_HEIGHT;
+/// Half-width of the body cylinder after scaling: the source body has
+/// R ≈ 0.92 in the Y-up glTF, and `FLARE_MODEL_SCALE` carries it to ~0.027
+/// in world units. Used to lift the model off angled walls on collision.
+const FLARE_BODY_RADIUS: f32 = 0.92 * FLARE_MODEL_SCALE;
+
+/// Model-local position of the bright cap's centroid (in COLMAP coords, before
+/// `prim.transform.scale` is applied). The cap mesh spans Y ∈ [6.40, 8.84] in
+/// the Y-up source; the center Y ≈ 7.62 maps to Z = -7.62 via `yup_to_colmap`.
+/// Used by the deferred renderer to emit the flare's point light from the cap
+/// rather than the model's geometric center.
+pub const FLARE_LIGHT_LOCAL_OFFSET: Vec3 = Vec3::new(0.0, 0.0, -7.62);
 const BVH_MAX_LEAF: usize = 4;
 
 // -----------------------------------------------------------------------
@@ -64,16 +76,31 @@ pub struct CollisionMesh {
 impl CollisionMesh {
     /// Extract the boundary surface of the dense region and build a BVH.
     pub fn build(scene_data: &rmesh_data::SceneData, threshold: f32) -> Self {
-        let tet_count = scene_data.tet_count as usize;
-        let verts = &scene_data.vertices;
-        let idxs = &scene_data.indices;
+        Self::build_from_slices(
+            &scene_data.vertices,
+            &scene_data.indices,
+            &scene_data.densities,
+            scene_data.tet_count as usize,
+            threshold,
+        )
+    }
+
+    /// Same as [`build`] but takes the raw slices directly — used by the
+    /// async background rebuild path which moves owned `Vec`s into a thread.
+    pub fn build_from_slices(
+        verts: &[f32],
+        idxs: &[u32],
+        densities: &[f32],
+        tet_count: usize,
+        threshold: f32,
+    ) -> Self {
 
         // Collect faces from dense tets. Key = sorted (i, j, k).
         // Value = (tet_index, face_index, count).
         let mut face_map: HashMap<[u32; 3], Vec<(usize, usize)>> = HashMap::new();
 
         for t in 0..tet_count {
-            if scene_data.densities[t] < threshold {
+            if densities[t] < threshold {
                 continue;
             }
             let ti = [
@@ -148,7 +175,18 @@ impl CollisionMesh {
     }
 
     /// Ray-segment intersection. Returns the closest hit distance t ∈ (0, t_max], or None.
+    #[allow(dead_code)] // exercised by tests; kept on the public API
     pub fn ray_intersect(&self, origin: Vec3, dir: Vec3, t_max: f32) -> Option<f32> {
+        self.ray_intersect_with_normal(origin, dir, t_max).map(|(t, _)| t)
+    }
+
+    /// Like [`ray_intersect`] but also returns the outward surface normal of the hit triangle.
+    pub fn ray_intersect_with_normal(
+        &self,
+        origin: Vec3,
+        dir: Vec3,
+        t_max: f32,
+    ) -> Option<(f32, Vec3)> {
         if self.bvh.is_empty() {
             return None;
         }
@@ -172,7 +210,7 @@ impl CollisionMesh {
         );
 
         let mut closest = t_max;
-        let mut hit = false;
+        let mut hit_tri: Option<usize> = None;
         let mut stack = [0u32; 64];
         stack[0] = 0;
         let mut sp = 1;
@@ -195,7 +233,7 @@ impl CollisionMesh {
                     if let Some(t) = ray_triangle(origin, dir, v0, v1, v2) {
                         if t > 0.0 && t <= closest {
                             closest = t;
-                            hit = true;
+                            hit_tri = Some(ti);
                         }
                     }
                 }
@@ -211,11 +249,7 @@ impl CollisionMesh {
             }
         }
 
-        if hit {
-            Some(closest)
-        } else {
-            None
-        }
+        hit_tri.map(|ti| (closest, self.normals[ti]))
     }
 
     /// Convert to PrimitiveVertex triangles for debug visualization.
@@ -434,6 +468,14 @@ pub struct FlareSystem {
     pub has_flare_model: bool,
     /// Material indices for each mesh in the flare model.
     pub flare_material_indices: Vec<usize>,
+    /// In-flight async collision-mesh rebuild kicked off from
+    /// [`start_async_rebuild`]. Polled each frame via [`poll_rebuild`].
+    /// At most one pending rebuild — a fresh `start_async_rebuild` just
+    /// drops the older receiver (its result will land and be ignored).
+    pending_collision_rebuild: Option<mpsc::Receiver<CollisionMesh>>,
+    /// Threshold used for the in-flight rebuild — only install the result
+    /// if it still matches the current `density_threshold`.
+    pending_collision_threshold: f32,
 }
 
 impl Default for FlareSystem {
@@ -450,6 +492,8 @@ impl Default for FlareSystem {
             flare_mesh_base: 0,
             has_flare_model: false,
             flare_material_indices: Vec::new(),
+            pending_collision_rebuild: None,
+            pending_collision_threshold: 0.0,
         }
     }
 }
@@ -519,6 +563,62 @@ impl FlareSystem {
         self.ensure_collision_mesh(scene_data);
     }
 
+    /// Kick off a background BVH rebuild from the current scene data. Returns
+    /// immediately — the new mesh installs once [`poll_rebuild`] sees the
+    /// result. Replaces any in-flight rebuild; the old result is dropped.
+    /// Used after a PBD soft-body grab confirm so flares track the deformed
+    /// surface without blocking the user.
+    pub fn start_async_rebuild(&mut self, scene_data: &rmesh_data::SceneData) {
+        if scene_data.tet_count == 0 {
+            return;
+        }
+        let verts = scene_data.vertices.clone();
+        let idxs = scene_data.indices.clone();
+        let densities = scene_data.densities.clone();
+        let tet_count = scene_data.tet_count as usize;
+        let threshold = self.density_threshold;
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mesh = CollisionMesh::build_from_slices(
+                &verts, &idxs, &densities, tet_count, threshold,
+            );
+            log::info!(
+                "[flare] async collision-mesh rebuild done in {:.2}s",
+                t0.elapsed().as_secs_f64()
+            );
+            // Receiver may be gone if a newer rebuild superseded us — that's fine.
+            let _ = tx.send(mesh);
+        });
+        self.pending_collision_rebuild = Some(rx);
+        self.pending_collision_threshold = threshold;
+    }
+
+    /// Try to install any completed async rebuild. Cheap (non-blocking
+    /// `try_recv`); safe to call every frame.
+    pub fn poll_rebuild(&mut self) {
+        let Some(rx) = self.pending_collision_rebuild.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(mesh) => {
+                // Only install if the threshold hasn't changed under us; if it
+                // has, ensure_collision_mesh will rebuild synchronously anyway.
+                if (self.pending_collision_threshold - self.density_threshold).abs() < 1e-6 {
+                    self.collision_mesh = Some(mesh);
+                    self.last_built_threshold = self.pending_collision_threshold;
+                    self.collision_mesh_dirty = true;
+                }
+                self.pending_collision_rebuild = None;
+            }
+            Err(mpsc::TryRecvError::Empty) => {} // still building
+            Err(mpsc::TryRecvError::Disconnected) => {
+                // Thread panicked — drop the receiver, no install.
+                self.pending_collision_rebuild = None;
+            }
+        }
+    }
+
     /// Rebuild the collision mesh if the threshold changed or it hasn't been built yet.
     pub fn ensure_collision_mesh(&mut self, scene_data: &rmesh_data::SceneData) {
         if scene_data.tet_count == 0 {
@@ -565,16 +665,22 @@ impl FlareSystem {
 
                 let hit = if seg_len > 1e-8 {
                     let dir = segment / seg_len;
-                    self.collision_mesh
-                        .as_ref()
-                        .and_then(|mesh| mesh.ray_intersect(flare.position, dir, seg_len))
+                    self.collision_mesh.as_ref().and_then(|mesh| {
+                        mesh.ray_intersect_with_normal(flare.position, dir, seg_len)
+                    })
                 } else {
                     None
                 };
 
-                if let Some(t) = hit {
+                if let Some((t, normal)) = hit {
                     let dir = segment / seg_len;
-                    flare.position += dir * (t - FLARE_RADIUS).max(0.0);
+                    // Back the center off along the velocity so the leading
+                    // end of the model is at the hit point, then push it
+                    // outward along the surface normal by the model's lateral
+                    // radius so the cylinder body doesn't clip into angled
+                    // walls (purely-perpendicular hits get a negligible lift).
+                    flare.position += dir * (t - FLARE_RADIUS).max(0.0)
+                        + normal * FLARE_BODY_RADIUS;
                     flare.velocity = Vec3::ZERO;
                     flare.stuck = true;
                 } else {
@@ -698,16 +804,17 @@ impl FlareSystem {
     }
 }
 
-/// Compute a rotation quaternion that orients the model's -Z axis (its long axis
-/// in COLMAP coords after yup_to_colmap) along the given direction vector.
+/// Compute a rotation quaternion that orients the model's bright (cap) end
+/// toward the camera by making the dim end lead the velocity. The bright cap
+/// is at +Y in the source Y-up model; `yup_to_colmap` ([x,y,z] → [x,z,-y])
+/// puts it at -Z in COLMAP. Mapping +Z onto `dir` rotates the cap to -dir
+/// (back toward the user) while the dim end embeds in the wall on impact.
 fn dir_to_rotation(dir: Vec3) -> Quat {
     if dir.length_squared() < 1e-8 {
         return Quat::IDENTITY;
     }
     let dir = dir.normalize();
-    // Model long axis is -Z in COLMAP; flip to +Z so the head faces forward.
-    let from = Vec3::Z;
-    Quat::from_rotation_arc(from, dir)
+    Quat::from_rotation_arc(Vec3::Z, dir)
 }
 
 // -----------------------------------------------------------------------

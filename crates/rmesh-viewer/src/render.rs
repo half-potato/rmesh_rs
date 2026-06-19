@@ -5,6 +5,7 @@ use rmesh_compositor::record_primitive_pass;
 use rmesh_interact::{InteractContext, Primitive, PrimitiveKind};
 use rmesh_render::{record_blit, Uniforms};
 
+use crate::flare;
 use crate::gpu_state::*;
 use crate::App;
 
@@ -240,6 +241,8 @@ impl App {
         let mut show_primitives = self.show_primitives;
         let mut show_scene = self.show_scene;
         let mut sort_mode = self.sort_mode;
+        let mut pbd_radius = self.pbd_radius;
+        let vertex_select_on = self.vertex_select.is_enabled();
         let interact_display = self.interaction.display_info();
         let interact_selected = self.interaction.selected();
         let mut new_selected: Option<rmesh_interact::Selection> = interact_selected;
@@ -482,6 +485,17 @@ impl App {
                         delete_selected = true;
                     }
                 }
+
+                ui.separator();
+                ui.heading("PBD Grab");
+                let mode_label = if vertex_select_on { "ON (Tab)" } else { "off (Tab)" };
+                ui.label(format!("Vertex select: {mode_label}"));
+                ui.add(
+                    egui::Slider::new(&mut pbd_radius, 0.01..=2.0)
+                        .logarithmic(true)
+                        .text("Radius"),
+                );
+                ui.small("Larger radius = wider deformation island.\nApplies on next grab.");
             });
 
             // Animated scene hierarchy panel (right side, only shown when a scene is loaded)
@@ -652,6 +666,7 @@ impl App {
         }
         self.show_scene = show_scene;
         self.sort_mode = sort_mode;
+        self.pbd_radius = pbd_radius;
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
         self.sky_color = sky_color;
@@ -673,6 +688,10 @@ impl App {
         self.flare_system.density_threshold = density_threshold;
         self.flare_system.force_dsm_recompute = force_dsm_recompute;
         self.flare_system.show_collision_mesh = show_collision_mesh;
+
+        // Install any async-rebuilt collision mesh kicked off by the PBD
+        // ConfirmGrab path.
+        self.flare_system.poll_rebuild();
 
         // Build/rebuild collision mesh if threshold changed (or first time showing)
         if show_collision_mesh || self.flare_system.flare_count() > 0 {
@@ -1479,11 +1498,22 @@ impl App {
                         break;
                     }
                     // Flare CustomMesh primitives also emit point lights
-                    let acts_as_point_light = matches!(prim.kind, PrimitiveKind::PointLight)
-                        || (prim.kind.is_custom_mesh() && is_flare_light(prim));
+                    let is_flare = prim.kind.is_custom_mesh() && is_flare_light(prim);
+                    let acts_as_point_light =
+                        matches!(prim.kind, PrimitiveKind::PointLight) || is_flare;
                     if acts_as_point_light {
+                        // For a flare, the visible bright end is the cap at the
+                        // model's -Z side, so push the light position off the
+                        // model center toward the cap.
+                        let position = if is_flare {
+                            prim.transform.position
+                                + prim.transform.rotation
+                                    * (prim.transform.scale * flare::FLARE_LIGHT_LOCAL_OFFSET)
+                        } else {
+                            prim.transform.position
+                        };
                         gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
-                            position: prim.transform.position.to_array(),
+                            position: position.to_array(),
                             light_type: 0, // point
                             color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
                             intensity: prim.color.map_or(1.0, |c| c[3]),

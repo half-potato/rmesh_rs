@@ -159,6 +159,10 @@ struct App {
     pbd_handle_initial: Vec<(u32, [f32; 3])>,
     /// Number of PBD steps dispatched in the current grab (reset on init).
     pbd_step_counter: u32,
+    /// Soft-body grab island radius in world units. Drives the BFS extent
+    /// in [`init_pbd_grab`] — larger = more vertices pulled along, softer
+    /// falloff. Exposed via the left side panel.
+    pbd_radius: f32,
     /// Vertex that would be picked if user clicked now — refreshed each
     /// frame while VertexSelect mode is on and not grabbing. Rendered as
     /// a small overlay circle.
@@ -258,6 +262,7 @@ impl App {
             pbd_pre_grab_vertices: None,
             pbd_handle_initial: Vec::new(),
             pbd_step_counter: 0,
+            pbd_radius: 0.25,
             pbd_hover_vertex: None,
             pbd_vertex_max_density: None,
             primitives: Vec::new(),
@@ -2240,6 +2245,15 @@ impl App {
                     gpu.pbd_solver = None;
                 }
                 self.pbd_handle_initial.clear();
+                // Force DSM atlas rebuild on next frame — the shadow cubemaps
+                // were baked against the old geometry. Cleared via the same
+                // idiom as render.rs:663-664 / main.rs:1534-1535.
+                self.cached_dsm_lights.clear();
+                self.cached_dsm_num_lights = 0;
+                // Kick off a background rebuild of the flare collision-mesh
+                // BVH so subsequent flares bounce off the deformed surface.
+                // Does not block confirm; the new mesh installs once ready.
+                self.flare_system.start_async_rebuild(&self.scene_data);
             }
             VertexSelectResult::CancelGrab => {
                 log::info!("[pbd] CancelGrab: restoring pre-grab vertices");
@@ -2315,7 +2329,7 @@ impl App {
             return;
         }
         let topology = self.mesh_topology.as_ref().unwrap();
-        let radius = 0.25_f32;
+        let radius = self.pbd_radius;
         let t0 = std::time::Instant::now();
         let island: Island = build_island(
             topology,
