@@ -207,7 +207,7 @@ impl App {
         let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
         let mut show_scene = self.show_scene;
-        let mut sort_16bit = self.sort_16bit;
+        let mut sort_mode = self.sort_mode;
         let mut fluid_reset = false;
         let fluid_params = &mut self.fluid_params;
         let interact_display = self.interaction.display_info();
@@ -300,9 +300,6 @@ impl App {
                         ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                         ui.checkbox(&mut show_scene, "Show Scene");
-                        if render_mode == RenderMode::IntervalShader {
-                            ui.checkbox(&mut sort_16bit, "16-bit Sort");
-                        }
                         ui.separator();
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
@@ -346,6 +343,14 @@ impl App {
                         ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
                         ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
                         ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
+                    });
+                    // Sort selector — only the interval-shading path uses sort,
+                    // so we visually gray it out otherwise but keep it clickable
+                    // (selecting CPU before switching to IntervalShader is fine).
+                    ui.menu_button(format!("Sort: {}", sort_mode), |ui| {
+                        ui.radio_value(&mut sort_mode, SortMode::Gpu32, "GPU 32-bit");
+                        ui.radio_value(&mut sort_mode, SortMode::Gpu16, "GPU 16-bit");
+                        ui.radio_value(&mut sort_mode, SortMode::Cpu, "CPU (radsort + cull)");
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let rt_info = if render_mode == RenderMode::RayTrace {
@@ -610,7 +615,7 @@ impl App {
             self.cached_dsm_num_lights = 0;
         }
         self.show_scene = show_scene;
-        self.sort_16bit = sort_16bit;
+        self.sort_mode = sort_mode;
         self.deferred_enabled = deferred_enabled;
         self.ambient = ambient;
         self.sky_color = sky_color;
@@ -1126,33 +1131,99 @@ impl App {
         }
         if !skip_volume { match self.render_mode {
             RenderMode::IntervalShader => {
-                let (sort_st, gen_a, gen_b) = if self.sort_16bit {
-                    (&gpu.sort_state_16bit, &gpu.compute_interval_gen_bg_a_16bit, &gpu.compute_interval_gen_bg_b_16bit)
-                } else {
-                    (&gpu.sort_state, &gpu.compute_interval_gen_bg_a, &gpu.compute_interval_gen_bg_b)
-                };
-                rmesh_render::record_sorted_compute_interval_forward_pass(
-                    &mut encoder,
-                    &gpu.device,
-                    &gpu.pipelines,
-                    &gpu.compute_interval_pipelines,
-                    &gpu.sort_pipelines,
-                    sort_st,
-                    &gpu.buffers,
-                    &gpu.targets,
-                    &gpu.compute_bg,
-                    gen_a,
-                    gen_b,
-                    &gpu.compute_interval_render_bg,
-                    &gpu.compute_interval_convert_bg,
-                    gpu.tet_count,
-                    &gpu.queue,
-                    &gpu.primitive_targets.depth_view,
-                    Some(&gpu.hw_compute_bg),
-                    Some(&gpu.ts_query_set),
-                    self.sort_16bit,
-                    mrt_enabled,
-                );
+                match self.sort_mode {
+                    SortMode::Cpu => {
+                        // Single-encoder CPU-sort dispatch. wgpu schedules
+                        // pipeline barriers between project_compute (writes
+                        // sort_values), the StagingBelt copy (overwrites it),
+                        // and interval_gen (reads it) so the encoded order is
+                        // the executed order.
+                        let visible_count = gpu.cpu_sorter.cull_and_sort(
+                            &self.scene_data.vertices,
+                            &self.scene_data.indices,
+                            &self.scene_data.circumdata,
+                            self.camera.position,
+                            vp,
+                        );
+                        rmesh_render::record_compute_interval_project(
+                            &mut encoder,
+                            &gpu.pipelines,
+                            &gpu.sort_state,
+                            &gpu.buffers,
+                            &gpu.compute_bg,
+                            Some(&gpu.hw_compute_bg),
+                            gpu.tet_count,
+                            &gpu.queue,
+                            Some(&gpu.ts_query_set),
+                            false, // use_16bit_sort always false on Cpu path
+                        );
+                        if visible_count > 0 {
+                            let size = (visible_count * 4) as wgpu::BufferAddress;
+                            let mut view = gpu.staging_belt.write_buffer(
+                                &mut encoder,
+                                &gpu.buffers.sort_values,
+                                0,
+                                wgpu::BufferSize::new(size).unwrap(),
+                            );
+                            view.copy_from_slice(bytemuck::cast_slice(
+                                &gpu.cpu_sorter.sorted_indices[..visible_count],
+                            ));
+                        }
+                        {
+                            let mut view = gpu.staging_belt.write_buffer(
+                                &mut encoder,
+                                &gpu.buffers.indirect_args,
+                                4,
+                                wgpu::BufferSize::new(4).unwrap(),
+                            );
+                            view.copy_from_slice(bytemuck::bytes_of(
+                                &(visible_count as u32),
+                            ));
+                        }
+                        rmesh_render::record_compute_interval_after_sort(
+                            &mut encoder,
+                            &gpu.compute_interval_pipelines,
+                            &gpu.buffers,
+                            &gpu.targets,
+                            &gpu.compute_interval_gen_bg_a,
+                            &gpu.compute_interval_render_bg,
+                            &gpu.compute_interval_convert_bg,
+                            &gpu.primitive_targets.depth_view,
+                            Some(&gpu.ts_query_set),
+                            mrt_enabled,
+                        );
+                    }
+                    _ => {
+                        let use_16bit = matches!(self.sort_mode, SortMode::Gpu16);
+                        let (sort_st, gen_a, gen_b) = if use_16bit {
+                            (&gpu.sort_state_16bit, &gpu.compute_interval_gen_bg_a_16bit, &gpu.compute_interval_gen_bg_b_16bit)
+                        } else {
+                            (&gpu.sort_state, &gpu.compute_interval_gen_bg_a, &gpu.compute_interval_gen_bg_b)
+                        };
+                        rmesh_render::record_sorted_compute_interval_forward_pass(
+                            &mut encoder,
+                            &gpu.device,
+                            &gpu.pipelines,
+                            &gpu.compute_interval_pipelines,
+                            &gpu.sort_pipelines,
+                            sort_st,
+                            &gpu.buffers,
+                            &gpu.targets,
+                            &gpu.compute_bg,
+                            gen_a,
+                            gen_b,
+                            &gpu.compute_interval_render_bg,
+                            &gpu.compute_interval_convert_bg,
+                            gpu.tet_count,
+                            &gpu.queue,
+                            &gpu.primitive_targets.depth_view,
+                            Some(&gpu.hw_compute_bg),
+                            Some(&gpu.ts_query_set),
+                            use_16bit,
+                            mrt_enabled,
+                        );
+                    }
+                }
             }
             RenderMode::MeshShader
                 if gpu.mesh_pipelines.is_some()
@@ -1291,6 +1362,10 @@ impl App {
         // Submit forward pass before deferred to avoid read-after-write stall on hw depth
         let use_deferred = self.deferred_enabled && gpu.deferred_pipeline.is_some();
         if use_deferred {
+            // CPU-sort path writes to the staging belt earlier in this encoder; the
+            // belt must be finished before any submit that contains those copies,
+            // otherwise wgpu fails validation ("StagingBelt staging buffer is still mapped").
+            gpu.staging_belt.finish();
             gpu.queue.submit(std::iter::once(encoder.finish()));
             encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("deferred+blit"),
@@ -1355,10 +1430,16 @@ impl App {
                         gpu.dsm_atlas = None;
                         gpu.deferred_dsm_bg = None;
                     } else {
-                        // Filter out light primitives from DSM occluders
+                        // Filter out light primitives and flares from DSM occluders
                         let dsm_primitives: Vec<_> = if self.show_primitives {
+                            let flare_base = self.flare_system.flare_mesh_base;
+                            let flare_end = flare_base + self.flare_system.flare_mesh_count;
                             self.primitives.iter().filter(|p| {
-                                !matches!(p.kind, PrimitiveKind::PointLight | PrimitiveKind::SpotLight)
+                                match p.kind {
+                                    PrimitiveKind::PointLight | PrimitiveKind::SpotLight => false,
+                                    PrimitiveKind::CustomMesh(idx) => idx < flare_base || idx >= flare_end,
+                                    _ => true,
+                                }
                             }).cloned().collect()
                         } else {
                             Vec::new()
@@ -1805,16 +1886,12 @@ impl App {
         // 3b. DSM debug view
         let use_dsm_debug = self.deferred_enabled && self.deferred_debug_mode == 14;
         if use_dsm_debug {
-            // Camera-perspective DSM debug (original mode 15)
-            let fourier_views: [&wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT] =
-                std::array::from_fn(|i| &gpu.dsm_fourier_views[i]);
-
             rmesh_dsm::record_dsm_primitive_pass(
                 &mut encoder,
                 &gpu.queue,
                 &gpu.dsm_prim_pipeline,
                 &gpu.primitive_geometry,
-                &fourier_views,
+                &gpu.dsm_moments_view,
                 &gpu.dsm_depth_view,
                 if self.show_primitives { &self.primitives } else { &[] },
                 &vp,
@@ -1830,7 +1907,7 @@ impl App {
                 &gpu.dsm_render_bg,
                 &gpu.buffers.interval_fan_index_buf,
                 &gpu.buffers.interval_args_buf,
-                &fourier_views,
+                &gpu.dsm_moments_view,
                 &gpu.dsm_depth_view,
                 w,
                 h,
@@ -1912,7 +1989,12 @@ impl App {
         }
 
         let t_before_submit = std::time::Instant::now();
+        // Close any in-flight staging chunks (CPU sort writes for this
+        // frame) and submit.
+        gpu.staging_belt.finish();
         gpu.queue.submit(std::iter::once(encoder.finish()));
+        // Recycle staging chunks whose copies completed on previous frames.
+        gpu.staging_belt.recall();
         let t_after_submit = std::time::Instant::now();
 
         // Async map of this frame's timestamp readback (will be ready next frame)

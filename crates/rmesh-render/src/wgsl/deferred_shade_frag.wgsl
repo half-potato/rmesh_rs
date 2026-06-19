@@ -11,7 +11,7 @@
 // aux0.b, occlusion in depth_tex.g. Primitives write 0 in aux0.g so the
 // shader falls back to 0.04 for dielectric F0; volumes can write an
 // f0_dielectric override there.
-// Group 1: cached Fourier DSM shadow atlas for transmittance lookup.
+// Group 1: cached DSM moments cubemap atlas for transmittance lookup.
 //
 // Material model: GGX D + Smith G (height-correlated) + Schlick Fresnel
 // metallic workflow. Output is linear color (Rgba16Float); a downstream blit
@@ -79,11 +79,9 @@ struct ShadowLight {
 @group(0) @binding(10) var ssr_tex: texture_2d<f32>;      // Rgba16Float SSR radiance (reflection direction)
 
 // Group 1: DSM shadow cubemap
-@group(1) @binding(0) var dsm_rt0: texture_cube<f32>;
-@group(1) @binding(1) var dsm_rt1: texture_cube<f32>;
-@group(1) @binding(2) var dsm_rt2: texture_cube<f32>;
-@group(1) @binding(3) var<storage, read> shadow_meta: array<ShadowLight>;
-@group(1) @binding(4) var dsm_sampler: sampler;
+@group(1) @binding(0) var dsm_moments: texture_cube<f32>;
+@group(1) @binding(1) var<storage, read> shadow_meta: array<ShadowLight>;
+@group(1) @binding(2) var dsm_sampler: sampler;
 
 // Debug mode constants
 const DBG_FINAL:       u32 = 0u;
@@ -200,18 +198,17 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let clip = vp * vec4f(world_pos, 1.0);
     // if clip.w <= 0.0 { return 1.0; }
 
-    let c0 = textureSample(dsm_rt0, dsm_sampler, dir);
-    let c1 = textureSample(dsm_rt1, dsm_sampler, dir);
-    let shadow_alpha = c0.a;
+    let m = textureSample(dsm_moments, dsm_sampler, dir);
+    let shadow_alpha = m.a;
     if shadow_alpha < 0.01 { return 1.0; }
 
     let inv_alpha = 1.0 / shadow_alpha;
-    let mean = c0.r * inv_alpha;        // E[z]
+    let mean = m.r * inv_alpha;        // E[z]
 
     let z = (clip.w - sm.near) / (sm.far - sm.near);
     if z <= mean { return 1.0; }
 
-    let variance = max(c1.r - c0.r * c0.r, 3e-5) / shadow_alpha;
+    let variance = max(m.g - m.r * m.r, 3e-5) / shadow_alpha;
     let d = z - mean;
     let p_max = variance / (variance + d * d);
 

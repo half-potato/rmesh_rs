@@ -61,6 +61,22 @@ export class WebViewer {
         }
     }
     /**
+     * Returns the current render mode label (matching the setter strings).
+     * @returns {string}
+     */
+    get_render_mode() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.webviewer_get_render_mode(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Get the selected primitive index (-1 for none). Returns -1 for non-primitive selections too.
      * @returns {number}
      */
@@ -224,6 +240,16 @@ export class WebViewer {
      */
     resize(width, height) {
         wasm.webviewer_resize(this.__wbg_ptr, width, height);
+    }
+    /**
+     * Switch render path. Accepts `"interval"` (compute-interval shading,
+     * default) or `"forward"` (legacy HW raster). Unknown values are ignored.
+     * @param {string} mode
+     */
+    set_render_mode(mode) {
+        const ptr0 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webviewer_set_render_mode(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Set the selected primitive index (-1 for none).
@@ -431,12 +457,6 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2);
             return ret;
         }, arguments); },
-        __wbg_clearBuffer_1d2fa28049240bde: function(arg0, arg1, arg2) {
-            arg0.clearBuffer(arg1, arg2);
-        },
-        __wbg_clearBuffer_591d8dce25a4a8fa: function(arg0, arg1, arg2, arg3) {
-            arg0.clearBuffer(arg1, arg2, arg3);
-        },
         __wbg_clearBufferfv_ec80930351b38bfb: function(arg0, arg1, arg2, arg3, arg4) {
             arg0.clearBufferfv(arg1 >>> 0, arg2, getArrayF32FromWasm0(arg3, arg4));
         },
@@ -725,6 +745,9 @@ function __wbg_get_imports() {
         __wbg_disable_f6643aaf3c8e61c7: function(arg0, arg1) {
             arg0.disable(arg1 >>> 0);
         },
+        __wbg_dispatchWorkgroupsIndirect_0b5aa70af5409bf1: function(arg0, arg1, arg2) {
+            arg0.dispatchWorkgroupsIndirect(arg1, arg2);
+        },
         __wbg_dispatchWorkgroups_84e3afede9542ffe: function(arg0, arg1, arg2, arg3) {
             arg0.dispatchWorkgroups(arg1 >>> 0, arg2 >>> 0, arg3 >>> 0);
         },
@@ -755,6 +778,9 @@ function __wbg_get_imports() {
         },
         __wbg_drawElementsInstanced_653f99f5abef21ba: function(arg0, arg1, arg2, arg3, arg4, arg5) {
             arg0.drawElementsInstanced(arg1 >>> 0, arg2, arg3 >>> 0, arg4, arg5);
+        },
+        __wbg_drawIndexedIndirect_2570efac7f2240c8: function(arg0, arg1, arg2) {
+            arg0.drawIndexedIndirect(arg1, arg2);
         },
         __wbg_drawIndirect_5c629f24d9366887: function(arg0, arg1, arg2) {
             arg0.drawIndirect(arg1, arg2);
@@ -1349,6 +1375,12 @@ function __wbg_get_imports() {
         }, arguments); },
         __wbg_setBindGroup_af7eca394a335db6: function(arg0, arg1, arg2) {
             arg0.setBindGroup(arg1 >>> 0, arg2);
+        },
+        __wbg_setIndexBuffer_69727b22549a9470: function(arg0, arg1, arg2, arg3) {
+            arg0.setIndexBuffer(arg1, __wbindgen_enum_GpuIndexFormat[arg2], arg3);
+        },
+        __wbg_setIndexBuffer_b194910ae0ffcbf4: function(arg0, arg1, arg2, arg3, arg4) {
+            arg0.setIndexBuffer(arg1, __wbindgen_enum_GpuIndexFormat[arg2], arg3, arg4);
         },
         __wbg_setPipeline_5cbb15c634c129f9: function(arg0, arg1) {
             arg0.setPipeline(arg1);
@@ -2186,12 +2218,12 @@ function __wbg_get_imports() {
             arg0.writeTexture(arg1, arg2, arg3, arg4);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 602, function: Function { arguments: [Externref], shim_idx: 603, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 599, function: Function { arguments: [Externref], shim_idx: 600, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h5099a9b6e995c023, wasm_bindgen__convert__closures_____invoke__h42d2efe72d2a85cc);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 945, function: Function { arguments: [Externref], shim_idx: 946, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 952, function: Function { arguments: [Externref], shim_idx: 953, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hbff1e879642c999f, wasm_bindgen__convert__closures_____invoke__h5625310ab6c01d7e);
             return ret;
         },

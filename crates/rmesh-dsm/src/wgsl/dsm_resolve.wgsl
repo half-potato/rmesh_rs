@@ -1,8 +1,9 @@
-// Fourier DSM resolve: reconstructs transmittance T(z_query) from stored
-// Fourier coefficients. See TMSM.md for derivation.
+// DSM resolve (debug visualization): reads a single 2-moment shadow map texel
+// and reconstructs T(z_query) via the Cantelli (one-sided Chebyshev) bound,
+// matching deferred_shade_frag.wgsl::evaluate_transmittance.
 //
-// Reads 3 textures (9 coefficients packed as in dsm_fourier_fragment.wgsl)
-// and a uniform z_query depth, outputs grayscale T value.
+// Storage layout (from dsm_moment_fragment.wgsl):
+//   .r = E[α·z], .g = E[α·z²], .b = 0, .a = α
 
 struct ResolveUniforms {
     z_query: f32,  // metric (linear) depth
@@ -12,12 +13,7 @@ struct ResolveUniforms {
 };
 
 @group(0) @binding(0) var<uniform> params: ResolveUniforms;
-@group(0) @binding(1) var rt0_tex: texture_2d<f32>;
-@group(0) @binding(2) var rt1_tex: texture_2d<f32>;
-@group(0) @binding(3) var rt2_tex: texture_2d<f32>;
-
-const PI: f32 = 3.14159265358979323846;
-const TWO_PI: f32 = 6.28318530717958647692;
+@group(0) @binding(1) var moments_tex: texture_2d<f32>;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
@@ -29,45 +25,26 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> @builtin(position) vec4<f32> {
 @fragment
 fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     let coords = vec2<u32>(u32(frag_coord.x), u32(frag_coord.y));
+    let m = textureLoad(moments_tex, coords, 0);
 
-    let c0 = textureLoad(rt0_tex, coords, 0);
-    let c1 = textureLoad(rt1_tex, coords, 0);
-    let c2 = textureLoad(rt2_tex, coords, 0);
+    let shadow_alpha = m.a;
+    if (shadow_alpha < 0.01) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
+    let inv_alpha = 1.0 / shadow_alpha;
+    let mean = m.r * inv_alpha;
 
-    // Unpack coefficients
-    let a0 = c0.x;
-    let a1 = c0.y;  let b1 = c0.z;
-    let a2 = c0.w;  let b2 = c1.x;
-    let a3 = c1.y;  let b3 = c1.z;
-    let a4 = c1.w;  let b4 = c2.x;
-
-    // Normalize metric depth to [0,1] (Fourier basis is in linear depth space)
+    // z_query normalized to the same [0,1] space the fragment shader stored.
     let z = clamp((params.z_query - params.near) / (params.far - params.near), 0.0, 1.0);
+    if (z <= mean) {
+        return vec4<f32>(1.0, 1.0, 1.0, 1.0);
+    }
 
-    // Reconstruct absorbance A(z) = integral_0^z sigma(t) dt
-    // A(z) = (a0/2)*z + sum_k [ a_k*sin(2*PI*k*z)/(2*PI*k) + b_k*(1-cos(2*PI*k*z))/(2*PI*k) ]
-    var A = (a0 / 2.0) * z;
+    let variance = max(m.g - m.r * m.r, 3e-5) * inv_alpha;
+    let d = z - mean;
+    let p_max = variance / (variance + d * d);
 
-    // k=1
-    let w1 = TWO_PI * 1.0;
-    A += a1 * sin(w1 * z) / w1 + b1 * (1.0 - cos(w1 * z)) / w1;
-
-    // k=2
-    let w2 = TWO_PI * 2.0;
-    A += a2 * sin(w2 * z) / w2 + b2 * (1.0 - cos(w2 * z)) / w2;
-
-    // k=3
-    let w3 = TWO_PI * 3.0;
-    A += a3 * sin(w3 * z) / w3 + b3 * (1.0 - cos(w3 * z)) / w3;
-
-    // k=4
-    let w4 = TWO_PI * 4.0;
-    A += a4 * sin(w4 * z) / w4 + b4 * (1.0 - cos(w4 * z)) / w4;
-
-    // Clamp absorbance (Gibbs oscillation can make it negative)
-    A = max(A, 0.0);
-
-    let T = exp(-A);
-
+    let T_total = 1.0 - shadow_alpha;
+    let T = max(p_max, T_total);
     return vec4<f32>(T, T, T, 1.0);
 }

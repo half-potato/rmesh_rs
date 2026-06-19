@@ -29,7 +29,10 @@ struct DrawIndirectArgs {
     first_instance: u32,
 };
 
-@group(0) @binding(0) var<storage, read> uniforms: Uniforms;
+// Uniforms uses var<uniform> (not storage) so the COMPUTE-stage storage-buffer
+// count drops from 11 to 10 (uniform buffers don't count toward
+// maxStorageBuffersPerShaderStage, which Chrome caps at 10).
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> circumdata: array<f32>;

@@ -5,7 +5,10 @@
 //!   - `drs`   — 3-kernel DeviceRadixSort (8-bit radix, requires SUBGROUP feature)
 
 pub mod basic;
+pub mod cpu;
 pub mod drs;
+
+pub use cpu::CpuSorter;
 
 // ---------------------------------------------------------------------------
 // Shared helpers

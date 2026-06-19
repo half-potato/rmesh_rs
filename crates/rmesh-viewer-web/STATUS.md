@@ -55,50 +55,57 @@ checks pixels in the canvas region of the resulting PNG (via Pillow).
    was rejected. Fixed 1 store + 2 loads across
    `radix_sort_count.wgsl` and `radix_sort_scatter.wgsl`.
 
-4. **`maxStorageBuffersPerShaderStage = 10` on Chrome WebGPU.** Three
-   compute layouts exceeded it (14, 11, 11 buffers across all bind groups
-   in the COMPUTE stage). Fix shipped:
+4. **`maxStorageBuffersPerShaderStage = 10` on Chrome WebGPU.** Two
+   compute pipelines on the web viewer's active path exceeded it. Fix
+   uses the **uniform-buffer trick**: `var<uniform> uniforms` instead of
+   `var<storage, read> uniforms` drops one storage binding without
+   restructuring anything else.
 
-   - `ForwardPipelines` compute layouts split into bg0/bg1 (8+6 and 7+4)
-     for cleaner code organization, though the per-stage cap still counts
-     across both groups so the split alone does not lower validation count.
-   - `project_compute_hw.wgsl` `uniforms` switched from `var<storage, read>`
-     to `var<uniform>` — uniforms count toward `maxUniformBuffersPerShaderStage`
-     (default 12) instead, so the hw_compute path is now 10 storage + 1
-     uniform → fits.
-   - `SceneBuffers.uniforms` BufferUsages now include `UNIFORM | STORAGE`
-     so the same buffer can be bound either way.
-   - Web viewer now passes `hw_compute_bg = Some(...)` to
-     `record_sorted_forward_pass`, dispatching `hw_compute_pipeline` instead
-     of the still-too-big `compute_pipeline`.
-   - `record_sorted_forward_pass`, `record_project_compute(_and_sort)`,
-     `record_forward_pass`, `record_sorted_mesh_forward_pass`,
-     `record_sorted_interval_forward_pass`,
-     `record_sorted_compute_interval_forward_pass` now take small carrier
-     structs (`ForwardComputeBindGroups`, `ForwardHwComputeBindGroups`) so
-     all consumers (viewer, viewer-web, train, python, tests, benches) get
-     a mechanical type change instead of fan-out edits.
+   | Pipeline | Storage / Uniform | Status |
+   |---|---|---|
+   | `hw_compute_pipeline` | 10 / 1 | fits |
+   | `compute_interval_gen_pipeline` | 10 / 1 | fits |
+   | `compute_interval_render_*` | 5 / 1 | fits |
+   | `compute_interval_indirect_convert` | 2 / 0 | fits |
+
+   - `project_compute_hw.wgsl`, `interval_compute.wgsl` now declare
+     `@group(0) @binding(0) var<uniform> uniforms: Uniforms;`.
+   - `hw_compute_bind_group_layout` and `compute_interval_gen_bg_layout`
+     binding 0 use `BufferBindingType::Uniform`.
+   - `SceneBuffers.uniforms` BufferUsages include `UNIFORM | STORAGE` so
+     the same buffer can be bound either way.
+
+5. **Active rendering path: interval shading.** The web viewer now uses
+   `record_sorted_compute_interval_forward_pass` — same as the native
+   viewer's default for PBR scenes. The legacy `record_sorted_forward_pass`
+   call site is gone; render bind groups (`render_bg`/`render_bg_b`) are
+   replaced by `gen_bg_a` / `gen_bg_b` / `ci_render_bg` / `ci_convert_bg`.
+   `mrt_enabled=false` because there's no deferred pass.
+
+6. **Non-PBR color fallback in `interval_fragment.wgsl`.** Previously
+   `out.color` always read `albedo` from `aux_data`. For non-PBR scenes
+   (which is every `.rmesh` the web viewer loads today) `aux_data` is
+   bound to a 4-byte dummy, so every tet wrote `vec4(0,0,0,alpha)` and
+   the canvas composited to black. Fix detects the dummy via
+   `arrayLength(&aux_data) > 1u` and uses the proper volume-rendering
+   integral of `c_front` / `c_back` (matching `forward_fragment.wgsl`'s
+   `compute_integral`) so the color-only path produces the same output
+   as Regular mode.
 
 ## Known cosmetic noise
 
-The `compute_pipeline` (14 storage buffers) still fails to validate on
-Chrome — the error scope picks up
-*"The number of storage buffers (14) in the Compute stage exceeds the
-maximum per-stage limit (10)"*. **The web viewer does not use this
-pipeline at runtime** (it uses `hw_compute_pipeline`), so this is purely a
-log-noise issue and rendering proceeds normally. See `TODO.md` for the
-clean-up option (pack buffers in `project_compute.wgsl` or gate creation
-behind a non-wasm cfg).
+`compute_pipeline` (the 14-storage-buffer projection shader used by
+training and the native viewer's fallback) still fails to validate on
+Chrome. **The web viewer does not dispatch it** — interval shading uses
+`hw_compute_pipeline` for the project step — so the
+*"Invalid ComputePipeline 'project_compute_pipeline'"* log line is
+harmless. See `TODO.md` for the clean-up option (pack buffers in
+`project_compute.wgsl` or gate creation behind a non-wasm cfg).
 
 ## Known follow-ups (also in `TODO.md`)
 
-- Strip `compute_pipeline` to ≤10 storage buffers to clear the validation
-  noise.
-- Apply the uniform-buffer trick to `compute_interval_gen_bg_layout` (11
-  buffers) before migrating the web viewer to the active interval shading
-  path. The web viewer is currently on the legacy forward path; matching
-  the native viewer's compute-interval pipeline is the obvious next step
-  but is out of scope for this fix.
+- Strip `compute_pipeline` to ≤10 storage buffers to clear the
+  validation noise.
 - Mouse/keyboard interaction is wired but not visually exercised. Open
   `http://localhost:8000/` in a real browser to drive the UX.
 

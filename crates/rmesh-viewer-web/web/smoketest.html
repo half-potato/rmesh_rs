@@ -3,8 +3,8 @@
 <head><meta charset="utf-8"><title>rmesh-viewer-web smoke test</title></head>
 <body style="background:#111;color:#eee;font:13px monospace;padding:8px;">
 <h3>rmesh-viewer-web smoke test</h3>
-<pre id="log"></pre>
 <canvas id="canvas" width="320" height="240" style="border:1px solid #444;display:block;"></canvas>
+<pre id="log"></pre>
 
 <script type="module">
 const logEl = document.getElementById('log');
@@ -15,6 +15,12 @@ function log(msg) {
   logEl.textContent = lines.join('\n');
 }
 window.__smoketest = { lines, done: false, ok: false, error: null };
+
+// Mirror console.log/info calls from wasm-bindgen's console_log crate into our log.
+const _origLog = console.log.bind(console);
+const _origInfo = console.info ? console.info.bind(console) : _origLog;
+console.log = (...args) => { _origLog(...args); const s = args.map(a => typeof a === 'string' ? a : JSON.stringify(a)).join(' '); if (!s.startsWith('[smoketest]')) lines.push('  [wasm] ' + s); logEl.textContent = lines.join('\n'); };
+console.info = console.log;
 
 // Hook GPUDevice to push validation error scopes around every async dispatch boundary.
 // We'll just check unhandlederror events instead — they're emitted async by the browser.
@@ -43,6 +49,10 @@ window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' +
     } catch (e) {
       log('  PROBE: maxStorageBuffersPerShaderStage=20 rejected: ' + String(e).split('\n')[0]);
     }
+
+    // Probe adapter features so we can see in-page whether SUBGROUP is exposed.
+    const feats = Array.from(adapter.features || []);
+    log('  features: ' + feats.join(',') + (feats.length ? '' : ' (none)'));
 
     log('importing pkg/rmesh_viewer_web.js...');
     const mod = await import('./pkg/rmesh_viewer_web.js');

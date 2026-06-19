@@ -54,7 +54,7 @@ fn main(
     var data_index = block_index;
     for (var i = 0u; i < ELEMENTS_PER_THREAD; i++) {
         if (local_id.x < BIN_COUNT) {
-            local_histogram[local_id.x] = 0u;
+            atomicStore(&local_histogram[local_id.x], 0u);
         }
         var local_key_lo = ~0u;
         var local_key_hi = ~0u;
@@ -119,7 +119,7 @@ fn main(
         workgroupBarrier();
         var histogram_local_sum = 0u;
         if (local_id.x < BIN_COUNT) {
-            histogram_local_sum = local_histogram[local_id.x];
+            histogram_local_sum = atomicLoad(&local_histogram[local_id.x]);
         }
         // workgroup prefix sum of histogram
         var histogram_prefix_sum = histogram_local_sum;
@@ -151,7 +151,7 @@ fn main(
             out_values[total_offset] = local_value;
         }
         if (local_id.x < BIN_COUNT) {
-            bin_offset_cache[local_id.x] += local_histogram[local_id.x];
+            bin_offset_cache[local_id.x] += atomicLoad(&local_histogram[local_id.x]);
         }
         workgroupBarrier();
         data_index += WG;

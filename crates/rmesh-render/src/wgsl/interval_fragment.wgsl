@@ -115,17 +115,33 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let alpha = 1.0 - alpha_t;
 
     // Per-tet aux channels lookup (parametric BRDF layout, AUX_DIM=6).
+    // For non-PBR scenes, aux_data is bound to a 4-byte dummy buffer (see
+    // `create_compute_interval_render_bind_group`); detect that and use the
+    // proper volume-integrated SH color for `out.color` so the color-only
+    // path matches what the Regular forward pass produces.
+    let has_pbr = arrayLength(&aux_data) > 1u;
     let aux_base = in.tet_id * AUX_DIM;
-    let roughness     = aux_data[aux_base + 0u];
-    let metallic      = aux_data[aux_base + 1u];
-    let f0_dielectric = aux_data[aux_base + 2u];
-    let alb_r         = aux_data[aux_base + 3u];
-    let alb_g         = aux_data[aux_base + 4u];
-    let alb_b         = aux_data[aux_base + 5u];
+    let roughness     = select(0.5,  aux_data[aux_base + 0u], has_pbr);
+    let metallic      = select(0.0,  aux_data[aux_base + 1u], has_pbr);
+    let f0_dielectric = select(0.04, aux_data[aux_base + 2u], has_pbr);
+    let albedo        = select(in.base_color,
+                               vec3f(aux_data[aux_base + 3u],
+                                     aux_data[aux_base + 4u],
+                                     aux_data[aux_base + 5u]),
+                               has_pbr);
 
-    // Slot 0: albedo (flat per tet, premultiplied alpha)
-    let albedo = vec3f(alb_r, alb_g, alb_b);
-    out.color = vec4f(albedo * alpha, alpha);
+    // Slot 0: color (premultiplied alpha).
+    //   PBR: flat per-tet albedo × α (deferred shader applies lighting).
+    //   non-PBR: volume integral of the SH color through the tet, using the
+    //   same w0/w1 transmittance weighting as `forward_fragment.wgsl` so the
+    //   interval render matches the Regular path.
+    let phi_color = phi(od);
+    let w0_color = phi_color - alpha_t;  // back weight
+    let w1_color = 1.0 - phi_color;      // front weight
+    let integrated = c_back * w0_color + c_front * w1_color;  // already × α
+    out.color = select(vec4f(integrated, alpha),
+                       vec4f(albedo * alpha, alpha),
+                       has_pbr);
 
     // Slot 1: PBR material (roughness, f0_dielectric, metallic) — metallic in
     // .b to match primitive_mrt's glTF convention.

@@ -131,6 +131,68 @@ fn render_tet_pixel(
     [c.x, c.y, c.z, alpha]
 }
 
+/// Exact transmittance T(z_query) along a unit ray from `origin`.
+///
+/// Iterates all tets, intersects the ray against each, clips the intersection
+/// interval at `z_query`, accumulates `density · clipped_length` into total
+/// absorbance, returns `exp(-A_total)`. No sorting needed — absorbance is
+/// commutative along a single ray.
+pub fn cpu_transmittance_along_ray(
+    scene: &SceneData,
+    origin: Vec3,
+    dir: Vec3,
+    z_query: f32,
+) -> f32 {
+    let n = scene.tet_count as usize;
+    let mut absorbance = 0.0f32;
+
+    for ti in 0..n {
+        let verts = load_tet_verts(scene, ti);
+        let density = scene.densities[ti];
+
+        let mut t_min = f32::NEG_INFINITY;
+        let mut t_max = f32::INFINITY;
+        let mut valid = true;
+
+        for face in TET_FACES.iter() {
+            let va = verts[face[0]];
+            let vb = verts[face[1]];
+            let vc = verts[face[2]];
+            let v_opp = verts[face[3]];
+            let mut nrm = (vc - va).cross(vb - va);
+            if nrm.dot(v_opp - va) < 0.0 {
+                nrm = -nrm;
+            }
+            let num = nrm.dot(va - origin);
+            let den = nrm.dot(dir);
+            if den.abs() < 1e-20 {
+                if num > 0.0 {
+                    valid = false;
+                }
+                continue;
+            }
+            let t = num / den;
+            if den > 0.0 {
+                t_min = t_min.max(t);
+            } else {
+                t_max = t_max.min(t);
+            }
+        }
+
+        if !valid {
+            continue;
+        }
+
+        let lo = t_min.max(0.0);
+        let hi = t_max.min(z_query);
+        if hi > lo {
+            absorbance += density * (hi - lo);
+        }
+    }
+
+    (-absorbance).exp()
+}
+
 // ---------------------------------------------------------------------------
 // Scene helpers
 // ---------------------------------------------------------------------------

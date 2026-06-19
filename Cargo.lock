@@ -3416,7 +3416,13 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "half",
+ "image",
+ "pollster",
+ "rand",
+ "rand_chacha",
  "rmesh-compositor",
+ "rmesh-data",
  "rmesh-interact",
  "rmesh-render",
  "rmesh-sort",
@@ -3494,6 +3500,7 @@ name = "rmesh-sort"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "glam",
  "wgpu",
 ]
 

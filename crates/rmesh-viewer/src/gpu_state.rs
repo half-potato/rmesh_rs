@@ -32,6 +32,34 @@ impl std::fmt::Display for RenderMode {
     }
 }
 
+/// Which sort path the interval-shading render uses. Replaces the old
+/// `sort_16bit: bool` toggle and adds a CPU option (sphere-frustum cull +
+/// `radsort` on the CPU, two-submit dispatch with `queue.write_buffer` in
+/// between — same code path the web viewer uses).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SortMode {
+    /// GPU radix sort, 32-bit depth keys. Default; fastest on Metal/Vulkan
+    /// with subgroups (Drs backend).
+    Gpu32,
+    /// GPU radix sort, 16-bit linearly-quantized depth keys. ~2× faster
+    /// than `Gpu32` (4 passes vs 8) with negligible visual diff.
+    Gpu16,
+    /// CPU sphere-frustum cull + `radsort` on packed (depth_key, tet_id).
+    /// Necessary on Chrome WebGPU because subgroups aren't exposed; correct
+    /// on every backend.
+    Cpu,
+}
+
+impl std::fmt::Display for SortMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SortMode::Gpu32 => write!(f, "GPU 32-bit"),
+            SortMode::Gpu16 => write!(f, "GPU 16-bit"),
+            SortMode::Cpu => write!(f, "CPU"),
+        }
+    }
+}
+
 /// Per-frame GPU timing breakdown from timestamp queries.
 #[derive(Clone, Default)]
 pub struct GpuTimings {
@@ -98,6 +126,15 @@ pub struct GpuState {
     pub sort_state: rmesh_sort::RadixSortState,
     pub sort_state_16bit: rmesh_sort::RadixSortState,
     pub sort_backend: rmesh_sort::SortBackend,
+    /// CPU sphere-frustum cull + sort workspace. Used when
+    /// `App.sort_mode == SortMode::Cpu`.
+    pub cpu_sorter: rmesh_sort::CpuSorter,
+    /// Reused staging-buffer pool for streaming `sort_values` +
+    /// `indirect_args.instance_count` writes when `SortMode::Cpu` is active.
+    /// Without this, every frame would call `queue.write_buffer` with ~19MB
+    /// of sorted indices, which allocates a fresh staging buffer per call
+    /// and leaks memory until the next-next submit completes.
+    pub staging_belt: wgpu::util::StagingBelt,
     pub buffers: SceneBuffers,
     pub material_buffers: MaterialBuffers,
     pub targets: RenderTargets,
@@ -203,12 +240,12 @@ pub struct GpuState {
     /// Blit bind group pointing to deferred output (swapped when deferred is active)
     pub deferred_blit_bg: Option<wgpu::BindGroup>,
     pub has_pbr_data: bool,
-    // DSM debug view (Fourier deep shadow map from camera perspective)
+    // DSM debug view (2-moment deep shadow map from camera perspective)
     pub dsm_pipeline: rmesh_dsm::DsmPipeline,
     pub dsm_prim_pipeline: rmesh_dsm::DsmPrimitivePipeline,
     pub dsm_resolve_pipeline: rmesh_dsm::DsmResolvePipeline,
-    pub dsm_fourier_textures: [wgpu::Texture; rmesh_dsm::FOURIER_MRT_COUNT],
-    pub dsm_fourier_views: [wgpu::TextureView; rmesh_dsm::FOURIER_MRT_COUNT],
+    pub dsm_moments_texture: wgpu::Texture,
+    pub dsm_moments_view: wgpu::TextureView,
     pub dsm_depth_texture: wgpu::Texture,
     pub dsm_depth_view: wgpu::TextureView,
     pub dsm_resolve_output: wgpu::Texture,
@@ -216,7 +253,7 @@ pub struct GpuState {
     pub dsm_render_bg: wgpu::BindGroup,
     pub dsm_resolve_bg: wgpu::BindGroup,
     pub dsm_blit_bg: wgpu::BindGroup,
-    // Per-light DSM cache (Fourier deep shadow maps)
+    // Per-light DSM cache (2-moment deep shadow maps)
     pub dsm_atlas: Option<rmesh_dsm::DsmAtlas>,
     pub deferred_dsm_bg: Option<wgpu::BindGroup>,
     pub deferred_dsm_dummy_bg: Option<wgpu::BindGroup>,

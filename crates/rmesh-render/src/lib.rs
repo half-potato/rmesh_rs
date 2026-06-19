@@ -228,7 +228,10 @@ impl SceneBuffers {
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("uniforms"),
             size: std::mem::size_of::<Uniforms>() as u64,
-            usage: storage_copy,
+            // UNIFORM in addition to STORAGE so the same buffer can be bound
+            // as `var<uniform>` in shaders that need to reduce their storage-
+            // buffer count under WebGPU's 10-per-stage cap.
+            usage: storage_copy | wgpu::BufferUsages::UNIFORM,
             mapped_at_creation: false,
         });
 
@@ -530,15 +533,35 @@ impl ForwardPipelines {
         // Bindings: uniforms(r), vertices(r), indices(r), circumdata(r),
         //           sort_keys(rw), sort_values(rw), indirect_args(rw),
         //           colors(rw), base_colors(r), color_grads(r), sh_coeffs(r)
-        // 11 > 10 so this pipeline is invalid on WebGPU; the web viewer doesn't
-        // use it — it dispatches `compute_pipeline` via a separate code path.
-        let hw_compute_read_only = [
-            true, true, true, true,   // 0-3 read-only
+        // Binding 0 (uniforms) is bound as a UNIFORM buffer so the COMPUTE-stage
+        // storage-buffer count is 10, fitting WebGPU's per-stage cap.
+        let hw_compute_storage_read_only = [
+            true, true, true,         // 1-3 read-only (vertices, indices, circumdata)
             false, false, false,      // 4-6 read-write (sort_keys, sort_values, indirect_args)
             false, true, true, true,  // 7=colors(rw), 8=base_colors(r), 9=color_grads(r), 10=sh_coeffs(r)
         ];
-        let hw_compute_entries =
-            storage_entries(11, wgpu::ShaderStages::COMPUTE, &hw_compute_read_only);
+        let mut hw_compute_entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }];
+        for (i, &read_only) in hw_compute_storage_read_only.iter().enumerate() {
+            hw_compute_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: (i + 1) as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
         let hw_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw_compute_bind_group_layout"),
@@ -1294,13 +1317,37 @@ pub struct ComputeIntervalPipelines {
 impl ComputeIntervalPipelines {
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         // ----- Gen compute pipeline (11 bindings) -----
-        // Bindings 0-7: read-only, 8-9: read-write, 10: read-only (vertex_normals)
-        let gen_read_only = [
-            true, true, true, true, true, true, true, true, // 0-7 read-only
-            false, false, // 8-9 read-write (out_vertices, out_tet_data)
-            true,  // 10 read-only (vertex_normals)
+        // Binding 0 (uniforms) is bound as a UNIFORM buffer so the COMPUTE-stage
+        // storage-buffer count is 10, fitting WebGPU's per-stage cap.
+        //   1-7 read-only, 8-9 read-write (out_vertices, out_tet_data),
+        //   10 read-only (vertex_normals).
+        let gen_storage_read_only = [
+            true, true, true, true, true, true, true, // 1-7 read-only
+            false, false,                              // 8-9 read-write
+            true,                                      // 10 read-only
         ];
-        let gen_entries = storage_entries(11, wgpu::ShaderStages::COMPUTE, &gen_read_only);
+        let mut gen_entries = vec![wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }];
+        for (i, &read_only) in gen_storage_read_only.iter().enumerate() {
+            gen_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: (i + 1) as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
         let gen_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute_interval_gen_bg_layout"),
             entries: &gen_entries,
@@ -3215,6 +3262,110 @@ pub fn record_sorted_interval_forward_pass(
 ///   4. Indirect convert: writes both compute dispatch + draw-indexed-indirect args
 ///   5. Compute pass: interval_compute generates vertices + per-tet data
 ///   6. Render pass with instanced indexed draw + interval_fragment (single color output)
+/// Record steps 1 + 2 of the compute-interval pipeline: reset the indirect
+/// args and dispatch the project compute (SH eval + frustum cull + depth
+/// keys + `atomicAdd` on `indirect_args.instance_count`).
+///
+/// Extracted so callers that want to substitute a CPU sort can `queue.submit`
+/// after this call, overwrite `sort_values` / `indirect_args.instance_count`
+/// via `queue.write_buffer`, and then call
+/// [`record_compute_interval_after_sort`] in a second encoder.
+/// `record_sorted_compute_interval_forward_pass` calls both halves with the
+/// GPU radix sort in between.
+pub fn record_compute_interval_project(
+    encoder: &mut wgpu::CommandEncoder,
+    fwd_pipelines: &ForwardPipelines,
+    sort_state: &rmesh_sort::RadixSortState,
+    buffers: &SceneBuffers,
+    compute_bg: &ForwardComputeBindGroups,
+    hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
+    tet_count: u32,
+    queue: &wgpu::Queue,
+    profiler: Option<&wgpu::QuerySet>,
+    use_16bit_sort: bool,
+) {
+    // ----- 1. Reset indirect args + interval_args_buf -----
+    let reset_cmd = DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+    queue.write_buffer(
+        &buffers.interval_args_buf,
+        0,
+        bytemuck::cast_slice(&[0u32; 8]),
+    );
+
+    let n_pow2 = tet_count.next_power_of_two();
+    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+
+    // ----- 2. Compute pass (projection + SH eval) -----
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("project_compute"),
+        timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+            query_set: qs,
+            beginning_of_pass_write_index: Some(0),
+            end_of_pass_write_index: Some(1),
+        }),
+    });
+    if use_16bit_sort {
+        cpass.set_pipeline(&fwd_pipelines.compute_pipeline_16bit);
+        cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+        cpass.set_bind_group(1, &compute_bg.bg1, &[]);
+    } else if let Some(hw_bg) = hw_compute_bg {
+        cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+        cpass.set_bind_group(0, &hw_bg.bg, &[]);
+    } else {
+        cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+        cpass.set_bind_group(0, &compute_bg.bg0, &[]);
+        cpass.set_bind_group(1, &compute_bg.bg1, &[]);
+    }
+
+    let workgroup_size = 64u32;
+    let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+    let max_per_dim = 65535u32;
+    let dispatch_x = total_workgroups.min(max_per_dim);
+    let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+    cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+}
+
+/// Record steps 4–6 of the compute-interval pipeline: indirect-convert (turns
+/// `indirect_args.instance_count` into dispatch+draw args), gen compute
+/// (writes interval vertex/tet-data buffers), and the interval render pass.
+///
+/// `gen_bg` selects which sort-values buffer the gen step reads (A or B).
+/// For the GPU-sort path the caller picks based on
+/// [`rmesh_sort::record_radix_sort`]'s `result_in_b` return; for the CPU-sort
+/// path it's always A because the caller wrote the sorted indices into
+/// `buffers.sort_values` (which is what the A bind group references).
+pub fn record_compute_interval_after_sort(
+    encoder: &mut wgpu::CommandEncoder,
+    ci_pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    gen_bg: &wgpu::BindGroup,
+    ci_render_bg: &wgpu::BindGroup,
+    ci_convert_bg: &wgpu::BindGroup,
+    depth_view: &wgpu::TextureView,
+    profiler: Option<&wgpu::QuerySet>,
+    mrt_enabled: bool,
+) {
+    record_compute_interval_after_sort_impl(
+        encoder,
+        ci_pipelines,
+        buffers,
+        targets,
+        gen_bg,
+        ci_render_bg,
+        ci_convert_bg,
+        depth_view,
+        profiler,
+        mrt_enabled,
+    );
+}
+
 pub fn record_sorted_compute_interval_forward_pass(
     encoder: &mut wgpu::CommandEncoder,
     device: &wgpu::Device,
@@ -3237,54 +3388,19 @@ pub fn record_sorted_compute_interval_forward_pass(
     use_16bit_sort: bool,
     mrt_enabled: bool,
 ) {
-    // ----- 1. Reset indirect args + interval_args_buf -----
-    let reset_cmd = DrawIndirectCommand {
-        vertex_count: 12,
-        instance_count: 0,
-        first_vertex: 0,
-        first_instance: 0,
-    };
-    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
-    queue.write_buffer(
-        &buffers.interval_args_buf,
-        0,
-        bytemuck::cast_slice(&[0u32; 8]),
+    // Steps 1 + 2: reset + project compute
+    record_compute_interval_project(
+        encoder,
+        fwd_pipelines,
+        sort_state,
+        buffers,
+        compute_bg,
+        hw_compute_bg,
+        tet_count,
+        queue,
+        profiler,
+        use_16bit_sort,
     );
-
-    let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
-
-    // ----- 2. Compute pass (projection + SH eval) -----
-    {
-        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("project_compute"),
-            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
-                query_set: qs,
-                beginning_of_pass_write_index: Some(0),
-                end_of_pass_write_index: Some(1),
-            }),
-        });
-        if use_16bit_sort {
-            // 16-bit linear key shader uses the same split compute layout
-            cpass.set_pipeline(&fwd_pipelines.compute_pipeline_16bit);
-            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
-            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
-        } else if let Some(hw_bg) = hw_compute_bg {
-            cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-            cpass.set_bind_group(0, &hw_bg.bg, &[]);
-        } else {
-            cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
-            cpass.set_bind_group(0, &compute_bg.bg0, &[]);
-            cpass.set_bind_group(1, &compute_bg.bg1, &[]);
-        }
-
-        let workgroup_size = 64u32;
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
-        let max_per_dim = 65535u32;
-        let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
-        cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
-    }
 
     // ----- 3. Radix sort -----
     let result_in_b = rmesh_sort::record_radix_sort(
@@ -3296,6 +3412,36 @@ pub fn record_sorted_compute_interval_forward_pass(
         &buffers.sort_values,
     );
 
+    // Steps 4 + 5 + 6: indirect convert + gen + render
+    let gen_bg = if result_in_b { gen_bg_b } else { gen_bg_a };
+    record_compute_interval_after_sort_impl(
+        encoder,
+        ci_pipelines,
+        buffers,
+        targets,
+        gen_bg,
+        ci_render_bg,
+        ci_convert_bg,
+        depth_view,
+        profiler,
+        mrt_enabled,
+    );
+}
+
+/// Shared body of steps 4-6 (factored so the wrapper and the public
+/// `record_compute_interval_after_sort` both go through one implementation).
+fn record_compute_interval_after_sort_impl(
+    encoder: &mut wgpu::CommandEncoder,
+    ci_pipelines: &ComputeIntervalPipelines,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    gen_bg: &wgpu::BindGroup,
+    ci_render_bg: &wgpu::BindGroup,
+    ci_convert_bg: &wgpu::BindGroup,
+    depth_view: &wgpu::TextureView,
+    profiler: Option<&wgpu::QuerySet>,
+    mrt_enabled: bool,
+) {
     // ----- 4. Indirect convert → combined dispatch + draw args -----
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3313,7 +3459,6 @@ pub fn record_sorted_compute_interval_forward_pass(
 
     // ----- 5. Compute pass: generate interval vertices + indices -----
     {
-        let gen_bg = if result_in_b { gen_bg_b } else { gen_bg_a };
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("compute_interval_gen"),
             timestamp_writes: None,
@@ -4913,12 +5058,12 @@ impl DeferredShadePipeline {
             ],
         });
 
-        // Group 1: DSM shadow atlas (3 Fourier texture arrays + metadata buffer)
+        // Group 1: DSM shadow atlas (moments cubemap + metadata buffer + sampler)
         let dsm_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("deferred_dsm_bgl"),
                 entries: &[
-                    // 0-2: Fourier MRT texture arrays
+                    // 0: moments cubemap (E[α·z], E[α·z²], 0, α)
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
@@ -4929,29 +5074,9 @@ impl DeferredShadePipeline {
                         },
                         count: None,
                     },
+                    // 1: per-light shadow metadata
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::Cube,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::Cube,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 3: per-light shadow metadata
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Storage { read_only: true },
@@ -4960,9 +5085,9 @@ impl DeferredShadePipeline {
                         },
                         count: None,
                     },
-                    // 4: bilinear sampler for moment textures
+                    // 2: bilinear sampler for moment textures
                     wgpu::BindGroupLayoutEntry {
-                        binding: 4,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
@@ -5107,7 +5232,7 @@ pub fn create_deferred_bind_group(
 pub fn create_deferred_dsm_bind_group(
     device: &wgpu::Device,
     deferred: &DeferredShadePipeline,
-    cubemap_views: &[wgpu::TextureView; 3],
+    moments_cube_view: &wgpu::TextureView,
     meta_buf: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -5122,22 +5247,14 @@ pub fn create_deferred_dsm_bind_group(
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[0]),
+                resource: wgpu::BindingResource::TextureView(moments_cube_view),
             },
             wgpu::BindGroupEntry {
                 binding: 1,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[1]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: wgpu::BindingResource::TextureView(&cubemap_views[2]),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
                 resource: meta_buf.as_entire_binding(),
             },
             wgpu::BindGroupEntry {
-                binding: 4,
+                binding: 2,
                 resource: wgpu::BindingResource::Sampler(&sampler),
             },
         ],

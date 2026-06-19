@@ -52,6 +52,13 @@
 <body>
   <div id="controls">
     <input type="file" id="file-input" accept=".rmesh,.ply">
+    <label style="font-size:13px; opacity:0.8; margin-left:6px;">
+      Mode:
+      <select id="render-mode" style="font-size:12px;">
+        <option value="interval" selected>Interval (CPU sort)</option>
+        <option value="forward">Forward (HW raster)</option>
+      </select>
+    </label>
     <span id="info"></span>
   </div>
   <div id="primitives-panel">
@@ -81,6 +88,7 @@
     const status = document.getElementById('status');
     const info = document.getElementById('info');
     const fileInput = document.getElementById('file-input');
+    const renderModeSelect = document.getElementById('render-mode');
     const primList = document.getElementById('prim-list');
     const deleteBtn = document.getElementById('delete-btn');
     const interactHud = document.getElementById('interact-hud');
@@ -160,6 +168,12 @@
         console.error(e);
         return;
       }
+
+      // Initialize the dropdown to match the viewer's default mode.
+      renderModeSelect.value = viewer.get_render_mode();
+      renderModeSelect.addEventListener('change', () => {
+        viewer.set_render_mode(renderModeSelect.value);
+      });
 
       fileInput.addEventListener('change', async (e) => {
         const file = e.target.files[0];

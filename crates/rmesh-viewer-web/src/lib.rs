@@ -7,11 +7,16 @@ use wasm_bindgen::prelude::*;
 use wgpu::util::DeviceExt;
 
 use rmesh_render::{
-    create_blit_bind_group, create_compute_bind_group, create_hw_compute_bind_group,
+    create_blit_bind_group, create_compute_bind_group, create_compute_interval_gen_bind_group,
+    create_compute_interval_indirect_convert_bind_group,
+    create_compute_interval_render_bind_group, create_hw_compute_bind_group,
     create_render_bind_group, create_render_bind_group_with_sort_values, record_blit,
-    BlitPipeline, ForwardComputeBindGroups, ForwardHwComputeBindGroups, ForwardPipelines,
-    MaterialBuffers, RenderTargets, SceneBuffers, Uniforms,
+    record_compute_interval_after_sort, record_compute_interval_project, BlitPipeline,
+    ComputeIntervalPipelines, ForwardComputeBindGroups, ForwardHwComputeBindGroups,
+    ForwardPipelines, MaterialBuffers, RenderTargets, SceneBuffers, Uniforms,
 };
+use rmesh_sort::CpuSorter;
+use std::sync::Arc;
 use rmesh_util::camera::Camera;
 
 use glam::Vec3;
@@ -46,23 +51,51 @@ fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
     packed
 }
 
+/// CPU-side scene arrays needed for per-frame frustum cull + sort.
+/// Wrapped in `Arc` so a future async sort worker can borrow them cheaply.
+struct SceneArrays {
+    vertices: Vec<f32>,
+    indices: Vec<u32>,
+    circumdata: Vec<f32>,
+}
+
 /// Internal state for a loaded scene (separated so `WebViewer` can exist without a scene).
 #[allow(dead_code)]
 struct SceneState {
     buffers: SceneBuffers,
     material: MaterialBuffers,
+    /// Project step bindings (kept around — used if `use_16bit_sort` is ever
+    /// enabled, and required by the underlying recorder's signature).
     compute_bg: ForwardComputeBindGroups,
-    /// HW projection compute bindings (10 storage buffers — fits WebGPU's
-    /// per-stage cap). The web viewer uses this in place of the full
-    /// compute_pipeline (14 buffers, exceeds cap and stays invalid on web).
+    /// HW projection compute bindings (10 storage + 1 uniform — fits WebGPU's
+    /// per-stage cap thanks to `var<uniform>` on binding 0).
     hw_compute_bg: ForwardHwComputeBindGroups,
+    /// Interval gen bind group reading from `buffers.sort_values`. The web
+    /// viewer overwrites `sort_values` with CPU-sorted indices between the
+    /// project and after-sort submits, so we never need the B (ping-pong)
+    /// variant.
+    gen_bg_a: wgpu::BindGroup,
+    /// Forward render bind groups (legacy HW-raster path). The A variant
+    /// references `buffers.sort_values`; in the forward path it also reads
+    /// the CPU-sorted indices we write before the render pass.
     render_bg: wgpu::BindGroup,
+    #[allow(dead_code)]
     render_bg_b: wgpu::BindGroup,
+    /// Interval render bind group (non-PBR: aux_data + tet_indices are dummy).
+    ci_render_bg: wgpu::BindGroup,
+    /// Indirect convert bind group (turns instance_count into a mesh dispatch).
+    ci_convert_bg: wgpu::BindGroup,
     blit_bg: wgpu::BindGroup,
     sort_state: rmesh_sort::RadixSortState,
     sh_coeffs_buf: wgpu::Buffer,
     sh_degree: u32,
     tet_count: u32,
+    /// CPU sorter workspace + scene arrays. Per-frame cull+sort produces
+    /// `sorted_indices` which we upload to `buffers.sort_values` before the
+    /// interval gen step. See `rmesh_sort::cpu` and `STATUS.md` for why GPU
+    /// sort isn't viable on web.
+    cpu_sorter: CpuSorter,
+    arrays: Arc<SceneArrays>,
 }
 
 #[wasm_bindgen]
@@ -73,7 +106,12 @@ pub struct WebViewer {
     surface_config: wgpu::SurfaceConfiguration,
     camera: Camera,
     pipelines: ForwardPipelines,
+    compute_interval_pipelines: ComputeIntervalPipelines,
     sort_pipelines: rmesh_sort::RadixSortPipelines,
+    /// Persistent staging-buffer pool for CPU-sort `sort_values` /
+    /// `indirect_args` writes. Without this, every frame's `queue.write_buffer`
+    /// would allocate a fresh ~19 MB staging buffer, leaking memory.
+    staging_belt: wgpu::util::StagingBelt,
     blit_pipeline: BlitPipeline,
     targets: RenderTargets,
     scene: Option<SceneState>,
@@ -87,6 +125,22 @@ pub struct WebViewer {
     interaction: TransformInteraction,
     primitives: Vec<Primitive>,
     next_primitive_id: u32,
+    /// Render path selection. Defaults to `Interval`; the UI dropdown can
+    /// toggle to `Forward` (the legacy HW-raster path, same as the viewer
+    /// shipped before interval shading was wired up).
+    render_mode: WebRenderMode,
+}
+
+/// Which render pipeline the web viewer drives. Both share the CPU sort —
+/// only the GPU rendering step differs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WebRenderMode {
+    /// Compute-interval shading (default): one compute pass to emit interval
+    /// geometry, then an instanced indexed draw.
+    Interval,
+    /// Legacy forward HW-raster: one draw_indirect call per visible tet
+    /// (12 vertices each). Slower but visually identical when sorted right.
+    Forward,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -171,7 +225,13 @@ impl WebViewer {
 
         log::info!("Compiling shader pipelines...");
         let pipelines = ForwardPipelines::new(&device, color_format);
+        let compute_interval_pipelines = ComputeIntervalPipelines::new(&device, color_format);
         let blit_pipeline = BlitPipeline::new(&device, surface_format);
+        // wgpu 28's WebGPU backend doesn't expose `Features::SUBGROUP`, so the
+        // Drs subgroup-based sort isn't usable on web — Basic is the only
+        // option on the GPU. It produces visibly out-of-order rendering on
+        // large scenes (room.rmesh = 4.8M tets), so the web viewer needs a
+        // CPU-side sort to feed `buffers.sort_values` correctly (planned).
         let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Basic);
         let targets = RenderTargets::new(&device, width, height);
 
@@ -185,6 +245,7 @@ impl WebViewer {
 
         log::info!("WebViewer initialized ({width}×{height})");
 
+        let device_for_belt = device.clone();
         Ok(WebViewer {
             device,
             queue,
@@ -192,7 +253,9 @@ impl WebViewer {
             surface_config,
             camera,
             pipelines,
+            compute_interval_pipelines,
             sort_pipelines,
+            staging_belt: wgpu::util::StagingBelt::new(device_for_belt, 32 * 1024 * 1024),
             blit_pipeline,
             targets,
             scene: None,
@@ -204,6 +267,7 @@ impl WebViewer {
             interaction: TransformInteraction::new(),
             primitives: Vec::new(),
             next_primitive_id: 1,
+            render_mode: WebRenderMode::Interval,
         })
     }
 
@@ -240,9 +304,29 @@ impl WebViewer {
         Ok(())
     }
 
+    /// Switch render path. Accepts `"interval"` (compute-interval shading,
+    /// default) or `"forward"` (legacy HW raster). Unknown values are ignored.
+    pub fn set_render_mode(&mut self, mode: &str) {
+        self.render_mode = match mode {
+            "forward" => WebRenderMode::Forward,
+            "interval" => WebRenderMode::Interval,
+            _ => return,
+        };
+        log::info!("Render mode set to {:?}", self.render_mode);
+    }
+
+    /// Returns the current render mode label (matching the setter strings).
+    pub fn get_render_mode(&self) -> String {
+        match self.render_mode {
+            WebRenderMode::Interval => "interval".to_string(),
+            WebRenderMode::Forward => "forward".to_string(),
+        }
+    }
+
     /// Render one frame. JS calls this from `requestAnimationFrame`.
     pub fn render(&mut self) -> Result<(), JsValue> {
-        let scene = match &self.scene {
+        // Mutable borrow — CPU sort mutates `scene.cpu_sorter`.
+        let scene = match self.scene.as_mut() {
             Some(s) => s,
             None => return Ok(()), // nothing loaded yet
         };
@@ -295,6 +379,18 @@ impl WebViewer {
         self.queue
             .write_buffer(&scene.buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
+        // ----- CPU frustum cull + back-to-front sort -----
+        // Phase 1 (synchronous): block the render thread on the sort. Slow
+        // (~100-300ms for 4.8M tets) but verifies the rendering pipeline.
+        // Phase 2 will move this into `spawn_local` for 1-frame-lag async.
+        let visible_count = scene.cpu_sorter.cull_and_sort(
+            &scene.arrays.vertices,
+            &scene.arrays.indices,
+            &scene.arrays.circumdata,
+            self.camera.position,
+            vp,
+        );
+
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -308,16 +404,18 @@ impl WebViewer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut encoder = self
+        // Single-encoder render. wgpu's pipeline barriers serialize:
+        //   project_compute (writes sort_values/instance_count) →
+        //   StagingBelt copies (overwrite sort_values + instance_count) →
+        //   interval gen + render (reads sort_values).
+        let mut encoder2 = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("web forward pass"),
+                label: Some("web render"),
             });
 
-        // Primitive pass first: renders to volume color target + primitive depth target
-        // (clears both even if no primitives, so forward pass can LoadOp::Load)
         record_primitive_pass(
-            &mut encoder,
+            &mut encoder2,
             &self.queue,
             &self.primitive_pipeline,
             &self.primitive_geometry,
@@ -329,36 +427,137 @@ impl WebViewer {
             Some(&self.material_registry),
         );
 
-        // Sorted forward pass: compute → radix sort → HW render
-        // Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
-        rmesh_render::record_sorted_forward_pass(
-            &mut encoder,
-            &self.device,
+        record_compute_interval_project(
+            &mut encoder2,
             &self.pipelines,
-            &self.sort_pipelines,
             &scene.sort_state,
             &scene.buffers,
-            &self.targets,
             &scene.compute_bg,
-            &scene.render_bg,
-            &scene.render_bg_b,
+            Some(&scene.hw_compute_bg),
             scene.tet_count,
             &self.queue,
-            &self.primitive_targets.depth_view,
-            Some(&scene.hw_compute_bg),
-            false,
-            None, None, None,
             None,
             false,
         );
 
-        // Blit directly — no compositor needed
-        record_blit(&mut encoder, &self.blit_pipeline, &scene.blit_bg, &view);
+        // ----- StagingBelt writes: sort_values + instance_count -----
+        // The belt reuses pinned chunks across frames so there's no per-frame
+        // allocation. Without the belt the equivalent `queue.write_buffer`
+        // calls would each allocate a fresh ~19 MB staging buffer and leak.
+        if visible_count > 0 {
+            let size = (visible_count * 4) as wgpu::BufferAddress;
+            let mut view = self.staging_belt.write_buffer(
+                &mut encoder2,
+                &scene.buffers.sort_values,
+                0,
+                wgpu::BufferSize::new(size).unwrap(),
+            );
+            view.copy_from_slice(bytemuck::cast_slice(
+                &scene.cpu_sorter.sorted_indices[..visible_count],
+            ));
+        }
+        {
+            let mut view = self.staging_belt.write_buffer(
+                &mut encoder2,
+                &scene.buffers.indirect_args,
+                4,
+                wgpu::BufferSize::new(4).unwrap(),
+            );
+            view.copy_from_slice(bytemuck::bytes_of(&(visible_count as u32)));
+        }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        match self.render_mode {
+            WebRenderMode::Interval => {
+                // Compute-interval: indirect_convert → interval_gen → indexed draw.
+                record_compute_interval_after_sort(
+                    &mut encoder2,
+                    &self.compute_interval_pipelines,
+                    &scene.buffers,
+                    &self.targets,
+                    &scene.gen_bg_a, // CPU-sorted sort_values
+                    &scene.ci_render_bg,
+                    &scene.ci_convert_bg,
+                    &self.primitive_targets.depth_view,
+                    None,
+                    false, // mrt_enabled
+                );
+            }
+            WebRenderMode::Forward => {
+                // Legacy forward HW raster: render_pipeline_color_only draws
+                // 12 vertices per tet instanced via draw_indirect, reading
+                // colors and the CPU-sorted indices we wrote into sort_values.
+                Self::record_forward_render(
+                    &mut encoder2,
+                    &self.pipelines,
+                    &self.targets,
+                    &self.primitive_targets.depth_view,
+                    scene,
+                );
+            }
+        }
+
+        record_blit(&mut encoder2, &self.blit_pipeline, &scene.blit_bg, &view);
+
+        self.staging_belt.finish();
+        self.queue.submit(std::iter::once(encoder2.finish()));
+        self.staging_belt.recall();
         output.present();
 
         Ok(())
+    }
+
+    /// Forward-path render pass (used when `render_mode == Forward`). Mirrors
+    /// the tail end of `record_sorted_forward_pass`, sharing the same
+    /// `targets.color_view` + primitive depth as the interval path so a blit
+    /// works either way.
+    fn record_forward_render(
+        encoder: &mut wgpu::CommandEncoder,
+        pipelines: &ForwardPipelines,
+        targets: &RenderTargets,
+        depth_view: &wgpu::TextureView,
+        scene: &SceneState,
+    ) {
+        let color_attachment = wgpu::RenderPassColorAttachment {
+            view: &targets.color_view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            },
+            depth_slice: None,
+        };
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("web forward render"),
+            color_attachments: &[
+                Some(color_attachment),
+                None,
+                None,
+                None,
+            ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: depth_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rpass.set_viewport(
+            0.0,
+            0.0,
+            targets.width as f32,
+            targets.height as f32,
+            0.0,
+            1.0,
+        );
+        rpass.set_scissor_rect(0, 0, targets.width, targets.height);
+        rpass.set_pipeline(&pipelines.render_pipeline_color_only);
+        rpass.set_bind_group(0, &scene.render_bg, &[]);
+        rpass.draw_indirect(&scene.buffers.indirect_args, 0);
     }
 
     /// Resize the rendering surface (call when canvas size changes).
@@ -640,8 +839,35 @@ impl WebViewer {
             &material,
             &sh_coeffs_buf,
         );
-        let render_bg =
-            create_render_bind_group(&self.device, &self.pipelines, &buffers, &material);
+        // Interval shading bind groups. Only gen_bg_a is needed because the
+        // web viewer skips GPU radix sort and writes pre-sorted indices into
+        // `buffers.sort_values` (the buffer gen_bg_a references) directly.
+        let gen_bg_a = create_compute_interval_gen_bind_group(
+            &self.device,
+            &self.compute_interval_pipelines,
+            &buffers,
+            &material,
+        );
+        let ci_render_bg = create_compute_interval_render_bind_group(
+            &self.device,
+            &self.compute_interval_pipelines,
+            &buffers,
+        );
+        let ci_convert_bg = create_compute_interval_indirect_convert_bind_group(
+            &self.device,
+            &self.compute_interval_pipelines,
+            &buffers,
+        );
+        // Forward path render bind groups. The A variant reads from
+        // `buffers.sort_values` (which the CPU sort writes); B reads from
+        // the radix-sort ping-pong buffer (unused on web since we skip GPU
+        // sort, but kept so we can compile the existing API).
+        let render_bg = create_render_bind_group(
+            &self.device,
+            &self.pipelines,
+            &buffers,
+            &material,
+        );
         let render_bg_b = create_render_bind_group_with_sort_values(
             &self.device,
             &self.pipelines,
@@ -655,18 +881,30 @@ impl WebViewer {
             &self.targets.color_view,
         );
 
+        let arrays = Arc::new(SceneArrays {
+            vertices: scene_data.vertices.clone(),
+            indices: scene_data.indices.clone(),
+            circumdata: scene_data.circumdata.clone(),
+        });
+        let cpu_sorter = CpuSorter::new(tet_count as usize);
+
         self.scene = Some(SceneState {
             buffers,
             material,
             compute_bg,
             hw_compute_bg,
+            gen_bg_a,
             render_bg,
             render_bg_b,
+            ci_render_bg,
+            ci_convert_bg,
             blit_bg,
             sort_state,
             sh_coeffs_buf,
             sh_degree: sh_coeffs.degree,
             tet_count,
+            cpu_sorter,
+            arrays,
         });
     }
 }
