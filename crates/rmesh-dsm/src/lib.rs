@@ -1,8 +1,20 @@
 //! Deep shadow map rendering for tetrahedral radiance meshes.
 //!
-//! Stores a 2-moment α-weighted depth distribution per cubemap texel and
-//! reconstructs transmittance T(z) at query time via the Cantelli (one-sided
-//! Chebyshev) bound. See `MSM.md` for the math.
+//! Stores a 2-moment α-weighted depth distribution per cubemap texel in a
+//! single `Rgba16Float` target per face:
+//!
+//! ```text
+//!   .r = alpha * E[z]    (mean depth,    normalized to [0,1] over [near,far])
+//!   .g = alpha * E[z^2]  (second moment)
+//!   .b = unused
+//!   .a = alpha           (occlusion; accumulates to 1 - T_total)
+//! ```
+//!
+//! Hardware premultiplied-alpha blending (back-to-front) accumulates each
+//! channel. The deferred shading pass reconstructs transmittance `T(z)` via the
+//! Cantelli (one-sided Chebyshev) bound (see `evaluate_transmittance` in
+//! `deferred_shade_frag.wgsl`); [`DsmResolvePipeline`] does the same for debug
+//! visualization. See `MSM.md` for the math.
 //!
 //! # Pipeline flow
 //!
@@ -62,7 +74,7 @@ impl DsmPipeline {
     /// `color_format` should match the output texture (e.g. `Rgba16Float`).
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         // 3 read-only storage bindings: uniforms, verts, tet_data
-        let render_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3)
+        let render_entries: Vec<wgpu::BindGroupLayoutEntry> = (0..3u32)
             .map(|i| wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -111,7 +123,7 @@ impl DsmPipeline {
             },
         };
 
-        let premul_target = Some(wgpu::ColorTargetState {
+        let moment_target = Some(wgpu::ColorTargetState {
             format: color_format,
             blend: Some(premul_blend),
             write_mask: wgpu::ColorWrites::ALL,
@@ -146,7 +158,7 @@ impl DsmPipeline {
             fragment: Some(wgpu::FragmentState {
                 module: &fragment_shader,
                 entry_point: Some("main"),
-                targets: &[premul_target],
+                targets: &[moment_target], // (alpha*E[z], alpha*E[z²], _, alpha)
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
@@ -184,14 +196,14 @@ pub fn create_dsm_render_bind_group(
 
 /// Record a DSM render pass.
 ///
-/// Clears the output to zero (full transmittance) and draws the interval
-/// triangles with premultiplied-alpha blending. After the pass, the alpha
-/// channel of `output_view` contains `1 - T_total`.
+/// Draws the interval triangles with premultiplied-alpha blending into the
+/// moment target (loading over the primitive pre-pass). After the pass, the
+/// alpha channel of `moment_view` contains `1 - T_total`.
 ///
 /// * `index_buf` — the static fan index buffer (`interval_fan_index_buf`, 12 u32s)
 /// * `indirect_args_buf` — the `interval_args_buf`; draw-indexed-indirect args
 ///   start at byte offset 12 (skipping the 3 dispatch u32s)
-/// * `output_view` — texture view for the DSM output
+/// * `moment_view` — texture view for the DSM moment output
 /// * `width`, `height` — output dimensions (for viewport/scissor)
 pub fn record_dsm_render(
     encoder: &mut wgpu::CommandEncoder,
@@ -602,7 +614,7 @@ pub fn create_dsm_resolve_bind_group(
 /// Record resolve passes for all 6 cubemap faces in a cross layout.
 ///
 /// Layout (4×3 grid, each cell = face_size × face_size):
-/// ```
+/// ```text
 ///        [+Y]
 ///  [-X]  [+Z]  [+X]  [-Z]
 ///        [-Y]
@@ -645,7 +657,7 @@ pub fn record_dsm_resolve_cubemap_cross(
 
     // Clear output
     {
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("dsm_cross_clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: output_view,
@@ -698,7 +710,7 @@ pub fn record_dsm_resolve_cubemap_cross(
     }
 }
 
-/// Record the resolve pass: reads Fourier textures, writes T(z_query) to output.
+/// Record the resolve pass: reads the moment texture, writes T(z_query) to output.
 pub fn record_dsm_resolve(
     encoder: &mut wgpu::CommandEncoder,
     resolve: &DsmResolvePipeline,

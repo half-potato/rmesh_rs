@@ -301,6 +301,12 @@ impl App {
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                         ui.checkbox(&mut show_scene, "Show Scene");
                         ui.separator();
+                        ui.label("Flare Gun");
+                        ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
+                        ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
+                        ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
+                    });
+                    ui.menu_button("Deferred Shading", |ui| {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
                             ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient"));
@@ -318,6 +324,12 @@ impl App {
                                 ui.label("Ground");
                                 ui.color_edit_button_rgb(&mut ground_color);
                             });
+                        } else if !has_pbr {
+                            ui.label("Scene has no PBR data");
+                        }
+                    });
+                    ui.menu_button("Debug View", |ui| {
+                        if deferred_enabled && has_pbr {
                             let debug_labels = [
                                 "Final", "Raw Albedo", "True Albedo", "Normals",
                                 "Roughness", "PBR (R/M/F0)", "Depth", "Specular",
@@ -326,7 +338,6 @@ impl App {
                                 "AO", "SSGI", "Lit History", "SSR",
                                 "Depth Std",
                             ];
-                            ui.separator();
                             ui.label("Debug Layer");
                             for (i, label) in debug_labels.iter().enumerate() {
                                 ui.radio_value(&mut deferred_debug_mode, i as u32, *label);
@@ -337,12 +348,9 @@ impl App {
                                     .logarithmic(true)
                                     .text("DSM Depth"));
                             }
+                        } else {
+                            ui.label("Enable Deferred Shading to access debug layers");
                         }
-                        ui.separator();
-                        ui.label("Flare Gun");
-                        ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
-                        ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
-                        ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
                     });
                     // Sort selector — only the interval-shading path uses sort,
                     // so we visually gray it out otherwise but keep it clickable

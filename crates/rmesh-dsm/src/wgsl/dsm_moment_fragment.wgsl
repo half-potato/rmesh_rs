@@ -13,7 +13,7 @@
 // Reconstruction (in deferred_shade_frag.wgsl::evaluate_transmittance) uses
 // the Cantelli (one-sided Chebyshev) bound:
 //   μ        = .r / .a
-//   variance = (.g − .r²/.a) / .a   (clamped to a tiny positive floor)
+//   variance = (.g/.a − μ²)   (clamped to a tiny positive floor)
 //   T(z) = 1                          if z ≤ μ
 //        = σ² / (σ² + (z − μ)²)      otherwise
 //   Floor at (1 − α) to bound by total transmittance.
@@ -92,8 +92,8 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> @locatio
     let phi_val = phi(od);
     let w0 = phi_val - alpha_t;  // back weight
     let w1 = 1.0 - phi_val;      // front weight
-    let depth_premul = w0 * zb + w1 * za;
-    let depth_sq_premul = w0 * zb * zb + w1 * za * za;
+    let depth_premul = w0 * zb + w1 * za;          // alpha * E[z]
+    let depth_sq_premul = w0 * zb * zb + w1 * za * za; // alpha * E[z^2]
 
     return vec4<f32>(depth_premul, depth_sq_premul, 0.0, alpha);
 }

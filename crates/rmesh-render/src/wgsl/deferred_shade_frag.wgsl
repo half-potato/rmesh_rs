@@ -79,6 +79,7 @@ struct ShadowLight {
 @group(0) @binding(10) var ssr_tex: texture_2d<f32>;      // Rgba16Float SSR radiance (reflection direction)
 
 // Group 1: DSM shadow cubemap
+// Moment cubemap: .r = alpha*E[z], .g = alpha*E[z^2], .a = alpha.
 @group(1) @binding(0) var dsm_moments: texture_cube<f32>;
 @group(1) @binding(1) var<storage, read> shadow_meta: array<ShadowLight>;
 @group(1) @binding(2) var dsm_sampler: sampler;
@@ -179,24 +180,34 @@ fn select_cubemap_face(dir: vec3f) -> u32 {
     }
 }
 
+// --- DSM shadow tunables (normalized-depth units over [near, far]) ---
+// Raise SHADOW_DEPTH_BIAS / SHADOW_MIN_VARIANCE to kill self-shadow acne and
+// f16-precision banding; raise SHADOW_LBR if that reintroduces light bleeding.
+const SHADOW_DEPTH_BIAS: f32   = 1.5e-3;
+const SHADOW_MIN_VARIANCE: f32 = 4.0e-4;
+const SHADOW_LBR: f32          = 0.15;
+
+fn linstep(lo: f32, hi: f32, v: f32) -> f32 {
+    return clamp((v - lo) / (hi - lo), 0.0, 1.0);
+}
+
 /// Evaluate transmittance T(world_pos) via the Cantelli (one-sided Chebyshev)
 /// bound on the α-weighted light-side termination distribution:
 ///   P(z_terminate ≥ z) ≤ σ²/(σ² + (z − μ)²),   for z > μ
 ///   T(z)               = 1,                     for z ≤ μ
-/// The receiver-side bias is implicit: any receiver at or before the mean of
-/// the absorber distribution reads as fully lit. The (1 − α_total) floor
-/// clamps shadow strength for partially-translucent occluders.
+/// where μ = E[z], σ² = E[z²] − E[z]² are recovered by un-premultiplying the
+/// stored moments by α. A minimum variance floor softens the bound near the
+/// occluder (absorbing f16 precision → no acne/banding); a small receiver
+/// depth bias prevents self-shadowing; light-bleeding reduction trims the
+/// low-confidence tail. The (1 − α_total) floor clamps shadow strength for
+/// partially-translucent occluders.
 fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let sm = shadow_meta[li];
 
     let dir = world_pos - lights[li].position;
-    let dist = length(dir);
-    // if dist < 1e-6 { return 1.0; }
-
     let face = select_cubemap_face(dir);
     let vp = get_shadow_vp(sm, face);
     let clip = vp * vec4f(world_pos, 1.0);
-    // if clip.w <= 0.0 { return 1.0; }
 
     let m = textureSample(dsm_moments, dsm_sampler, dir);
     let shadow_alpha = m.a;
@@ -204,13 +215,17 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
 
     let inv_alpha = 1.0 / shadow_alpha;
     let mean = m.r * inv_alpha;        // E[z]
+    let e_z2 = m.g * inv_alpha;        // E[z²]
 
-    let z = (clip.w - sm.near) / (sm.far - sm.near);
+    // Receiver depth from the light, biased to avoid self-shadow acne.
+    let z = (clip.w - sm.near) / (sm.far - sm.near) - SHADOW_DEPTH_BIAS;
     if z <= mean { return 1.0; }
 
-    let variance = max(m.g - m.r * m.r, 3e-5) / shadow_alpha;
+    // True one-sided-Chebyshev variance, floored to soften the bound.
+    let variance = max(e_z2 - mean * mean, SHADOW_MIN_VARIANCE);
     let d = z - mean;
-    let p_max = variance / (variance + d * d);
+    var p_max = variance / (variance + d * d);
+    p_max = linstep(SHADOW_LBR, 1.0, p_max); // light-bleeding reduction
 
     let T_total = 1.0 - shadow_alpha;
     return max(p_max, T_total);
@@ -398,7 +413,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let ao_factor = mix(1.0, ao_combined, uniforms.ao_strength);
     let env_F = env_brdf_approx(F0, r_clamped, NoV);
 
-    let ambient_diffuse = (1-env_F) * (1.0 - metallic) * albedo * ssgi_indirect * uniforms.ssgi_strength;
+    let ambient_diffuse = (1-env_F) * (1.0 - metallic) * albedo;// * ssgi_indirect * uniforms.ssgi_strength;
 
     // Indirect specular radiance: smooth surfaces use the SSR ray (sharp,
     // along reflect(V, N)); rough surfaces fall back to SSGI's hemisphere
@@ -438,7 +453,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     else if (dm == DBG_PBR)         { final_color = vec3f(roughness, metallic, f0_dielectric); }
     else if (dm == DBG_DEPTH)       { final_color = vec3f(uniforms.exposure * z_expected * 0.1); }
     else if (dm == DBG_SPECULAR)    { final_color = aces_narkowicz(total_specular * uniforms.exposure); }
-    else if (dm == DBG_DIFFUSE)     { final_color = aces_narkowicz((total_diffuse) * uniforms.exposure); }
+    else if (dm == DBG_DIFFUSE)     { final_color = aces_narkowicz((total_diffuse + ambient_term) * uniforms.exposure); }
     else if (dm == DBG_SHADOW) {
         var T_total = 0.0;
         for (var li = 0u; li < uniforms.num_lights; li = li + 1u) {

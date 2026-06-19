@@ -470,6 +470,16 @@ impl FlareSystem {
         });
     }
 
+    /// Force-rebuild the collision mesh from the given scene. Call this right
+    /// after a new scene is loaded so the BVH is cached up front, avoiding a
+    /// hitch the first time a flare is fired or the collision mesh is shown.
+    /// Also clears the stale mesh left over from a previously loaded scene.
+    pub fn rebuild_collision_mesh(&mut self, scene_data: &rmesh_data::SceneData) {
+        self.collision_mesh = None;
+        self.last_built_threshold = -1.0;
+        self.ensure_collision_mesh(scene_data);
+    }
+
     /// Rebuild the collision mesh if the threshold changed or it hasn't been built yet.
     pub fn ensure_collision_mesh(&mut self, scene_data: &rmesh_data::SceneData) {
         if scene_data.tet_count == 0 {

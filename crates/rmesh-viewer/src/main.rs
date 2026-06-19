@@ -208,8 +208,8 @@ impl App {
             deferred_enabled: pbr.is_some(),
             deferred_debug_mode: 0,
             ambient: 0.3,
-            sky_color: [0.55, 0.7, 0.95],
-            ground_color: [0.25, 0.22, 0.18],
+            sky_color: [0.0, 0.0, 0.0],
+            ground_color: [0.0, 0.0, 0.0],
             exposure: 1.0,
             ao_strength: 1.0,
             gtao_radius: 0.5,
@@ -1035,6 +1035,10 @@ impl App {
         self.scene_data = scene;
         self.sh_coeffs = sh;
         self.pbr_data = pbr;
+
+        // Cache the flare collision mesh up front for the new scene (drops the
+        // stale mesh from the previous scene and avoids a first-flare hitch).
+        self.flare_system.rebuild_collision_mesh(&self.scene_data);
         self.deferred_enabled = self.pbr_data.is_some();
         self.loaded_path = Some(path.to_path_buf());
 
@@ -1611,6 +1615,11 @@ impl ApplicationHandler for App {
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.init_gpu(window.clone());
         self.window = Some(window);
+
+        // Cache the flare collision mesh on load so the BVH is ready before the
+        // first flare is fired or the collision mesh is toggled on.
+        self.flare_system.rebuild_collision_mesh(&self.scene_data);
+
         log::info!(
             "Viewer initialized: {} tets, {} vertices (SH degree {})",
             self.scene_data.tet_count,
