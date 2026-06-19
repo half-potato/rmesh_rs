@@ -35,10 +35,7 @@ macro_rules! par_chunks_for_each {
         }
         #[cfg(not(feature = "parallel"))]
         {
-            $data
-                .chunks_mut($chunk_size)
-                .enumerate()
-                .for_each($closure);
+            $data.chunks_mut($chunk_size).enumerate().for_each($closure);
         }
     }};
 }
@@ -161,7 +158,7 @@ fn slice_f32(data: &[u8], off: &mut usize, count: usize) -> Vec<f32> {
     let bytes = &data[*off..*off + byte_len];
     *off += byte_len;
     // bytemuck can cast aligned slices directly; fall back to per-element for safety
-    if bytes.as_ptr() as usize % 4 == 0 {
+    if (bytes.as_ptr() as usize).is_multiple_of(4) {
         bytemuck::cast_slice::<u8, f32>(bytes).to_vec()
     } else {
         bytes
@@ -176,7 +173,7 @@ fn slice_u32(data: &[u8], off: &mut usize, count: usize) -> Vec<u32> {
     let byte_len = count * 4;
     let bytes = &data[*off..*off + byte_len];
     *off += byte_len;
-    if bytes.as_ptr() as usize % 4 == 0 {
+    if (bytes.as_ptr() as usize).is_multiple_of(4) {
         bytemuck::cast_slice::<u8, u32>(bytes).to_vec()
     } else {
         bytes
@@ -238,13 +235,16 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     log::info!(
         "rmesh: {} vertices, {} tets, SH degree {}, {} PCA components",
-        vertex_count, tet_count, sh_degree, k_components
+        vertex_count,
+        tet_count,
+        sh_degree,
+        k_components
     );
 
     // Start pose (8 floats: x, y, z, qx, qy, qz, qw, _pad)
     let mut start_pose = [0.0f32; 7];
-    for i in 0..7 {
-        start_pose[i] = read_f32_val(data, &mut offset);
+    for value in &mut start_pose {
+        *value = read_f32_val(data, &mut offset);
     }
     let _pad = read_f32_val(data, &mut offset);
 
@@ -260,7 +260,11 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     // Densities [M] u8, log-encoded → parallel decode
     let t0 = web_time::Instant::now();
-    log::debug!("Parse offsets: after verts+indices = {} / {} bytes", offset, data.len());
+    log::debug!(
+        "Parse offsets: after verts+indices = {} / {} bytes",
+        offset,
+        data.len()
+    );
     let densities_u8 = &data[offset..offset + tet_count as usize];
     offset += tet_count as usize;
     let mut densities = vec![0.0f32; tet_count as usize];
@@ -275,20 +279,34 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     offset = (offset + 3) & !3;
 
     // SH data: PCA-compressed
-    log::debug!("Parse offsets: after densities+align = {} / {} bytes", offset, data.len());
+    log::debug!(
+        "Parse offsets: after densities+align = {} / {} bytes",
+        offset,
+        data.len()
+    );
     let num_coeffs = ((sh_degree + 1) * (sh_degree + 1)) as usize;
     let total_dims = num_coeffs * 3;
 
     // PCA can only produce min(k, total_dims) components — old files may claim k=12 with total_dims=3
     let effective_k = (k_components as usize).min(total_dims);
-    log::debug!("SH: num_coeffs={}, total_dims={}, k={} (effective={})", num_coeffs, total_dims, k_components, effective_k);
+    log::debug!(
+        "SH: num_coeffs={}, total_dims={}, k={} (effective={})",
+        num_coeffs,
+        total_dims,
+        k_components,
+        effective_k
+    );
 
     // SH Mean + Basis are small, Weights + Grads are large → parallel f16 conversion
     let mean = slice_f16_to_f32(data, &mut offset, total_dims);
     let basis = slice_f16_to_f32(data, &mut offset, effective_k * total_dims);
     let weights = slice_f16_to_f32(data, &mut offset, tet_count as usize * effective_k);
-    log::debug!("Parse offsets: after SH weights = {} / {} bytes ({:.1} MB remaining)",
-        offset, data.len(), (data.len() - offset) as f64 / 1e6);
+    log::debug!(
+        "Parse offsets: after SH weights = {} / {} bytes ({:.1} MB remaining)",
+        offset,
+        data.len(),
+        (data.len() - offset) as f64 / 1e6
+    );
 
     offset = (offset + 3) & !3;
     let color_grads_count = tet_count as usize * 3;
@@ -297,7 +315,10 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let has_tagged_here = offset + 4 <= data.len()
         && u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) == TAGGED_MAGIC;
     let color_grads = if has_tagged_here {
-        log::info!("Tagged sections found at offset {} (before color_grads). Using zeros for color_grads.", offset);
+        log::info!(
+            "Tagged sections found at offset {} (before color_grads). Using zeros for color_grads.",
+            offset
+        );
         vec![0.0f32; color_grads_count]
     } else if offset + color_grads_bytes <= data.len() {
         slice_f16_to_f32(data, &mut offset, color_grads_count)
@@ -311,19 +332,27 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         grads.resize(color_grads_count, 0.0);
         grads
     };
-    log::info!("Densities + SH + gradients: {:.2}s", t0.elapsed().as_secs_f64());
+    log::info!(
+        "Densities + SH + gradients: {:.2}s",
+        t0.elapsed().as_secs_f64()
+    );
 
     // --- Parallel PCA decompression ---
     // result[tet][feat] = mean[feat] + Σ_k(weight[tet][k] * basis[k][feat])
     log::info!(
         "Decompressing PCA ({} tets × {} dims × {} components)...",
-        tet_count, total_dims, effective_k
+        tet_count,
+        total_dims,
+        effective_k
     );
     let t0 = web_time::Instant::now();
     let k = effective_k;
     let mut sh_coeffs = vec![0.0f32; tet_count as usize * total_dims];
 
-    par_chunks_for_each!(sh_coeffs, total_dims, |(tet, chunk): (usize, &mut [f32])| {
+    par_chunks_for_each!(sh_coeffs, total_dims, |(tet, chunk): (
+        usize,
+        &mut [f32]
+    )| {
         let w_base = tet * k;
         for feat in 0..total_dims {
             let mut val = mean[feat];
@@ -437,7 +466,10 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
 
         log::info!(
             "  section '{}': dtype={}, shape={:?}, {} bytes",
-            tag, dtype, shape, data_bytes
+            tag,
+            dtype,
+            shape,
+            data_bytes
         );
 
         match tag.as_str() {
@@ -508,97 +540,93 @@ fn f16_payload_to_f32(payload: &[u8], dtype: u32) -> Vec<f32> {
 
 /// Parallel circumsphere computation using rayon.
 /// Matches stable_power.slang: double precision + degenerate tet handling.
-fn compute_circumspheres_parallel(
-    vertices: &[f32],
-    indices: &[u32],
-    tet_count: usize,
-) -> Vec<f32> {
+fn compute_circumspheres_parallel(vertices: &[f32], indices: &[u32], tet_count: usize) -> Vec<f32> {
     use glam::DVec3;
 
     let mut circumdata = vec![0.0f32; tet_count * 4];
 
     par_chunks_for_each!(circumdata, 4, |(i, out): (usize, &mut [f32])| {
-            let i0 = indices[i * 4] as usize;
-            let i1 = indices[i * 4 + 1] as usize;
-            let i2 = indices[i * 4 + 2] as usize;
-            let i3 = indices[i * 4 + 3] as usize;
+        let i0 = indices[i * 4] as usize;
+        let i1 = indices[i * 4 + 1] as usize;
+        let i2 = indices[i * 4 + 2] as usize;
+        let i3 = indices[i * 4 + 3] as usize;
 
-            // Double precision to match stable_power.slang
-            let v0 = DVec3::new(
-                vertices[i0 * 3] as f64,
-                vertices[i0 * 3 + 1] as f64,
-                vertices[i0 * 3 + 2] as f64,
-            );
-            let v1 = DVec3::new(
-                vertices[i1 * 3] as f64,
-                vertices[i1 * 3 + 1] as f64,
-                vertices[i1 * 3 + 2] as f64,
-            );
-            let v2 = DVec3::new(
-                vertices[i2 * 3] as f64,
-                vertices[i2 * 3 + 1] as f64,
-                vertices[i2 * 3 + 2] as f64,
-            );
-            let v3 = DVec3::new(
-                vertices[i3 * 3] as f64,
-                vertices[i3 * 3 + 1] as f64,
-                vertices[i3 * 3 + 2] as f64,
-            );
+        // Double precision to match stable_power.slang
+        let v0 = DVec3::new(
+            vertices[i0 * 3] as f64,
+            vertices[i0 * 3 + 1] as f64,
+            vertices[i0 * 3 + 2] as f64,
+        );
+        let v1 = DVec3::new(
+            vertices[i1 * 3] as f64,
+            vertices[i1 * 3 + 1] as f64,
+            vertices[i1 * 3 + 2] as f64,
+        );
+        let v2 = DVec3::new(
+            vertices[i2 * 3] as f64,
+            vertices[i2 * 3 + 1] as f64,
+            vertices[i2 * 3 + 2] as f64,
+        );
+        let v3 = DVec3::new(
+            vertices[i3 * 3] as f64,
+            vertices[i3 * 3 + 1] as f64,
+            vertices[i3 * 3 + 2] as f64,
+        );
 
-            let a = v1 - v0;
-            let b = v2 - v0;
-            let c = v3 - v0;
+        let a = v1 - v0;
+        let b = v2 - v0;
+        let c = v3 - v0;
 
-            let aa = a.dot(a);
-            let bb = b.dot(b);
-            let cc = c.dot(c);
+        let aa = a.dot(a);
+        let bb = b.dot(b);
+        let cc = c.dot(c);
 
-            let cross_bc = b.cross(c);
-            let cross_ca = c.cross(a);
-            let cross_ab = a.cross(b);
+        let cross_bc = b.cross(c);
+        let cross_ca = c.cross(a);
+        let cross_ab = a.cross(b);
 
-            let denom = 2.0 * a.dot(cross_bc);
+        let denom = 2.0 * a.dot(cross_bc);
 
-            if denom.abs() < 1e-10 {
-                // Degenerate tet — match stable_power.slang logic
-                let max_dist = (v1 - v0)
+        if denom.abs() < 1e-10 {
+            // Degenerate tet — match stable_power.slang logic
+            let max_dist = (v1 - v0)
+                .length()
+                .max((v2 - v0).length())
+                .max((v3 - v0).length())
+                .max((v2 - v1).length())
+                .max((v3 - v1).length())
+                .max((v3 - v2).length());
+
+            if max_dist < 1e-7 {
+                // Tiny tet: use centroid, radius = min vertex distance
+                let center = 0.25 * (v0 + v1 + v2 + v3);
+                let r = (v0 - center)
                     .length()
-                    .max((v2 - v0).length())
-                    .max((v3 - v0).length())
-                    .max((v2 - v1).length())
-                    .max((v3 - v1).length())
-                    .max((v3 - v2).length());
-
-                if max_dist < 1e-7 {
-                    // Tiny tet: use centroid, radius = min vertex distance
-                    let center = 0.25 * (v0 + v1 + v2 + v3);
-                    let r = (v0 - center)
-                        .length()
-                        .min((v1 - center).length())
-                        .min((v2 - center).length())
-                        .min((v3 - center).length());
-                    out[0] = center.x as f32;
-                    out[1] = center.y as f32;
-                    out[2] = center.z as f32;
-                    out[3] = (r * r) as f32;
-                } else {
-                    // Near-planar tet: mark invalid (centroid, r²=-1e20)
-                    // Sort key = |diff|² - r² will be huge → sorted to back
-                    let center = 0.25 * (v0 + v1 + v2 + v3);
-                    out[0] = center.x as f32;
-                    out[1] = center.y as f32;
-                    out[2] = center.z as f32;
-                    out[3] = 1e20_f32; // huge r² → power always very negative → back of sort
-                }
-            } else {
-                let rel = (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denom;
-                let center = v0 + rel;
+                    .min((v1 - center).length())
+                    .min((v2 - center).length())
+                    .min((v3 - center).length());
                 out[0] = center.x as f32;
                 out[1] = center.y as f32;
                 out[2] = center.z as f32;
-                out[3] = rel.dot(rel) as f32;
+                out[3] = (r * r) as f32;
+            } else {
+                // Near-planar tet: mark invalid (centroid, r²=-1e20)
+                // Sort key = |diff|² - r² will be huge → sorted to back
+                let center = 0.25 * (v0 + v1 + v2 + v3);
+                out[0] = center.x as f32;
+                out[1] = center.y as f32;
+                out[2] = center.z as f32;
+                out[3] = 1e20_f32; // huge r² → power always very negative → back of sort
             }
-        });
+        } else {
+            let rel = (aa * cross_bc + bb * cross_ca + cc * cross_ab) / denom;
+            let center = v0 + rel;
+            out[0] = center.x as f32;
+            out[1] = center.y as f32;
+            out[2] = center.z as f32;
+            out[3] = rel.dot(rel) as f32;
+        }
+    });
 
     circumdata
 }
@@ -635,11 +663,11 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         let line = line.trim();
         if line == "format binary_little_endian 1.0" {
             is_binary_le = true;
-        } else if line.starts_with("element vertex ") {
-            vertex_count = line[15..].trim().parse().context("Bad vertex count")?;
+        } else if let Some(stripped) = line.strip_prefix("element vertex ") {
+            vertex_count = stripped.trim().parse().context("Bad vertex count")?;
             in_tet_element = false;
-        } else if line.starts_with("element tetrahedron ") {
-            tet_count = line[20..].trim().parse().context("Bad tet count")?;
+        } else if let Some(stripped) = line.strip_prefix("element tetrahedron ") {
+            tet_count = stripped.trim().parse().context("Bad tet count")?;
             in_tet_element = true;
         } else if line.starts_with("element ") {
             in_tet_element = false;
@@ -657,7 +685,10 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 
     log::info!(
         "PLY: {} vertices, {} tets, {} SH coefficients (degree {})",
-        vertex_count, tet_count, num_sh, sh_degree,
+        vertex_count,
+        tet_count,
+        num_sh,
+        sh_degree,
     );
 
     let mut offset = header_end;
@@ -672,7 +703,6 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let num_scalar_props = 1 + 3 + num_sh as usize * 3; // density + grad(3) + SH
     let tet_stride = 1 + 4 * 4 + num_scalar_props * 4; // 1 byte list prefix + indices + floats
     let tet_data = &data[offset..offset + tet_stride * tet_count as usize];
-    offset += tet_stride * tet_count as usize;
 
     log::info!(
         "Parsing {} tets ({:.1} MB, {} bytes/tet)...",
@@ -737,7 +767,10 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let circumdata = compute_circumspheres_parallel(&vertices, &indices, tet_count as usize);
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 
-    log::info!("Total PLY parse time: {:.2}s", t_total.elapsed().as_secs_f64());
+    log::info!(
+        "Total PLY parse time: {:.2}s",
+        t_total.elapsed().as_secs_f64()
+    );
 
     let sh = ShCoeffs {
         coeffs: sh_coeffs,

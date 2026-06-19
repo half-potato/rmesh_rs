@@ -24,7 +24,11 @@ impl CompositorTargets {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("composited_color"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -34,7 +38,10 @@ impl CompositorTargets {
         });
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Self { color_texture, color_view }
+        Self {
+            color_texture,
+            color_view,
+        }
     }
 }
 
@@ -106,9 +113,9 @@ impl CompositorPipeline {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(
-                            std::mem::size_of::<CompositorUniforms>() as u64,
-                        ),
+                        min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                            CompositorUniforms,
+                        >() as u64),
                     },
                     count: None,
                 },
@@ -157,7 +164,11 @@ impl CompositorPipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout, uniforms_buffer }
+        Self {
+            pipeline,
+            bind_group_layout,
+            uniforms_buffer,
+        }
     }
 }
 

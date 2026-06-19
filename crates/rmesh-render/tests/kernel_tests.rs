@@ -28,7 +28,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -55,18 +56,22 @@ fn test_project_compute_kernel() {
 
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
-    let pipelines = rmesh_render::ForwardPipelines::new(
+    let material = rmesh_render::MaterialBuffers::upload(
         &device,
-        wgpu::TextureFormat::Rgba16Float,
+        &zero_base_colors,
+        &scene.color_grads,
+        scene.tet_count,
     );
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, wgpu::TextureFormat::Rgba16Float);
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
         size: 4,
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material, &dummy_sh);
+    let compute_bg = rmesh_render::create_compute_bind_group(
+        &device, &pipelines, &buffers, &material, &dummy_sh,
+    );
 
     // Camera looking at tet from outside
     let verts = load_tet_verts(&scene, 0);
@@ -74,8 +79,21 @@ fn test_project_compute_kernel() {
     let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
     let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
 
-    let uniforms =
-        rmesh_render::make_uniforms(vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0, 12, 0.0, 0, 0.01, 1000.0);
+    let uniforms = rmesh_render::make_uniforms(
+        vp,
+        c2w,
+        intrinsics,
+        eye,
+        W as f32,
+        H as f32,
+        scene.tet_count,
+        0,
+        12,
+        0.0,
+        0,
+        0.01,
+        1000.0,
+    );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Reset indirect args
@@ -98,7 +116,7 @@ fn test_project_compute_kernel() {
         pass.set_bind_group(0, &compute_bg.bg0, &[]);
         pass.set_bind_group(1, &compute_bg.bg1, &[]);
         let n_pow2 = scene.tet_count.next_power_of_two();
-        pass.dispatch_workgroups((n_pow2 + 63) / 64, 1, 1);
+        pass.dispatch_workgroups(n_pow2.div_ceil(64), 1, 1);
     }
     queue.submit(std::iter::once(encoder.finish()));
 
@@ -109,6 +127,102 @@ fn test_project_compute_kernel() {
     assert!(
         instance_count > 0,
         "Tet should be visible but instance_count=0"
+    );
+}
+
+/// Equivalent of `test_project_compute_kernel` but for the HW-compute project
+/// path (`project_compute_hw.wgsl`). After hoisting the per-view cull out, the
+/// shader publishes `instance_count = uniforms.tet_count` from thread 0;
+/// this test makes sure that write actually lands.
+#[test]
+fn test_project_compute_hw_kernel() {
+    let (device, queue) = match create_test_device() {
+        Some(dq) => dq,
+        None => {
+            eprintln!("Skipping test_project_compute_hw_kernel (no GPU)");
+            return;
+        }
+    };
+
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = random_single_tet_scene(&mut rng, 0.3);
+
+    let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, &scene);
+    let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
+    let material = rmesh_render::MaterialBuffers::upload(
+        &device,
+        &zero_base_colors,
+        &scene.color_grads,
+        scene.tet_count,
+    );
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, wgpu::TextureFormat::Rgba16Float);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let hw_bg = rmesh_render::create_hw_compute_bind_group(
+        &device, &pipelines, &buffers, &material, &dummy_sh,
+    );
+
+    let verts = load_tet_verts(&scene, 0);
+    let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+    let eye = centroid + Vec3::new(2.0, 0.0, 0.0);
+    let (vp, c2w, intrinsics) = setup_camera(eye, centroid);
+
+    let uniforms = rmesh_render::make_uniforms(
+        vp,
+        c2w,
+        intrinsics,
+        eye,
+        W as f32,
+        H as f32,
+        scene.tet_count,
+        0,
+        12,
+        0.0,
+        0,
+        0.01,
+        1000.0,
+    );
+    queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
+
+    let reset_cmd = rmesh_render::DrawIndirectCommand {
+        vertex_count: 12,
+        instance_count: 0,
+        first_vertex: 0,
+        first_instance: 0,
+    };
+    queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("project_compute_hw"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipelines.hw_compute_pipeline);
+        pass.set_bind_group(0, &hw_bg.bg, &[]);
+        let n_pow2 = scene.tet_count.next_power_of_two();
+        pass.dispatch_workgroups(n_pow2.div_ceil(64), 1, 1);
+    }
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let args: Vec<u32> = read_buffer(&device, &queue, &buffers.indirect_args, 4);
+    eprintln!(
+        "project_compute_hw: vertex_count={}, instance_count={}",
+        args[0], args[1]
+    );
+    let sort_vals: Vec<u32> = read_buffer(&device, &queue, &buffers.sort_values, 4);
+    eprintln!("project_compute_hw: sort_values[0..4]={:?}", sort_vals);
+    let sort_keys: Vec<u32> = read_buffer(&device, &queue, &buffers.sort_keys, 4);
+    eprintln!("project_compute_hw: sort_keys[0..4]={:?}", sort_keys);
+
+    assert_eq!(
+        args[1], scene.tet_count,
+        "project_compute_hw should publish instance_count = tet_count ({}), got {}",
+        scene.tet_count, args[1]
     );
 }
 
@@ -133,7 +247,7 @@ fn test_rasterize_pipeline_creation() {
     };
 
     // This will panic if the shader fails to compile (e.g., subgroups not supported)
-    let pipeline = rmesh_render::RasterizeComputePipeline::new(&device, W, H, 0);
+    let pipeline = rmesh_trainable::RasterizeComputePipeline::new(&device, W, H, 0);
 
     // Verify the output buffer was created with correct size
     assert_eq!(pipeline.width, W);
@@ -165,7 +279,10 @@ fn test_interval_pipeline_creation() {
             .await
             .ok()?;
 
-        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER) {
+        if !adapter
+            .features()
+            .contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
+        {
             return None;
         }
 
@@ -183,7 +300,8 @@ fn test_interval_pipeline_creation() {
         limits.max_mesh_output_layers = supported.max_mesh_output_layers;
         limits.max_mesh_multiview_view_count = supported.max_mesh_multiview_view_count;
         limits.max_task_mesh_workgroup_total_count = supported.max_task_mesh_workgroup_total_count;
-        limits.max_task_mesh_workgroups_per_dimension = supported.max_task_mesh_workgroups_per_dimension;
+        limits.max_task_mesh_workgroups_per_dimension =
+            supported.max_task_mesh_workgroups_per_dimension;
 
         adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -199,7 +317,9 @@ fn test_interval_pipeline_creation() {
     }) {
         Some(dq) => dq,
         None => {
-            eprintln!("Skipping test_interval_pipeline_creation (no GPU or no mesh shader support)");
+            eprintln!(
+                "Skipping test_interval_pipeline_creation (no GPU or no mesh shader support)"
+            );
             return;
         }
     };
@@ -227,13 +347,21 @@ fn test_interval_forward_e2e() {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, centroid, std::f32::consts::FRAC_PI_2, E2E_W as f32, E2E_H as f32);
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(
+        eye,
+        centroid,
+        std::f32::consts::FRAC_PI_2,
+        E2E_W as f32,
+        E2E_H as f32,
+    );
 
     let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H) {
+    if let Some(gpu_image) =
+        gpu_interval_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H)
+    {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("interval_forward_e2e: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(mean_diff < 0.1, "mean_diff {mean_diff} >= 0.1");
@@ -276,13 +404,21 @@ fn test_compute_interval_forward_e2e() {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, centroid, std::f32::consts::FRAC_PI_2, E2E_W as f32, E2E_H as f32);
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(
+        eye,
+        centroid,
+        std::f32::consts::FRAC_PI_2,
+        E2E_W as f32,
+        E2E_H as f32,
+    );
 
     let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H) {
+    if let Some(gpu_image) =
+        gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H)
+    {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("compute_interval_forward_e2e: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(mean_diff < 0.1, "mean_diff {mean_diff} >= 0.1");
@@ -311,7 +447,13 @@ fn test_legacy_forward_e2e() {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, centroid, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, centroid, std::f32::consts::FRAC_PI_2, E2E_W as f32, E2E_H as f32);
+    let (c2w, intrinsics) = test_camera_c2w_intrinsics(
+        eye,
+        centroid,
+        std::f32::consts::FRAC_PI_2,
+        E2E_W as f32,
+        E2E_H as f32,
+    );
 
     let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, E2E_W, E2E_H);
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();

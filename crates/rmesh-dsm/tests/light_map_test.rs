@@ -24,14 +24,15 @@
 
 use glam::Vec3;
 use rmesh_compositor::PrimitiveGeometry;
+use rmesh_data::SceneData;
 use rmesh_dsm::{
     build_light_vp, generate_dsm_for_lights, DsmAtlas, DsmPipeline, DsmPrimitivePipeline,
+    DsmProjectPipeline,
 };
 use rmesh_interact::{Primitive, PrimitiveKind};
 use rmesh_render::GpuLight;
 use rmesh_util::camera::TET_FACES;
 use rmesh_util::test_util::build_test_scene;
-use rmesh_data::SceneData;
 
 const NEAR: f32 = 0.05;
 const FAR: f32 = 20.0;
@@ -54,9 +55,9 @@ fn point_light(position: Vec3) -> GpuLight {
         light_type: 0, // point
         color: [1.0, 1.0, 1.0],
         intensity: 1.0,
-        direction: [0.0, 0.0, 0.0],
-        inner_angle: 0.0,
-        outer_angle: 0.0,
+        direction: [0.0, 0.0, -1.0],
+        inner_cos: 1.0,
+        outer_cos: 1.0,
         _pad: [0.0; 3],
     }
 }
@@ -222,27 +223,30 @@ fn generate(
     let queue = &gpu.queue;
 
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, fwd_pipelines, _targets, _cbg, _rbg) =
-        rmesh_render::setup_forward(device, queue, scene, &base_colors, &scene.color_grads, RES, RES);
+    let (buffers, material, _fwd_pipelines, _targets, _cbg, _rbg) = rmesh_render::setup_forward(
+        device,
+        queue,
+        scene,
+        &base_colors,
+        &scene.color_grads,
+        RES,
+        RES,
+    );
 
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(device, wgpu::TextureFormat::Rgba16Float);
+    let ci_pipelines =
+        rmesh_render::ComputeIntervalPipelines::new(device, wgpu::TextureFormat::Rgba16Float);
 
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(device, 1, rmesh_sort::SortBackend::Drs);
-    let sort_state = rmesh_sort::RadixSortState::new(device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    let sort_pipelines =
+        rmesh_sort::RadixSortPipelines::new(device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state =
+        rmesh_sort::RadixSortState::new(device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(queue);
 
     let dsm_pipeline = DsmPipeline::new(device, wgpu::TextureFormat::Rgba16Float);
     let dsm_prim_pipeline = DsmPrimitivePipeline::new(device);
+    let dsm_project_pipeline = DsmProjectPipeline::new(device);
     let prim_geometry = PrimitiveGeometry::new(device);
-
-    // sh_degree=0 path uses base_colors instead of SH; a tiny dummy buffer suffices.
-    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("dummy_sh_coeffs"),
-        size: 4,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
 
     let atlas = DsmAtlas::new(device, RES, &[light.light_type]);
     let lights = [light];
@@ -257,15 +261,14 @@ fn generate(
         queue,
         &dsm_pipeline,
         &dsm_prim_pipeline,
+        &dsm_project_pipeline,
         &prim_geometry,
         primitives,
-        &fwd_pipelines,
         &ci_pipelines,
         &sort_pipelines,
         &sort_state,
         &buffers,
         &material,
-        &dummy_sh,
         &lights,
         lights.len() as u32,
         scene.tet_count,
@@ -304,7 +307,11 @@ fn read_face(gpu: &Gpu, atlas: &DsmAtlas, li: usize, face: u32) -> Vec<[f32; 4]>
         wgpu::TexelCopyTextureInfo {
             texture: &atlas.cubemaps[li],
             mip_level: 0,
-            origin: wgpu::Origin3d { x: 0, y: 0, z: face },
+            origin: wgpu::Origin3d {
+                x: 0,
+                y: 0,
+                z: face,
+            },
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
@@ -523,14 +530,27 @@ fn tet_light_map_density_monotonic() {
     let scene_lo = single_tet_scene(center_pos, 0.7, 1.0);
     let scene_hi = single_tet_scene(center_pos, 0.7, 5.0);
 
-    let alpha_lo = center(&read_face(&gpu, &generate(&gpu, &scene_lo, &[], light, true), 0, 5))[3];
-    let alpha_hi = center(&read_face(&gpu, &generate(&gpu, &scene_hi, &[], light, true), 0, 5))[3];
+    let alpha_lo = center(&read_face(
+        &gpu,
+        &generate(&gpu, &scene_lo, &[], light, true),
+        0,
+        5,
+    ))[3];
+    let alpha_hi = center(&read_face(
+        &gpu,
+        &generate(&gpu, &scene_hi, &[], light, true),
+        0,
+        5,
+    ))[3];
 
     assert!(
         alpha_hi > alpha_lo + 0.05,
         "higher density should occlude more: lo={alpha_lo}, hi={alpha_hi}"
     );
-    assert!(alpha_hi <= 1.01 && alpha_lo >= -0.01, "alpha must stay in [0,1]");
+    assert!(
+        alpha_hi <= 1.01 && alpha_lo >= -0.01,
+        "alpha must stay in [0,1]"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -619,7 +639,10 @@ fn tet_transmittance_reconstruction() {
     let atlas = generate(&gpu, &scene, &[], light, true);
     let m = center(&read_face(&gpu, &atlas, 0, 5));
     let alpha = m[3];
-    assert!(alpha > 0.05 && alpha < 0.95, "expected a partial occluder, got α={alpha}");
+    assert!(
+        alpha > 0.05 && alpha < 0.95,
+        "expected a partial occluder, got α={alpha}"
+    );
 
     // Receiver in front of the absorber → fully lit.
     let t_front = reconstruct_transmittance(m, normalize_depth(t_enter - 0.5));

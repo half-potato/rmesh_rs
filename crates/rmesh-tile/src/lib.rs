@@ -61,15 +61,8 @@ pub fn dispatch_2d(total_workgroups: u32) -> (u32, u32) {
         (total_workgroups, 1)
     } else {
         let x = 65535u32;
-        let y = (total_workgroups + x - 1) / x;
+        let y = total_workgroups.div_ceil(x);
         (x, y)
-    }
-}
-
-fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
-    wgpu::BindGroupEntry {
-        binding,
-        resource: buffer.as_entire_binding(),
     }
 }
 
@@ -95,9 +88,15 @@ impl TileBuffers {
     ///
     /// Sort buffer size is `next_power_of_two(tet_count * num_tiles)` (each tet can
     /// touch every tile in the worst case), capped to avoid excessive allocation.
-    pub fn new(device: &wgpu::Device, tet_count: u32, width: u32, height: u32, tile_size: u32) -> Self {
-        let tiles_x = (width + tile_size - 1) / tile_size;
-        let tiles_y = (height + tile_size - 1) / tile_size;
+    pub fn new(
+        device: &wgpu::Device,
+        tet_count: u32,
+        width: u32,
+        height: u32,
+        tile_size: u32,
+    ) -> Self {
+        let tiles_x = width.div_ceil(tile_size);
+        let tiles_y = height.div_ceil(tile_size);
         let num_tiles = tiles_x * tiles_y;
 
         // Each tet can touch up to num_tiles tiles. Use tet_count * num_tiles as the
@@ -115,28 +114,36 @@ impl TileBuffers {
         let tile_sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_keys"),
             size: (max_pairs_pow2 as u64) * 8, // 2 u32s per key (64-bit: lo=depth, hi=tile_id)
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let tile_sort_values = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_sort_values"),
             size: (max_pairs_pow2 as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let tile_pair_count = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_pair_count"),
             size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let tile_ranges = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tile_ranges"),
             size: (num_tiles as u64) * 2 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -189,21 +196,19 @@ impl TilePipelines {
                     storage_entry(2, false), // tile_sort_values
                 ],
             });
-        let fill_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("tile_fill_pl"),
-                bind_group_layouts: &[&fill_bind_group_layout],
-                immediate_size: 0,
-            });
-        let fill_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("tile_fill_pipeline"),
-                layout: Some(&fill_pipeline_layout),
-                module: &fill_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let fill_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("tile_fill_pl"),
+            bind_group_layouts: &[&fill_bind_group_layout],
+            immediate_size: 0,
+        });
+        let fill_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("tile_fill_pipeline"),
+            layout: Some(&fill_pipeline_layout),
+            module: &fill_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
         // ----- Tile ranges pipeline (4 bindings) -----
         let tile_ranges_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -268,17 +273,23 @@ impl ScanPipelines {
             label: Some("prepare_dispatch"),
             source: wgpu::ShaderSource::Wgsl(PREPARE_DISPATCH_WGSL.into()),
         });
-        let prepare_dispatch_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("prepare_dispatch_bgl"),
-            entries: &[
-                storage_entry(0, true),  // indirect_args
-                storage_entry(1, false), // dispatch_scan
-                storage_entry(2, false), // dispatch_tile_gen
-                storage_entry(3, false), // visible_count_out
-                storage_entry(4, false), // rts_info
-            ],
-        });
-        let prepare_dispatch_pipeline = make_compute_pipeline(device, "prepare_dispatch", &prepare_dispatch_shader, &[&prepare_dispatch_bgl]);
+        let prepare_dispatch_bgl =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("prepare_dispatch_bgl"),
+                entries: &[
+                    storage_entry(0, true),  // indirect_args
+                    storage_entry(1, false), // dispatch_scan
+                    storage_entry(2, false), // dispatch_tile_gen
+                    storage_entry(3, false), // visible_count_out
+                    storage_entry(4, false), // rts_info
+                ],
+            });
+        let prepare_dispatch_pipeline = make_compute_pipeline(
+            device,
+            "prepare_dispatch",
+            &prepare_dispatch_shader,
+            &[&prepare_dispatch_bgl],
+        );
 
         // RTS (Reduce Then Scan) — 3 entry points sharing one bind group layout
         let rts_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -301,30 +312,33 @@ impl ScanPipelines {
             bind_group_layouts: &[&rts_bgl],
             immediate_size: 0,
         });
-        let rts_reduce_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rts_reduce_pipeline"),
-            layout: Some(&rts_layout),
-            module: &rts_shader,
-            entry_point: Some("reduce"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let rts_spine_scan_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rts_spine_scan_pipeline"),
-            layout: Some(&rts_layout),
-            module: &rts_shader,
-            entry_point: Some("spine_scan"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-        let rts_downsweep_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rts_downsweep_pipeline"),
-            layout: Some(&rts_layout),
-            module: &rts_shader,
-            entry_point: Some("downsweep"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
+        let rts_reduce_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rts_reduce_pipeline"),
+                layout: Some(&rts_layout),
+                module: &rts_shader,
+                entry_point: Some("reduce"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let rts_spine_scan_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rts_spine_scan_pipeline"),
+                layout: Some(&rts_layout),
+                module: &rts_shader,
+                entry_point: Some("spine_scan"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+        let rts_downsweep_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("rts_downsweep_pipeline"),
+                layout: Some(&rts_layout),
+                module: &rts_shader,
+                entry_point: Some("downsweep"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
 
         // Tile gen scan
         let tile_gen_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -334,21 +348,26 @@ impl ScanPipelines {
         let tile_gen_scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile_gen_scan_bgl"),
             entries: &[
-                storage_entry(0, true),  // tile_uniforms
-                storage_entry(1, true),  // uniforms
-                storage_entry(2, true),  // vertices
-                storage_entry(3, true),  // indices
-                storage_entry(4, true),  // compact_tet_ids
-                storage_entry(5, true),  // circumdata
-                storage_entry(6, false), // tile_sort_keys
-                storage_entry(7, false), // tile_sort_values
-                storage_entry(8, true),  // pair_offsets
-                storage_entry(9, true),  // tiles_touched
-                storage_entry(10, true), // visible_count
+                storage_entry(0, true),   // tile_uniforms
+                storage_entry(1, true),   // uniforms
+                storage_entry(2, true),   // vertices
+                storage_entry(3, true),   // indices
+                storage_entry(4, true),   // compact_tet_ids
+                storage_entry(5, true),   // circumdata
+                storage_entry(6, false),  // tile_sort_keys
+                storage_entry(7, false),  // tile_sort_values
+                storage_entry(8, true),   // pair_offsets
+                storage_entry(9, true),   // tiles_touched
+                storage_entry(10, true),  // visible_count
                 storage_entry(11, false), // num_keys_out
             ],
         });
-        let tile_gen_scan_pipeline = make_compute_pipeline(device, "tile_gen_scan", &tile_gen_scan_shader, &[&tile_gen_scan_bgl]);
+        let tile_gen_scan_pipeline = make_compute_pipeline(
+            device,
+            "tile_gen_scan",
+            &tile_gen_scan_shader,
+            &[&tile_gen_scan_bgl],
+        );
 
         Self {
             prepare_dispatch_pipeline,
@@ -377,48 +396,62 @@ pub struct ScanBuffers {
 
 impl ScanBuffers {
     pub fn new(device: &wgpu::Device, max_visible: u32) -> Self {
-        let max_vec_size = ((max_visible as u64) + 3) / 4;
-        let max_thread_blocks = ((max_vec_size + 1023) / 1024).max(1) as u32;
+        let max_vec_size = (max_visible as u64).div_ceil(4);
+        let max_thread_blocks = max_vec_size.div_ceil(1024).max(1) as u32;
 
         let dispatch_scan = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dispatch_scan"),
             size: 12,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let dispatch_tile_gen = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("dispatch_tile_gen"),
             size: 12,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::INDIRECT
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let visible_count = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("visible_count"),
             size: 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let pair_offsets = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("pair_offsets"),
             size: max_vec_size * 16,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let rts_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rts_uniform"),
             size: 12,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let rts_reduction = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rts_reduction"),
             size: (max_thread_blocks as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
@@ -462,9 +495,18 @@ pub fn create_tile_fill_bind_group(
         label: Some("tile_fill_bg"),
         layout: &pipelines.fill_bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: tile_buffers.tile_sort_values.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tile_buffers.tile_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: tile_buffers.tile_sort_keys.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tile_buffers.tile_sort_values.as_entire_binding(),
+            },
         ],
     })
 }
@@ -478,10 +520,22 @@ pub fn create_tile_ranges_bind_group(
         label: Some("tile_ranges_bg"),
         layout: &pipelines.tile_ranges_bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: tile_buffers.tile_ranges.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: tile_buffers.tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: tile_buffers.tile_pair_count.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tile_buffers.tile_sort_keys.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: tile_buffers.tile_ranges.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tile_buffers.tile_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: tile_buffers.tile_pair_count.as_entire_binding(),
+            },
         ],
     })
 }
@@ -499,10 +553,22 @@ pub fn create_tile_ranges_bind_group_with_keys(
         label: Some("tile_ranges_bg"),
         layout: &pipelines.tile_ranges_bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tile_sort_keys.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: tile_ranges.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: tile_pair_count.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tile_sort_keys.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: tile_ranges.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: tile_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: tile_pair_count.as_entire_binding(),
+            },
         ],
     })
 }
@@ -518,11 +584,26 @@ pub fn create_prepare_dispatch_bind_group(
         label: Some("prepare_dispatch_bg"),
         layout: &pipelines.prepare_dispatch_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: indirect_args.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: scan_buffers.dispatch_scan.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.dispatch_tile_gen.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.visible_count.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.rts_uniform.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: indirect_args.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: scan_buffers.dispatch_scan.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: scan_buffers.dispatch_tile_gen.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: scan_buffers.visible_count.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: scan_buffers.rts_uniform.as_entire_binding(),
+            },
         ],
     })
 }
@@ -538,17 +619,36 @@ pub fn create_rts_bind_group(
         label: Some("rts_bg"),
         layout: &pipelines.rts_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: scan_buffers.rts_uniform.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: tiles_touched.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: scan_buffers.pair_offsets.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: scan_buffers.rts_scan_bump.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: scan_buffers.rts_reduction.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: scan_buffers.rts_misc.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: scan_buffers.rts_uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: tiles_touched.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: scan_buffers.pair_offsets.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: scan_buffers.rts_scan_bump.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: scan_buffers.rts_reduction.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: scan_buffers.rts_misc.as_entire_binding(),
+            },
         ],
     })
 }
 
 /// Create the scan-based tile gen bind group.
+#[allow(clippy::too_many_arguments)]
 pub fn create_tile_gen_scan_bind_group(
     device: &wgpu::Device,
     pipelines: &ScanPipelines,
@@ -566,18 +666,54 @@ pub fn create_tile_gen_scan_bind_group(
         label: Some("tile_gen_scan_bg"),
         layout: &pipelines.tile_gen_scan_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: tile_buffers.tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: vertices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: indices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: compact_tet_ids.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: circumdata.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: tile_buffers.tile_sort_keys.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: tile_buffers.tile_sort_values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: scan_buffers.pair_offsets.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 9, resource: tiles_touched.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 10, resource: scan_buffers.visible_count.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 11, resource: num_keys_buf.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: tile_buffers.tile_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: vertices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: indices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: compact_tet_ids.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: circumdata.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: tile_buffers.tile_sort_keys.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: tile_buffers.tile_sort_values.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: scan_buffers.pair_offsets.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 9,
+                resource: tiles_touched.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 10,
+                resource: scan_buffers.visible_count.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 11,
+                resource: num_keys_buf.as_entire_binding(),
+            },
         ],
     })
 }
@@ -589,6 +725,7 @@ pub fn create_tile_gen_scan_bind_group(
 /// Record the full scan-based tile pipeline using RTS (Reduce Then Scan).
 ///
 /// Stages: prepare_dispatch → rts_reduce → rts_spine_scan → rts_downsweep → tile_fill → tile_gen_scan
+#[allow(clippy::too_many_arguments)]
 pub fn record_scan_tile_pipeline(
     encoder: &mut wgpu::CommandEncoder,
     scan_pipelines: &ScanPipelines,
@@ -652,7 +789,7 @@ pub fn record_scan_tile_pipeline(
         });
         pass.set_pipeline(&tile_pipelines.fill_pipeline);
         pass.set_bind_group(0, tile_fill_bg, &[]);
-        let (fx, fy) = dispatch_2d((tile_buffers.max_pairs_pow2 + 255) / 256);
+        let (fx, fy) = dispatch_2d(tile_buffers.max_pairs_pow2.div_ceil(256));
         pass.dispatch_workgroups(fx, fy, 1);
     }
 

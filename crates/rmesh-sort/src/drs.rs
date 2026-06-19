@@ -21,7 +21,11 @@ pub const SCAN_DIM: u32 = 128;
 /// Compute sorting_bits for 64-bit tile sort keys: 32 bits of depth + enough
 /// bits to distinguish all tile IDs, rounded up to a multiple of 8.
 pub fn sorting_bits_for_tiles(num_tiles: u32) -> u32 {
-    let tile_bits = if num_tiles <= 1 { 1 } else { 32 - (num_tiles - 1).leading_zeros() };
+    let tile_bits = if num_tiles <= 1 {
+        1
+    } else {
+        32 - (num_tiles - 1).leading_zeros()
+    };
     (32 + tile_bits + 7) & !7
 }
 
@@ -37,8 +41,10 @@ pub struct RadixSortPipelines {
 
 impl RadixSortPipelines {
     pub fn new(device: &wgpu::Device, key_stride: u32) -> Self {
-        let upsweep_src = DRS_UPSWEEP_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
-        let downsweep_src = DRS_DOWNSWEEP_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
+        let upsweep_src =
+            DRS_UPSWEEP_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
+        let downsweep_src =
+            DRS_DOWNSWEEP_WGSL.replace("/*KEY_STRIDE*/1u", &format!("/*KEY_STRIDE*/{key_stride}u"));
 
         // Upsweep: config(r), b_sort(r), b_globalHist(rw), b_passHist(rw)
         let upsweep_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -54,7 +60,8 @@ impl RadixSortPipelines {
                 storage_entry(3, false), // b_passHist
             ],
         });
-        let upsweep_pipeline = make_compute_pipeline(device, "drs_upsweep", &upsweep_shader, &[&upsweep_bgl]);
+        let upsweep_pipeline =
+            make_compute_pipeline(device, "drs_upsweep", &upsweep_shader, &[&upsweep_bgl]);
 
         // Scan: config(r), b_passHist(rw)
         let scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -87,7 +94,12 @@ impl RadixSortPipelines {
                 storage_entry(6, true),  // b_passHist
             ],
         });
-        let downsweep_pipeline = make_compute_pipeline(device, "drs_downsweep", &downsweep_shader, &[&downsweep_bgl]);
+        let downsweep_pipeline = make_compute_pipeline(
+            device,
+            "drs_downsweep",
+            &downsweep_shader,
+            &[&downsweep_bgl],
+        );
 
         Self {
             upsweep_pipeline,
@@ -114,11 +126,20 @@ pub struct RadixSortState {
 }
 
 impl RadixSortState {
-    pub fn new(device: &wgpu::Device, sort_buf_size: u32, sorting_bits: u32, key_stride: u32) -> Self {
-        let max_thread_blocks = (sort_buf_size + PART_SIZE - 1) / PART_SIZE;
-        let num_passes = (sorting_bits + 7) / 8;
+    pub fn new(
+        device: &wgpu::Device,
+        sort_buf_size: u32,
+        sorting_bits: u32,
+        key_stride: u32,
+    ) -> Self {
+        let max_thread_blocks = sort_buf_size.div_ceil(PART_SIZE);
+        let num_passes = sorting_bits.div_ceil(8);
 
-        let keys_b = create_storage_buffer(device, "radix_keys_b", (sort_buf_size as u64) * (key_stride as u64) * 4);
+        let keys_b = create_storage_buffer(
+            device,
+            "radix_keys_b",
+            (sort_buf_size as u64) * (key_stride as u64) * 4,
+        );
         let values_b = create_storage_buffer(device, "radix_values_b", (sort_buf_size as u64) * 4);
 
         // Global histogram: RADIX * num_passes entries
@@ -165,10 +186,14 @@ impl RadixSortState {
     /// Write per-pass config to GPU buffers. Call once at init.
     /// numKeys is set to 0 here and updated per-frame via queue.write_buffer.
     pub fn upload_configs(&self, queue: &wgpu::Queue) {
-        let num_passes = (self.sorting_bits + 7) / 8;
+        let num_passes = self.sorting_bits.div_ceil(8);
         for pass in 0..num_passes {
             let config = [0u32, pass * 8, self.max_thread_blocks, 0u32];
-            queue.write_buffer(&self.config_buffers[pass as usize], 0, bytemuck::cast_slice(&config));
+            queue.write_buffer(
+                &self.config_buffers[pass as usize],
+                0,
+                bytemuck::cast_slice(&config),
+            );
         }
     }
 }
@@ -185,7 +210,7 @@ pub fn record_radix_sort(
     keys_a: &wgpu::Buffer,
     values_a: &wgpu::Buffer,
 ) -> bool {
-    let num_passes = (state.sorting_bits + 7) / 8;
+    let num_passes = state.sorting_bits.div_ceil(8);
     let thread_blocks = state.max_thread_blocks;
     let (us_dx, us_dy) = dispatch_2d(thread_blocks);
     let (ds_dx, ds_dy) = dispatch_2d(thread_blocks);
@@ -215,10 +240,22 @@ pub fn record_radix_sort(
                 label: Some("drs_upsweep_bg"),
                 layout: &pipelines.upsweep_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: config_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: src_keys.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: state.global_hist.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: state.pass_hist.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: config_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: src_keys.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: state.global_hist.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: state.pass_hist.as_entire_binding(),
+                    },
                 ],
             });
             let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -236,8 +273,14 @@ pub fn record_radix_sort(
                 label: Some("drs_scan_bg"),
                 layout: &pipelines.scan_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: config_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: state.pass_hist.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: config_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: state.pass_hist.as_entire_binding(),
+                    },
                 ],
             });
             let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -255,13 +298,34 @@ pub fn record_radix_sort(
                 label: Some("drs_downsweep_bg"),
                 layout: &pipelines.downsweep_bgl,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: config_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: src_keys.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: dst_keys.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: src_vals.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 4, resource: dst_vals.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 5, resource: state.global_hist.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 6, resource: state.pass_hist.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: config_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: src_keys.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: dst_keys.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: src_vals.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: dst_vals.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: state.global_hist.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: state.pass_hist.as_entire_binding(),
+                    },
                 ],
             });
             let mut p = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -275,5 +339,5 @@ pub fn record_radix_sort(
     }
 
     // Return true if result ended up in B buffers (odd number of passes)
-    num_passes % 2 != 0
+    !num_passes.is_multiple_of(2)
 }

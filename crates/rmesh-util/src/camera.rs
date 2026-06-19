@@ -128,7 +128,10 @@ pub fn look_at(eye: Vec3, target: Vec3, up: Vec3) -> Mat4 {
 pub fn project_to_ndc(pos: Vec3, vp: Mat4) -> (Vec3, f32) {
     let clip = vp * Vec4::new(pos.x, pos.y, pos.z, 1.0);
     let inv_w = 1.0 / (clip.w + 1e-6);
-    (Vec3::new(clip.x * inv_w, clip.y * inv_w, clip.z * inv_w), clip.w)
+    (
+        Vec3::new(clip.x * inv_w, clip.y * inv_w, clip.z * inv_w),
+        clip.w,
+    )
 }
 
 /// NDC → pixel. Matches WGSL: px = (ndc_x+1)*0.5*W, py = (1-ndc_y)*0.5*H.
@@ -158,12 +161,7 @@ pub fn pixel_ray_intrinsics(
     let fy = intrinsics[1];
     let cx = intrinsics[2];
     let cy = intrinsics[3];
-    let dir_cam = Vec3::new(
-        (px + 0.5 - cx) / fx,
-        (py + 0.5 - cy) / fy,
-        1.0,
-    )
-    .normalize();
+    let dir_cam = Vec3::new((px + 0.5 - cx) / fx, (py + 0.5 - cy) / fy, 1.0).normalize();
     let dir = (c2w * dir_cam).normalize();
     (cam_pos, dir)
 }
@@ -292,7 +290,11 @@ mod tests {
         assert!(clip_w > 0.0, "clip_w should be positive");
         assert!(ndc.x.abs() < 0.1, "ndc_x should be near 0, got {}", ndc.x);
         assert!(ndc.y.abs() < 0.1, "ndc_y should be near 0, got {}", ndc.y);
-        assert!(ndc.z >= 0.0 && ndc.z <= 1.0, "ndc_z should be in [0,1], got {}", ndc.z);
+        assert!(
+            ndc.z >= 0.0 && ndc.z <= 1.0,
+            "ndc_z should be in [0,1], got {}",
+            ndc.z
+        );
     }
 
     #[test]
@@ -314,7 +316,10 @@ mod tests {
         let result = ray_tet_intersect(origin, dir, &verts);
         assert!(result.is_some(), "ray should hit tet");
         let (t_enter, t_exit) = result.unwrap();
-        assert!(t_enter < t_exit, "t_enter ({t_enter}) should be < t_exit ({t_exit})");
+        assert!(
+            t_enter < t_exit,
+            "t_enter ({t_enter}) should be < t_exit ({t_exit})"
+        );
         assert!(t_enter > 0.0, "t_enter should be positive");
     }
 

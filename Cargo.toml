@@ -5,7 +5,7 @@ members = [
     "crates/rmesh-sort",
     "crates/rmesh-tile",
     "crates/rmesh-render",
-    "crates/rmesh-backward",
+    "crates/rmesh-trainable",
     "crates/rmesh-error",
     "crates/rmesh-data",
     "crates/rmesh-train",

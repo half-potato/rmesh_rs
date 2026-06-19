@@ -56,7 +56,12 @@ impl ApplicationHandler for App {
 
         let caps = surface.get_capabilities(&adapter);
         // Match the viewer: prefer non-sRGB, AutoNoVsync, frame_latency=3
-        let format = caps.formats.iter().copied().find(|f| !f.is_srgb()).unwrap_or(caps.formats[0]);
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
         let size = window.inner_size();
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -68,18 +73,32 @@ impl ApplicationHandler for App {
             view_formats: vec![],
             desired_maximum_frame_latency: 3,
         };
-        log::info!("configuring surface: {}x{} fmt={:?} present={:?} alpha={:?}",
-            config.width, config.height, config.format, config.present_mode, config.alpha_mode);
+        log::info!(
+            "configuring surface: {}x{} fmt={:?} present={:?} alpha={:?}",
+            config.width,
+            config.height,
+            config.format,
+            config.present_mode,
+            config.alpha_mode
+        );
         surface.configure(&device, &config);
         log::info!("surface configured");
 
         self.window = Some(window.clone());
-        self.state = Some(State { surface, device, queue, config, frame_count: 0 });
+        self.state = Some(State {
+            surface,
+            device,
+            queue,
+            config,
+            frame_count: 0,
+        });
         window.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        let Some(state) = self.state.as_mut() else { return; };
+        let Some(state) = self.state.as_mut() else {
+            return;
+        };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
@@ -92,9 +111,15 @@ impl ApplicationHandler for App {
                 let frame = match state.surface.get_current_texture() {
                     Ok(f) => f,
                     Err(e) => {
-                        log::error!("frame {} acquire error: {:?} (waited {:.1}ms)",
-                            state.frame_count, e, t.elapsed().as_secs_f64() * 1000.0);
-                        if let Some(w) = &self.window { w.request_redraw(); }
+                        log::error!(
+                            "frame {} acquire error: {:?} (waited {:.1}ms)",
+                            state.frame_count,
+                            e,
+                            t.elapsed().as_secs_f64() * 1000.0
+                        );
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
                         return;
                     }
                 };
@@ -108,7 +133,12 @@ impl ApplicationHandler for App {
                             view: &view,
                             resolve_target: None,
                             ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.4, b: 0.7, a: 1.0 }),
+                                load: wgpu::LoadOp::Clear(wgpu::Color {
+                                    r: 0.1,
+                                    g: 0.4,
+                                    b: 0.7,
+                                    a: 1.0,
+                                }),
                                 store: wgpu::StoreOp::Store,
                             },
                             depth_slice: None,
@@ -125,7 +155,9 @@ impl ApplicationHandler for App {
                 if state.frame_count <= 5 || state.frame_count % 60 == 0 {
                     log::info!("frame {} acquired in {:.1}ms", state.frame_count, dt);
                 }
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             _ => {}
         }
@@ -135,6 +167,9 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let event_loop = EventLoop::new().unwrap();
-    let mut app = App { window: None, state: None };
+    let mut app = App {
+        window: None,
+        state: None,
+    };
     event_loop.run_app(&mut app).unwrap();
 }

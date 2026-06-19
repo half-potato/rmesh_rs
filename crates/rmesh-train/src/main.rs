@@ -83,14 +83,12 @@ fn main() -> Result<()> {
         log::info!("GPU: {:?}", adapter.get_info().name);
 
         adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("rmesh train"),
-                    required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                    required_limits: wgpu::Limits::default(),
-                    ..Default::default()
-                },
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("rmesh train"),
+                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
             .await
             .expect("Failed to create device")
     });

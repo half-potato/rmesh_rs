@@ -3363,28 +3363,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmesh-backward"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "criterion",
- "env_logger",
- "glam",
- "log",
- "pollster",
- "rand",
- "rand_chacha",
- "rmesh-data",
- "rmesh-render",
- "rmesh-sort",
- "rmesh-tile",
- "rmesh-train",
- "rmesh-util",
- "wgpu",
-]
-
-[[package]]
 name = "rmesh-compositor"
 version = "0.1.0"
 dependencies = [
@@ -3457,11 +3435,11 @@ dependencies = [
  "numpy",
  "pollster",
  "pyo3",
- "rmesh-backward",
  "rmesh-data",
  "rmesh-error",
  "rmesh-render",
  "rmesh-train",
+ "rmesh-trainable",
  "rmesh-util",
  "wgpu",
 ]
@@ -3472,6 +3450,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytemuck",
+ "criterion",
  "glam",
  "half",
  "log",
@@ -3481,6 +3460,7 @@ dependencies = [
  "rmesh-data",
  "rmesh-sort",
  "rmesh-tile",
+ "rmesh-trainable",
  "rmesh-util",
  "wgpu",
 ]
@@ -3523,9 +3503,31 @@ dependencies = [
  "glam",
  "log",
  "pollster",
- "rmesh-backward",
  "rmesh-data",
  "rmesh-render",
+ "rmesh-trainable",
+ "rmesh-util",
+ "wgpu",
+]
+
+[[package]]
+name = "rmesh-trainable"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "criterion",
+ "env_logger",
+ "glam",
+ "log",
+ "pollster",
+ "rand",
+ "rand_chacha",
+ "rmesh-data",
+ "rmesh-render",
+ "rmesh-sort",
+ "rmesh-tile",
+ "rmesh-train",
  "rmesh-util",
  "wgpu",
 ]

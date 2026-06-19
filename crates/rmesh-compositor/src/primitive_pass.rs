@@ -1,8 +1,8 @@
 //! Render pass that draws opaque primitives to their own color + depth targets.
 
-use bytemuck::{Pod, Zeroable};
 use crate::geometry::{PrimitiveGeometry, PrimitiveVertex};
 use crate::material::MaterialRegistry;
+use bytemuck::{Pod, Zeroable};
 use rmesh_interact::Primitive;
 
 const PRIMITIVE_WGSL: &str = include_str!("wgsl/primitive.wgsl");
@@ -12,16 +12,16 @@ const PRIMITIVE_MRT_WGSL: &str = include_str!("wgsl/primitive_mrt.wgsl");
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct PrimitiveUniformsPadded {
-    pub vp: [[f32; 4]; 4],          // 64 bytes
-    pub model: [[f32; 4]; 4],       // 64 bytes
-    pub color: [f32; 4],            // 16 bytes (base_color_factor RGBA)
-    pub roughness_factor: f32,      // 4 bytes
-    pub metallic_factor: f32,       // 4 bytes
-    pub occlusion_strength: f32,    // 4 bytes
-    pub normal_scale: f32,          // 4 bytes
-    pub tex_flags: u32,             // 4 bytes (bit0=base_color, bit1=metal_rough, bit2=normal, bit3=occlusion)
-    pub _pad2: u32,                 // 4 bytes (alignment)
-    pub _pad: [f32; 22],            // 88 bytes → total 256
+    pub vp: [[f32; 4]; 4],       // 64 bytes
+    pub model: [[f32; 4]; 4],    // 64 bytes
+    pub color: [f32; 4],         // 16 bytes (base_color_factor RGBA)
+    pub roughness_factor: f32,   // 4 bytes
+    pub metallic_factor: f32,    // 4 bytes
+    pub occlusion_strength: f32, // 4 bytes
+    pub normal_scale: f32,       // 4 bytes
+    pub tex_flags: u32, // 4 bytes (bit0=base_color, bit1=metal_rough, bit2=normal, bit3=occlusion)
+    pub _pad2: u32,     // 4 bytes (alignment)
+    pub _pad: [f32; 22], // 88 bytes → total 256
 }
 
 const UNIFORM_ALIGN: u64 = 256;
@@ -47,7 +47,11 @@ impl PrimitiveTargets {
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("prim_color"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -59,7 +63,11 @@ impl PrimitiveTargets {
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("prim_depth"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -69,7 +77,12 @@ impl PrimitiveTargets {
         });
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        Self { color_texture, color_view, depth_texture, depth_view }
+        Self {
+            color_texture,
+            color_view,
+            depth_texture,
+            depth_view,
+        }
     }
 }
 
@@ -108,9 +121,9 @@ impl PrimitivePipeline {
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
                     has_dynamic_offset: true,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<PrimitiveUniformsPadded>() as u64,
-                    ),
+                    min_binding_size: wgpu::BufferSize::new(std::mem::size_of::<
+                        PrimitiveUniformsPadded,
+                    >() as u64),
                 },
                 count: None,
             }],
@@ -175,7 +188,7 @@ impl PrimitivePipeline {
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[vertex_state.clone()],
+                buffers: std::slice::from_ref(&vertex_state),
                 compilation_options: Default::default(),
             },
             fragment: Some(wgpu::FragmentState {
@@ -244,13 +257,19 @@ impl PrimitivePipeline {
                     buffer: &uniform_buffer,
                     offset: 0,
                     size: wgpu::BufferSize::new(
-                        std::mem::size_of::<PrimitiveUniformsPadded>() as u64,
+                        std::mem::size_of::<PrimitiveUniformsPadded>() as u64
                     ),
                 }),
             }],
         });
 
-        Self { pipeline, pipeline_mrt, bind_group_layout, uniform_buffer, bind_group }
+        Self {
+            pipeline,
+            pipeline_mrt,
+            bind_group_layout,
+            uniform_buffer,
+            bind_group,
+        }
     }
 }
 
@@ -258,6 +277,7 @@ impl PrimitivePipeline {
 ///
 /// When `mrt_views` is `Some`, renders to 4 MRT targets (color + aux0 + normals + depth)
 /// for deferred shading. Otherwise renders to a single color target.
+#[allow(clippy::too_many_arguments)]
 pub fn record_primitive_pass(
     encoder: &mut wgpu::CommandEncoder,
     queue: &wgpu::Queue,
@@ -285,33 +305,34 @@ pub fn record_primitive_pass(
     // Build color attachments based on MRT mode
     let mrt_attachments;
     let single_attachments;
-    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if let Some(ref mrt) = mrt_views {
-        mrt_attachments = [
-            color_attachment,
-            Some(wgpu::RenderPassColorAttachment {
-                view: mrt.aux0_view,
-                resolve_target: None,
-                ops: clear_ops,
-                depth_slice: None,
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: mrt.normals_view,
-                resolve_target: None,
-                ops: clear_ops,
-                depth_slice: None,
-            }),
-            Some(wgpu::RenderPassColorAttachment {
-                view: mrt.albedo_view,
-                resolve_target: None,
-                ops: clear_ops,
-                depth_slice: None,
-            }),
-        ];
-        &mrt_attachments
-    } else {
-        single_attachments = [color_attachment];
-        &single_attachments
-    };
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] =
+        if let Some(ref mrt) = mrt_views {
+            mrt_attachments = [
+                color_attachment,
+                Some(wgpu::RenderPassColorAttachment {
+                    view: mrt.aux0_view,
+                    resolve_target: None,
+                    ops: clear_ops,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: mrt.normals_view,
+                    resolve_target: None,
+                    ops: clear_ops,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: mrt.albedo_view,
+                    resolve_target: None,
+                    ops: clear_ops,
+                    depth_slice: None,
+                }),
+            ];
+            &mrt_attachments
+        } else {
+            single_attachments = [color_attachment];
+            &single_attachments
+        };
 
     if primitives.is_empty() {
         // Still clear the targets
@@ -407,9 +428,10 @@ pub fn record_primitive_pass(
         }
 
         if let PrimitiveKind::CustomMesh(mesh_id) = prim.kind {
-            if let (Some(ref cvb), Some(slice)) =
-                (&geometry.custom_vertex_buffer, geometry.custom_meshes.get(mesh_id))
-            {
+            if let (Some(ref cvb), Some(slice)) = (
+                &geometry.custom_vertex_buffer,
+                geometry.custom_meshes.get(mesh_id),
+            ) {
                 if !using_custom_vb {
                     rpass.set_vertex_buffer(0, cvb.slice(..));
                     using_custom_vb = true;

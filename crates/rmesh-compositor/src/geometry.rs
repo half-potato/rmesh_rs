@@ -26,8 +26,12 @@ fn yup_to_colmap(v: [f32; 3]) -> [f32; 3] {
 /// Compute tangent for a triangle from position and UV gradients.
 /// Returns `(tangent_dir, handedness_sign)`.
 fn compute_tangent(
-    p0: [f32; 3], p1: [f32; 3], p2: [f32; 3],
-    uv0: [f32; 2], uv1: [f32; 2], uv2: [f32; 2],
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    uv0: [f32; 2],
+    uv1: [f32; 2],
+    uv2: [f32; 2],
     normal: [f32; 3],
 ) -> [f32; 4] {
     let dp1 = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
@@ -98,7 +102,10 @@ impl PrimitiveGeometry {
         let cylinder = generate_cylinder(24);
 
         let mut all_verts = Vec::new();
-        let mut kinds = [MeshSlice { offset: 0, count: 0 }; 4];
+        let mut kinds = [MeshSlice {
+            offset: 0,
+            count: 0,
+        }; 4];
 
         for (i, mesh) in [&cube, &sphere, &plane, &cylinder].iter().enumerate() {
             kinds[i] = MeshSlice {
@@ -174,34 +181,78 @@ impl PrimitiveGeometry {
 fn generate_cube() -> Vec<PrimitiveVertex> {
     let mut verts = Vec::with_capacity(36);
 
+    type CubeFace = ([f32; 3], [[f32; 3]; 4], [[f32; 2]; 4]);
+
     // Each quad's vertices must be ordered so that (v1-v0)×(v2-v0) = outward normal (CCW).
     // Generated in Y-up then converted to COLMAP space.
     // UVs: each face gets a standard [0,1]^2 mapping.
-    let faces_yup: [([f32; 3], [[f32; 3]; 4], [[f32; 2]; 4]); 6] = [
+    let faces_yup: [CubeFace; 6] = [
         // +X
-        ([1.0, 0.0, 0.0],
-         [[0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [0.5, 0.5, 0.5], [0.5, -0.5, 0.5]],
-         [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+        (
+            [1.0, 0.0, 0.0],
+            [
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, -0.5, 0.5],
+            ],
+            [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+        ),
         // -X
-        ([-1.0, 0.0, 0.0],
-         [[-0.5, -0.5, 0.5], [-0.5, 0.5, 0.5], [-0.5, 0.5, -0.5], [-0.5, -0.5, -0.5]],
-         [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]),
+        (
+            [-1.0, 0.0, 0.0],
+            [
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+            ],
+            [[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]],
+        ),
         // +Y
-        ([0.0, 1.0, 0.0],
-         [[-0.5, 0.5, 0.5], [0.5, 0.5, 0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5]],
-         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+        (
+            [0.0, 1.0, 0.0],
+            [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        ),
         // -Y
-        ([0.0, -1.0, 0.0],
-         [[-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, -0.5, 0.5], [-0.5, -0.5, 0.5]],
-         [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]),
+        (
+            [0.0, -1.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+        ),
         // +Z
-        ([0.0, 0.0, 1.0],
-         [[-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5]],
-         [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]),
+        (
+            [0.0, 0.0, 1.0],
+            [
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+            ],
+            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        ),
         // -Z
-        ([0.0, 0.0, -1.0],
-         [[0.5, -0.5, -0.5], [-0.5, -0.5, -0.5], [-0.5, 0.5, -0.5], [0.5, 0.5, -0.5]],
-         [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]),
+        (
+            [0.0, 0.0, -1.0],
+            [
+                [0.5, -0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+            ],
+            [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+        ),
     ];
 
     for (normal, quad, uvs) in &faces_yup {
@@ -209,9 +260,24 @@ fn generate_cube() -> Vec<PrimitiveVertex> {
         let p: Vec<[f32; 3]> = quad.iter().map(|v| yup_to_colmap(*v)).collect();
         for &[a, b, c] in &[[0, 1, 2], [0, 2, 3]] {
             let tan = compute_tangent(p[a], p[b], p[c], uvs[a], uvs[b], uvs[c], n);
-            verts.push(PrimitiveVertex { position: p[a], normal: n, uv: uvs[a], tangent: tan });
-            verts.push(PrimitiveVertex { position: p[b], normal: n, uv: uvs[b], tangent: tan });
-            verts.push(PrimitiveVertex { position: p[c], normal: n, uv: uvs[c], tangent: tan });
+            verts.push(PrimitiveVertex {
+                position: p[a],
+                normal: n,
+                uv: uvs[a],
+                tangent: tan,
+            });
+            verts.push(PrimitiveVertex {
+                position: p[b],
+                normal: n,
+                uv: uvs[b],
+                tangent: tan,
+            });
+            verts.push(PrimitiveVertex {
+                position: p[c],
+                normal: n,
+                uv: uvs[c],
+                tangent: tan,
+            });
         }
     }
 
@@ -252,18 +318,48 @@ fn generate_sphere(slices: u32, stacks: u32) -> Vec<PrimitiveVertex> {
         let (p1, n1, uv1) = sphere_pt(theta1, phi1);
         let north_uv = [(phi0 + phi1) / (2.0 * two_pi), 0.0];
         let tan = compute_tangent(north_p, p1, p0, north_uv, uv1, uv0, north_n);
-        verts.push(PrimitiveVertex { position: north_p, normal: north_n, uv: north_uv, tangent: tan });
-        verts.push(PrimitiveVertex { position: p1, normal: n1, uv: uv1, tangent: tan });
-        verts.push(PrimitiveVertex { position: p0, normal: n0, uv: uv0, tangent: tan });
+        verts.push(PrimitiveVertex {
+            position: north_p,
+            normal: north_n,
+            uv: north_uv,
+            tangent: tan,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1,
+            normal: n1,
+            uv: uv1,
+            tangent: tan,
+        });
+        verts.push(PrimitiveVertex {
+            position: p0,
+            normal: n0,
+            uv: uv0,
+            tangent: tan,
+        });
 
         // South pole fan
         let (p0, n0, uv0) = sphere_pt(theta_last, phi0);
         let (p1, n1, uv1) = sphere_pt(theta_last, phi1);
         let south_uv = [(phi0 + phi1) / (2.0 * two_pi), 1.0];
         let tan = compute_tangent(south_p, p0, p1, south_uv, uv0, uv1, south_n);
-        verts.push(PrimitiveVertex { position: south_p, normal: south_n, uv: south_uv, tangent: tan });
-        verts.push(PrimitiveVertex { position: p0, normal: n0, uv: uv0, tangent: tan });
-        verts.push(PrimitiveVertex { position: p1, normal: n1, uv: uv1, tangent: tan });
+        verts.push(PrimitiveVertex {
+            position: south_p,
+            normal: south_n,
+            uv: south_uv,
+            tangent: tan,
+        });
+        verts.push(PrimitiveVertex {
+            position: p0,
+            normal: n0,
+            uv: uv0,
+            tangent: tan,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1,
+            normal: n1,
+            uv: uv1,
+            tangent: tan,
+        });
     }
 
     // Middle bands
@@ -281,14 +377,44 @@ fn generate_sphere(slices: u32, stacks: u32) -> Vec<PrimitiveVertex> {
             let (p11, n11, uv11) = sphere_pt(theta1, phi1);
 
             let tan0 = compute_tangent(p00, p11, p10, uv00, uv11, uv10, n00);
-            verts.push(PrimitiveVertex { position: p00, normal: n00, uv: uv00, tangent: tan0 });
-            verts.push(PrimitiveVertex { position: p11, normal: n11, uv: uv11, tangent: tan0 });
-            verts.push(PrimitiveVertex { position: p10, normal: n10, uv: uv10, tangent: tan0 });
+            verts.push(PrimitiveVertex {
+                position: p00,
+                normal: n00,
+                uv: uv00,
+                tangent: tan0,
+            });
+            verts.push(PrimitiveVertex {
+                position: p11,
+                normal: n11,
+                uv: uv11,
+                tangent: tan0,
+            });
+            verts.push(PrimitiveVertex {
+                position: p10,
+                normal: n10,
+                uv: uv10,
+                tangent: tan0,
+            });
 
             let tan1 = compute_tangent(p00, p01, p11, uv00, uv01, uv11, n00);
-            verts.push(PrimitiveVertex { position: p00, normal: n00, uv: uv00, tangent: tan1 });
-            verts.push(PrimitiveVertex { position: p01, normal: n01, uv: uv01, tangent: tan1 });
-            verts.push(PrimitiveVertex { position: p11, normal: n11, uv: uv11, tangent: tan1 });
+            verts.push(PrimitiveVertex {
+                position: p00,
+                normal: n00,
+                uv: uv00,
+                tangent: tan1,
+            });
+            verts.push(PrimitiveVertex {
+                position: p01,
+                normal: n01,
+                uv: uv01,
+                tangent: tan1,
+            });
+            verts.push(PrimitiveVertex {
+                position: p11,
+                normal: n11,
+                uv: uv11,
+                tangent: tan1,
+            });
         }
     }
 
@@ -311,12 +437,42 @@ fn generate_plane() -> Vec<PrimitiveVertex> {
     let tan1 = compute_tangent(q0, q2, q3, uv0, uv2, uv3, n);
 
     vec![
-        PrimitiveVertex { position: q0, normal: n, uv: uv0, tangent: tan0 },
-        PrimitiveVertex { position: q1, normal: n, uv: uv1, tangent: tan0 },
-        PrimitiveVertex { position: q2, normal: n, uv: uv2, tangent: tan0 },
-        PrimitiveVertex { position: q0, normal: n, uv: uv0, tangent: tan1 },
-        PrimitiveVertex { position: q2, normal: n, uv: uv2, tangent: tan1 },
-        PrimitiveVertex { position: q3, normal: n, uv: uv3, tangent: tan1 },
+        PrimitiveVertex {
+            position: q0,
+            normal: n,
+            uv: uv0,
+            tangent: tan0,
+        },
+        PrimitiveVertex {
+            position: q1,
+            normal: n,
+            uv: uv1,
+            tangent: tan0,
+        },
+        PrimitiveVertex {
+            position: q2,
+            normal: n,
+            uv: uv2,
+            tangent: tan0,
+        },
+        PrimitiveVertex {
+            position: q0,
+            normal: n,
+            uv: uv0,
+            tangent: tan1,
+        },
+        PrimitiveVertex {
+            position: q2,
+            normal: n,
+            uv: uv2,
+            tangent: tan1,
+        },
+        PrimitiveVertex {
+            position: q3,
+            normal: n,
+            uv: uv3,
+            tangent: tan1,
+        },
     ]
 }
 
@@ -350,14 +506,44 @@ fn generate_cylinder(segments: u32) -> Vec<PrimitiveVertex> {
         let uv_1t = [u1, 1.0];
 
         let tan_s0 = compute_tangent(p0b, p1t, p1b, uv_0b, uv_1t, uv_1b, n0);
-        verts.push(PrimitiveVertex { position: p0b, normal: n0, uv: uv_0b, tangent: tan_s0 });
-        verts.push(PrimitiveVertex { position: p1t, normal: n1, uv: uv_1t, tangent: tan_s0 });
-        verts.push(PrimitiveVertex { position: p1b, normal: n1, uv: uv_1b, tangent: tan_s0 });
+        verts.push(PrimitiveVertex {
+            position: p0b,
+            normal: n0,
+            uv: uv_0b,
+            tangent: tan_s0,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1t,
+            normal: n1,
+            uv: uv_1t,
+            tangent: tan_s0,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1b,
+            normal: n1,
+            uv: uv_1b,
+            tangent: tan_s0,
+        });
 
         let tan_s1 = compute_tangent(p0b, p0t, p1t, uv_0b, uv_0t, uv_1t, n0);
-        verts.push(PrimitiveVertex { position: p0b, normal: n0, uv: uv_0b, tangent: tan_s1 });
-        verts.push(PrimitiveVertex { position: p0t, normal: n0, uv: uv_0t, tangent: tan_s1 });
-        verts.push(PrimitiveVertex { position: p1t, normal: n1, uv: uv_1t, tangent: tan_s1 });
+        verts.push(PrimitiveVertex {
+            position: p0b,
+            normal: n0,
+            uv: uv_0b,
+            tangent: tan_s1,
+        });
+        verts.push(PrimitiveVertex {
+            position: p0t,
+            normal: n0,
+            uv: uv_0t,
+            tangent: tan_s1,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1t,
+            normal: n1,
+            uv: uv_1t,
+            tangent: tan_s1,
+        });
 
         // Top cap: circular projection UVs
         let nt = yup_to_colmap([0.0, 1.0, 0.0]);
@@ -366,9 +552,24 @@ fn generate_cylinder(segments: u32) -> Vec<PrimitiveVertex> {
         let uv_t0 = [c0 * 0.5 + 0.5, s0 * 0.5 + 0.5];
         let uv_t1 = [c1 * 0.5 + 0.5, s1 * 0.5 + 0.5];
         let tan_t = compute_tangent(top_center, p1t, p0t, uv_tc, uv_t1, uv_t0, nt);
-        verts.push(PrimitiveVertex { position: top_center, normal: nt, uv: uv_tc, tangent: tan_t });
-        verts.push(PrimitiveVertex { position: p1t, normal: nt, uv: uv_t1, tangent: tan_t });
-        verts.push(PrimitiveVertex { position: p0t, normal: nt, uv: uv_t0, tangent: tan_t });
+        verts.push(PrimitiveVertex {
+            position: top_center,
+            normal: nt,
+            uv: uv_tc,
+            tangent: tan_t,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1t,
+            normal: nt,
+            uv: uv_t1,
+            tangent: tan_t,
+        });
+        verts.push(PrimitiveVertex {
+            position: p0t,
+            normal: nt,
+            uv: uv_t0,
+            tangent: tan_t,
+        });
 
         // Bottom cap
         let nb = yup_to_colmap([0.0, -1.0, 0.0]);
@@ -377,9 +578,24 @@ fn generate_cylinder(segments: u32) -> Vec<PrimitiveVertex> {
         let uv_b0 = [c0 * 0.5 + 0.5, s0 * 0.5 + 0.5];
         let uv_b1 = [c1 * 0.5 + 0.5, s1 * 0.5 + 0.5];
         let tan_b = compute_tangent(bot_center, p0b, p1b, uv_bc, uv_b0, uv_b1, nb);
-        verts.push(PrimitiveVertex { position: bot_center, normal: nb, uv: uv_bc, tangent: tan_b });
-        verts.push(PrimitiveVertex { position: p0b, normal: nb, uv: uv_b0, tangent: tan_b });
-        verts.push(PrimitiveVertex { position: p1b, normal: nb, uv: uv_b1, tangent: tan_b });
+        verts.push(PrimitiveVertex {
+            position: bot_center,
+            normal: nb,
+            uv: uv_bc,
+            tangent: tan_b,
+        });
+        verts.push(PrimitiveVertex {
+            position: p0b,
+            normal: nb,
+            uv: uv_b0,
+            tangent: tan_b,
+        });
+        verts.push(PrimitiveVertex {
+            position: p1b,
+            normal: nb,
+            uv: uv_b1,
+            tangent: tan_b,
+        });
     }
 
     verts
@@ -395,21 +611,39 @@ mod tests {
         assert_eq!(cube.len(), 36);
 
         let sphere = generate_sphere(16, 8);
-        assert!(sphere.len() > 400, "sphere should have many vertices, got {}", sphere.len());
+        assert!(
+            sphere.len() > 400,
+            "sphere should have many vertices, got {}",
+            sphere.len()
+        );
 
         let plane = generate_plane();
         assert_eq!(plane.len(), 6);
 
         let cylinder = generate_cylinder(24);
-        assert!(cylinder.len() > 100, "cylinder should have many vertices, got {}", cylinder.len());
+        assert!(
+            cylinder.len() > 100,
+            "cylinder should have many vertices, got {}",
+            cylinder.len()
+        );
     }
 
     #[test]
     fn all_normals_unit_length() {
-        for mesh in [generate_cube(), generate_sphere(16, 8), generate_plane(), generate_cylinder(24)] {
+        for mesh in [
+            generate_cube(),
+            generate_sphere(16, 8),
+            generate_plane(),
+            generate_cylinder(24),
+        ] {
             for v in &mesh {
                 let len = (v.normal[0].powi(2) + v.normal[1].powi(2) + v.normal[2].powi(2)).sqrt();
-                assert!((len - 1.0).abs() < 0.01, "normal not unit length: {:?} (len={})", v.normal, len);
+                assert!(
+                    (len - 1.0).abs() < 0.01,
+                    "normal not unit length: {:?} (len={})",
+                    v.normal,
+                    len
+                );
             }
         }
     }

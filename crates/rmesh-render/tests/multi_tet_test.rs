@@ -24,7 +24,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -67,14 +68,14 @@ fn four_tet_scene(rng: &mut ChaCha8Rng) -> SceneData {
     let s = 0.5f32;
     let vertices = vec![
         0.0, 0.0, 0.0, // v0: center
-        s, s, s,       // v1
-        -s, s, s,      // v2
-        -s, -s, s,     // v3
-        s, -s, s,      // v4
-        s, s, -s,      // v5
-        -s, s, -s,     // v6
-        -s, -s, -s,    // v7
-        s, -s, -s,     // v8
+        s, s, s, // v1
+        -s, s, s, // v2
+        -s, -s, s, // v3
+        s, -s, s, // v4
+        s, s, -s, // v5
+        -s, s, -s, // v6
+        -s, -s, -s, // v7
+        s, -s, -s, // v8
     ];
     let indices = vec![
         0, 1, 2, 3, // tet 0
@@ -223,9 +224,12 @@ fn test_interval_four_tet_multi_angle() {
         let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
         let cpu_image = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
 
-        if let Some(gpu_image) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+        if let Some(gpu_image) = gpu_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H)
+        {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
-            eprintln!("interval_four_tet angle {i}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+            eprintln!(
+                "interval_four_tet angle {i}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
+            );
             assert!(
                 mean_diff < ATOL,
                 "interval_four_tet angle {i}: mean_diff {mean_diff} >= {ATOL}"
@@ -253,7 +257,9 @@ fn test_compute_interval_four_tet_multi_angle() {
         let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
         let cpu_image = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
 
-        if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H) {
+        if let Some(gpu_image) =
+            gpu_compute_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H)
+        {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
             eprintln!("compute_interval_four_tet angle {i}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
             assert!(

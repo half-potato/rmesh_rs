@@ -25,22 +25,16 @@ use rmesh_compositor::PrimitiveGeometry;
 use rmesh_data::SceneData;
 use rmesh_dsm::{
     build_light_vp, generate_dsm_for_lights, DsmAtlas, DsmPipeline, DsmPrimitivePipeline,
+    DsmProjectPipeline,
 };
 use rmesh_render::{ComputeIntervalPipelines, GpuLight};
 use rmesh_sort::{RadixSortPipelines, RadixSortState, SortBackend};
 use rmesh_util::camera::TET_FACES;
-use rmesh_util::test_util::{
-    build_test_scene, create_test_device_default, random_tet_vertices,
-};
+use rmesh_util::test_util::{build_test_scene, create_test_device_default, random_tet_vertices};
 
 /// Exact transmittance T(z_query) along a unit ray from `origin`.
 /// Mirrors `crates/rmesh-render/tests/common/mod.rs::cpu_transmittance_along_ray`.
-fn cpu_transmittance_along_ray(
-    scene: &SceneData,
-    origin: Vec3,
-    dir: Vec3,
-    z_query: f32,
-) -> f32 {
+fn cpu_transmittance_along_ray(scene: &SceneData, origin: Vec3, dir: Vec3, z_query: f32) -> f32 {
     let n = scene.tet_count as usize;
     let mut absorbance = 0.0f32;
 
@@ -50,10 +44,26 @@ fn cpu_transmittance_along_ray(
         let i2 = scene.indices[ti * 4 + 2] as usize;
         let i3 = scene.indices[ti * 4 + 3] as usize;
         let verts = [
-            Vec3::new(scene.vertices[i0 * 3], scene.vertices[i0 * 3 + 1], scene.vertices[i0 * 3 + 2]),
-            Vec3::new(scene.vertices[i1 * 3], scene.vertices[i1 * 3 + 1], scene.vertices[i1 * 3 + 2]),
-            Vec3::new(scene.vertices[i2 * 3], scene.vertices[i2 * 3 + 1], scene.vertices[i2 * 3 + 2]),
-            Vec3::new(scene.vertices[i3 * 3], scene.vertices[i3 * 3 + 1], scene.vertices[i3 * 3 + 2]),
+            Vec3::new(
+                scene.vertices[i0 * 3],
+                scene.vertices[i0 * 3 + 1],
+                scene.vertices[i0 * 3 + 2],
+            ),
+            Vec3::new(
+                scene.vertices[i1 * 3],
+                scene.vertices[i1 * 3 + 1],
+                scene.vertices[i1 * 3 + 2],
+            ),
+            Vec3::new(
+                scene.vertices[i2 * 3],
+                scene.vertices[i2 * 3 + 1],
+                scene.vertices[i2 * 3 + 2],
+            ),
+            Vec3::new(
+                scene.vertices[i3 * 3],
+                scene.vertices[i3 * 3 + 1],
+                scene.vertices[i3 * 3 + 2],
+            ),
         ];
         let density = scene.densities[ti];
 
@@ -111,8 +121,8 @@ fn make_light() -> GpuLight {
         color: [1.0; 3],
         intensity: 1.0,
         direction: [0.0, 0.0, 1.0],
-        inner_angle: 0.0,
-        outer_angle: 0.0,
+        inner_cos: 1.0,
+        outer_cos: 1.0,
         _pad: [0.0; 3],
     }
 }
@@ -203,9 +213,15 @@ fn probe_vs_cpu() {
     // --- Forward + interval + sort pipelines (mirrors what the viewer does) ---
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, fwd_pipelines, _targets, _compute_bg, _render_bg) =
+    let (buffers, material, _fwd_pipelines, _targets, _compute_bg, _render_bg) =
         rmesh_render::setup_forward(
-            &device, &queue, &scene, &zero_colors, &scene.color_grads, RES, RES,
+            &device,
+            &queue,
+            &scene,
+            &zero_colors,
+            &scene.color_grads,
+            RES,
+            RES,
         );
 
     let ci_pipelines = ComputeIntervalPipelines::new(&device, color_format);
@@ -216,14 +232,8 @@ fn probe_vs_cpu() {
 
     let dsm_pipeline = DsmPipeline::new(&device, color_format);
     let dsm_prim_pipeline = DsmPrimitivePipeline::new(&device);
+    let dsm_project_pipeline = DsmProjectPipeline::new(&device);
     let prim_geometry = PrimitiveGeometry::new(&device);
-
-    let sh_coeffs_buf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("sh_coeffs_dummy"),
-        size: 16,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
 
     let lights = vec![make_light()];
     let atlas = DsmAtlas::new(&device, RES, &[0]);
@@ -233,11 +243,26 @@ fn probe_vs_cpu() {
         label: Some("probe_test_dsm"),
     });
     generate_dsm_for_lights(
-        &atlas, &mut encoder, &device, &queue,
-        &dsm_pipeline, &dsm_prim_pipeline, &prim_geometry, &[],
-        &fwd_pipelines, &ci_pipelines, &sort_pipelines, &sort_state,
-        &buffers, &material, &sh_coeffs_buf,
-        &lights, 1, scene.tet_count, NEAR, FAR, true,
+        &atlas,
+        &mut encoder,
+        &device,
+        &queue,
+        &dsm_pipeline,
+        &dsm_prim_pipeline,
+        &dsm_project_pipeline,
+        &prim_geometry,
+        &[],
+        &ci_pipelines,
+        &sort_pipelines,
+        &sort_state,
+        &buffers,
+        &material,
+        &lights,
+        1,
+        scene.tet_count,
+        NEAR,
+        FAR,
+        true,
     );
     queue.submit(std::iter::once(encoder.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -246,7 +271,7 @@ fn probe_vs_cpu() {
     let bytes_per_texel: u32 = 8;
     let row_bytes = RES * bytes_per_texel;
     assert!(
-        row_bytes % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT == 0,
+        row_bytes.is_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT),
         "row_bytes ({row_bytes}) must be a multiple of COPY_BYTES_PER_ROW_ALIGNMENT"
     );
     let total_bytes = (row_bytes as u64) * RES as u64 * 6;
@@ -312,8 +337,8 @@ fn probe_vs_cpu() {
     readback_buf.unmap();
 
     // --- Per-texel comparison + PNG output ---
-    let out_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/test_output/dsm_probe");
+    let out_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/test_output/dsm_probe");
     std::fs::create_dir_all(&out_dir).ok();
 
     let light_pos = Vec3::ZERO;
@@ -367,8 +392,7 @@ fn probe_vs_cpu() {
                     let t = (v as f32 + 0.5) / RES as f32;
                     let dir = cubemap_dir(face, s, t);
 
-                    let t_cpu =
-                        cpu_transmittance_along_ray(&scene, light_pos, dir, z_query);
+                    let t_cpu = cpu_transmittance_along_ray(&scene, light_pos, dir, z_query);
 
                     let m = moments[face][(v * RES + u) as usize];
                     let t_dsm = cantelli_eval(m, z_query, NEAR, FAR);

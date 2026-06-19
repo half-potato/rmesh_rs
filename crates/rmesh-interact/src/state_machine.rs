@@ -274,7 +274,14 @@ impl TransformInteraction {
                     InteractResult::PreviewUpdated
                 }
                 InteractKey::Enter => {
-                    let new_t = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
+                    let new_t = Self::compute_preview(
+                        *original_transform,
+                        *mode,
+                        *axis,
+                        numeric,
+                        *mouse_accum,
+                        ctx,
+                    );
                     self.state = InteractState::Idle;
                     InteractResult::Confirmed(new_t)
                 }
@@ -309,13 +316,24 @@ impl TransformInteraction {
                 }
             }
 
-            InteractEvent::MouseDown { button: MouseButton::Left } => {
-                let new_t = Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx);
+            InteractEvent::MouseDown {
+                button: MouseButton::Left,
+            } => {
+                let new_t = Self::compute_preview(
+                    *original_transform,
+                    *mode,
+                    *axis,
+                    numeric,
+                    *mouse_accum,
+                    ctx,
+                );
                 self.state = InteractState::Idle;
                 InteractResult::Confirmed(new_t)
             }
 
-            InteractEvent::MouseDown { button: MouseButton::Right } => {
+            InteractEvent::MouseDown {
+                button: MouseButton::Right,
+            } => {
                 self.state = InteractState::Idle;
                 InteractResult::Canceled
             }
@@ -341,9 +359,8 @@ impl TransformInteraction {
                         ..original
                     }
                 } else {
-                    let delta = Self::mouse_to_world_grab(
-                        mouse_accum, axis, original.position, ctx,
-                    );
+                    let delta =
+                        Self::mouse_to_world_grab(mouse_accum, axis, original.position, ctx);
                     Transform {
                         position: original.position + delta,
                         ..original
@@ -404,11 +421,7 @@ impl TransformInteraction {
             AxisConstraint::Free => right * dx - up * dy,
             AxisConstraint::SingleAxis(a) => {
                 let world_dir = a.unit();
-                let screen_dir = Vec3::new(
-                    right.dot(world_dir),
-                    up.dot(world_dir),
-                    0.0,
-                );
+                let screen_dir = Vec3::new(right.dot(world_dir), up.dot(world_dir), 0.0);
                 let screen_len = screen_dir.length();
                 if screen_len < 1e-6 {
                     return Vec3::ZERO;
@@ -446,7 +459,14 @@ impl TransformInteraction {
             ..
         } = &self.state
         {
-            Some(Self::compute_preview(*original_transform, *mode, *axis, numeric, *mouse_accum, ctx))
+            Some(Self::compute_preview(
+                *original_transform,
+                *mode,
+                *axis,
+                numeric,
+                *mouse_accum,
+                ctx,
+            ))
         } else {
             None
         }
@@ -633,7 +653,9 @@ mod tests {
         ti.process_event(&InteractEvent::CharInput('2'), &ctx);
 
         let r = ti.process_event(
-            &InteractEvent::MouseDown { button: MouseButton::Left },
+            &InteractEvent::MouseDown {
+                button: MouseButton::Left,
+            },
             &ctx,
         );
         match r {
@@ -652,7 +674,9 @@ mod tests {
         ti.process_event(&InteractEvent::CharInput('9'), &ctx);
 
         let r = ti.process_event(
-            &InteractEvent::MouseDown { button: MouseButton::Right },
+            &InteractEvent::MouseDown {
+                button: MouseButton::Right,
+            },
             &ctx,
         );
         assert!(matches!(r, InteractResult::Canceled));

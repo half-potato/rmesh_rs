@@ -6,6 +6,10 @@
 //!
 //! All GPU buffer management and bind group creation lives here.
 
+#![allow(clippy::doc_lazy_continuation)]
+#![allow(clippy::too_many_arguments)]
+#![allow(dead_code)]
+
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use rmesh_data::SceneData;
@@ -33,7 +37,6 @@ const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
 const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
 const BLIT_WGSL: &str = include_str!("wgsl/blit.wgsl");
 const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
-const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
 const LOCATE_COMPUTE_WGSL: &str = include_str!("wgsl/locate_compute.wgsl");
 const FORWARD_MESH_WGSL: &str = include_str!("wgsl/forward_mesh.wgsl");
 const INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/indirect_convert.wgsl");
@@ -43,8 +46,6 @@ const INTERVAL_COMPUTE_WGSL: &str = include_str!("wgsl/interval_compute.wgsl");
 const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
 const INTERVAL_INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/interval_indirect_convert.wgsl");
 const PROJECT_COMPUTE_16BIT_WGSL: &str = include_str!("wgsl/project_compute_16bit.wgsl");
-const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl");
-const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
 const SHADOW_RAY_GEN_WGSL: &str = include_str!("wgsl/shadow_ray_gen.wgsl");
 const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wgsl");
 const GTAO_WGSL: &str = include_str!("wgsl/gtao.wgsl");
@@ -68,9 +69,12 @@ pub struct GpuLight {
     pub light_type: u32, // 0=point, 1=spot, 2=directional
     pub color: [f32; 3],
     pub intensity: f32,
+    /// Pre-normalized — shader skips the normalize.
     pub direction: [f32; 3],
-    pub inner_angle: f32,
-    pub outer_angle: f32,
+    /// cos(inner_angle) — pre-computed so the shader avoids a per-pixel cos.
+    pub inner_cos: f32,
+    /// cos(outer_angle) — pre-computed so the shader avoids a per-pixel cos.
+    pub outer_cos: f32,
     pub _pad: [f32; 3],
 }
 
@@ -89,10 +93,9 @@ pub struct DeferredUniforms {
     pub far_plane: f32,
     pub dsm_enabled: u32,
     pub exposure: f32,
-    pub sky_color: [f32; 3],
     pub ao_strength: f32,
-    pub ground_color: [f32; 3],
     pub ssgi_strength: f32,
+    pub _pad: [f32; 2],
 }
 
 /// Maximum number of lights supported.
@@ -237,7 +240,7 @@ impl SceneBuffers {
 
         let tiles_touched = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("tiles_touched"),
-            size: ((m + 3) / 4) * 16,
+            size: m.div_ceil(4) * 16,
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -481,15 +484,13 @@ impl ForwardPipelines {
         // `hw_compute_bg = Some(...)` to `record_sorted_forward_pass`, which
         // uses `hw_compute_pipeline` (10 storage total via uniform-buffer trick)
         // instead of `compute_pipeline`.
-        let compute_bg0_entries =
-            storage_entries(8, wgpu::ShaderStages::COMPUTE, &[true; 8]);
+        let compute_bg0_entries = storage_entries(8, wgpu::ShaderStages::COMPUTE, &[true; 8]);
         let compute_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg0_layout"),
                 entries: &compute_bg0_entries,
             });
-        let compute_bg1_entries =
-            storage_entries(6, wgpu::ShaderStages::COMPUTE, &[false; 6]);
+        let compute_bg1_entries = storage_entries(6, wgpu::ShaderStages::COMPUTE, &[false; 6]);
         let compute_bg1_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg1_layout"),
@@ -536,9 +537,10 @@ impl ForwardPipelines {
         // Binding 0 (uniforms) is bound as a UNIFORM buffer so the COMPUTE-stage
         // storage-buffer count is 10, fitting WebGPU's per-stage cap.
         let hw_compute_storage_read_only = [
-            true, true, true,         // 1-3 read-only (vertices, indices, circumdata)
-            false, false, false,      // 4-6 read-write (sort_keys, sort_values, indirect_args)
-            false, true, true, true,  // 7=colors(rw), 8=base_colors(r), 9=color_grads(r), 10=sh_coeffs(r)
+            true, true, true, // 1-3 read-only (vertices, indices, circumdata)
+            false, false, false, // 4-6 read-write (sort_keys, sort_values, indirect_args)
+            false, true, true,
+            true, // 7=colors(rw), 8=base_colors(r), 9=color_grads(r), 10=sh_coeffs(r)
         ];
         let mut hw_compute_entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -1323,8 +1325,8 @@ impl ComputeIntervalPipelines {
         //   10 read-only (vertex_normals).
         let gen_storage_read_only = [
             true, true, true, true, true, true, true, // 1-7 read-only
-            false, false,                              // 8-9 read-write
-            true,                                      // 10 read-only
+            false, false, // 8-9 read-write
+            true,  // 10 read-only
         ];
         let mut gen_entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
@@ -1760,66 +1762,83 @@ impl RenderTargets {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
 
-        let make_target = |label: &'static str, format: wgpu::TextureFormat, extra: wgpu::TextureUsages| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | extra,
-                view_formats: &[],
-            })
-        };
+        let make_target =
+            |label: &'static str, format: wgpu::TextureFormat, extra: wgpu::TextureUsages| {
+                device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | extra,
+                    view_formats: &[],
+                })
+            };
         let none = wgpu::TextureUsages::empty();
         let cdst = wgpu::TextureUsages::COPY_DST;
         let csrc = wgpu::TextureUsages::COPY_SRC;
         // ssgi_view is the post-blur final and gets copied to ssgi_history → COPY_SRC.
         let ssgi_texture = make_target("ssgi", wgpu::TextureFormat::Rgba16Float, csrc);
-        let ssgi_blur_temp_texture = make_target("ssgi_blur_temp", wgpu::TextureFormat::Rgba16Float, none);
-        let ssgi_temporal_texture = make_target("ssgi_temporal", wgpu::TextureFormat::Rgba16Float, none);
-        let ssgi_history_texture = make_target("ssgi_history", wgpu::TextureFormat::Rgba16Float, cdst);
+        let ssgi_blur_temp_texture =
+            make_target("ssgi_blur_temp", wgpu::TextureFormat::Rgba16Float, none);
+        let ssgi_temporal_texture =
+            make_target("ssgi_temporal", wgpu::TextureFormat::Rgba16Float, none);
+        let ssgi_history_texture =
+            make_target("ssgi_history", wgpu::TextureFormat::Rgba16Float, cdst);
         // lit_current is the deferred shader's location(1) target — copied to
         // lit_history each frame so SSGI feedback survives debug-mode overrides.
-        let lit_current_texture = make_target("lit_current", wgpu::TextureFormat::Rgba16Float, csrc);
-        let lit_history_texture = make_target("lit_history", wgpu::TextureFormat::Rgba16Float, cdst);
+        let lit_current_texture =
+            make_target("lit_current", wgpu::TextureFormat::Rgba16Float, csrc);
+        let lit_history_texture =
+            make_target("lit_history", wgpu::TextureFormat::Rgba16Float, cdst);
         let ao_temporal_texture = make_target("ao_temporal", wgpu::TextureFormat::R8Unorm, none);
         let ao_history_texture = make_target("ao_history", wgpu::TextureFormat::R8Unorm, cdst);
         // ssr_view receives the temporal copy AND is the source of the
         // history copy each frame, so it needs both COPY_DST and COPY_SRC.
-        let ssr_texture = make_target(
-            "ssr",
-            wgpu::TextureFormat::Rgba16Float,
-            csrc | cdst,
-        );
-        let ssr_temporal_texture = make_target("ssr_temporal", wgpu::TextureFormat::Rgba16Float, csrc);
-        let ssr_history_texture = make_target("ssr_history", wgpu::TextureFormat::Rgba16Float, cdst);
+        let ssr_texture = make_target("ssr", wgpu::TextureFormat::Rgba16Float, csrc | cdst);
+        let ssr_temporal_texture =
+            make_target("ssr_temporal", wgpu::TextureFormat::Rgba16Float, csrc);
+        let ssr_history_texture =
+            make_target("ssr_history", wgpu::TextureFormat::Rgba16Float, cdst);
 
         let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ao_view = ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_blur_temp_view = ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_blur_temp_view =
+            ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ssgi_view = ssgi_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_blur_temp_view = ssgi_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_temporal_view = ssgi_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_history_view = ssgi_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_temporal_view = ao_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_history_view = ao_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let lit_current_view = lit_current_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let lit_history_view = lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_blur_temp_view =
+            ssgi_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_temporal_view =
+            ssgi_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssgi_history_view =
+            ssgi_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_temporal_view =
+            ao_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ao_history_view =
+            ao_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lit_current_view =
+            lit_current_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let lit_history_view =
+            lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssr_temporal_view = ssr_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssr_history_view = ssr_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_temporal_view =
+            ssr_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let ssr_history_view =
+            ssr_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
         Self {
             color_texture,
             aux0_texture,
@@ -2005,7 +2024,7 @@ pub fn record_tex_to_buffer(encoder: &mut wgpu::CommandEncoder, ttb: &TexToBuffe
     });
     pass.set_pipeline(&ttb.pipeline);
     pass.set_bind_group(0, &ttb.bind_group, &[]);
-    pass.dispatch_workgroups((ttb.width + 15) / 16, (ttb.height + 15) / 16, 1);
+    pass.dispatch_workgroups(ttb.width.div_ceil(16), ttb.height.div_ceil(16), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -2502,10 +2521,10 @@ pub fn record_project_compute(
 
         let workgroup_size = 64u32;
         let n_pow2 = tet_count.next_power_of_two();
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 }
@@ -2544,10 +2563,10 @@ pub fn record_project_compute_and_sort(
 
         let workgroup_size = 64u32;
         let n_pow2 = tet_count.next_power_of_two();
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 }
@@ -2596,10 +2615,10 @@ pub fn record_forward_pass(
         // padding threads (tet_count..n_pow2-1) initialize sort buffers.
         let workgroup_size = 64u32;
         let n_pow2 = tet_count.next_power_of_two();
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
@@ -2766,10 +2785,10 @@ pub fn record_sorted_forward_pass(
         }
 
         let workgroup_size = 64u32;
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
@@ -2802,10 +2821,10 @@ pub fn record_sorted_forward_pass(
         cpass.set_bind_group(0, prepass_bg, &[]);
         // Dispatch enough threads: tet_count is upper bound on visible tets
         let workgroup_size = 64u32;
-        let total_workgroups = (tet_count + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = tet_count.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
@@ -2977,10 +2996,10 @@ pub fn record_sorted_mesh_forward_pass(
         }
 
         let workgroup_size = 64u32;
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
@@ -3167,10 +3186,10 @@ pub fn record_sorted_interval_forward_pass(
         }
 
         let workgroup_size = 64u32;
-        let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+        let total_workgroups = n_pow2.div_ceil(workgroup_size);
         let max_per_dim = 65535u32;
         let dispatch_x = total_workgroups.min(max_per_dim);
-        let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+        let dispatch_y = total_workgroups.div_ceil(max_per_dim);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
     }
 
@@ -3324,10 +3343,10 @@ pub fn record_compute_interval_project(
     }
 
     let workgroup_size = 64u32;
-    let total_workgroups = (n_pow2 + workgroup_size - 1) / workgroup_size;
+    let total_workgroups = n_pow2.div_ceil(workgroup_size);
     let max_per_dim = 65535u32;
     let dispatch_x = total_workgroups.min(max_per_dim);
-    let dispatch_y = (total_workgroups + max_per_dim - 1) / max_per_dim;
+    let dispatch_y = total_workgroups.div_ceil(max_per_dim);
     cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
 }
 
@@ -3832,10 +3851,10 @@ pub fn build_boundary_bvh(
         let count = task.end - task.start;
         let mut amin = [f32::INFINITY; 3];
         let mut amax = [f32::NEG_INFINITY; 3];
-        for i in task.start..task.end {
+        for aabb in aabbs.iter().take(task.end).skip(task.start) {
             for d in 0..3 {
-                amin[d] = amin[d].min(aabbs[i].0[d]);
-                amax[d] = amax[d].max(aabbs[i].1[d]);
+                amin[d] = amin[d].min(aabb.0[d]);
+                amax[d] = amax[d].max(aabb.1[d]);
             }
         }
 
@@ -4197,217 +4216,10 @@ pub fn record_raytrace(
     pass.set_pipeline(rt_pipeline.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
     pass.set_bind_group(1, &rt_pipeline.aux_bind_group, &[]);
-    pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
+    pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
 }
 
-// ===========================================================================
-// Forward tiled pipeline
-// ===========================================================================
-
-/// Compute-based forward renderer using tiles with warp-per-tile.
-///
-/// Requires `wgpu::Features::SUBGROUPS` on the device.
-/// Renders directly to an f32 storage buffer (no texture intermediate).
-pub struct RasterizeComputePipeline {
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    aux_bind_group_layout: wgpu::BindGroupLayout,
-    /// The output storage buffer: [W x H x 4] f32
-    pub rendered_image: wgpu::Buffer,
-    /// Auxiliary output buffer: [W x H x AUX_STRIDE] f32
-    pub aux_image: wgpu::Buffer,
-    /// Debug stats output buffer: [W x H x 4] u32 (ray_miss, ghost, occluded, useful)
-    pub debug_image: wgpu::Buffer,
-    /// Default aux bind group (group 1) with dummy aux_data + debug_image
-    pub aux_bind_group: wgpu::BindGroup,
-    pub width: u32,
-    pub height: u32,
-    pub aux_dim: u32,
-    pub aux_stride: u32,
-}
-
-impl RasterizeComputePipeline {
-    /// Create the forward tiled pipeline and allocate the rendered_image buffer.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, aux_dim: u32) -> Self {
-        let aux_stride = 8 + aux_dim;
-
-        // String-substitute AUX_DIM and SM_AUX_SIZE in shader source
-        let source = RASTERIZE_COMPUTE_WGSL
-            .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
-            .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", (256 * aux_dim).max(1)));
-
-        let shader =
-            rmesh_util::compose::create_shader_module(device, "rasterize_compute.wgsl", &source)
-                .expect("Failed to compose rasterize_compute.wgsl");
-
-        // Group 0: 10 bindings
-        let read_only = [true, true, true, true, true, true, true, true, true, false];
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
-            .iter()
-            .enumerate()
-            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
-            .collect();
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("rasterize_compute_bgl"),
-            entries: &entries,
-        });
-
-        // Group 1: aux_image (rw), aux_data (read), debug_image (rw)
-        let aux_entries: Vec<wgpu::BindGroupLayoutEntry> = [false, true, false]
-            .iter()
-            .enumerate()
-            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
-            .collect();
-        let aux_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("rasterize_aux_bgl"),
-                entries: &aux_entries,
-            });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("rasterize_compute_pl"),
-            bind_group_layouts: &[&bind_group_layout, &aux_bind_group_layout],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("rasterize_compute_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rasterize_rendered_image"),
-            size: (width as u64) * (height as u64) * 4 * 4, // RGBA f32
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rasterize_aux_image"),
-            size: (width as u64) * (height as u64) * (aux_stride as u64) * 4,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        // Dummy aux_data buffer (4 bytes minimum)
-        let aux_data_dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rasterize_aux_data_dummy"),
-            size: 4,
-            usage: wgpu::BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        // Debug stats buffer: 4 u32 per pixel (ray_miss, ghost, occluded, useful)
-        let debug_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("rasterize_debug_image"),
-            size: (width as u64) * (height as u64) * 4 * 4, // 4 × u32 per pixel
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("rasterize_aux_bg_default"),
-            layout: &aux_bind_group_layout,
-            entries: &[
-                buf_entry(0, &aux_image),
-                buf_entry(1, &aux_data_dummy),
-                buf_entry(2, &debug_image),
-            ],
-        });
-
-        Self {
-            pipeline,
-            bind_group_layout,
-            aux_bind_group_layout,
-            rendered_image,
-            aux_image,
-            debug_image,
-            aux_bind_group,
-            width,
-            height,
-            aux_dim,
-            aux_stride,
-        }
-    }
-
-    /// Get the bind group layout (for creating bind groups externally).
-    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.bind_group_layout
-    }
-
-    /// Get the pipeline (for recording dispatches).
-    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
-        &self.pipeline
-    }
-}
-
-/// Create the forward tiled bind group.
-///
-/// Binding order matches `rasterize_compute.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: colors,
-///   4: densities, 5: color_grads, 6: tile_sort_values,
-///   7: tile_ranges, 8: tile_uniforms, 9: rendered_image
-pub fn create_rasterize_bind_group(
-    device: &wgpu::Device,
-    rasterize: &RasterizeComputePipeline,
-    uniforms: &wgpu::Buffer,
-    vertices: &wgpu::Buffer,
-    indices: &wgpu::Buffer,
-    colors: &wgpu::Buffer,
-    densities: &wgpu::Buffer,
-    color_grads: &wgpu::Buffer,
-    tile_sort_values: &wgpu::Buffer,
-    tile_ranges: &wgpu::Buffer,
-    tile_uniforms: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("rasterize_compute_bg"),
-        layout: rasterize.bind_group_layout(),
-        entries: &[
-            buf_entry(0, uniforms),
-            buf_entry(1, vertices),
-            buf_entry(2, indices),
-            buf_entry(3, colors),
-            buf_entry(4, densities),
-            buf_entry(5, color_grads),
-            buf_entry(6, tile_sort_values),
-            buf_entry(7, tile_ranges),
-            buf_entry(8, tile_uniforms),
-            buf_entry(9, &rasterize.rendered_image),
-        ],
-    })
-}
-
-/// Record the forward tiled compute pass dispatch.
-///
-/// Dispatches one workgroup per tile (32 threads each).
-pub fn record_rasterize_compute(
-    encoder: &mut wgpu::CommandEncoder,
-    rasterize: &RasterizeComputePipeline,
-    bind_group: &wgpu::BindGroup,
-    num_tiles: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("rasterize_compute"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(rasterize.pipeline());
-    pass.set_bind_group(0, bind_group, &[]);
-    pass.set_bind_group(1, &rasterize.aux_bind_group, &[]);
-    let (x, y) = dispatch_2d(num_tiles);
-    pass.dispatch_workgroups(x, y, 1);
-}
+// Forward tiled pipeline (`RasterizeComputePipeline`) moved to `rmesh-trainable`.
 
 // ===========================================================================
 // Point Location Pipeline (adjacency walking)
@@ -4519,7 +4331,7 @@ pub fn record_locate(
     });
     pass.set_pipeline(pipeline.pipeline());
     pass.set_bind_group(0, bind_group, &[]);
-    pass.dispatch_workgroups((num_queries + 63) / 64, 1, 1);
+    pass.dispatch_workgroups(num_queries.div_ceil(64), 1, 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -5417,7 +5229,11 @@ impl GtaoPipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout, uniforms_buf }
+        Self {
+            pipeline,
+            bind_group_layout,
+            uniforms_buf,
+        }
     }
 }
 
@@ -5467,7 +5283,12 @@ pub fn record_gtao_pass(
             resolve_target: None,
             ops: wgpu::Operations {
                 // Clear to AO=1 (no occlusion); fragments overwrite where they shade.
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -5555,18 +5376,16 @@ impl HizPipelines {
 
         let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("hiz_downsample_bgl"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
                 },
-            ],
+                count: None,
+            }],
         });
 
         let r32_target = wgpu::ColorTargetState {
@@ -5673,7 +5492,11 @@ impl HizTexture {
         let mip_count = 32 - max_dim.leading_zeros();
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("hiz_texture"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -5695,7 +5518,14 @@ impl HizTexture {
                 })
             })
             .collect();
-        Self { texture, full_view, mip_views, mip_count, width, height }
+        Self {
+            texture,
+            full_view,
+            mip_views,
+            mip_count,
+            width,
+            height,
+        }
     }
 }
 
@@ -5709,9 +5539,18 @@ pub fn create_hiz_linearize_bind_group(
         label: Some("hiz_linearize_bg"),
         layout: &hiz.linearize_bgl,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: hiz.uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hw_depth_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(volume_depth_view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: hiz.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hw_depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(volume_depth_view),
+            },
         ],
     })
 }
@@ -5724,9 +5563,10 @@ pub fn create_hiz_downsample_bind_group(
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hiz_downsample_bg"),
         layout: &hiz.downsample_bgl,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(parent_mip_view) },
-        ],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(parent_mip_view),
+        }],
     })
 }
 
@@ -5748,7 +5588,12 @@ pub fn record_hiz_pass(
                 view: &tex.mip_views[0],
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0e20, g: 0.0, b: 0.0, a: 0.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 1.0e20,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -5763,14 +5608,23 @@ pub fn record_hiz_pass(
 
     // Mips 1..mip_count: min-downsample from parent.
     // downsample_bgs[i] binds mip i (parent), pass writes to mip i+1.
-    for i in 0..(tex.mip_count as usize - 1) {
+    for (i, downsample_bg) in downsample_bgs
+        .iter()
+        .enumerate()
+        .take(tex.mip_count as usize - 1)
+    {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("hiz_downsample_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &tex.mip_views[i + 1],
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0e20, g: 0.0, b: 0.0, a: 0.0 }),
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 1.0e20,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 0.0,
+                    }),
                     store: wgpu::StoreOp::Store,
                 },
                 depth_slice: None,
@@ -5779,7 +5633,7 @@ pub fn record_hiz_pass(
             ..Default::default()
         });
         rpass.set_pipeline(&hiz.downsample_pipeline);
-        rpass.set_bind_group(0, &downsample_bgs[i], &[]);
+        rpass.set_bind_group(0, downsample_bg, &[]);
         rpass.draw(0..3, 0..1);
     }
 }
@@ -5793,10 +5647,10 @@ pub fn record_hiz_pass(
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AoBlurUniforms {
-    pub dir_x: i32,    // (1, 0) for horizontal pass, (0, 1) for vertical
+    pub dir_x: i32, // (1, 0) for horizontal pass, (0, 1) for vertical
     pub dir_y: i32,
-    pub sigma_z: f32,  // depth tolerance (world units)
-    pub sigma_n: f32,  // normal cosine power (e.g. 8 = cos^8)
+    pub sigma_z: f32, // depth tolerance (world units)
+    pub sigma_n: f32, // normal cosine power (e.g. 8 = cos^8)
 }
 
 pub struct AoBlurPipeline {
@@ -5894,16 +5748,23 @@ impl AoBlurPipeline {
             cache: None,
         });
 
-        let mk_uniforms = |label: &'static str| device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: std::mem::size_of::<AoBlurUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mk_uniforms = |label: &'static str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<AoBlurUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         let uniforms_h = mk_uniforms("ao_blur_uniforms_h");
         let uniforms_v = mk_uniforms("ao_blur_uniforms_v");
 
-        Self { pipeline, bind_group_layout: bgl, uniforms_h, uniforms_v }
+        Self {
+            pipeline,
+            bind_group_layout: bgl,
+            uniforms_h,
+            uniforms_v,
+        }
     }
 }
 
@@ -5919,10 +5780,22 @@ pub fn create_ao_blur_bind_group(
         label: Some("ao_blur_bg"),
         layout: &blur.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ao_in_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(normals_view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(ao_in_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(normals_view),
+            },
         ],
     })
 }
@@ -5941,7 +5814,12 @@ pub fn record_ao_blur_pass(
             view: out_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 0.0, a: 1.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 1.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 1.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -5966,8 +5844,8 @@ pub fn record_ao_blur_pass(
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SsgiUniforms {
     pub inv_proj: [[f32; 4]; 4],
-    pub proj:     [[f32; 4]; 4],
-    pub view:     [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
     pub width: u32,
     pub height: u32,
@@ -6084,7 +5962,11 @@ impl SsgiPipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout: bgl, uniforms_buf }
+        Self {
+            pipeline,
+            bind_group_layout: bgl,
+            uniforms_buf,
+        }
     }
 }
 
@@ -6099,10 +5981,22 @@ pub fn create_ssgi_bind_group(
         label: Some("ssgi_bg"),
         layout: &ssgi.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: ssgi.uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normals_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lit_history_view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ssgi.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hiz_full_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normals_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(lit_history_view),
+            },
         ],
     })
 }
@@ -6119,7 +6013,12 @@ pub fn record_ssgi_pass(
             view: out_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -6238,16 +6137,23 @@ impl SsgiBlurPipeline {
             cache: None,
         });
 
-        let mk = |label: &'static str| device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(label),
-            size: std::mem::size_of::<SsgiBlurUniforms>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let mk = |label: &'static str| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: std::mem::size_of::<SsgiBlurUniforms>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
         let uniforms_h = mk("ssgi_blur_uniforms_h");
         let uniforms_v = mk("ssgi_blur_uniforms_v");
 
-        Self { pipeline, bind_group_layout: bgl, uniforms_h, uniforms_v }
+        Self {
+            pipeline,
+            bind_group_layout: bgl,
+            uniforms_h,
+            uniforms_v,
+        }
     }
 }
 
@@ -6263,10 +6169,22 @@ pub fn create_ssgi_blur_bind_group(
         label: Some("ssgi_blur_bg"),
         layout: &blur.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssgi_in_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(normals_view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(ssgi_in_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(depth_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(normals_view),
+            },
         ],
     })
 }
@@ -6283,7 +6201,12 @@ pub fn record_ssgi_blur_pass(
             view: out_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -6306,8 +6229,8 @@ pub fn record_ssgi_blur_pass(
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SsrUniforms {
     pub inv_proj: [[f32; 4]; 4],
-    pub proj:     [[f32; 4]; 4],
-    pub view:     [[f32; 4]; 4],
+    pub proj: [[f32; 4]; 4],
+    pub view: [[f32; 4]; 4],
     pub inv_view: [[f32; 4]; 4],
     pub width: u32,
     pub height: u32,
@@ -6448,7 +6371,11 @@ impl SsrPipeline {
             mapped_at_creation: false,
         });
 
-        Self { pipeline, bind_group_layout: bgl, uniforms_buf }
+        Self {
+            pipeline,
+            bind_group_layout: bgl,
+            uniforms_buf,
+        }
     }
 }
 
@@ -6465,12 +6392,30 @@ pub fn create_ssr_bind_group(
         label: Some("ssr_bg"),
         layout: &ssr.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: ssr.uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(normals_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lit_history_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(ssgi_view) },
-            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(volume_depth_view) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ssr.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(hiz_full_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(normals_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(lit_history_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureView(ssgi_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: wgpu::BindingResource::TextureView(volume_depth_view),
+            },
         ],
     })
 }
@@ -6487,7 +6432,12 @@ pub fn record_ssr_pass(
             view: out_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -6509,7 +6459,7 @@ pub fn record_ssr_pass(
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct TemporalUniforms {
-    pub inv_vp:  [[f32; 4]; 4],
+    pub inv_vp: [[f32; 4]; 4],
     pub prev_vp: [[f32; 4]; 4],
     pub width: u32,
     pub height: u32,
@@ -6646,7 +6596,12 @@ impl TemporalPipeline {
             ..Default::default()
         });
 
-        Self { pipeline, bind_group_layout: bgl, uniforms_buf, sampler }
+        Self {
+            pipeline,
+            bind_group_layout: bgl,
+            uniforms_buf,
+            sampler,
+        }
     }
 }
 
@@ -6661,11 +6616,26 @@ pub fn create_temporal_bind_group(
         label: Some("temporal_bg"),
         layout: &pipeline.bind_group_layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: pipeline.uniforms_buf.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(current_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(history_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(hiz_full_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&pipeline.sampler) },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: pipeline.uniforms_buf.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(current_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::TextureView(history_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: wgpu::BindingResource::TextureView(hiz_full_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::Sampler(&pipeline.sampler),
+            },
         ],
     })
 }
@@ -6682,7 +6652,12 @@ pub fn record_temporal_pass(
             view: out_view,
             resolve_target: None,
             ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                }),
                 store: wgpu::StoreOp::Store,
             },
             depth_slice: None,
@@ -6719,347 +6694,5 @@ pub fn clear_texture_view(
     });
 }
 
-// ===========================================================================
-// Interval Tiled Pipeline (forward)
-// ===========================================================================
-
-/// Buffers for the tiled interval pipeline (shared between forward and backward).
-pub struct IntervalTiledBuffers {
-    /// Screen triangle vertices: [max_visible × 5 × 4] vec4<f32>
-    pub interval_verts: wgpu::Buffer,
-    /// Per-tet base_color + density: [max_visible] vec4<f32>
-    pub interval_tet_data: wgpu::Buffer,
-    /// Per-tet metadata (num_silhouette | tet_id << 4): [max_visible] u32
-    pub interval_meta: wgpu::Buffer,
-}
-
-impl IntervalTiledBuffers {
-    /// Allocate interval tiled buffers for `max_visible` tets (use tet_count as upper bound).
-    pub fn new(device: &wgpu::Device, max_visible: u32) -> Self {
-        let m = max_visible as u64;
-        let storage_rw = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC;
-
-        let interval_verts = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_verts"),
-            size: m * 5 * 4 * 16, // 5 verts × 4 vec4 × 16 bytes (pos+z, offsets, n_front, n_back)
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let interval_tet_data = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_tet_data"),
-            size: m * 16, // 1 vec4 × 16 bytes
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let interval_meta = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_meta"),
-            size: m * 4, // 1 u32
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        Self {
-            interval_verts,
-            interval_tet_data,
-            interval_meta,
-        }
-    }
-}
-
-/// Pipeline for the interval generate pass (per-tet screen triangle decomposition).
-pub struct IntervalGeneratePipeline {
-    pub pipeline: wgpu::ComputePipeline,
-    pub bg_layout: wgpu::BindGroupLayout,
-}
-
-impl IntervalGeneratePipeline {
-    pub fn new(device: &wgpu::Device) -> Self {
-        // 12 bindings: 0-7 read-only, 8-10 read-write, 11 read-only (vertex_normals)
-        let read_only = [
-            true, true, true, true, true, true, true, true, // 0-7
-            false, false, false, // 8-10 (interval_verts, interval_tet_data, interval_meta)
-            true,  // 11 (vertex_normals)
-        ];
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
-            .iter()
-            .enumerate()
-            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
-            .collect();
-
-        let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("interval_generate_bgl"),
-            entries: &entries,
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("interval_generate_pl"),
-            bind_group_layouts: &[&bg_layout],
-            immediate_size: 0,
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("interval_generate.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_GENERATE_WGSL.into()),
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("interval_generate_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        Self {
-            pipeline,
-            bg_layout,
-        }
-    }
-}
-
-/// Create the interval generate bind group (12 bindings).
-///
-/// Binding order matches `interval_generate.wgsl`:
-///   0: uniforms, 1: vertices, 2: indices, 3: colors, 4: densities,
-///   5: color_grads, 6: compact_tet_ids, 7: indirect_args,
-///   8: interval_verts, 9: interval_tet_data, 10: interval_meta,
-///   11: vertex_normals
-pub fn create_interval_generate_bind_group(
-    device: &wgpu::Device,
-    pipeline: &IntervalGeneratePipeline,
-    scene: &SceneBuffers,
-    material: &MaterialBuffers,
-    interval: &IntervalTiledBuffers,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("interval_generate_bg"),
-        layout: &pipeline.bg_layout,
-        entries: &[
-            buf_entry(0, &scene.uniforms),
-            buf_entry(1, &scene.vertices),
-            buf_entry(2, &scene.indices),
-            buf_entry(3, &material.colors),
-            buf_entry(4, &scene.densities),
-            buf_entry(5, &material.color_grads),
-            buf_entry(6, &scene.compact_tet_ids),
-            buf_entry(7, &scene.indirect_args),
-            buf_entry(8, &interval.interval_verts),
-            buf_entry(9, &interval.interval_tet_data),
-            buf_entry(10, &interval.interval_meta),
-            buf_entry(11, &scene.vertex_normals),
-        ],
-    })
-}
-
-/// Record the interval generate compute pass.
-///
-/// Dispatches ceil(visible_count / 64) workgroups. Uses indirect dispatch
-/// from indirect_args.instance_count (the visible tet count).
-pub fn record_interval_generate(
-    encoder: &mut wgpu::CommandEncoder,
-    pipeline: &IntervalGeneratePipeline,
-    bind_group: &wgpu::BindGroup,
-    tet_count: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("interval_generate"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(&pipeline.pipeline);
-    pass.set_bind_group(0, bind_group, &[]);
-    let workgroups = (tet_count + 63) / 64;
-    let (x, y) = dispatch_2d(workgroups);
-    pass.dispatch_workgroups(x, y, 1);
-}
-
-/// Pipeline for the interval tiled rasterize pass (forward, per-tile).
-pub struct IntervalTiledRasterizePipeline {
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    /// The output storage buffer: [W × H × 4] f32
-    pub rendered_image: wgpu::Buffer,
-    /// Normal+depth output: [W × H × 4] f32 (normal.xyz + depth)
-    pub xyzd_image: wgpu::Buffer,
-    /// Distortion state output: [W × H × 5] f32
-    pub distortion_image: wgpu::Buffer,
-    /// Custom aux output: [W × H × aux_dim] f32
-    pub aux_image: wgpu::Buffer,
-    /// Number of custom aux channels per tet (0 = no aux)
-    pub aux_dim: usize,
-    /// Dummy buffer for aux_data binding when no scene data is provided
-    pub aux_data_dummy: wgpu::Buffer,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl IntervalTiledRasterizePipeline {
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, aux_dim: usize) -> Self {
-        let sm_aux_size = if aux_dim > 0 { 256 * aux_dim } else { 1 };
-        let source = INTERVAL_TILED_RASTERIZE_WGSL
-            .replace("/*AUX_DIM*/0u", &format!("{}u", aux_dim))
-            .replace("/*SM_AUX_SIZE*/1u", &format!("{}u", sm_aux_size));
-        let shader = rmesh_util::compose::create_shader_module(
-            device,
-            "interval_tiled_rasterize.wgsl",
-            &source,
-        )
-        .expect("Failed to compose interval_tiled_rasterize.wgsl");
-
-        // Group 0: 12 bindings (7 read, 3 rw, 1 read, 1 rw)
-        let read_only = [
-            true, true, true, true, true, true, true, false, false, false, true, false,
-        ];
-        let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
-            .iter()
-            .enumerate()
-            .map(|(i, &ro)| rmesh_tile::storage_entry(i as u32, ro))
-            .collect();
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("interval_tiled_rasterize_bgl"),
-            entries: &entries,
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("interval_tiled_rasterize_pl"),
-            bind_group_layouts: &[&bind_group_layout],
-            immediate_size: 0,
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("interval_tiled_rasterize_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let n_pixels = (width as u64) * (height as u64);
-        let storage_rw = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC;
-
-        let rendered_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_rendered_image"),
-            size: n_pixels * 4 * 4, // RGBA f32
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let xyzd_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_xyzd_image"),
-            size: n_pixels * 4 * 4, // normal.xyz + depth, 4 f32
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let distortion_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_distortion_image"),
-            size: n_pixels * 5 * 4, // 5 f32 distortion state
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let aux_image_size = if aux_dim > 0 {
-            n_pixels * (aux_dim as u64) * 4
-        } else {
-            4
-        };
-        let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_aux_image"),
-            size: aux_image_size,
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        let aux_data_dummy = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("interval_tiled_aux_data_dummy"),
-            size: 4,
-            usage: storage_rw,
-            mapped_at_creation: false,
-        });
-
-        Self {
-            pipeline,
-            bind_group_layout,
-            rendered_image,
-            xyzd_image,
-            distortion_image,
-            aux_image,
-            aux_dim,
-            aux_data_dummy,
-            width,
-            height,
-        }
-    }
-
-    pub fn bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.bind_group_layout
-    }
-
-    pub fn pipeline(&self) -> &wgpu::ComputePipeline {
-        &self.pipeline
-    }
-}
-
-/// Create the interval tiled rasterize bind group (12 bindings).
-///
-/// Binding order matches `interval_tiled_rasterize.wgsl`:
-///   0: uniforms, 1: interval_verts, 2: interval_tet_data, 3: interval_meta,
-///   4: tile_sort_values, 5: tile_ranges, 6: tile_uniforms, 7: rendered_image,
-///   8: xyzd_image, 9: distortion_image, 10: aux_data, 11: aux_image
-pub fn create_interval_tiled_rasterize_bind_group(
-    device: &wgpu::Device,
-    rasterize: &IntervalTiledRasterizePipeline,
-    uniforms: &wgpu::Buffer,
-    interval: &IntervalTiledBuffers,
-    tile_sort_values: &wgpu::Buffer,
-    tile_ranges: &wgpu::Buffer,
-    tile_uniforms: &wgpu::Buffer,
-    aux_data: &wgpu::Buffer,
-    aux_image: &wgpu::Buffer,
-) -> wgpu::BindGroup {
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("interval_tiled_rasterize_bg"),
-        layout: rasterize.bind_group_layout(),
-        entries: &[
-            buf_entry(0, uniforms),
-            buf_entry(1, &interval.interval_verts),
-            buf_entry(2, &interval.interval_tet_data),
-            buf_entry(3, &interval.interval_meta),
-            buf_entry(4, tile_sort_values),
-            buf_entry(5, tile_ranges),
-            buf_entry(6, tile_uniforms),
-            buf_entry(7, &rasterize.rendered_image),
-            buf_entry(8, &rasterize.xyzd_image),
-            buf_entry(9, &rasterize.distortion_image),
-            buf_entry(10, aux_data),
-            buf_entry(11, aux_image),
-        ],
-    })
-}
-
-/// Record the interval tiled rasterize compute pass dispatch.
-///
-/// Dispatches one workgroup per tile (32 threads each).
-pub fn record_interval_tiled_rasterize(
-    encoder: &mut wgpu::CommandEncoder,
-    rasterize: &IntervalTiledRasterizePipeline,
-    bind_group: &wgpu::BindGroup,
-    num_tiles: u32,
-) {
-    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: Some("interval_tiled_rasterize"),
-        timestamp_writes: None,
-    });
-    pass.set_pipeline(rasterize.pipeline());
-    pass.set_bind_group(0, bind_group, &[]);
-    let (x, y) = dispatch_2d(num_tiles);
-    pass.dispatch_workgroups(x, y, 1);
-}
+// Interval tiled pipeline (`IntervalTiledBuffers`, `IntervalGeneratePipeline`,
+// `IntervalTiledRasterizePipeline`) moved to `rmesh-trainable`.

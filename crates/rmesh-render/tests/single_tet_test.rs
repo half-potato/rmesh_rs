@@ -25,7 +25,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -137,9 +138,7 @@ fn test_raytrace_single_tet_outside() {
 
     if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
-        eprintln!(
-            "raytrace outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
-        );
+        eprintln!("raytrace outside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         assert!(
             mean_diff < ATOL,
             "raytrace outside: mean_diff {mean_diff} >= {ATOL}"
@@ -170,9 +169,7 @@ fn test_raytrace_single_tet_inside() {
 
     if let Some(rt_image) = gpu_raytrace_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &rt_image);
-        eprintln!(
-            "raytrace inside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"
-        );
+        eprintln!("raytrace inside: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         // Interior view still has divergence due to floating-point differences
         // in ray-tet intersection math between CPU and GPU. Relax tolerance.
         assert!(
@@ -307,7 +304,9 @@ fn test_compute_interval_center_view() {
     let total_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
     assert!(total_alpha > 0.01, "CPU image is all-zero");
 
-    if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+    if let Some(gpu_image) =
+        gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+    {
         let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
         eprintln!("compute_interval_center_view: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
         let tol = ATOL + 0.3 * 0.6;
@@ -317,6 +316,84 @@ fn test_compute_interval_center_view() {
         );
     } else {
         eprintln!("Skipping GPU compute-interval test (no adapter)");
+    }
+}
+
+/// HW-compute interval shading: camera near a face of the tet.
+///
+/// Exercises `project_compute_hw.wgsl` (uniform-buffer uniforms, the viewer's
+/// path) instead of the legacy storage-buffer `project_compute.wgsl` that the
+/// other interval tests cover. Before this test existed, changes that broke
+/// only the HW project pipeline could pass every interval test while still
+/// rendering the viewer all-black. The regression check is intentionally
+/// minimal: just "did anything get rendered" — total alpha must be
+/// non-trivial.
+#[test]
+fn test_hw_compute_interval_face_view() {
+    // Iterating multiple offsets so we can see which (camera distance, GPU
+    // path) combinations black out. offset=0.1 is the close-camera regime that
+    // diverges from the CPU reference even on the legacy compute-interval path.
+    let offsets = [1.0, 5.0, 10.0, 0.1];
+
+    for &offset in &offsets {
+        let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+        let scene = random_single_tet_scene(&mut rng, 0.3);
+
+        let verts = load_tet_verts(&scene, 0);
+        let centroid = (verts[0] + verts[1] + verts[2] + verts[3]) * 0.25;
+        let face_center = (verts[0] + verts[2] + verts[1]) / 3.0;
+        let face_normal = (face_center - centroid).normalize();
+
+        let eye = face_center + face_normal * offset;
+        let target = centroid;
+        let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+        let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
+        let cpu_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+        assert!(
+            cpu_alpha > 0.01,
+            "offset={offset}: CPU reference is all-zero — bad test scene"
+        );
+
+        let Some(gpu_image) =
+            gpu_hw_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+        else {
+            eprintln!("Skipping hw_compute_interval_face_view (no GPU adapter)");
+            return;
+        };
+
+        // Also render via the LEGACY compute path so we can compare. Both share
+        // the entire downstream (sort, indirect_convert, interval_compute, render).
+        // If legacy_alpha > 0 and gpu_alpha == 0, the bug is in
+        // project_compute_hw.wgsl vs project_compute.wgsl.
+        let legacy_image =
+            gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+                .expect("legacy path should also be runnable");
+        let legacy_alpha: f32 = legacy_image.iter().map(|p| p[3]).sum();
+
+        let gpu_alpha: f32 = gpu_image.iter().map(|p| p[3]).sum();
+        eprintln!(
+            "hw_compute_interval_face_view offset={offset}: cpu_alpha={cpu_alpha:.3}, gpu_alpha={gpu_alpha:.3}, legacy_alpha={legacy_alpha:.3}"
+        );
+
+        // Primary regression assertion: image is NOT all-black. Any non-trivial
+        // alpha means the project_compute_hw → sort → interval_gen → render
+        // chain emitted at least one visible fragment.
+        assert!(
+            gpu_alpha > 0.1,
+            "offset={offset}: HW-compute interval render is all-black (gpu_alpha={gpu_alpha}); \
+             project_compute_hw.wgsl / interval_generate.wgsl chain is broken"
+        );
+
+        // Sanity-check it agrees with the CPU reference within the same
+        // tolerance the legacy-path test uses.
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
+        let tol = ATOL + 0.3 * 0.6;
+        assert!(
+            mean_diff < tol,
+            "offset={offset}: HW-compute mean_diff {mean_diff} >= {tol} \
+             (max_diff={max_diff})"
+        );
     }
 }
 
@@ -341,7 +418,9 @@ fn test_compute_interval_face_view() {
 
         let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
 
-        if let Some(gpu_image) = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H) {
+        if let Some(gpu_image) =
+            gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+        {
             let (max_diff, mean_diff, _) = compare_images(&cpu_image, &gpu_image);
             eprintln!(
                 "compute_interval_face_view offset={offset}: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}"

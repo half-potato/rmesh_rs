@@ -39,10 +39,18 @@ impl PbrMaterial {
     /// Pack texture presence flags into a u32 bitmask.
     pub fn tex_flags(&self) -> u32 {
         let mut flags = 0u32;
-        if self.has_base_color_tex { flags |= 1; }
-        if self.has_metallic_roughness_tex { flags |= 2; }
-        if self.has_normal_tex { flags |= 4; }
-        if self.has_occlusion_tex { flags |= 8; }
+        if self.has_base_color_tex {
+            flags |= 1;
+        }
+        if self.has_metallic_roughness_tex {
+            flags |= 2;
+        }
+        if self.has_normal_tex {
+            flags |= 4;
+        }
+        if self.has_occlusion_tex {
+            flags |= 8;
+        }
         flags
     }
 }
@@ -86,12 +94,21 @@ pub struct MaterialRegistry {
     default_occlusion: wgpu::TextureView,
 }
 
-fn create_1x1_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, rgba: [u8; 4]) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_1x1_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    rgba: [u8; 4],
+) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some(label),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -106,12 +123,21 @@ fn create_1x1_texture(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, r
     (tex, view)
 }
 
-fn create_1x1_texture_linear(device: &wgpu::Device, queue: &wgpu::Queue, label: &str, rgba: [u8; 4]) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_1x1_texture_linear(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    rgba: [u8; 4],
+) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
             label: Some(label),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -197,23 +223,42 @@ impl MaterialRegistry {
         });
 
         // Default 1x1 textures
-        let (_bc_tex, default_base_color) = create_1x1_texture(device, queue, "default_base_color", [255, 255, 255, 255]);
+        let (_bc_tex, default_base_color) =
+            create_1x1_texture(device, queue, "default_base_color", [255, 255, 255, 255]);
         // metallic_roughness: G=roughness(1.0=255), B=metallic(0.0=0)
-        let (_mr_tex, default_metallic_roughness) = create_1x1_texture_linear(device, queue, "default_metal_rough", [255, 255, 0, 255]);
+        let (_mr_tex, default_metallic_roughness) =
+            create_1x1_texture_linear(device, queue, "default_metal_rough", [255, 255, 0, 255]);
         // Normal: tangent-space up = (0.5, 0.5, 1.0) encoded as (128, 128, 255)
-        let (_nm_tex, default_normal) = create_1x1_texture_linear(device, queue, "default_normal", [128, 128, 255, 255]);
+        let (_nm_tex, default_normal) =
+            create_1x1_texture_linear(device, queue, "default_normal", [128, 128, 255, 255]);
         // Occlusion: R=1.0 = no occlusion
-        let (_ao_tex, default_occlusion) = create_1x1_texture_linear(device, queue, "default_occlusion", [255, 255, 255, 255]);
+        let (_ao_tex, default_occlusion) =
+            create_1x1_texture_linear(device, queue, "default_occlusion", [255, 255, 255, 255]);
 
         let default_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("default_material_bg"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&default_base_color) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&default_metallic_roughness) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&default_normal) },
-                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&default_occlusion) },
-                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&default_base_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&default_metallic_roughness),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&default_normal),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&default_occlusion),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
 
@@ -273,16 +318,20 @@ impl MaterialRegistry {
         self.materials = materials
             .iter()
             .map(|mat| {
-                let bc_view = mat.base_color_texture
+                let bc_view = mat
+                    .base_color_texture
                     .and_then(|i| gpu_views.get(i))
                     .unwrap_or(&self.default_base_color);
-                let mr_view = mat.metallic_roughness_texture
+                let mr_view = mat
+                    .metallic_roughness_texture
                     .and_then(|i| gpu_views.get(i))
                     .unwrap_or(&self.default_metallic_roughness);
-                let nm_view = mat.normal_texture
+                let nm_view = mat
+                    .normal_texture
                     .and_then(|i| gpu_views.get(i))
                     .unwrap_or(&self.default_normal);
-                let ao_view = mat.occlusion_texture
+                let ao_view = mat
+                    .occlusion_texture
                     .and_then(|i| gpu_views.get(i))
                     .unwrap_or(&self.default_occlusion);
 
@@ -290,11 +339,26 @@ impl MaterialRegistry {
                     label: Some("material_bg"),
                     layout: &self.bind_group_layout,
                     entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(bc_view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mr_view) },
-                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(nm_view) },
-                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(ao_view) },
-                        wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(bc_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(mr_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(nm_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::TextureView(ao_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
                     ],
                 });
 
@@ -310,7 +374,10 @@ impl MaterialRegistry {
                     has_occlusion_tex: mat.occlusion_texture.is_some(),
                 };
 
-                MaterialTextures { bind_group, properties }
+                MaterialTextures {
+                    bind_group,
+                    properties,
+                }
             })
             .collect();
     }

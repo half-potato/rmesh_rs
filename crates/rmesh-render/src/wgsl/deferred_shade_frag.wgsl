@@ -29,9 +29,7 @@ struct DeferredUniforms {
     far_plane: f32,
     dsm_enabled: u32,
     exposure: f32,
-    sky_color: vec3f,
     ao_strength: f32,
-    ground_color: vec3f,
     ssgi_strength: f32,
 }
 
@@ -40,21 +38,21 @@ struct Light {
     light_type: u32,    // 0=point, 1=spot, 2=directional
     color: vec3f,
     intensity: f32,
+    // direction is pre-normalized on the CPU; shader skips normalize().
     direction: vec3f,
-    inner_angle: f32,
-    outer_angle: f32,
+    inner_cos: f32,     // cos(inner_angle), precomputed.
+    outer_cos: f32,     // cos(outer_angle), precomputed.
     _pad0: f32,
     _pad1: f32,
     _pad2: f32,
 }
 
 struct ShadowLight {
-    vp0: mat4x4f,
-    vp1: mat4x4f,
-    vp2: mat4x4f,
-    vp3: mat4x4f,
-    vp4: mat4x4f,
-    vp5: mat4x4f,
+    // Per-face W row of the VP matrix. evaluate_transmittance only needs
+    // clip.w = dot(vp_w, vec4(world_pos, 1)); storing six full mat4x4s here
+    // burned 384 bytes/light and forced the compiler to materialize all six
+    // matrices for a runtime-indexed select. 96 bytes/light now.
+    vp_w: array<vec4f, 6>,
     face_offset: u32,
     face_count: u32,
     near: f32,
@@ -157,17 +155,6 @@ fn env_brdf_approx(F0: vec3f, roughness: f32, n_dot_v: f32) -> vec3f {
 // DSM shadow helpers
 // ---------------------------------------------------------------------------
 
-fn get_shadow_vp(sm: ShadowLight, face: u32) -> mat4x4f {
-    switch face {
-        case 0u: { return sm.vp0; }
-        case 1u: { return sm.vp1; }
-        case 2u: { return sm.vp2; }
-        case 3u: { return sm.vp3; }
-        case 4u: { return sm.vp4; }
-        default: { return sm.vp5; }
-    }
-}
-
 /// Select cubemap face from a direction vector (world-space, light → surface).
 fn select_cubemap_face(dir: vec3f) -> u32 {
     let a = abs(dir);
@@ -206,8 +193,9 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
 
     let dir = world_pos - lights[li].position;
     let face = select_cubemap_face(dir);
-    let vp = get_shadow_vp(sm, face);
-    let clip = vp * vec4f(world_pos, 1.0);
+    // Only clip.w is needed for the receiver depth; pull it directly from the
+    // precomputed W row instead of materializing the full mat4x4f.
+    let clip_w = dot(sm.vp_w[face], vec4f(world_pos, 1.0));
 
     let m = textureSample(dsm_moments, dsm_sampler, dir);
     let shadow_alpha = m.a;
@@ -218,7 +206,7 @@ fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let e_z2 = m.g * inv_alpha;        // E[z²]
 
     // Receiver depth from the light, biased to avoid self-shadow acne.
-    let z = (clip.w - sm.near) / (sm.far - sm.near) - SHADOW_DEPTH_BIAS;
+    let z = (clip_w - sm.near) / (sm.far - sm.near) - SHADOW_DEPTH_BIAS;
     if z <= mean { return 1.0; }
 
     // True one-sided-Chebyshev variance, floored to soften the bound.
@@ -361,7 +349,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         var to_light: vec3f;
         var atten: f32;
         if (light.light_type == 2u) {
-            to_light = normalize(-light.direction);
+            // light.direction is pre-normalized on the CPU.
+            to_light = -light.direction;
             atten = 1.0;
         } else {
             let to_light_raw = light.position - world_pos;
@@ -371,11 +360,11 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         }
 
         if (light.light_type == 1u) {
-            let l_fwd = normalize(light.direction);
-            let cos_a = dot(-to_light, l_fwd);
-            let inner_cos = cos(light.inner_angle);
-            let outer_cos = cos(light.outer_angle);
-            let spot = clamp((cos_a - outer_cos) / (inner_cos - outer_cos + 1e-8), 0.0, 1.0);
+            // light.direction is pre-normalized; inner_cos/outer_cos precomputed.
+            let cos_a = dot(-to_light, light.direction);
+            let spot = clamp(
+                (cos_a - light.outer_cos) / (light.inner_cos - light.outer_cos + 1e-8),
+                0.0, 1.0);
             atten *= spot;
         }
 
@@ -462,23 +451,21 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         final_color = uniforms.exposure * vec3f(T_total / max(f32(uniforms.num_lights), 1.0));
     }
     else if (dm == DBG_LAMBDA) {
-        // Reused: UV coords in light-space (first light) for debugging shadow projection.
+        // Cubemap-face index for the first light, one solid color per face.
+        // (Previously visualized shadow-space UVs, but that required the full
+        // VP matrix; we now only store its W row.)
         if uniforms.dsm_enabled != 0u && uniforms.num_lights > 0u {
-            let sm = shadow_meta[0u];
             let to_surface = world_pos - lights[0u].position;
-            var face = 0u;
-            if sm.light_type == 0u {
-                face = select_cubemap_face(to_surface);
-            }
-            let vp = get_shadow_vp(sm, face);
-            let clip = vp * vec4f(world_pos, 1.0);
-            if clip.w > 0.0 {
-                let ndc_xy = clip.xy / clip.w;
-                let uv = vec2f(ndc_xy.x * 0.5 + 0.5, 0.5 - ndc_xy.y * 0.5);
-                final_color = vec3f(uv.x, uv.y, 0.0);
-            } else {
-                final_color = vec3f(1.0, 0.0, 1.0);
-            }
+            let face = select_cubemap_face(to_surface);
+            let face_colors = array<vec3f, 6>(
+                vec3f(1.0, 0.0, 0.0),  // +X
+                vec3f(0.0, 1.0, 1.0),  // -X
+                vec3f(0.0, 1.0, 0.0),  // +Y
+                vec3f(1.0, 0.0, 1.0),  // -Y
+                vec3f(0.0, 0.0, 1.0),  // +Z
+                vec3f(1.0, 1.0, 0.0),  // -Z
+            );
+            final_color = face_colors[face];
         } else {
             final_color = vec3f(0.5);
         }

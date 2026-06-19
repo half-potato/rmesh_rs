@@ -56,7 +56,9 @@ pub fn create_test_device(config: TestDeviceConfig) -> Option<(wgpu::Device, wgp
 
         adapter
             .request_device(&wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC | config.extra_features,
+                required_features: wgpu::Features::SUBGROUP
+                    | wgpu::Features::SHADER_FLOAT32_ATOMIC
+                    | config.extra_features,
                 required_limits: wgpu::Limits {
                     max_storage_buffers_per_shader_stage: 20,
                     max_storage_buffer_binding_size: 1 << 30,
@@ -357,8 +359,7 @@ impl TimestampRecorder {
         let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("timestamp_resolve"),
             size: (query_count as u64) * 8, // u64 per query
-            usage: wgpu::BufferUsages::QUERY_RESOLVE
-                | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let period_ns = queue.get_timestamp_period();
@@ -402,21 +403,12 @@ impl TimestampRecorder {
     /// Resolve all recorded timestamps to the readback buffer.
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
         if self.next_index > 0 {
-            encoder.resolve_query_set(
-                &self.query_set,
-                0..self.next_index,
-                &self.resolve_buf,
-                0,
-            );
+            encoder.resolve_query_set(&self.query_set, 0..self.next_index, &self.resolve_buf, 0);
         }
     }
 
     /// Read back resolved timestamps and compute per-pass durations in milliseconds.
-    pub fn read_results(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-    ) -> Vec<(String, f64)> {
+    pub fn read_results(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Vec<(String, f64)> {
         if self.next_index == 0 {
             return Vec::new();
         }
@@ -429,8 +421,7 @@ impl TimestampRecorder {
             mapped_at_creation: false,
         });
 
-        let mut encoder =
-            device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_buffer_to_buffer(&self.resolve_buf, 0, &readback, 0, byte_count);
         queue.submit(std::iter::once(encoder.finish()));
 
@@ -467,7 +458,12 @@ pub fn print_timestamp_table(results: &[(String, f64)]) {
     }
     let max_name_len = results.iter().map(|(n, _)| n.len()).max().unwrap_or(10);
     eprintln!("\n{:─<width$}", "", width = max_name_len + 20);
-    eprintln!("{:<width$}  {:>10}", "Pass", "Time (ms)", width = max_name_len);
+    eprintln!(
+        "{:<width$}  {:>10}",
+        "Pass",
+        "Time (ms)",
+        width = max_name_len
+    );
     eprintln!("{:─<width$}", "", width = max_name_len + 20);
     let mut total = 0.0;
     for (name, ms) in results {

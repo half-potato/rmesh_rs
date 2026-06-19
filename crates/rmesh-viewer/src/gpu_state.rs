@@ -1,14 +1,13 @@
 //! GPU state: device, pipelines, buffers, bind groups, and profiling.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
-use rmesh_render::{
-    BlitPipeline, ForwardPipelines, MaterialBuffers,
-    MeshForwardPipelines, IntervalPipelines, ComputeIntervalPipelines, RenderTargets,
-    SceneBuffers,
-};
 use rmesh_compositor::{MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
+use rmesh_render::{
+    BlitPipeline, ComputeIntervalPipelines, ForwardPipelines, IntervalPipelines, MaterialBuffers,
+    MeshForwardPipelines, RenderTargets, SceneBuffers,
+};
 use rmesh_sim::FluidSim;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -97,7 +96,7 @@ pub fn pack_sh_coeffs_f16(coeffs: &[f32], total_dims: usize) -> Vec<u32> {
     }
     let tet_count = coeffs.len() / total_dims;
     // Words per tet: ceil(total_dims / 2) — matches WGSL: (stride + 1) / 2
-    let words_per_tet = (total_dims + 1) / 2;
+    let words_per_tet = total_dims.div_ceil(2);
     let mut packed = vec![0u32; tet_count * words_per_tet];
     for t in 0..tet_count {
         let src_base = t * total_dims;
@@ -243,6 +242,7 @@ pub struct GpuState {
     // DSM debug view (2-moment deep shadow map from camera perspective)
     pub dsm_pipeline: rmesh_dsm::DsmPipeline,
     pub dsm_prim_pipeline: rmesh_dsm::DsmPrimitivePipeline,
+    pub dsm_project_pipeline: rmesh_dsm::DsmProjectPipeline,
     pub dsm_resolve_pipeline: rmesh_dsm::DsmResolvePipeline,
     pub dsm_moments_texture: wgpu::Texture,
     pub dsm_moments_view: wgpu::TextureView,

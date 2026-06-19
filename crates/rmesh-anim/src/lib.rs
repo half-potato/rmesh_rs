@@ -33,6 +33,12 @@ impl AnimationClock {
     }
 }
 
+impl Default for AnimationClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Keyframe interpolation
 // ---------------------------------------------------------------------------
@@ -181,8 +187,7 @@ impl AnimationChannel {
                 node.local_transform.position = Vec3::from_slice(v);
             }
             TargetProperty::Rotation => {
-                node.local_transform.rotation =
-                    Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize();
+                node.local_transform.rotation = Quat::from_xyzw(v[0], v[1], v[2], v[3]).normalize();
             }
             TargetProperty::Scale => {
                 node.local_transform.scale = Vec3::from_slice(v);
@@ -334,7 +339,7 @@ impl AnimatedScene {
             if clip_idx < self.clips.len() {
                 let t = self.playback.time;
                 // Clone channels to avoid borrow conflict (clips is immutable during eval)
-                let channels: Vec<_> = self.clips[clip_idx].channels.iter().cloned().collect();
+                let channels = self.clips[clip_idx].channels.to_vec();
                 for channel in &channels {
                     if channel.target_node < self.nodes.len() {
                         channel.evaluate(t, &mut self.nodes);
@@ -392,11 +397,7 @@ impl AnimatedScene {
             }
             let mut node = node;
             node.parent = node.parent.and_then(|p| remap[p]);
-            node.children = node
-                .children
-                .into_iter()
-                .filter_map(|c| remap[c])
-                .collect();
+            node.children = node.children.into_iter().filter_map(|c| remap[c]).collect();
             survivors.push(node);
         }
         self.nodes = survivors;
@@ -418,9 +419,7 @@ impl AnimatedScene {
         for i in 0..self.nodes.len() {
             let local_mat = self.nodes[i].local_transform.model_matrix();
             let world_mat = match self.nodes[i].parent {
-                Some(p) if p < i => {
-                    self.nodes[p].world_transform.model_matrix() * local_mat
-                }
+                Some(p) if p < i => self.nodes[p].world_transform.model_matrix() * local_mat,
                 _ => local_mat,
             };
             let (scale, rotation, translation) = world_mat.to_scale_rotation_translation();

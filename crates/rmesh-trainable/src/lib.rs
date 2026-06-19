@@ -5,33 +5,45 @@
 //!   - Backward tiled compute dispatch
 //!   - Gradient buffer management
 
+#![allow(clippy::too_many_arguments)]
+
 use rmesh_util::shared;
-use wgpu;
 
 // Re-export shared uniform types for downstream crates.
 pub use shared::TileUniforms;
 
 // Re-export sort types (moved to rmesh-sort crate).
 pub use rmesh_sort::{
-    RadixSortPipelines, RadixSortState, SortBackend,
-    record_radix_sort, sorting_bits_for_tiles,
+    record_radix_sort, sorting_bits_for_tiles, RadixSortPipelines, RadixSortState, SortBackend,
 };
 
 // Re-export tile types (moved to rmesh-tile crate).
 pub use rmesh_tile::{
+    create_prepare_dispatch_bind_group, create_rts_bind_group, create_tile_fill_bind_group,
+    create_tile_gen_scan_bind_group, create_tile_ranges_bind_group,
+    create_tile_ranges_bind_group_with_keys, record_scan_tile_pipeline, ScanBuffers, ScanPipelines,
     TileBuffers, TilePipelines,
-    ScanPipelines, ScanBuffers,
-    create_tile_fill_bind_group, create_tile_ranges_bind_group,
-    create_tile_ranges_bind_group_with_keys,
-    create_prepare_dispatch_bind_group, create_rts_bind_group,
-    create_tile_gen_scan_bind_group,
-    record_scan_tile_pipeline,
 };
 
 // WGSL shader sources, embedded from crate-local files.
 const BACKWARD_TILED_WGSL: &str = include_str!("wgsl/backward_tiled_compute.wgsl");
 const BACKWARD_INTERVAL_TILED_WGSL: &str = include_str!("wgsl/backward_interval_tiled.wgsl");
 const INTERVAL_CHAIN_BACK_WGSL: &str = include_str!("wgsl/interval_chain_back.wgsl");
+
+// Forward (compute-based) tiled rasterizers — the forward half of the
+// trainable pipeline. Moved out of rmesh-render because they exist solely
+// to feed the backward kernel below.
+pub mod interval_tiled;
+pub mod rasterize;
+
+pub use interval_tiled::{
+    create_interval_generate_bind_group, create_interval_tiled_rasterize_bind_group,
+    record_interval_generate, record_interval_tiled_rasterize, IntervalGeneratePipeline,
+    IntervalTiledBuffers, IntervalTiledRasterizePipeline,
+};
+pub use rasterize::{
+    create_rasterize_bind_group, record_rasterize_compute, RasterizeComputePipeline,
+};
 
 /// Gradient buffers for scene geometry parameters.
 pub struct GradientBuffers {
@@ -54,7 +66,9 @@ fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu:
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -65,32 +79,17 @@ fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu:
 
 impl GradientBuffers {
     /// Allocate zero-initialized geometry gradient buffers.
-    pub fn new(
-        device: &wgpu::Device,
-        vertex_count: u32,
-        tet_count: u32,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, vertex_count: u32, tet_count: u32) -> Self {
         Self {
-            d_vertices: create_storage_buffer(
-                device,
-                "d_vertices",
-                (vertex_count as u64) * 3 * 4,
-            ),
-            d_densities: create_storage_buffer(
-                device,
-                "d_densities",
-                (tet_count as u64) * 4,
-            ),
+            d_vertices: create_storage_buffer(device, "d_vertices", (vertex_count as u64) * 3 * 4),
+            d_densities: create_storage_buffer(device, "d_densities", (tet_count as u64) * 4),
         }
     }
 }
 
 impl MaterialGradBuffers {
     /// Allocate zero-initialized material gradient buffers.
-    pub fn new(
-        device: &wgpu::Device,
-        tet_count: u32,
-    ) -> Self {
+    pub fn new(device: &wgpu::Device, tet_count: u32) -> Self {
         Self {
             d_base_colors: create_storage_buffer(
                 device,
@@ -125,54 +124,54 @@ impl BackwardTiledPipelines {
         });
 
         // Group 0: 9 read-only bindings
-        let bg_layout_0 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("backward_tiled_bgl_0"),
-                entries: &[
-                    storage_entry(0, true),  // uniforms
-                    storage_entry(1, true),  // dl_d_image
-                    storage_entry(2, true),  // rendered_image
-                    storage_entry(3, true),  // vertices
-                    storage_entry(4, true),  // indices
-                    storage_entry(5, true),  // densities
-                    storage_entry(6, true),  // color_grads
-                    storage_entry(7, true),  // colors_buf
-                    storage_entry(8, true),  // tile_sort_values
-                ],
-            });
+        let bg_layout_0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backward_tiled_bgl_0"),
+            entries: &[
+                storage_entry(0, true), // uniforms
+                storage_entry(1, true), // dl_d_image
+                storage_entry(2, true), // rendered_image
+                storage_entry(3, true), // vertices
+                storage_entry(4, true), // indices
+                storage_entry(5, true), // densities
+                storage_entry(6, true), // color_grads
+                storage_entry(7, true), // colors_buf
+                storage_entry(8, true), // tile_sort_values
+            ],
+        });
 
         // Group 1: 6 bindings (3 rw + 2 read + 1 rw)
-        let bg_layout_1 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("backward_tiled_bgl_1"),
-                entries: &[
-                    storage_entry(0, false), // d_vertices
-                    storage_entry(1, false), // d_densities
-                    storage_entry(2, false), // d_color_grads
-                    storage_entry(3, true),  // tile_ranges
-                    storage_entry(4, true),  // tile_uniforms
-                    storage_entry(5, false), // d_base_colors
-                ],
-            });
+        let bg_layout_1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("backward_tiled_bgl_1"),
+            entries: &[
+                storage_entry(0, false), // d_vertices
+                storage_entry(1, false), // d_densities
+                storage_entry(2, false), // d_color_grads
+                storage_entry(3, true),  // tile_ranges
+                storage_entry(4, true),  // tile_uniforms
+                storage_entry(5, false), // d_base_colors
+            ],
+        });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("backward_tiled_pl"),
-                bind_group_layouts: &[&bg_layout_0, &bg_layout_1],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("backward_tiled_pl"),
+            bind_group_layouts: &[&bg_layout_0, &bg_layout_1],
+            immediate_size: 0,
+        });
 
-        let pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("backward_tiled_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("backward_tiled_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
-        Self { pipeline, bg_layout_0, bg_layout_1 }
+        Self {
+            pipeline,
+            bg_layout_0,
+            bg_layout_1,
+        }
     }
 }
 
@@ -206,15 +205,42 @@ pub fn create_backward_tiled_bind_groups(
         label: Some("backward_tiled_bg_0"),
         layout: &pipelines.bg_layout_0,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: dl_d_image.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: rendered_image.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: vertices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: indices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: densities.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: color_grads.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: colors.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: tile_sort_values.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: dl_d_image.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: rendered_image.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: vertices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: indices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: densities.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: color_grads.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: colors.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: tile_sort_values.as_entire_binding(),
+            },
         ],
     });
 
@@ -222,12 +248,30 @@ pub fn create_backward_tiled_bind_groups(
         label: Some("backward_tiled_bg_1"),
         layout: &pipelines.bg_layout_1,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: d_vertices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: d_densities.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: d_color_grads.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: tile_ranges.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: tile_uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: d_base_colors.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: d_vertices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: d_densities.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: d_color_grads.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: tile_ranges.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: tile_uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: d_base_colors.as_entire_binding(),
+            },
         ],
     });
 
@@ -257,7 +301,7 @@ fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 }
 
 /// Shorthand for a full-buffer bind group entry.
-fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+pub(crate) fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -282,10 +326,20 @@ pub struct IntervalGradBuffers {
 }
 
 impl IntervalGradBuffers {
-    pub fn new(device: &wgpu::Device, max_visible: u32, vertex_count: u32, tet_count: u32, aux_dim: usize) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        max_visible: u32,
+        vertex_count: u32,
+        tet_count: u32,
+        aux_dim: usize,
+    ) -> Self {
         let m = max_visible as u64;
         let n = vertex_count as u64;
-        let aux_size = if aux_dim > 0 { (tet_count as u64) * (aux_dim as u64) * 4 } else { 4 };
+        let aux_size = if aux_dim > 0 {
+            (tet_count as u64) * (aux_dim as u64) * 4
+        } else {
+            4
+        };
         Self {
             d_interval_verts: create_storage_buffer(
                 device,
@@ -302,11 +356,7 @@ impl IntervalGradBuffers {
                 "d_vertex_normals",
                 n * 3 * 4, // N × 3 f32
             ),
-            d_aux_data: create_storage_buffer(
-                device,
-                "d_aux_data",
-                aux_size,
-            ),
+            d_aux_data: create_storage_buffer(device, "d_aux_data", aux_size),
         }
     }
 }
@@ -381,7 +431,12 @@ impl BackwardIntervalTiledPipeline {
             cache: None,
         });
 
-        Self { pipeline, bg_layout_0, bg_layout_1, aux_dim }
+        Self {
+            pipeline,
+            bg_layout_0,
+            bg_layout_1,
+            aux_dim,
+        }
     }
 }
 
@@ -462,7 +517,7 @@ pub fn record_backward_interval_tiled(
     pass.set_bind_group(1, bg1, &[]);
     let max_per_dim = 65535u32;
     let x = num_tiles.min(max_per_dim);
-    let y = (num_tiles + max_per_dim - 1) / max_per_dim;
+    let y = num_tiles.div_ceil(max_per_dim);
     pass.dispatch_workgroups(x, y, 1);
 }
 
@@ -488,16 +543,16 @@ impl IntervalChainBackPipeline {
         let bg_layout_0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("interval_chain_back_bgl_0"),
             entries: &[
-                storage_entry(0, true),  // uniforms
-                storage_entry(1, true),  // vertices
-                storage_entry(2, true),  // indices
-                storage_entry(3, true),  // color_grads
-                storage_entry(4, true),  // compact_tet_ids
-                storage_entry(5, true),  // indirect_args
-                storage_entry(6, true),  // interval_meta
-                storage_entry(7, true),  // d_interval_verts
-                storage_entry(8, true),  // d_interval_tet_data
-                storage_entry(9, true),  // vertex_normals
+                storage_entry(0, true), // uniforms
+                storage_entry(1, true), // vertices
+                storage_entry(2, true), // indices
+                storage_entry(3, true), // color_grads
+                storage_entry(4, true), // compact_tet_ids
+                storage_entry(5, true), // indirect_args
+                storage_entry(6, true), // interval_meta
+                storage_entry(7, true), // d_interval_verts
+                storage_entry(8, true), // d_interval_tet_data
+                storage_entry(9, true), // vertex_normals
             ],
         });
 
@@ -528,7 +583,11 @@ impl IntervalChainBackPipeline {
             cache: None,
         });
 
-        Self { pipeline, bg_layout_0, bg_layout_1 }
+        Self {
+            pipeline,
+            bg_layout_0,
+            bg_layout_1,
+        }
     }
 }
 
@@ -601,10 +660,9 @@ pub fn record_interval_chain_back(
     pass.set_pipeline(&pipeline.pipeline);
     pass.set_bind_group(0, bg0, &[]);
     pass.set_bind_group(1, bg1, &[]);
-    let workgroups = (tet_count + 63) / 64;
+    let workgroups = tet_count.div_ceil(64);
     let max_per_dim = 65535u32;
     let x = workgroups.min(max_per_dim);
-    let y = (workgroups + max_per_dim - 1) / max_per_dim;
+    let y = workgroups.div_ceil(max_per_dim);
     pass.dispatch_workgroups(x, y, 1);
 }
-

@@ -25,7 +25,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -35,7 +36,13 @@ fn image_loss(image: &[[f32; 4]]) -> f32 {
 }
 
 /// Render scene and return scalar loss.
-fn render_loss(scene: &SceneData, eye: Vec3, vp: glam::Mat4, c2w: glam::Mat3, intrinsics: [f32; 4]) -> f32 {
+fn render_loss(
+    scene: &SceneData,
+    eye: Vec3,
+    vp: glam::Mat4,
+    c2w: glam::Mat3,
+    intrinsics: [f32; 4],
+) -> f32 {
     let image = cpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H);
     image_loss(&image)
 }

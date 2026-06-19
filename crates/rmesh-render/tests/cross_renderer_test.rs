@@ -8,6 +8,8 @@
 //!
 //! Run: `cargo test -p rmesh-render --test cross_renderer_test -- --nocapture`
 
+#![allow(clippy::needless_range_loop, clippy::type_complexity)]
+
 mod common;
 
 use common::*;
@@ -24,7 +26,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -80,7 +83,10 @@ fn print_pixel_diffs(
         }
     }
     if count > max_print {
-        eprintln!("  ... and {} more pixels above threshold", count - max_print);
+        eprintln!(
+            "  ... and {} more pixels above threshold",
+            count - max_print
+        );
     }
 }
 
@@ -396,10 +402,30 @@ fn assert_all_renderers_match_cpu(
 
     // (name, gpu_image, mean_tolerance, max_tolerance)
     let renderers: Vec<(&str, Option<Vec<[f32; 4]>>, f32, f32)> = vec![
-        ("HW raster", gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.05, 0.01),
-        ("raytrace", gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
-        ("tiled", gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
-        ("interval", gpu_interval_render_scene(scene, eye, vp, c2w, intrinsics, W, H), 0.01, 0.002),
+        (
+            "HW raster",
+            gpu_render_scene(scene, eye, vp, c2w, intrinsics, W, H),
+            0.05,
+            0.01,
+        ),
+        (
+            "raytrace",
+            gpu_raytrace_scene(scene, eye, vp, c2w, intrinsics, W, H),
+            0.01,
+            0.002,
+        ),
+        (
+            "tiled",
+            gpu_tiled_render_scene(scene, eye, vp, c2w, intrinsics, W, H),
+            0.01,
+            0.002,
+        ),
+        (
+            "interval",
+            gpu_interval_render_scene(scene, eye, vp, c2w, intrinsics, W, H),
+            0.01,
+            0.002,
+        ),
     ];
 
     // Print all comparisons before asserting (so we see ALL renderer results
@@ -426,7 +452,11 @@ fn assert_all_renderers_match_cpu(
             eprintln!("{label}: Skipping {name} (no GPU)");
         }
     }
-    assert!(failures.is_empty(), "Renderer mismatches:\n{}", failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "Renderer mismatches:\n{}",
+        failures.join("\n")
+    );
 }
 
 // ===========================================================================
@@ -489,14 +519,14 @@ fn test_four_tet_all_renderers() {
     let s = 0.5f32;
     let vertices = vec![
         0.0, 0.0, 0.0, // v0: center
-        s, s, s,       // v1
-        -s, s, s,      // v2
-        -s, -s, s,     // v3
-        s, -s, s,      // v4
-        s, s, -s,      // v5
-        -s, s, -s,     // v6
-        -s, -s, -s,    // v7
-        s, -s, -s,     // v8
+        s, s, s, // v1
+        -s, s, s, // v2
+        -s, -s, s, // v3
+        s, -s, s, // v4
+        s, s, -s, // v5
+        -s, s, -s, // v6
+        -s, -s, -s, // v7
+        s, -s, -s, // v8
     ];
     let indices = vec![
         0, 1, 2, 3, // tet 0
@@ -534,8 +564,14 @@ fn test_four_tet_all_renderers() {
             if max_diff > 0.002 {
                 print_pixel_diffs("cpu", "tiled", &cpu, tiled, 0.002, 10);
             }
-            assert!(mean_diff < 0.01, "{label}: CPU vs tiled: mean_diff {mean_diff} >= 0.01");
-            assert!(max_diff < 0.002, "{label}: CPU vs tiled: max_diff {max_diff} >= 0.002");
+            assert!(
+                mean_diff < 0.01,
+                "{label}: CPU vs tiled: mean_diff {mean_diff} >= 0.01"
+            );
+            assert!(
+                max_diff < 0.002,
+                "{label}: CPU vs tiled: max_diff {max_diff} >= 0.002"
+            );
         }
 
         // Raytrace: relaxed (adjacency traversal can't reach isolated tets)
@@ -680,14 +716,14 @@ fn test_four_tet_cross_renderer() {
     let s = 0.5f32;
     let vertices = vec![
         0.0, 0.0, 0.0, // v0: center
-        s, s, s,       // v1
-        -s, s, s,      // v2
-        -s, -s, s,     // v3
-        s, -s, s,      // v4
-        s, s, -s,      // v5
-        -s, s, -s,     // v6
-        -s, -s, -s,    // v7
-        s, -s, -s,     // v8
+        s, s, s, // v1
+        -s, s, s, // v2
+        -s, -s, s, // v3
+        s, -s, s, // v4
+        s, s, -s, // v5
+        -s, s, -s, // v6
+        -s, -s, -s, // v7
+        s, -s, -s, // v8
     ];
     let indices = vec![
         0, 1, 2, 3, // tet 0
@@ -931,7 +967,8 @@ fn test_center_pixel_cross_renderer() {
             assert!(
                 diff < 0.01,
                 "Center pixel ch{ch}: CPU={:.6} tiled={:.6} diff={diff:.6}",
-                cpu_pixel[ch], tiled_pixel[ch]
+                cpu_pixel[ch],
+                tiled_pixel[ch]
             );
         }
     }
@@ -944,7 +981,8 @@ fn test_center_pixel_cross_renderer() {
             assert!(
                 diff < 0.01,
                 "Center pixel ch{ch}: CPU={:.6} raytrace={:.6} diff={diff:.6}",
-                cpu_pixel[ch], rt_pixel[ch]
+                cpu_pixel[ch],
+                rt_pixel[ch]
             );
         }
     }
@@ -958,7 +996,8 @@ fn test_center_pixel_cross_renderer() {
             assert!(
                 diff < 0.02,
                 "Center pixel ch{ch}: CPU={:.6} HW={:.6} diff={diff:.6}",
-                cpu_pixel[ch], hw_pixel[ch]
+                cpu_pixel[ch],
+                hw_pixel[ch]
             );
         }
     }
@@ -971,7 +1010,8 @@ fn test_center_pixel_cross_renderer() {
             assert!(
                 diff < 0.01,
                 "Center pixel ch{ch}: CPU={:.6} interval={:.6} diff={diff:.6}",
-                cpu_pixel[ch], iv_pixel[ch]
+                cpu_pixel[ch],
+                iv_pixel[ch]
             );
         }
     }
@@ -1007,17 +1047,9 @@ fn test_worst_pixel_divergence() {
 
         let px = worst_idx as u32 % W;
         let py = worst_idx as u32 / W;
-        eprintln!(
-            "Worst pixel divergence (CPU vs tiled): ({px},{py}) diff={worst_diff:.6}"
-        );
-        eprintln!(
-            "  CPU:   {:?}",
-            cpu[worst_idx]
-        );
-        eprintln!(
-            "  Tiled: {:?}",
-            tiled[worst_idx]
-        );
+        eprintln!("Worst pixel divergence (CPU vs tiled): ({px},{py}) diff={worst_diff:.6}");
+        eprintln!("  CPU:   {:?}", cpu[worst_idx]);
+        eprintln!("  Tiled: {:?}", tiled[worst_idx]);
 
         // Log overall stats
         let (max_diff, mean_diff, _) = compare_images(&cpu, &tiled);
@@ -1042,9 +1074,7 @@ fn test_worst_pixel_divergence() {
 
         let px = worst_idx as u32 % W;
         let py = worst_idx as u32 / W;
-        eprintln!(
-            "Worst pixel divergence (CPU vs interval): ({px},{py}) diff={worst_diff:.6}"
-        );
+        eprintln!("Worst pixel divergence (CPU vs interval): ({px},{py}) diff={worst_diff:.6}");
         eprintln!("  CPU:      {:?}", cpu[worst_idx]);
         eprintln!("  Interval: {:?}", interval[worst_idx]);
 
@@ -1064,15 +1094,17 @@ fn test_four_tet_diagnostic() {
     let mut rng = ChaCha8Rng::seed_from_u64(SEED);
     let s = 0.5f32;
     let vertices = vec![
-        0.0, 0.0, 0.0,
-        s, s, s, -s, s, s, -s, -s, s,
-        s, -s, s, s, s, -s, -s, s, -s,
-        -s, -s, -s, s, -s, -s,
+        0.0, 0.0, 0.0, s, s, s, -s, s, s, -s, -s, s, s, -s, s, s, s, -s, -s, s, -s, -s, -s, -s, s,
+        -s, -s,
     ];
-    let indices = vec![0,1,2,3, 0,1,4,5, 0,2,6,3, 0,5,8,7];
+    let indices = vec![0, 1, 2, 3, 0, 1, 4, 5, 0, 2, 6, 3, 0, 5, 8, 7];
     let tet_count = 4;
-    let densities: Vec<f32> = (0..tet_count).map(|_| rng.random::<f32>() * 3.0 + 0.5).collect();
-    let color_grads: Vec<f32> = (0..tet_count*3).map(|_| (rng.random::<f32>() - 0.5) * 0.1).collect();
+    let densities: Vec<f32> = (0..tet_count)
+        .map(|_| rng.random::<f32>() * 3.0 + 0.5)
+        .collect();
+    let color_grads: Vec<f32> = (0..tet_count * 3)
+        .map(|_| (rng.random::<f32>() - 0.5) * 0.1)
+        .collect();
     let scene = build_test_scene(vertices, indices, densities, color_grads);
 
     let eye = Vec3::new(3.0, 0.0, 0.0);
@@ -1092,13 +1124,22 @@ fn test_four_tet_diagnostic() {
             let ndc = clip.truncate() * inv_w;
             let px = (ndc.x + 1.0) * 0.5 * W as f32;
             let py = (1.0 - ndc.y) * 0.5 * H as f32;
-            eprintln!("  v{vi}: world={:.3?} clip_w={:.4} ndc=({:.4},{:.4}) pixel=({:.1},{:.1})",
-                v, clip.w, ndc.x, ndc.y, px, py);
+            eprintln!(
+                "  v{vi}: world={:.3?} clip_w={:.4} ndc=({:.4},{:.4}) pixel=({:.1},{:.1})",
+                v, clip.w, ndc.x, ndc.y, px, py
+            );
         }
     }
 
     // Check failing pixels: trace per-tet ray-tet intersection
-    let failing_pixels = [(29u32,34u32), (28,35), (26,37), (37,26), (36,27), (35,28)];
+    let failing_pixels = [
+        (29u32, 34u32),
+        (28, 35),
+        (26, 37),
+        (37, 26),
+        (36, 27),
+        (35, 28),
+    ];
     for (px, py) in &failing_pixels {
         let ray_dir = pixel_ray_dir(c2w, intrinsics, eye, *px as f32, *py as f32);
         eprintln!("\npixel ({px},{py}): ray_dir={:.6?}", ray_dir);
@@ -1106,34 +1147,45 @@ fn test_four_tet_diagnostic() {
         for tet in 0..tet_count {
             let verts = load_tet_verts(&scene, tet);
             let grad = Vec3::new(
-                scene.color_grads[tet*3], scene.color_grads[tet*3+1], scene.color_grads[tet*3+2],
+                scene.color_grads[tet * 3],
+                scene.color_grads[tet * 3 + 1],
+                scene.color_grads[tet * 3 + 2],
             );
-            let base_color = Vec3::splat(0.5) + Vec3::splat(grad.dot(eye - verts[0]));
+            let _base_color = Vec3::splat(0.5) + Vec3::splat(grad.dot(eye - verts[0]));
             let density = scene.densities[tet];
 
             // Ray-tet intersection (same as CPU renderer)
             let mut t_min = f32::NEG_INFINITY;
             let mut t_max = f32::INFINITY;
-            for (fi, face) in TET_FACES.iter().enumerate() {
+            for (_fi, face) in TET_FACES.iter().enumerate() {
                 let va = verts[face[0]];
                 let vb = verts[face[1]];
                 let vc = verts[face[2]];
                 let v_opp = verts[face[3]];
                 let mut n = (vc - va).cross(vb - va);
-                if n.dot(v_opp - va) < 0.0 { n = -n; }
+                if n.dot(v_opp - va) < 0.0 {
+                    n = -n;
+                }
                 let num = n.dot(va - eye);
                 let den = n.dot(ray_dir);
-                if den.abs() < 1e-20 { continue; }
+                if den.abs() < 1e-20 {
+                    continue;
+                }
                 let t = num / den;
-                if den > 0.0 { t_min = t_min.max(t); }
-                else { t_max = t_max.min(t); }
+                if den > 0.0 {
+                    t_min = t_min.max(t);
+                } else {
+                    t_max = t_max.min(t);
+                }
             }
             let dist = (t_max - t_min).max(0.0);
             let od = density * dist;
             let alpha = 1.0 - (-od).exp();
             if alpha > 1e-6 {
-                eprintln!("  tet {tet}: t_min={:.6}, t_max={:.6}, dist={:.6}, density={:.3}, alpha={:.6}",
-                    t_min, t_max, dist, density, alpha);
+                eprintln!(
+                    "  tet {tet}: t_min={:.6}, t_max={:.6}, dist={:.6}, density={:.3}, alpha={:.6}",
+                    t_min, t_max, dist, density, alpha
+                );
             }
         }
     }

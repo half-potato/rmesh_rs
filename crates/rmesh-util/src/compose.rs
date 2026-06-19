@@ -80,12 +80,9 @@ pub fn create_shader_module(
     .validate(&module)
     .map_err(|e| format!("Validation error in {label}: {e:?}"))?;
 
-    let wgsl_text = naga::back::wgsl::write_string(
-        &module,
-        &info,
-        naga::back::wgsl::WriterFlags::empty(),
-    )
-    .map_err(|e| format!("WGSL write error in {label}: {e:?}"))?;
+    let wgsl_text =
+        naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|e| format!("WGSL write error in {label}: {e:?}"))?;
 
     Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(label),
@@ -122,7 +119,11 @@ fn main() {
             shader_type: ShaderType::Wgsl,
             ..Default::default()
         });
-        assert!(module.is_ok(), "selective math import failed: {:?}", module.err());
+        assert!(
+            module.is_ok(),
+            "selective math import failed: {:?}",
+            module.err()
+        );
     }
 
     #[test]
@@ -147,6 +148,10 @@ fn main() {
             shader_type: ShaderType::Wgsl,
             ..Default::default()
         });
-        assert!(module.is_ok(), "selective intersect import failed: {:?}", module.err());
+        assert!(
+            module.is_ok(),
+            "selective intersect import failed: {:?}",
+            module.err()
+        );
     }
 }

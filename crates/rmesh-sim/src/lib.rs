@@ -88,7 +88,7 @@ impl Default for FluidParams {
 const WORKGROUP_SIZE: u32 = 256;
 
 fn dispatch_count(tet_count: u32) -> u32 {
-    (tet_count + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE
+    tet_count.div_ceil(WORKGROUP_SIZE)
 }
 
 fn storage_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
@@ -167,7 +167,7 @@ pub struct FluidSim {
     // Bind group layouts
     precompute_bgl_0: wgpu::BindGroupLayout,
     precompute_bgl_1: wgpu::BindGroupLayout,
-    sim_geo_bgl: wgpu::BindGroupLayout,      // shared geometry BGL for sim shaders
+    sim_geo_bgl: wgpu::BindGroupLayout, // shared geometry BGL for sim shaders
     advect_state_bgl: wgpu::BindGroupLayout,
     diffuse_state_bgl: wgpu::BindGroupLayout,
     forces_state_bgl: wgpu::BindGroupLayout,
@@ -217,9 +217,13 @@ impl std::fmt::Display for BufferStats {
         write!(
             f,
             "min={:.6} max={:.6} mean={:.6} nonzero={}/{} nan={} inf={}",
-            self.min, self.max, self.mean,
-            self.nonzero_count, self.count,
-            self.nan_count, self.inf_count,
+            self.min,
+            self.max,
+            self.mean,
+            self.nonzero_count,
+            self.count,
+            self.nan_count,
+            self.inf_count,
         )
     }
 }
@@ -243,8 +247,12 @@ fn compute_stats(data: &[f32]) -> BufferStats {
         if v != 0.0 {
             nonzero_count += 1;
         }
-        if v < min { min = v; }
-        if v > max { max = v; }
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
         sum += v as f64;
     }
     let count = data.len();
@@ -253,7 +261,15 @@ fn compute_stats(data: &[f32]) -> BufferStats {
     } else {
         0.0
     };
-    BufferStats { min, max, mean, nan_count, inf_count, nonzero_count, count }
+    BufferStats {
+        min,
+        max,
+        mean,
+        nan_count,
+        inf_count,
+        nonzero_count,
+        count,
+    }
 }
 
 /// Read back a GPU buffer as f32 values.
@@ -273,7 +289,9 @@ fn readback_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffe
 
     let slice = staging.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
-    slice.map_async(wgpu::MapMode::Read, move |result| { tx.send(result).unwrap(); });
+    slice.map_async(wgpu::MapMode::Read, move |result| {
+        tx.send(result).unwrap();
+    });
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx.recv().unwrap().unwrap();
 
@@ -361,11 +379,10 @@ impl FluidSim {
         });
 
         // Diffuse state BG1: velocity(ro), velocity_tmp(rw)
-        let diffuse_state_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("diffuse_state_bgl"),
-                entries: &[storage_entry(0, true), storage_entry(1, false)],
-            });
+        let diffuse_state_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("diffuse_state_bgl"),
+            entries: &[storage_entry(0, true), storage_entry(1, false)],
+        });
 
         // Forces state BG1: velocity(rw), density(rw)
         let forces_state_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -392,11 +409,10 @@ impl FluidSim {
             });
 
         // Project state BG1: velocity(rw), pressure(ro)
-        let project_state_bgl =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("project_state_bgl"),
-                entries: &[storage_entry(0, false), storage_entry(1, true)],
-            });
+        let project_state_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("project_state_bgl"),
+            entries: &[storage_entry(0, false), storage_entry(1, true)],
+        });
 
         // To-render BG0: uniforms(ro)
         let to_render_bgl_0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -581,8 +597,12 @@ impl FluidSim {
         let mut bbox_max = [f32::NEG_INFINITY; 3];
         for chunk in centers.chunks_exact(4) {
             for i in 0..3 {
-                if chunk[i] < bbox_min[i] { bbox_min[i] = chunk[i]; }
-                if chunk[i] > bbox_max[i] { bbox_max[i] = chunk[i]; }
+                if chunk[i] < bbox_min[i] {
+                    bbox_min[i] = chunk[i];
+                }
+                if chunk[i] > bbox_max[i] {
+                    bbox_max[i] = chunk[i];
+                }
             }
         }
         self.mesh_bbox_min = bbox_min;
@@ -611,7 +631,8 @@ impl FluidSim {
         let center = self.mesh_center();
         let extent = self.mesh_extent();
         // Place source at bottom-center (lower 25% in Y)
-        let source_y = self.mesh_bbox_min[1] + (self.mesh_bbox_max[1] - self.mesh_bbox_min[1]) * 0.25;
+        let source_y =
+            self.mesh_bbox_min[1] + (self.mesh_bbox_max[1] - self.mesh_bbox_min[1]) * 0.25;
         FluidParams {
             source_pos: [center[0], source_y, center[2]],
             source_radius: extent * 0.05, // 5% of mesh extent
@@ -633,8 +654,12 @@ impl FluidSim {
         let mut bbox_max = [f32::NEG_INFINITY; 3];
         for chunk in centers.chunks_exact(4) {
             for i in 0..3 {
-                if chunk[i] < bbox_min[i] { bbox_min[i] = chunk[i]; }
-                if chunk[i] > bbox_max[i] { bbox_max[i] = chunk[i]; }
+                if chunk[i] < bbox_min[i] {
+                    bbox_min[i] = chunk[i];
+                }
+                if chunk[i] > bbox_max[i] {
+                    bbox_max[i] = chunk[i];
+                }
             }
         }
         let bbox_center = [
@@ -649,13 +674,21 @@ impl FluidSim {
         ];
         log::info!(
             "[fluid]   tet_centers bbox: min=[{:.3},{:.3},{:.3}] max=[{:.3},{:.3},{:.3}]",
-            bbox_min[0], bbox_min[1], bbox_min[2],
-            bbox_max[0], bbox_max[1], bbox_max[2],
+            bbox_min[0],
+            bbox_min[1],
+            bbox_min[2],
+            bbox_max[0],
+            bbox_max[1],
+            bbox_max[2],
         );
         log::info!(
             "[fluid]   tet_centers bbox center=[{:.3},{:.3},{:.3}] size=[{:.3},{:.3},{:.3}]",
-            bbox_center[0], bbox_center[1], bbox_center[2],
-            bbox_size[0], bbox_size[1], bbox_size[2],
+            bbox_center[0],
+            bbox_center[1],
+            bbox_center[2],
+            bbox_size[0],
+            bbox_size[1],
+            bbox_size[2],
         );
         log::info!("[fluid]   tet_centers: {}", compute_stats(&centers));
 
@@ -666,7 +699,7 @@ impl FluidSim {
             let nx = chunk[0];
             let ny = chunk[1];
             let nz = chunk[2];
-            normals_mag.push((nx*nx + ny*ny + nz*nz).sqrt());
+            normals_mag.push((nx * nx + ny * ny + nz * nz).sqrt());
             coeffs.push(chunk[3]);
         }
         log::info!("[fluid]   face_geo |n*A|: {}", compute_stats(&normals_mag));
@@ -677,7 +710,8 @@ impl FluidSim {
         let total_faces = coeffs.len();
         log::info!(
             "[fluid]   boundary faces: {}/{} ({:.1}%)",
-            boundary_count, total_faces,
+            boundary_count,
+            total_faces,
             100.0 * boundary_count as f64 / total_faces as f64
         );
     }
@@ -685,6 +719,7 @@ impl FluidSim {
     /// Run one fluid simulation timestep.
     ///
     /// Writes results into the scene's `densities_buf` and `colors_buf` for rendering.
+    #[allow(clippy::too_many_arguments)]
     pub fn step(
         &mut self,
         device: &wgpu::Device,
@@ -708,25 +743,38 @@ impl FluidSim {
                     let dx = chunk[0] - sp[0];
                     let dy = chunk[1] - sp[1];
                     let dz = chunk[2] - sp[2];
-                    if (dx*dx + dy*dy + dz*dz).sqrt() < r {
+                    if (dx * dx + dy * dy + dz * dz).sqrt() < r {
                         overlap_count += 1;
                     }
                 }
                 log::info!(
                     "[fluid] Source overlap: {} tets within radius {} of [{},{},{}]",
-                    overlap_count, r, sp[0], sp[1], sp[2],
+                    overlap_count,
+                    r,
+                    sp[0],
+                    sp[1],
+                    sp[2],
                 );
             }
             log::info!(
                 "[fluid] step {} params: dt={} visc={} gravity=[{},{},{}] \
                  source_pos=[{},{},{}] r={} strength={} buoyancy={} density_scale={} \
                  diffuse_iters={} pressure_iters={}",
-                self.step_count, params.dt, params.viscosity,
-                params.gravity[0], params.gravity[1], params.gravity[2],
-                params.source_pos[0], params.source_pos[1], params.source_pos[2],
-                params.source_radius, params.source_strength,
-                params.buoyancy, params.density_scale,
-                params.diffuse_iterations, params.pressure_iterations,
+                self.step_count,
+                params.dt,
+                params.viscosity,
+                params.gravity[0],
+                params.gravity[1],
+                params.gravity[2],
+                params.source_pos[0],
+                params.source_pos[1],
+                params.source_pos[2],
+                params.source_radius,
+                params.source_strength,
+                params.buoyancy,
+                params.density_scale,
+                params.diffuse_iterations,
+                params.pressure_iterations,
             );
         }
 
@@ -969,10 +1017,7 @@ impl FluidSim {
             let bg2 = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("to_render_bg2"),
                 layout: &self.to_render_bgl_2,
-                entries: &[
-                    buf_entry(0, densities_buf),
-                    buf_entry(1, colors_buf),
-                ],
+                entries: &[buf_entry(0, densities_buf), buf_entry(1, colors_buf)],
             });
 
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1006,13 +1051,16 @@ impl FluidSim {
         let sim_divergence = readback_f32(device, queue, &self.divergence);
 
         log::info!("[fluid]   sim density:    {}", compute_stats(&sim_density));
-        log::info!("[fluid]   sim divergence: {}", compute_stats(&sim_divergence));
+        log::info!(
+            "[fluid]   sim divergence: {}",
+            compute_stats(&sim_divergence)
+        );
         log::info!("[fluid]   sim pressure:   {}", compute_stats(&sim_pressure));
 
         // Velocity: report magnitude stats
         let vel_mag: Vec<f32> = sim_velocity
             .chunks_exact(4)
-            .map(|c| (c[0]*c[0] + c[1]*c[1] + c[2]*c[2]).sqrt())
+            .map(|c| (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt())
             .collect();
         log::info!("[fluid]   sim |velocity|: {}", compute_stats(&vel_mag));
 

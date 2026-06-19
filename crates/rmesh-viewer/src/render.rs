@@ -1,11 +1,10 @@
 //! Per-frame rendering: GPU readback, egui UI, command encoding, submit/present.
 
-use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-use rmesh_render::{Uniforms, record_blit};
 use rmesh_compositor::record_primitive_pass;
 use rmesh_interact::{InteractContext, Primitive, PrimitiveKind};
+use rmesh_render::{record_blit, Uniforms};
 use rmesh_sim::FluidSim;
 
 use crate::gpu_state::*;
@@ -36,7 +35,8 @@ impl App {
         }
 
         // Tick flare physics
-        self.flare_system.tick(anim_dt, &mut self.primitives, &self.scene_data);
+        self.flare_system
+            .tick(anim_dt, &mut self.primitives, &self.scene_data);
 
         if self.gpu.is_none() {
             return;
@@ -71,8 +71,14 @@ impl App {
         let pos = self.camera.position.to_array();
         let fps = self.fps;
         let visible_count = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
-        let gpu_times = self.gpu.as_ref().map_or(GpuTimings::default(), |g| g.gpu_times_ms.clone());
-        let cpu_times = self.gpu.as_ref().map_or(CpuTimings::default(), |g| g.cpu_times_ms.clone());
+        let gpu_times = self
+            .gpu
+            .as_ref()
+            .map_or(GpuTimings::default(), |g| g.gpu_times_ms.clone());
+        let cpu_times = self
+            .gpu
+            .as_ref()
+            .map_or(CpuTimings::default(), |g| g.cpu_times_ms.clone());
 
         let gpu = self.gpu.as_mut().unwrap();
 
@@ -127,7 +133,8 @@ impl App {
             if gpu.instance_count_ready.load(Ordering::Acquire) {
                 let slice = gpu.instance_count_readback.slice(..);
                 let data = slice.get_mapped_range();
-                gpu.visible_instance_count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                gpu.visible_instance_count =
+                    u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
                 drop(data);
                 gpu.instance_count_readback.unmap();
                 gpu.instance_count_ready.store(false, Ordering::Release);
@@ -144,9 +151,11 @@ impl App {
             } else {
                 wgpu::PresentMode::Immediate
             };
-            log::info!("Reconfiguring surface: present_mode={:?} frame_latency={}",
+            log::info!(
+                "Reconfiguring surface: present_mode={:?} frame_latency={}",
                 gpu.surface_config.present_mode,
-                gpu.surface_config.desired_maximum_frame_latency);
+                gpu.surface_config.desired_maximum_frame_latency
+            );
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
         }
 
@@ -158,7 +167,11 @@ impl App {
                 return;
             }
             Err(e) => {
-                log::error!("Surface error: {:?} (waited {:.1}ms)", e, t_before_acquire.elapsed().as_secs_f64() * 1000.0);
+                log::error!(
+                    "Surface error: {:?} (waited {:.1}ms)",
+                    e,
+                    t_before_acquire.elapsed().as_secs_f64() * 1000.0
+                );
                 return;
             }
         };
@@ -242,21 +255,42 @@ impl App {
         let mut dsm_query_depth = self.dsm_query_depth;
         let mut load_glb = false;
         // Animation playback state (read from scene, written back after egui)
-        let mut anim_playing = self.animated_scene.as_ref().map_or(false, |s| s.playback.playing);
-        let mut anim_looping = self.animated_scene.as_ref().map_or(true, |s| s.playback.looping);
-        let mut anim_speed = self.animated_scene.as_ref().map_or(1.0, |s| s.playback.speed);
-        let mut anim_time = self.animated_scene.as_ref().map_or(0.0, |s| s.playback.time);
-        let anim_duration = self.animated_scene.as_ref().map_or(0.0, |s| s.current_duration());
-        let mut anim_clip_index = self.animated_scene.as_ref().and_then(|s| s.playback.clip_index);
+        let mut anim_playing = self
+            .animated_scene
+            .as_ref()
+            .is_some_and(|s| s.playback.playing);
+        let mut anim_looping = self
+            .animated_scene
+            .as_ref()
+            .is_none_or(|s| s.playback.looping);
+        let mut anim_speed = self
+            .animated_scene
+            .as_ref()
+            .map_or(1.0, |s| s.playback.speed);
+        let mut anim_time = self
+            .animated_scene
+            .as_ref()
+            .map_or(0.0, |s| s.playback.time);
+        let anim_duration = self
+            .animated_scene
+            .as_ref()
+            .map_or(0.0, |s| s.current_duration());
+        let mut anim_clip_index = self
+            .animated_scene
+            .as_ref()
+            .and_then(|s| s.playback.clip_index);
         let anim_clip_names: Vec<String> = self.animated_scene.as_ref().map_or(Vec::new(), |s| {
             s.clips.iter().map(|c| c.name.clone()).collect()
         });
         let anim_scene_name = self.animated_scene.as_ref().map(|s| s.name.clone());
-        let anim_nodes: Vec<(String, usize, bool, Option<usize>)> = self.animated_scene.as_ref().map_or(Vec::new(), |s| {
-            s.nodes.iter().enumerate().map(|(i, n)| {
-                (n.name.clone(), i, n.mesh_kind.is_some(), n.parent)
-            }).collect()
-        });
+        let anim_nodes: Vec<(String, usize, bool, Option<usize>)> =
+            self.animated_scene.as_ref().map_or(Vec::new(), |s| {
+                s.nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| (n.name.clone(), i, n.mesh_kind.is_some(), n.parent))
+                    .collect()
+            });
         let mut anim_goto_start = false;
         let mut anim_goto_end = false;
         let mut unload_scene = false;
@@ -422,11 +456,10 @@ impl App {
                     if ui.button("Shoot Flare (L)").clicked() {
                         shoot_flare = true;
                     }
-                    if flare_count > 0 {
-                        if ui.button(format!("Clear Flares ({})", flare_count)).clicked() {
+                    if flare_count > 0
+                        && ui.button(format!("Clear Flares ({})", flare_count)).clicked() {
                             clear_flares = true;
                         }
-                    }
                 });
                 ui.separator();
                 for (i, prim) in primitives_ref.iter().enumerate() {
@@ -652,7 +685,8 @@ impl App {
         // Upload collision debug mesh to GPU if dirty
         if self.flare_system.collision_mesh_dirty {
             if let Some(verts) = self.flare_system.collision_debug_vertices() {
-                gpu.primitive_geometry.set_collision_mesh(&gpu.device, &verts);
+                gpu.primitive_geometry
+                    .set_collision_mesh(&gpu.device, &verts);
             } else {
                 gpu.primitive_geometry.set_collision_mesh(&gpu.device, &[]);
             }
@@ -703,7 +737,7 @@ impl App {
                 match rmesh_anim::gltf_loader::load_gltf(&path) {
                     Ok(mut gltf_scene) => {
                         // Upload custom meshes: flare model meshes first, then scene meshes
-                        let flare_base = self.flare_system.flare_mesh_count;
+                        let _flare_base = self.flare_system.flare_mesh_count;
                         let scene_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
                             .meshes
                             .iter()
@@ -712,8 +746,16 @@ impl App {
                                     .map(|i| rmesh_compositor::PrimitiveVertex {
                                         position: m.vertices[i],
                                         normal: m.normals[i],
-                                        uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
-                                        tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
+                                        uv: if i < m.uvs.len() {
+                                            m.uvs[i]
+                                        } else {
+                                            [0.0, 0.0]
+                                        },
+                                        tangent: if i < m.tangents.len() {
+                                            m.tangents[i]
+                                        } else {
+                                            [1.0, 0.0, 0.0, 1.0]
+                                        },
                                     })
                                     .collect()
                             })
@@ -728,14 +770,27 @@ impl App {
                         if self.flare_system.has_flare_model {
                             // Reload flare model to get vertex data
                             let flare_path = std::path::PathBuf::from("assets/flare/scene.gltf");
-                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path) {
+                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path)
+                            {
                                 for m in &flare_gltf.meshes {
-                                    combined.push((0..m.vertices.len()).map(|i| rmesh_compositor::PrimitiveVertex {
-                                        position: m.vertices[i],
-                                        normal: m.normals[i],
-                                        uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
-                                        tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
-                                    }).collect());
+                                    combined.push(
+                                        (0..m.vertices.len())
+                                            .map(|i| rmesh_compositor::PrimitiveVertex {
+                                                position: m.vertices[i],
+                                                normal: m.normals[i],
+                                                uv: if i < m.uvs.len() {
+                                                    m.uvs[i]
+                                                } else {
+                                                    [0.0, 0.0]
+                                                },
+                                                tangent: if i < m.tangents.len() {
+                                                    m.tangents[i]
+                                                } else {
+                                                    [1.0, 0.0, 0.0, 1.0]
+                                                },
+                                            })
+                                            .collect(),
+                                    );
                                 }
                             }
                         }
@@ -758,7 +813,8 @@ impl App {
 
                         if self.flare_system.has_flare_model {
                             let flare_path = std::path::PathBuf::from("assets/flare/scene.gltf");
-                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path) {
+                            if let Ok(flare_gltf) = rmesh_anim::gltf_loader::load_gltf(&flare_path)
+                            {
                                 let flare_tex_offset = 0;
                                 for t in &flare_gltf.textures {
                                     tex_data.push(rmesh_compositor::TextureData {
@@ -774,10 +830,18 @@ impl App {
                                         metallic_factor: m.metallic_factor,
                                         occlusion_strength: m.occlusion_strength,
                                         normal_scale: m.normal_scale,
-                                        base_color_texture: m.base_color_texture.map(|i| i + flare_tex_offset),
-                                        metallic_roughness_texture: m.metallic_roughness_texture.map(|i| i + flare_tex_offset),
-                                        normal_texture: m.normal_texture.map(|i| i + flare_tex_offset),
-                                        occlusion_texture: m.occlusion_texture.map(|i| i + flare_tex_offset),
+                                        base_color_texture: m
+                                            .base_color_texture
+                                            .map(|i| i + flare_tex_offset),
+                                        metallic_roughness_texture: m
+                                            .metallic_roughness_texture
+                                            .map(|i| i + flare_tex_offset),
+                                        normal_texture: m
+                                            .normal_texture
+                                            .map(|i| i + flare_tex_offset),
+                                        occlusion_texture: m
+                                            .occlusion_texture
+                                            .map(|i| i + flare_tex_offset),
                                     });
                                 }
                             }
@@ -799,10 +863,16 @@ impl App {
                                 metallic_factor: m.metallic_factor,
                                 occlusion_strength: m.occlusion_strength,
                                 normal_scale: m.normal_scale,
-                                base_color_texture: m.base_color_texture.map(|i| i + scene_tex_offset),
-                                metallic_roughness_texture: m.metallic_roughness_texture.map(|i| i + scene_tex_offset),
+                                base_color_texture: m
+                                    .base_color_texture
+                                    .map(|i| i + scene_tex_offset),
+                                metallic_roughness_texture: m
+                                    .metallic_roughness_texture
+                                    .map(|i| i + scene_tex_offset),
                                 normal_texture: m.normal_texture.map(|i| i + scene_tex_offset),
-                                occlusion_texture: m.occlusion_texture.map(|i| i + scene_tex_offset),
+                                occlusion_texture: m
+                                    .occlusion_texture
+                                    .map(|i| i + scene_tex_offset),
                             });
                         }
                         // Offset scene node material indices
@@ -813,12 +883,8 @@ impl App {
                                 }
                             }
                         }
-                        gpu.material_registry.upload(
-                            &gpu.device,
-                            &gpu.queue,
-                            &tex_data,
-                            &mat_defs,
-                        );
+                        gpu.material_registry
+                            .upload(&gpu.device, &gpu.queue, &tex_data, &mat_defs);
 
                         let mesh_count = gltf_scene.meshes.len();
                         let node_count = gltf_scene.scene.nodes.len();
@@ -827,7 +893,11 @@ impl App {
                         let mat_count = gltf_scene.materials.len();
                         log::info!(
                             "Loaded glTF: {} meshes, {} nodes, {} clips, {} textures, {} materials",
-                            mesh_count, node_count, clip_count, tex_count, mat_count,
+                            mesh_count,
+                            node_count,
+                            clip_count,
+                            tex_count,
+                            mat_count,
                         );
                         self.animated_scene = Some(gltf_scene.scene);
                     }
@@ -840,7 +910,7 @@ impl App {
 
         // Handle shadow test scene
         if add_shadow_test_scene {
-            use rmesh_interact::{Transform, PrimitiveKind};
+            use rmesh_interact::PrimitiveKind;
             self.primitives.clear();
             self.interaction.set_selected(None);
 
@@ -881,7 +951,8 @@ impl App {
             self.next_primitive_id += 1;
             self.primitives.push(Primitive::new(kind, name));
             let idx = self.primitives.len() - 1;
-            self.interaction.set_selected(Some(rmesh_interact::Selection::Primitive(idx)));
+            self.interaction
+                .set_selected(Some(rmesh_interact::Selection::Primitive(idx)));
         } else if delete_selected {
             match self.interaction.selected() {
                 Some(rmesh_interact::Selection::Primitive(idx)) => {
@@ -911,7 +982,9 @@ impl App {
         gpu.egui_state
             .handle_platform_output(window, full_output.platform_output);
 
-        let paint_jobs = self.egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
         let screen_desc = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [w, h],
             pixels_per_point: full_output.pixels_per_point,
@@ -931,8 +1004,13 @@ impl App {
                 label: Some("forward pass"),
             });
 
-        gpu.egui_renderer
-            .update_buffers(&gpu.device, &gpu.queue, &mut encoder, &paint_jobs, &screen_desc);
+        gpu.egui_renderer.update_buffers(
+            &gpu.device,
+            &gpu.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_desc,
+        );
 
         // Fluid simulation step (if enabled)
         if self.fluid_enabled {
@@ -965,7 +1043,8 @@ impl App {
                         &gpu.buffers.indices,
                         &tet_neighbors_buf,
                     );
-                    gpu.queue.submit(std::iter::once(precompute_encoder.finish()));
+                    gpu.queue
+                        .submit(std::iter::once(precompute_encoder.finish()));
                 }
                 fluid_sim.compute_mesh_bbox(&gpu.device, &gpu.queue);
                 fluid_sim.log_precompute_stats(&gpu.device, &gpu.queue);
@@ -1010,11 +1089,11 @@ impl App {
                         &gpu.buffers.densities,
                         &gpu.material_buffers.base_colors,
                     );
-                    encoder = gpu.device.create_command_encoder(
-                        &wgpu::CommandEncoderDescriptor {
+                    encoder = gpu
+                        .device
+                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                             label: Some("forward pass (post-fluid)"),
-                        },
-                    );
+                        });
                 }
             }
         }
@@ -1026,38 +1105,39 @@ impl App {
             // For primitives we patch in place and restore after the pass.
             // For scene nodes we patch world_transform; it gets overwritten by the next
             // animated_scene.update() call, so no explicit restore is needed.
-            let preview_restore: Option<(usize, rmesh_interact::Transform)> = if self.show_primitives {
-                let ctx = InteractContext {
-                    view_matrix: view_mat,
-                    proj_matrix: proj_mat,
-                    viewport_width: w as f32,
-                    viewport_height: h as f32,
-                };
-                if let Some(preview) = self.interaction.preview_transform(&ctx) {
-                    match self.interaction.selected() {
-                        Some(rmesh_interact::Selection::Primitive(idx))
-                            if idx < self.primitives.len() =>
-                        {
-                            let original = self.primitives[idx].transform;
-                            self.primitives[idx].transform = preview;
-                            Some((idx, original))
-                        }
-                        Some(rmesh_interact::Selection::Node(idx)) => {
-                            if let Some(ref mut scene) = self.animated_scene {
-                                if idx < scene.nodes.len() {
-                                    scene.nodes[idx].world_transform = preview;
-                                }
+            let preview_restore: Option<(usize, rmesh_interact::Transform)> =
+                if self.show_primitives {
+                    let ctx = InteractContext {
+                        view_matrix: view_mat,
+                        proj_matrix: proj_mat,
+                        viewport_width: w as f32,
+                        viewport_height: h as f32,
+                    };
+                    if let Some(preview) = self.interaction.preview_transform(&ctx) {
+                        match self.interaction.selected() {
+                            Some(rmesh_interact::Selection::Primitive(idx))
+                                if idx < self.primitives.len() =>
+                            {
+                                let original = self.primitives[idx].transform;
+                                self.primitives[idx].transform = preview;
+                                Some((idx, original))
                             }
-                            None
+                            Some(rmesh_interact::Selection::Node(idx)) => {
+                                if let Some(ref mut scene) = self.animated_scene {
+                                    if idx < scene.nodes.len() {
+                                        scene.nodes[idx].world_transform = preview;
+                                    }
+                                }
+                                None
+                            }
+                            _ => None,
                         }
-                        _ => None,
+                    } else {
+                        None
                     }
                 } else {
                     None
-                }
-            } else {
-                None
-            };
+                };
 
             let mrt_views = if self.deferred_enabled && gpu.has_pbr_data {
                 Some(rmesh_compositor::MrtViews {
@@ -1118,7 +1198,8 @@ impl App {
         // 2. Sorted forward pass: compute → radix sort → render
         //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        let skip_volume = !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 13);
+        let skip_volume =
+            !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 13);
         if skip_volume && mrt_enabled {
             // Clear MRT targets when volume is skipped to avoid ghosting
             let clear_ops = wgpu::Operations {
@@ -1128,241 +1209,287 @@ impl App {
             let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mrt_clear"),
                 color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.color_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
-                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.aux0_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
-                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.normals_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
-                    Some(wgpu::RenderPassColorAttachment { view: &gpu.targets.depth_view, resolve_target: None, ops: clear_ops, depth_slice: None }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gpu.targets.color_view,
+                        resolve_target: None,
+                        ops: clear_ops,
+                        depth_slice: None,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gpu.targets.aux0_view,
+                        resolve_target: None,
+                        ops: clear_ops,
+                        depth_slice: None,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gpu.targets.normals_view,
+                        resolve_target: None,
+                        ops: clear_ops,
+                        depth_slice: None,
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &gpu.targets.depth_view,
+                        resolve_target: None,
+                        ops: clear_ops,
+                        depth_slice: None,
+                    }),
                 ],
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
         }
-        if !skip_volume { match self.render_mode {
-            RenderMode::IntervalShader => {
-                match self.sort_mode {
-                    SortMode::Cpu => {
-                        // Single-encoder CPU-sort dispatch. wgpu schedules
-                        // pipeline barriers between project_compute (writes
-                        // sort_values), the StagingBelt copy (overwrites it),
-                        // and interval_gen (reads it) so the encoded order is
-                        // the executed order.
-                        let visible_count = gpu.cpu_sorter.cull_and_sort(
-                            &self.scene_data.vertices,
-                            &self.scene_data.indices,
-                            &self.scene_data.circumdata,
-                            self.camera.position,
-                            vp,
-                        );
-                        rmesh_render::record_compute_interval_project(
-                            &mut encoder,
-                            &gpu.pipelines,
-                            &gpu.sort_state,
-                            &gpu.buffers,
-                            &gpu.compute_bg,
-                            Some(&gpu.hw_compute_bg),
-                            gpu.tet_count,
-                            &gpu.queue,
-                            Some(&gpu.ts_query_set),
-                            false, // use_16bit_sort always false on Cpu path
-                        );
-                        if visible_count > 0 {
-                            let size = (visible_count * 4) as wgpu::BufferAddress;
-                            let mut view = gpu.staging_belt.write_buffer(
-                                &mut encoder,
-                                &gpu.buffers.sort_values,
-                                0,
-                                wgpu::BufferSize::new(size).unwrap(),
+        if !skip_volume {
+            match self.render_mode {
+                RenderMode::IntervalShader => {
+                    match self.sort_mode {
+                        SortMode::Cpu => {
+                            // Single-encoder CPU-sort dispatch. wgpu schedules
+                            // pipeline barriers between project_compute (writes
+                            // sort_values), the StagingBelt copy (overwrites it),
+                            // and interval_gen (reads it) so the encoded order is
+                            // the executed order.
+                            let visible_count = gpu.cpu_sorter.cull_and_sort(
+                                &self.scene_data.vertices,
+                                &self.scene_data.indices,
+                                &self.scene_data.circumdata,
+                                self.camera.position,
+                                vp,
                             );
-                            view.copy_from_slice(bytemuck::cast_slice(
-                                &gpu.cpu_sorter.sorted_indices[..visible_count],
-                            ));
-                        }
-                        {
-                            let mut view = gpu.staging_belt.write_buffer(
+                            rmesh_render::record_compute_interval_project(
                                 &mut encoder,
-                                &gpu.buffers.indirect_args,
-                                4,
-                                wgpu::BufferSize::new(4).unwrap(),
+                                &gpu.pipelines,
+                                &gpu.sort_state,
+                                &gpu.buffers,
+                                &gpu.compute_bg,
+                                Some(&gpu.hw_compute_bg),
+                                gpu.tet_count,
+                                &gpu.queue,
+                                Some(&gpu.ts_query_set),
+                                false, // use_16bit_sort always false on Cpu path
                             );
-                            view.copy_from_slice(bytemuck::bytes_of(
-                                &(visible_count as u32),
-                            ));
+                            if visible_count > 0 {
+                                let size = (visible_count * 4) as wgpu::BufferAddress;
+                                let mut view = gpu.staging_belt.write_buffer(
+                                    &mut encoder,
+                                    &gpu.buffers.sort_values,
+                                    0,
+                                    wgpu::BufferSize::new(size).unwrap(),
+                                );
+                                view.copy_from_slice(bytemuck::cast_slice(
+                                    &gpu.cpu_sorter.sorted_indices[..visible_count],
+                                ));
+                            }
+                            {
+                                let mut view = gpu.staging_belt.write_buffer(
+                                    &mut encoder,
+                                    &gpu.buffers.indirect_args,
+                                    4,
+                                    wgpu::BufferSize::new(4).unwrap(),
+                                );
+                                view.copy_from_slice(bytemuck::bytes_of(&(visible_count as u32)));
+                            }
+                            rmesh_render::record_compute_interval_after_sort(
+                                &mut encoder,
+                                &gpu.compute_interval_pipelines,
+                                &gpu.buffers,
+                                &gpu.targets,
+                                &gpu.compute_interval_gen_bg_a,
+                                &gpu.compute_interval_render_bg,
+                                &gpu.compute_interval_convert_bg,
+                                &gpu.primitive_targets.depth_view,
+                                Some(&gpu.ts_query_set),
+                                mrt_enabled,
+                            );
                         }
-                        rmesh_render::record_compute_interval_after_sort(
-                            &mut encoder,
-                            &gpu.compute_interval_pipelines,
-                            &gpu.buffers,
-                            &gpu.targets,
-                            &gpu.compute_interval_gen_bg_a,
-                            &gpu.compute_interval_render_bg,
-                            &gpu.compute_interval_convert_bg,
-                            &gpu.primitive_targets.depth_view,
-                            Some(&gpu.ts_query_set),
-                            mrt_enabled,
-                        );
-                    }
-                    _ => {
-                        let use_16bit = matches!(self.sort_mode, SortMode::Gpu16);
-                        let (sort_st, gen_a, gen_b) = if use_16bit {
-                            (&gpu.sort_state_16bit, &gpu.compute_interval_gen_bg_a_16bit, &gpu.compute_interval_gen_bg_b_16bit)
-                        } else {
-                            (&gpu.sort_state, &gpu.compute_interval_gen_bg_a, &gpu.compute_interval_gen_bg_b)
-                        };
-                        rmesh_render::record_sorted_compute_interval_forward_pass(
-                            &mut encoder,
-                            &gpu.device,
-                            &gpu.pipelines,
-                            &gpu.compute_interval_pipelines,
-                            &gpu.sort_pipelines,
-                            sort_st,
-                            &gpu.buffers,
-                            &gpu.targets,
-                            &gpu.compute_bg,
-                            gen_a,
-                            gen_b,
-                            &gpu.compute_interval_render_bg,
-                            &gpu.compute_interval_convert_bg,
-                            gpu.tet_count,
-                            &gpu.queue,
-                            &gpu.primitive_targets.depth_view,
-                            Some(&gpu.hw_compute_bg),
-                            Some(&gpu.ts_query_set),
-                            use_16bit,
-                            mrt_enabled,
-                        );
+                        _ => {
+                            let use_16bit = matches!(self.sort_mode, SortMode::Gpu16);
+                            let (sort_st, gen_a, gen_b) = if use_16bit {
+                                (
+                                    &gpu.sort_state_16bit,
+                                    &gpu.compute_interval_gen_bg_a_16bit,
+                                    &gpu.compute_interval_gen_bg_b_16bit,
+                                )
+                            } else {
+                                (
+                                    &gpu.sort_state,
+                                    &gpu.compute_interval_gen_bg_a,
+                                    &gpu.compute_interval_gen_bg_b,
+                                )
+                            };
+                            rmesh_render::record_sorted_compute_interval_forward_pass(
+                                &mut encoder,
+                                &gpu.device,
+                                &gpu.pipelines,
+                                &gpu.compute_interval_pipelines,
+                                &gpu.sort_pipelines,
+                                sort_st,
+                                &gpu.buffers,
+                                &gpu.targets,
+                                &gpu.compute_bg,
+                                gen_a,
+                                gen_b,
+                                &gpu.compute_interval_render_bg,
+                                &gpu.compute_interval_convert_bg,
+                                gpu.tet_count,
+                                &gpu.queue,
+                                &gpu.primitive_targets.depth_view,
+                                Some(&gpu.hw_compute_bg),
+                                Some(&gpu.ts_query_set),
+                                use_16bit,
+                                mrt_enabled,
+                            );
+                        }
                     }
                 }
-            }
-            RenderMode::MeshShader
-                if gpu.mesh_pipelines.is_some()
-                    && gpu.mesh_render_bg_a.is_some() =>
-            {
-                rmesh_render::record_sorted_mesh_forward_pass(
-                    &mut encoder,
-                    &gpu.device,
-                    &gpu.pipelines,
-                    gpu.mesh_pipelines.as_ref().unwrap(),
-                    &gpu.sort_pipelines,
-                    &gpu.sort_state,
-                    &gpu.buffers,
-                    &gpu.targets,
-                    &gpu.compute_bg,
-                    gpu.mesh_render_bg_a.as_ref().unwrap(),
-                    gpu.mesh_render_bg_b.as_ref().unwrap(),
-                    gpu.indirect_convert_bg.as_ref().unwrap(),
-                    gpu.tet_count,
-                    &gpu.queue,
-                    &gpu.primitive_targets.depth_view,
-                    Some(&gpu.hw_compute_bg),
-                    Some(&gpu.ts_query_set),
-                    mrt_enabled,
-                );
-            }
-            RenderMode::RayTrace => {
-                // Update start_tet for current camera position
-                let t_locate = std::time::Instant::now();
-                let hint = if self.rt_start_tet_hint >= 0 { self.rt_start_tet_hint as usize } else { 0 };
-                let new_start = rmesh_render::find_containing_tet_walk(
-                    &self.scene_data.vertices,
-                    &self.scene_data.indices,
-                    &self.rt_neighbors_cpu,
-                    self.scene_data.tet_count as usize,
-                    self.camera.position,
-                    hint,
-                ).map(|t| t as i32).unwrap_or(-1);
-                let locate_ms = t_locate.elapsed().as_secs_f32() * 1000.0;
-                let alpha = 0.1f32;
-                self.rt_locate_ms = self.rt_locate_ms * (1.0 - alpha) + locate_ms * alpha;
-                self.rt_start_tet_hint = new_start;
-                gpu.queue.write_buffer(&gpu.rt_buffers.start_tet, 0, bytemuck::cast_slice(&[new_start]));
-
-                // Forward compute (SH eval + color computation)
+                RenderMode::MeshShader
+                    if gpu.mesh_pipelines.is_some() && gpu.mesh_render_bg_a.is_some() =>
                 {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("rt_project_compute"),
-                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                            query_set: &gpu.ts_query_set,
-                            beginning_of_pass_write_index: Some(0),
-                            end_of_pass_write_index: Some(1),
-                        }),
-                    });
-                    cpass.set_pipeline(&gpu.pipelines.compute_pipeline);
-                    cpass.set_bind_group(0, &gpu.compute_bg.bg0, &[]);
-                    cpass.set_bind_group(1, &gpu.compute_bg.bg1, &[]);
-                    let n_pow2 = gpu.tet_count.next_power_of_two();
-                    let wgs = (n_pow2 + 63) / 64;
-                    cpass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+                    rmesh_render::record_sorted_mesh_forward_pass(
+                        &mut encoder,
+                        &gpu.device,
+                        &gpu.pipelines,
+                        gpu.mesh_pipelines.as_ref().unwrap(),
+                        &gpu.sort_pipelines,
+                        &gpu.sort_state,
+                        &gpu.buffers,
+                        &gpu.targets,
+                        &gpu.compute_bg,
+                        gpu.mesh_render_bg_a.as_ref().unwrap(),
+                        gpu.mesh_render_bg_b.as_ref().unwrap(),
+                        gpu.indirect_convert_bg.as_ref().unwrap(),
+                        gpu.tet_count,
+                        &gpu.queue,
+                        &gpu.primitive_targets.depth_view,
+                        Some(&gpu.hw_compute_bg),
+                        Some(&gpu.ts_query_set),
+                        mrt_enabled,
+                    );
                 }
+                RenderMode::RayTrace => {
+                    // Update start_tet for current camera position
+                    let t_locate = std::time::Instant::now();
+                    let hint = if self.rt_start_tet_hint >= 0 {
+                        self.rt_start_tet_hint as usize
+                    } else {
+                        0
+                    };
+                    let new_start = rmesh_render::find_containing_tet_walk(
+                        &self.scene_data.vertices,
+                        &self.scene_data.indices,
+                        &self.rt_neighbors_cpu,
+                        self.scene_data.tet_count as usize,
+                        self.camera.position,
+                        hint,
+                    )
+                    .map(|t| t as i32)
+                    .unwrap_or(-1);
+                    let locate_ms = t_locate.elapsed().as_secs_f32() * 1000.0;
+                    let alpha = 0.1f32;
+                    self.rt_locate_ms = self.rt_locate_ms * (1.0 - alpha) + locate_ms * alpha;
+                    self.rt_start_tet_hint = new_start;
+                    gpu.queue.write_buffer(
+                        &gpu.rt_buffers.start_tet,
+                        0,
+                        bytemuck::cast_slice(&[new_start]),
+                    );
 
-                // Clear raytrace output
-                encoder.clear_buffer(&gpu.rt_pipeline.rendered_image, 0, None);
+                    // Forward compute (SH eval + color computation)
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("rt_project_compute"),
+                            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                                query_set: &gpu.ts_query_set,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }),
+                        });
+                        cpass.set_pipeline(&gpu.pipelines.compute_pipeline);
+                        cpass.set_bind_group(0, &gpu.compute_bg.bg0, &[]);
+                        cpass.set_bind_group(1, &gpu.compute_bg.bg1, &[]);
+                        let n_pow2 = gpu.tet_count.next_power_of_two();
+                        let wgs = n_pow2.div_ceil(64);
+                        cpass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535).max(1), 1);
+                    }
 
-                // Ray trace compute pass (timestamped)
-                {
-                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("raytrace"),
-                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                            query_set: &gpu.ts_query_set,
-                            beginning_of_pass_write_index: Some(4),
-                            end_of_pass_write_index: Some(5),
-                        }),
-                    });
-                    cpass.set_pipeline(gpu.rt_pipeline.pipeline());
-                    cpass.set_bind_group(0, &gpu.rt_bg, &[]);
-                    cpass.set_bind_group(1, &gpu.rt_pipeline.aux_bind_group, &[]);
-                    cpass.dispatch_workgroups((w + 7) / 8, (h + 7) / 8, 1);
-                }
+                    // Clear raytrace output
+                    encoder.clear_buffer(&gpu.rt_pipeline.rendered_image, 0, None);
 
-                // Copy raytrace buffer → Rgba32Float texture for blitting
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: &gpu.rt_pipeline.rendered_image,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(w * 16), // 4 channels * 4 bytes/f32
-                            rows_per_image: Some(h),
+                    // Ray trace compute pass (timestamped)
+                    {
+                        let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("raytrace"),
+                            timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                                query_set: &gpu.ts_query_set,
+                                beginning_of_pass_write_index: Some(4),
+                                end_of_pass_write_index: Some(5),
+                            }),
+                        });
+                        cpass.set_pipeline(gpu.rt_pipeline.pipeline());
+                        cpass.set_bind_group(0, &gpu.rt_bg, &[]);
+                        cpass.set_bind_group(1, &gpu.rt_pipeline.aux_bind_group, &[]);
+                        cpass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
+                    }
+
+                    // Copy raytrace buffer → Rgba32Float texture for blitting
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &gpu.rt_pipeline.rendered_image,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(w * 16), // 4 channels * 4 bytes/f32
+                                rows_per_image: Some(h),
+                            },
                         },
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.rt_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                );
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &gpu.rt_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: w,
+                            height: h,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                _ => {
+                    rmesh_render::record_sorted_forward_pass(
+                        &mut encoder,
+                        &gpu.device,
+                        &gpu.pipelines,
+                        &gpu.sort_pipelines,
+                        &gpu.sort_state,
+                        &gpu.buffers,
+                        &gpu.targets,
+                        &gpu.compute_bg,
+                        &gpu.render_bg,
+                        &gpu.render_bg_b,
+                        gpu.tet_count,
+                        &gpu.queue,
+                        &gpu.primitive_targets.depth_view,
+                        Some(&gpu.hw_compute_bg),
+                        matches!(self.render_mode, RenderMode::Quad),
+                        Some(&gpu.prepass_bg_a),
+                        Some(&gpu.prepass_bg_b),
+                        Some(&gpu.quad_render_bg),
+                        Some(&gpu.ts_query_set),
+                        mrt_enabled,
+                    );
+                }
             }
-            _ => {
-                rmesh_render::record_sorted_forward_pass(
-                    &mut encoder,
-                    &gpu.device,
-                    &gpu.pipelines,
-                    &gpu.sort_pipelines,
-                    &gpu.sort_state,
-                    &gpu.buffers,
-                    &gpu.targets,
-                    &gpu.compute_bg,
-                    &gpu.render_bg,
-                    &gpu.render_bg_b,
-                    gpu.tet_count,
-                    &gpu.queue,
-                    &gpu.primitive_targets.depth_view,
-                    Some(&gpu.hw_compute_bg),
-                    matches!(self.render_mode, RenderMode::Quad),
-                    Some(&gpu.prepass_bg_a),
-                    Some(&gpu.prepass_bg_b),
-                    Some(&gpu.quad_render_bg),
-                    Some(&gpu.ts_query_set),
-                    mrt_enabled,
-                );
-            }
-        } } // end skip_volume
+        } // end skip_volume
 
         // Copy instance_count to readback — skip if buffer has a pending/completed map
-        if !gpu.instance_count_mapped.load(std::sync::atomic::Ordering::Acquire) {
+        if !gpu
+            .instance_count_mapped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             encoder.copy_buffer_to_buffer(
-                &gpu.buffers.indirect_args, 4,
-                &gpu.instance_count_readback, 0,
+                &gpu.buffers.indirect_args,
+                4,
+                &gpu.instance_count_readback,
+                0,
                 4,
             );
         }
@@ -1375,20 +1502,25 @@ impl App {
             // otherwise wgpu fails validation ("StagingBelt staging buffer is still mapped").
             gpu.staging_belt.finish();
             gpu.queue.submit(std::iter::once(encoder.finish()));
-            encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("deferred+blit"),
-            });
+            encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("deferred+blit"),
+                });
         }
 
         // 3. Deferred shading pass (if enabled + PBR data present)
         if use_deferred {
-            if let (Some(ref deferred), Some(ref bg), Some(ref out_view)) =
-                (&gpu.deferred_pipeline, &gpu.deferred_bg, &gpu.deferred_output_view)
-            {
+            if let (Some(ref deferred), Some(ref bg), Some(ref out_view)) = (
+                &gpu.deferred_pipeline,
+                &gpu.deferred_bg,
+                &gpu.deferred_output_view,
+            ) {
                 // Collect lights from PointLight/SpotLight primitives and flare CustomMesh primitives
                 let mut gpu_lights = [rmesh_render::GpuLight::default(); rmesh_render::MAX_LIGHTS];
                 let mut num_lights = 0u32;
-                let is_flare_light = |p: &Primitive| p.name.starts_with("Flare.") && p.name.ends_with(".0");
+                let is_flare_light =
+                    |p: &Primitive| p.name.starts_with("Flare.") && p.name.ends_with(".0");
                 for prim in &self.primitives {
                     if (num_lights as usize) >= rmesh_render::MAX_LIGHTS {
                         break;
@@ -1403,21 +1535,21 @@ impl App {
                             color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
                             intensity: prim.color.map_or(1.0, |c| c[3]),
                             direction: [0.0, 0.0, -1.0],
-                            inner_angle: 0.0,
-                            outer_angle: 0.0,
+                            inner_cos: 1.0,
+                            outer_cos: 1.0,
                             _pad: [0.0; 3],
                         };
                         num_lights += 1;
                     } else if matches!(prim.kind, PrimitiveKind::SpotLight) {
-                        let forward = prim.transform.rotation * glam::Vec3::NEG_Z;
+                        let forward = (prim.transform.rotation * glam::Vec3::NEG_Z).normalize();
                         gpu_lights[num_lights as usize] = rmesh_render::GpuLight {
                             position: prim.transform.position.to_array(),
                             light_type: 1, // spot
                             color: prim.color.map_or([1.0, 1.0, 1.0], |c| [c[0], c[1], c[2]]),
                             intensity: prim.color.map_or(1.0, |c| c[3]),
                             direction: forward.to_array(),
-                            inner_angle: 20.0_f32.to_radians(),
-                            outer_angle: 35.0_f32.to_radians(),
+                            inner_cos: 20.0_f32.to_radians().cos(),
+                            outer_cos: 35.0_f32.to_radians().cos(),
                             _pad: [0.0; 3],
                         };
                         num_lights += 1;
@@ -1442,27 +1574,35 @@ impl App {
                         let dsm_primitives: Vec<_> = if self.show_primitives {
                             let flare_base = self.flare_system.flare_mesh_base;
                             let flare_end = flare_base + self.flare_system.flare_mesh_count;
-                            self.primitives.iter().filter(|p| {
-                                match p.kind {
+                            self.primitives
+                                .iter()
+                                .filter(|p| match p.kind {
                                     PrimitiveKind::PointLight | PrimitiveKind::SpotLight => false,
-                                    PrimitiveKind::CustomMesh(idx) => idx < flare_base || idx >= flare_end,
+                                    PrimitiveKind::CustomMesh(idx) => {
+                                        idx < flare_base || idx >= flare_end
+                                    }
                                     _ => true,
-                                }
-                            }).cloned().collect()
+                                })
+                                .cloned()
+                                .collect()
                         } else {
                             Vec::new()
                         };
 
-                        log::debug!("DSM: {} primitives for shadow generation", dsm_primitives.len());
+                        log::debug!(
+                            "DSM: {} primitives for shadow generation",
+                            dsm_primitives.len()
+                        );
                         // Reallocate DsmAtlas if light count or types changed
-                        let need_realloc = gpu.dsm_atlas.as_ref().map_or(true, |atlas| {
-                            atlas.num_lights != scene_light_count
-                        });
+                        let need_realloc = gpu
+                            .dsm_atlas
+                            .as_ref()
+                            .is_none_or(|atlas| atlas.num_lights != scene_light_count);
                         if need_realloc {
-                            let light_types: Vec<u32> = scene_lights.iter().map(|l| l.light_type).collect();
-                            gpu.dsm_atlas = Some(rmesh_dsm::DsmAtlas::new(
-                                &gpu.device, 1024, &light_types,
-                            ));
+                            let light_types: Vec<u32> =
+                                scene_lights.iter().map(|l| l.light_type).collect();
+                            gpu.dsm_atlas =
+                                Some(rmesh_dsm::DsmAtlas::new(&gpu.device, 1024, &light_types));
                         }
 
                         // Compute scene-adaptive near/far for DSM
@@ -1477,7 +1617,11 @@ impl App {
                                 for li in 0..scene_light_count as usize {
                                     let lp = glam::Vec3::from(scene_lights[li].position);
                                     for vi in (0..verts.len() / 3).step_by(stride) {
-                                        let v = glam::Vec3::new(verts[vi*3], verts[vi*3+1], verts[vi*3+2]);
+                                        let v = glam::Vec3::new(
+                                            verts[vi * 3],
+                                            verts[vi * 3 + 1],
+                                            verts[vi * 3 + 2],
+                                        );
                                         max_dist = max_dist.max((v - lp).length());
                                     }
                                 }
@@ -1496,15 +1640,14 @@ impl App {
                                 &gpu.queue,
                                 &gpu.dsm_pipeline,
                                 &gpu.dsm_prim_pipeline,
+                                &gpu.dsm_project_pipeline,
                                 &gpu.primitive_geometry,
                                 &dsm_primitives,
-                                &gpu.pipelines,
                                 &gpu.compute_interval_pipelines,
                                 &gpu.sort_pipelines,
                                 &gpu.sort_state,
                                 &gpu.buffers,
                                 &gpu.material_buffers,
-                                &gpu.sh_coeffs_buf,
                                 scene_lights,
                                 scene_light_count,
                                 gpu.tet_count,
@@ -1512,22 +1655,27 @@ impl App {
                                 dsm_far,
                                 self.show_scene,
                             );
-                            atlas.populate_metadata(
-                                &gpu.queue, scene_lights,
-                                dsm_near, dsm_far,
-                            );
+                            atlas.populate_metadata(&gpu.queue, scene_lights, dsm_near, dsm_far);
 
                             // Create DSM bind group from atlas
-                            gpu.deferred_dsm_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
-                                &gpu.device, deferred,
-                                &atlas.cubemap_views[0], &atlas.meta_buf,
-                            ));
+                            gpu.deferred_dsm_bg =
+                                Some(rmesh_render::create_deferred_dsm_bind_group(
+                                    &gpu.device,
+                                    deferred,
+                                    &atlas.cubemap_views[0],
+                                    &atlas.meta_buf,
+                                ));
                         }
                     }
 
                     // Wait for DSM GPU work to complete before continuing
                     // (prevents shared buffer conflicts with the forward pass)
-                    gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok();
+                    gpu.device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: None,
+                            timeout: None,
+                        })
+                        .ok();
 
                     // Update cached state
                     self.cached_dsm_lights = scene_lights.to_vec();
@@ -1535,10 +1683,8 @@ impl App {
                 }
 
                 // Upload lights
-                gpu.queue.write_buffer(
-                    &deferred.light_buf, 0,
-                    bytemuck::cast_slice(&gpu_lights),
-                );
+                gpu.queue
+                    .write_buffer(&deferred.light_buf, 0, bytemuck::cast_slice(&gpu_lights));
 
                 // Upload deferred uniforms — DSM only for scene lights
                 let dsm_enabled = if gpu.dsm_atlas.is_some() { 1u32 } else { 0u32 };
@@ -1554,13 +1700,13 @@ impl App {
                     far_plane: self.camera.far_z,
                     dsm_enabled,
                     exposure: self.exposure,
-                    sky_color: self.sky_color,
                     ao_strength: self.ao_strength,
-                    ground_color: self.ground_color,
                     ssgi_strength: self.ssgi_strength,
+                    _pad: [0.0; 2],
                 };
                 gpu.queue.write_buffer(
-                    &deferred.uniforms_buf, 0,
+                    &deferred.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&deferred_uniforms),
                 );
 
@@ -1580,7 +1726,8 @@ impl App {
                     max_mip: gpu.hiz_texture.mip_count - 1,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.gtao_pipeline.uniforms_buf, 0,
+                    &gpu.gtao_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&gtao_uniforms),
                 );
 
@@ -1592,17 +1739,24 @@ impl App {
                     _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.hiz_pipelines.uniforms_buf, 0,
+                    &gpu.hiz_pipelines.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&hiz_uniforms),
                 );
                 rmesh_render::record_hiz_pass(
-                    &mut encoder, &gpu.hiz_pipelines, &gpu.hiz_texture,
-                    &gpu.hiz_linearize_bg, &gpu.hiz_downsample_bgs,
+                    &mut encoder,
+                    &gpu.hiz_pipelines,
+                    &gpu.hiz_texture,
+                    &gpu.hiz_linearize_bg,
+                    &gpu.hiz_downsample_bgs,
                 );
 
                 // GTAO pass: Hi-Z + normals + volume depth → AO texture
                 rmesh_render::record_gtao_pass(
-                    &mut encoder, &gpu.gtao_pipeline, &gpu.gtao_bg, &gpu.targets.ao_view,
+                    &mut encoder,
+                    &gpu.gtao_pipeline,
+                    &gpu.gtao_bg,
+                    &gpu.targets.ao_view,
                 );
 
                 // Per-frame matrices for the temporal pass: current inv_vp +
@@ -1615,47 +1769,62 @@ impl App {
                 let ao_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w, height: h,
+                    width: w,
+                    height: h,
                     near: self.camera.near_z,
                     far: self.camera.far_z,
                     max_mip: gpu.hiz_texture.mip_count - 1,
                     alpha: self.ao_temporal_alpha,
-                    _pad0: 0.0, _pad1: 0.0,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ao_temporal_pipeline.uniforms_buf, 0,
+                    &gpu.ao_temporal_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&ao_temporal_uniforms),
                 );
                 rmesh_render::record_temporal_pass(
-                    &mut encoder, &gpu.ao_temporal_pipeline, &gpu.ao_temporal_bg,
+                    &mut encoder,
+                    &gpu.ao_temporal_pipeline,
+                    &gpu.ao_temporal_bg,
                     &gpu.targets.ao_temporal_view,
                 );
 
                 // Bilateral AO blur — H reads ao_temporal_view, V writes ao_view.
                 let blur_h = rmesh_render::AoBlurUniforms {
-                    dir_x: 1, dir_y: 0,
+                    dir_x: 1,
+                    dir_y: 0,
                     sigma_z: self.gtao_radius * 0.25,
                     sigma_n: 8.0,
                 };
                 let blur_v = rmesh_render::AoBlurUniforms {
-                    dir_x: 0, dir_y: 1,
+                    dir_x: 0,
+                    dir_y: 1,
                     sigma_z: self.gtao_radius * 0.25,
                     sigma_n: 8.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ao_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&blur_h),
+                    &gpu.ao_blur_pipeline.uniforms_h,
+                    0,
+                    bytemuck::bytes_of(&blur_h),
                 );
                 gpu.queue.write_buffer(
-                    &gpu.ao_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&blur_v),
+                    &gpu.ao_blur_pipeline.uniforms_v,
+                    0,
+                    bytemuck::bytes_of(&blur_v),
                 );
                 // H: ao_temporal_view → ao_blur_temp_view
                 rmesh_render::record_ao_blur_pass(
-                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_h,
+                    &mut encoder,
+                    &gpu.ao_blur_pipeline,
+                    &gpu.ao_blur_bg_h,
                     &gpu.targets.ao_blur_temp_view,
                 );
                 // V: ao_blur_temp_view → ao_view (final, deferred reads this)
                 rmesh_render::record_ao_blur_pass(
-                    &mut encoder, &gpu.ao_blur_pipeline, &gpu.ao_blur_bg_v,
+                    &mut encoder,
+                    &gpu.ao_blur_pipeline,
+                    &gpu.ao_blur_bg_v,
                     &gpu.targets.ao_view,
                 );
 
@@ -1673,7 +1842,11 @@ impl App {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
 
                 // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
@@ -1700,11 +1873,14 @@ impl App {
                     _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ssgi_pipeline.uniforms_buf, 0,
+                    &gpu.ssgi_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&ssgi_uniforms),
                 );
                 rmesh_render::record_ssgi_pass(
-                    &mut encoder, &gpu.ssgi_pipeline, &gpu.ssgi_bg,
+                    &mut encoder,
+                    &gpu.ssgi_pipeline,
+                    &gpu.ssgi_bg,
                     &gpu.targets.ssgi_view,
                 );
 
@@ -1712,46 +1888,61 @@ impl App {
                 let ssgi_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w, height: h,
+                    width: w,
+                    height: h,
                     near: self.camera.near_z,
                     far: self.camera.far_z,
                     max_mip: gpu.hiz_texture.mip_count - 1,
                     alpha: self.ssgi_temporal_alpha,
-                    _pad0: 0.0, _pad1: 0.0,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ssgi_temporal_pipeline.uniforms_buf, 0,
+                    &gpu.ssgi_temporal_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&ssgi_temporal_uniforms),
                 );
                 rmesh_render::record_temporal_pass(
-                    &mut encoder, &gpu.ssgi_temporal_pipeline, &gpu.ssgi_temporal_bg,
+                    &mut encoder,
+                    &gpu.ssgi_temporal_pipeline,
+                    &gpu.ssgi_temporal_bg,
                     &gpu.targets.ssgi_temporal_view,
                 );
 
                 let ssgi_blur_h = rmesh_render::SsgiBlurUniforms {
-                    dir_x: 1, dir_y: 0,
+                    dir_x: 1,
+                    dir_y: 0,
                     sigma_z: self.ssgi_radius * 0.5,
                     sigma_n: 8.0,
                 };
                 let ssgi_blur_v = rmesh_render::SsgiBlurUniforms {
-                    dir_x: 0, dir_y: 1,
+                    dir_x: 0,
+                    dir_y: 1,
                     sigma_z: self.ssgi_radius * 0.5,
                     sigma_n: 8.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ssgi_blur_pipeline.uniforms_h, 0, bytemuck::bytes_of(&ssgi_blur_h),
+                    &gpu.ssgi_blur_pipeline.uniforms_h,
+                    0,
+                    bytemuck::bytes_of(&ssgi_blur_h),
                 );
                 gpu.queue.write_buffer(
-                    &gpu.ssgi_blur_pipeline.uniforms_v, 0, bytemuck::bytes_of(&ssgi_blur_v),
+                    &gpu.ssgi_blur_pipeline.uniforms_v,
+                    0,
+                    bytemuck::bytes_of(&ssgi_blur_v),
                 );
                 // H: ssgi_temporal_view → ssgi_blur_temp_view
                 rmesh_render::record_ssgi_blur_pass(
-                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_h,
+                    &mut encoder,
+                    &gpu.ssgi_blur_pipeline,
+                    &gpu.ssgi_blur_bg_h,
                     &gpu.targets.ssgi_blur_temp_view,
                 );
                 // V: ssgi_blur_temp_view → ssgi_view (deferred reads this)
                 rmesh_render::record_ssgi_blur_pass(
-                    &mut encoder, &gpu.ssgi_blur_pipeline, &gpu.ssgi_blur_bg_v,
+                    &mut encoder,
+                    &gpu.ssgi_blur_pipeline,
+                    &gpu.ssgi_blur_bg_v,
                     &gpu.targets.ssgi_view,
                 );
 
@@ -1769,7 +1960,11 @@ impl App {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
 
                 // -------- SSR (specular reflections) --------
@@ -1795,11 +1990,14 @@ impl App {
                     _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ssr_pipeline.uniforms_buf, 0,
+                    &gpu.ssr_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&ssr_uniforms),
                 );
                 rmesh_render::record_ssr_pass(
-                    &mut encoder, &gpu.ssr_pipeline, &gpu.ssr_bg,
+                    &mut encoder,
+                    &gpu.ssr_pipeline,
+                    &gpu.ssr_bg,
                     &gpu.targets.ssr_view,
                 );
 
@@ -1807,19 +2005,24 @@ impl App {
                 let ssr_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w, height: h,
+                    width: w,
+                    height: h,
                     near: self.camera.near_z,
                     far: self.camera.far_z,
                     max_mip: gpu.hiz_texture.mip_count - 1,
                     alpha: self.ssr_temporal_alpha,
-                    _pad0: 0.0, _pad1: 0.0,
+                    _pad0: 0.0,
+                    _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(
-                    &gpu.ssr_temporal_pipeline.uniforms_buf, 0,
+                    &gpu.ssr_temporal_pipeline.uniforms_buf,
+                    0,
                     bytemuck::bytes_of(&ssr_temporal_uniforms),
                 );
                 rmesh_render::record_temporal_pass(
-                    &mut encoder, &gpu.ssr_temporal_pipeline, &gpu.ssr_temporal_bg,
+                    &mut encoder,
+                    &gpu.ssr_temporal_pipeline,
+                    &gpu.ssr_temporal_bg,
                     &gpu.targets.ssr_temporal_view,
                 );
 
@@ -1837,7 +2040,11 @@ impl App {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
 
                 // Copy ssr_view → ssr_history for next frame's temporal pass.
@@ -1854,7 +2061,11 @@ impl App {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
 
                 // Record deferred shade pass — writes display to deferred_output
@@ -1864,11 +2075,17 @@ impl App {
                 // visualization. We render to lit_current rather than lit_history
                 // because lit_history is sampled in the same pass (binding 9 for
                 // DBG_LIT_HISTORY) and wgpu disallows that combination.
-                let dsm_bg = gpu.deferred_dsm_bg.as_ref()
+                let dsm_bg = gpu
+                    .deferred_dsm_bg
+                    .as_ref()
                     .or(gpu.deferred_dsm_dummy_bg.as_ref())
                     .unwrap();
                 rmesh_render::record_deferred_shade(
-                    &mut encoder, deferred, bg, dsm_bg, out_view,
+                    &mut encoder,
+                    deferred,
+                    bg,
+                    dsm_bg,
+                    out_view,
                     &gpu.targets.lit_current_view,
                 );
 
@@ -1886,7 +2103,11 @@ impl App {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
                 );
             }
         }
@@ -1901,7 +2122,11 @@ impl App {
                 &gpu.primitive_geometry,
                 &gpu.dsm_moments_view,
                 &gpu.dsm_depth_view,
-                if self.show_primitives { &self.primitives } else { &[] },
+                if self.show_primitives {
+                    &self.primitives
+                } else {
+                    &[]
+                },
                 &vp,
                 self.camera.near_z,
                 self.camera.far_z,
@@ -1942,7 +2167,10 @@ impl App {
         // 4. Blit to swapchain — from raytrace output, DSM debug, deferred output, or color_view
         if self.render_mode == RenderMode::RayTrace {
             rmesh_render::record_blit_nf(
-                &mut encoder, &gpu.rt_blit_pipeline, &gpu.rt_blit_bg, &view,
+                &mut encoder,
+                &gpu.rt_blit_pipeline,
+                &gpu.rt_blit_bg,
+                &view,
             );
         } else if use_dsm_debug {
             record_blit(&mut encoder, &gpu.blit_pipeline, &gpu.dsm_blit_bg, &view);
@@ -1957,41 +2185,42 @@ impl App {
 
         // egui render pass (overlay on swapchain)
         {
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None,
-                ..Default::default()
-            }).forget_lifetime();
-            gpu.egui_renderer.render(&mut rpass, &paint_jobs, &screen_desc);
+            let mut rpass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                })
+                .forget_lifetime();
+            gpu.egui_renderer
+                .render(&mut rpass, &paint_jobs, &screen_desc);
         }
 
         // Resolve GPU timestamps and copy to readback buffer (skip if target still mapped/pending)
         let cur_rb = gpu.ts_frame % 2;
-        let ts_buf_free = !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
+        let ts_buf_free =
+            !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
         if ts_buf_free {
             // Only resolve slots that are actually written this frame. Slots 6..8 are
             // SH-eval timestamps and are NOT written when sh_degree == 0 (no SH compute
             // pass runs). Resolving never-written queries is undefined behavior on Vulkan
             // and wedges the NVIDIA Linux driver.
             let written_count: u32 = if gpu.sh_degree > 0 { TS_QUERY_COUNT } else { 6 };
-            encoder.resolve_query_set(
-                &gpu.ts_query_set,
-                0..written_count,
+            encoder.resolve_query_set(&gpu.ts_query_set, 0..written_count, &gpu.ts_resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(
                 &gpu.ts_resolve_buf,
                 0,
-            );
-            encoder.copy_buffer_to_buffer(
-                &gpu.ts_resolve_buf, 0,
-                &gpu.ts_readback[cur_rb], 0,
+                &gpu.ts_readback[cur_rb],
+                0,
                 (written_count as u64) * 8,
             );
         }
@@ -2023,7 +2252,10 @@ impl App {
 
         // Async map instance count readback (will be ready next frame)
         // Only map if we actually copied data (i.e., buffer wasn't already mapped)
-        if !gpu.instance_count_mapped.load(std::sync::atomic::Ordering::Acquire) {
+        if !gpu
+            .instance_count_mapped
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             use std::sync::atomic::Ordering;
             gpu.instance_count_mapped.store(true, Ordering::Release);
             let ready = gpu.instance_count_ready.clone();
@@ -2050,13 +2282,34 @@ impl App {
         let mix = |old: f32, new: f32| old * (1.0 - alpha) + new * alpha;
         let prev = &gpu.cpu_times_ms;
         gpu.cpu_times_ms = CpuTimings {
-            poll_readback_ms: mix(prev.poll_readback_ms, (t_after_poll - t_frame_start).as_secs_f32() * 1000.0),
-            acquire_ms: mix(prev.acquire_ms, (t_after_acquire - t_before_acquire).as_secs_f32() * 1000.0),
-            egui_ms: mix(prev.egui_ms, (t_after_egui - t_before_egui).as_secs_f32() * 1000.0),
-            encode_ms: mix(prev.encode_ms, (t_before_submit - t_after_egui).as_secs_f32() * 1000.0),
-            submit_ms: mix(prev.submit_ms, (t_after_submit - t_before_submit).as_secs_f32() * 1000.0),
-            present_ms: mix(prev.present_ms, (t_after_present - t_before_present).as_secs_f32() * 1000.0),
-            total_ms: mix(prev.total_ms, (t_after_present - t_frame_start).as_secs_f32() * 1000.0),
+            poll_readback_ms: mix(
+                prev.poll_readback_ms,
+                (t_after_poll - t_frame_start).as_secs_f32() * 1000.0,
+            ),
+            acquire_ms: mix(
+                prev.acquire_ms,
+                (t_after_acquire - t_before_acquire).as_secs_f32() * 1000.0,
+            ),
+            egui_ms: mix(
+                prev.egui_ms,
+                (t_after_egui - t_before_egui).as_secs_f32() * 1000.0,
+            ),
+            encode_ms: mix(
+                prev.encode_ms,
+                (t_before_submit - t_after_egui).as_secs_f32() * 1000.0,
+            ),
+            submit_ms: mix(
+                prev.submit_ms,
+                (t_after_submit - t_before_submit).as_secs_f32() * 1000.0,
+            ),
+            present_ms: mix(
+                prev.present_ms,
+                (t_after_present - t_before_present).as_secs_f32() * 1000.0,
+            ),
+            total_ms: mix(
+                prev.total_ms,
+                (t_after_present - t_frame_start).as_secs_f32() * 1000.0,
+            ),
         };
 
         // Handle deferred file load

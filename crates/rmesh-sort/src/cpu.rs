@@ -67,12 +67,12 @@ impl CpuSorter {
         let r2 = vp.row(2);
         let r3 = vp.row(3);
         let raw = [
-            r3 + r0,  // left
-            r3 - r0,  // right
-            r3 + r1,  // bottom
-            r3 - r1,  // top
-            r2,        // near
-            r3 - r2,  // far
+            r3 + r0, // left
+            r3 - r0, // right
+            r3 + r1, // bottom
+            r3 - r1, // top
+            r2,      // near
+            r3 - r2, // far
         ];
         // Normalize so `dot(plane.xyz, p) + plane.w` is Euclidean distance.
         let mut planes = [Vec4::ZERO; 6];
@@ -83,11 +83,7 @@ impl CpuSorter {
 
         for tet in 0..tet_count {
             let base = tet * 4;
-            let center = Vec3::new(
-                circumdata[base],
-                circumdata[base + 1],
-                circumdata[base + 2],
-            );
+            let center = Vec3::new(circumdata[base], circumdata[base + 1], circumdata[base + 2]);
             // circumdata[base + 3] is radius² (see rmesh-data
             // compute_circumspheres_parallel). Take sqrt for the plane test.
             let radius = circumdata[base + 3].sqrt();
@@ -112,11 +108,7 @@ impl CpuSorter {
             // Bit-cast to u32, then bitwise NOT so radix sort ascending
             // produces back-to-front order (farthest = smallest key).
             let i0 = indices[base] as usize;
-            let v0 = Vec3::new(
-                vertices[i0 * 3],
-                vertices[i0 * 3 + 1],
-                vertices[i0 * 3 + 2],
-            );
+            let v0 = Vec3::new(vertices[i0 * 3], vertices[i0 * 3 + 1], vertices[i0 * 3 + 2]);
             let depth = (cam_pos - v0)
                 .dot(cam_pos + v0 - 2.0 * center)
                 .clamp(-1e20, 1e20);

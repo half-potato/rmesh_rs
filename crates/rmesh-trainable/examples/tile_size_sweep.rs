@@ -5,15 +5,13 @@
 //! Shared memory arrays are patched only for tile sizes > 16.
 //!
 //! Usage:
-//!   cargo run -p rmesh-backward --release --example tile_size_sweep
+//!   cargo run -p rmesh-trainable --release --example tile_size_sweep
 
 use glam::{Mat4, Vec3};
+use rmesh_train::{create_loss_bind_group, LossBuffers, LossPipeline};
 use rmesh_util::camera::{look_at, perspective_matrix};
 use rmesh_util::shared::{LossUniforms, TileUniforms};
-use rmesh_util::test_util::{
-    create_timestamp_device, grid_tet_scene, TimestampRecorder,
-};
-use rmesh_train::{create_loss_bind_group, LossBuffers, LossPipeline};
+use rmesh_util::test_util::{create_timestamp_device, grid_tet_scene, TimestampRecorder};
 
 const W: u32 = 1920;
 const H: u32 = 1080;
@@ -24,9 +22,12 @@ const BENCH_ITERS: u32 = 5;
 const TILE_SIZES: &[u32] = &[8, 12, 16, 20, 24, 32];
 
 // Shader sources — project_compute reads tile_size from uniforms at runtime.
-const PROJECT_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/project_compute.wgsl");
-const RASTERIZE_COMPUTE_SRC: &str = include_str!("../../../crates/rmesh-render/src/wgsl/rasterize_compute.wgsl");
-const BWD_TILED_SRC: &str = include_str!("../../../crates/rmesh-backward/src/wgsl/backward_tiled_compute.wgsl");
+const PROJECT_COMPUTE_SRC: &str =
+    include_str!("../../../crates/rmesh-render/src/wgsl/project_compute.wgsl");
+const RASTERIZE_COMPUTE_SRC: &str =
+    include_str!("../../../crates/rmesh-trainable/src/wgsl/rasterize_compute.wgsl");
+const BWD_TILED_SRC: &str =
+    include_str!("../../../crates/rmesh-trainable/src/wgsl/backward_tiled_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // Shader patching
@@ -86,10 +87,10 @@ fn create_compute_pipeline(
 /// Build the forward compute pipeline layout (13 bindings, matching ForwardPipelines).
 fn fwd_compute_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
     let read_only = [
-        true, true, true, true, true, true,   // 0-5 read-only
-        false, false, false, false,            // 6-9 read-write
-        false, false,                          // 10-11 read-write
-        true,                                  // 12 read-only (base_colors)
+        true, true, true, true, true, true, // 0-5 read-only
+        false, false, false, false, // 6-9 read-write
+        false, false, // 10-11 read-write
+        true,  // 12 read-only (base_colors)
     ];
     let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
         .iter()
@@ -118,7 +119,13 @@ fn fwd_compute_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Pi
 }
 
 /// Build the forward tiled pipeline layout (10 bindings group 0, 2 bindings group 1 for aux).
-fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+fn rasterize_layout(
+    device: &wgpu::Device,
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+    wgpu::PipelineLayout,
+) {
     let read_only = [true, true, true, true, true, true, true, true, true, false];
     let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
         .iter()
@@ -148,7 +155,11 @@ fn rasterize_layout(device: &wgpu::Device) -> (wgpu::BindGroupLayout, wgpu::Bind
 /// Build the backward tiled pipeline layout (2 groups: 9 + 6 bindings).
 fn bwd_tiled_layout(
     device: &wgpu::Device,
-) -> (wgpu::BindGroupLayout, wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::BindGroupLayout,
+    wgpu::PipelineLayout,
+) {
     let bgl0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("bwd_tiled_bgl_0"),
         entries: &(0..9)
@@ -185,8 +196,8 @@ struct TileSizeState {
     rasterize_pipeline: wgpu::ComputePipeline,
     bwd_tiled_pipeline: wgpu::ComputePipeline,
     // Tile infrastructure
-    tile_buffers: rmesh_backward::TileBuffers,
-    radix_state: rmesh_backward::RadixSortState,
+    tile_buffers: rmesh_trainable::TileBuffers,
+    radix_state: rmesh_trainable::RadixSortState,
     // Bind groups
     fwd_compute_bg: wgpu::BindGroup,
     tile_fill_bg: wgpu::BindGroup,
@@ -215,15 +226,15 @@ struct SharedState {
     scene_buffers: rmesh_render::SceneBuffers,
     material_buffers: rmesh_render::MaterialBuffers,
     // Scan pipelines (tile-size-independent)
-    scan_pipelines: rmesh_backward::ScanPipelines,
-    scan_buffers: rmesh_backward::ScanBuffers,
-    tile_pipelines: rmesh_backward::TilePipelines,
-    radix_pipelines: rmesh_backward::RadixSortPipelines,
+    scan_pipelines: rmesh_trainable::ScanPipelines,
+    scan_buffers: rmesh_trainable::ScanBuffers,
+    tile_pipelines: rmesh_trainable::TilePipelines,
+    radix_pipelines: rmesh_trainable::RadixSortPipelines,
     prepare_dispatch_bg: wgpu::BindGroup,
     rts_bg: wgpu::BindGroup,
     // Gradient buffers
-    grad_buffers: rmesh_backward::GradientBuffers,
-    mat_grad_buffers: rmesh_backward::MaterialGradBuffers,
+    grad_buffers: rmesh_trainable::GradientBuffers,
+    mat_grad_buffers: rmesh_trainable::MaterialGradBuffers,
     // Loss
     loss_pipeline: LossPipeline,
     loss_buffers: LossBuffers,
@@ -251,23 +262,36 @@ fn create_shared_state() -> Option<SharedState> {
     );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, eye, W as f32, H as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 1000.0,
+        vp,
+        c2w,
+        intrinsics,
+        eye,
+        W as f32,
+        H as f32,
+        scene.tet_count,
+        0u32,
+        12,
+        0.0,
+        0,
+        0.01,
+        1000.0,
     );
     queue.write_buffer(&scene_buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Scan pipelines (shared across tile sizes)
-    let scan_pipelines = rmesh_backward::ScanPipelines::new(&device);
-    let scan_buffers = rmesh_backward::ScanBuffers::new(&device, scene.tet_count);
-    let tile_pipelines = rmesh_backward::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_backward::RadixSortPipelines::new(&device, 2, rmesh_backward::SortBackend::Drs);
+    let scan_pipelines = rmesh_trainable::ScanPipelines::new(&device);
+    let scan_buffers = rmesh_trainable::ScanBuffers::new(&device, scene.tet_count);
+    let tile_pipelines = rmesh_trainable::TilePipelines::new(&device);
+    let radix_pipelines =
+        rmesh_trainable::RadixSortPipelines::new(&device, 2, rmesh_trainable::SortBackend::Drs);
 
-    let prepare_dispatch_bg = rmesh_backward::create_prepare_dispatch_bind_group(
+    let prepare_dispatch_bg = rmesh_trainable::create_prepare_dispatch_bind_group(
         &device,
         &scan_pipelines,
         &scene_buffers.indirect_args,
         &scan_buffers,
     );
-    let rts_bg = rmesh_backward::create_rts_bind_group(
+    let rts_bg = rmesh_trainable::create_rts_bind_group(
         &device,
         &scan_pipelines,
         &scene_buffers.tiles_touched,
@@ -276,8 +300,8 @@ fn create_shared_state() -> Option<SharedState> {
 
     // Gradient buffers
     let grad_buffers =
-        rmesh_backward::GradientBuffers::new(&device, scene.vertex_count, scene.tet_count);
-    let mat_grad_buffers = rmesh_backward::MaterialGradBuffers::new(&device, scene.tet_count);
+        rmesh_trainable::GradientBuffers::new(&device, scene.vertex_count, scene.tet_count);
+    let mat_grad_buffers = rmesh_trainable::MaterialGradBuffers::new(&device, scene.tet_count);
 
     // Loss
     let loss_pipeline = LossPipeline::new(&device);
@@ -356,20 +380,17 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     );
 
     // Tile buffers for this tile size
-    let tile_buffers = rmesh_backward::TileBuffers::new(
-        device,
-        shared.tet_count,
-        W,
-        H,
-        tile_size,
+    let tile_buffers = rmesh_trainable::TileBuffers::new(device, shared.tet_count, W, H, tile_size);
+    let sorting_bits = rmesh_trainable::sorting_bits_for_tiles(
+        tile_buffers.num_tiles,
+        rmesh_trainable::SortBackend::Drs,
     );
-    let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
-    let radix_state = rmesh_backward::RadixSortState::new(
+    let radix_state = rmesh_trainable::RadixSortState::new(
         device,
         tile_buffers.max_pairs_pow2,
         sorting_bits,
         2,
-        rmesh_backward::SortBackend::Drs,
+        rmesh_trainable::SortBackend::Drs,
     );
     radix_state.upload_configs(queue);
 
@@ -413,14 +434,11 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     });
 
     // Tile fill bind group
-    let tile_fill_bg = rmesh_backward::create_tile_fill_bind_group(
-        device,
-        &shared.tile_pipelines,
-        &tile_buffers,
-    );
+    let tile_fill_bg =
+        rmesh_trainable::create_tile_fill_bind_group(device, &shared.tile_pipelines, &tile_buffers);
 
     // Tile gen scan bind group
-    let tile_gen_scan_bg = rmesh_backward::create_tile_gen_scan_bind_group(
+    let tile_gen_scan_bg = rmesh_trainable::create_tile_gen_scan_bind_group(
         device,
         &shared.scan_pipelines,
         &tile_buffers,
@@ -435,7 +453,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     );
 
     // Tile ranges bind groups (A and B)
-    let tile_ranges_bg_a = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+    let tile_ranges_bg_a = rmesh_trainable::create_tile_ranges_bind_group_with_keys(
         device,
         &shared.tile_pipelines,
         &tile_buffers.tile_sort_keys,
@@ -443,7 +461,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
         &tile_buffers.tile_uniforms,
         radix_state.num_keys_buf(),
     );
-    let tile_ranges_bg_b = rmesh_backward::create_tile_ranges_bind_group_with_keys(
+    let tile_ranges_bg_b = rmesh_trainable::create_tile_ranges_bind_group_with_keys(
         device,
         &shared.tile_pipelines,
         radix_state.keys_b(),
@@ -478,10 +496,7 @@ fn create_tile_size_state(shared: &SharedState, tile_size: u32) -> TileSizeState
     let rasterize_aux_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("rasterize_aux_bg"),
         layout: &rasterize_aux_bgl,
-        entries: &[
-            buf_entry(0, &aux_image),
-            buf_entry(1, &aux_data_dummy),
-        ],
+        entries: &[buf_entry(0, &aux_image), buf_entry(1, &aux_data_dummy)],
     });
 
     // Forward tiled bind groups (A and B)
@@ -614,7 +629,12 @@ fn setup_camera() -> (Mat4, glam::Mat3, [f32; 4], Vec3) {
     let u = r.cross(f);
     let c2w = glam::Mat3::from_cols(r, -u, f);
     let f_val = 1.0 / (fov_y / 2.0).tan();
-    let intrinsics = [f_val * H as f32 / 2.0, f_val * H as f32 / 2.0, W as f32 / 2.0, H as f32 / 2.0];
+    let intrinsics = [
+        f_val * H as f32 / 2.0,
+        f_val * H as f32 / 2.0,
+        W as f32 / 2.0,
+        H as f32 / 2.0,
+    ];
     (vp, c2w, intrinsics, eye)
 }
 
@@ -661,7 +681,7 @@ fn record_forward_backward(
         pass.set_bind_group(0, &ts.fwd_compute_bg, &[]);
         let wg_size = 64u32;
         let n_pow2 = shared.tet_count.next_power_of_two();
-        let total_wg = (n_pow2 + wg_size - 1) / wg_size;
+        let total_wg = n_pow2.div_ceil(wg_size);
         let (x, y) = rmesh_tile::dispatch_2d(total_wg);
         pass.dispatch_workgroups(x, y, 1);
     }
@@ -676,7 +696,7 @@ fn record_forward_backward(
     encoder.clear_buffer(&shared.loss_buffers.loss_value, 0, None);
 
     // Scan tile pipeline
-    rmesh_backward::record_scan_tile_pipeline(
+    rmesh_trainable::record_scan_tile_pipeline(
         encoder,
         &shared.scan_pipelines,
         &shared.tile_pipelines,
@@ -689,7 +709,7 @@ fn record_forward_backward(
     );
 
     // Radix sort
-    let result_in_b = rmesh_backward::record_radix_sort(
+    let result_in_b = rmesh_trainable::record_radix_sort(
         encoder,
         device,
         &shared.radix_pipelines,
@@ -719,7 +739,7 @@ fn record_forward_backward(
         });
         pass.set_pipeline(&shared.tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        let wgs = (ts.tile_buffers.max_pairs_pow2 + 255) / 256;
+        let wgs = ts.tile_buffers.max_pairs_pow2.div_ceil(256);
         let (x, y) = rmesh_tile::dispatch_2d(wgs);
         pass.dispatch_workgroups(x, y, 1);
     }
@@ -766,7 +786,7 @@ fn record_forward_backward(
         });
         pass.set_pipeline(&shared.loss_pipeline.pipeline);
         pass.set_bind_group(0, &ts.loss_bg, &[]);
-        pass.dispatch_workgroups((W + 15) / 16, (H + 15) / 16, 1);
+        pass.dispatch_workgroups(W.div_ceil(16), H.div_ceil(16), 1);
     }
 
     // Backward tiled (patched)
@@ -850,7 +870,19 @@ fn main() {
         // Update uniforms buffer with the correct tile_size for this run
         let (vp, c2w, intrinsics, eye) = setup_camera();
         let uniforms = rmesh_render::make_uniforms(
-            vp, c2w, intrinsics, eye, W as f32, H as f32, shared.tet_count, 0u32, tile_size, 0.0, 0, 0.01, 1000.0,
+            vp,
+            c2w,
+            intrinsics,
+            eye,
+            W as f32,
+            H as f32,
+            shared.tet_count,
+            0u32,
+            tile_size,
+            0.0,
+            0,
+            0.01,
+            1000.0,
         );
         shared.queue.write_buffer(
             &shared.scene_buffers.uniforms,
@@ -895,9 +927,7 @@ fn main() {
         let bwd = bwd_times[mid];
         let total = total_times[mid];
 
-        eprintln!(
-            "tiles={num_tiles:>6}  fwd={fwd:>8.2}ms  bwd={bwd:>8.2}ms  total={total:>8.2}ms"
-        );
+        eprintln!("tiles={num_tiles:>6}  fwd={fwd:>8.2}ms  bwd={bwd:>8.2}ms  total={total:>8.2}ms");
         results.push((tile_size, fwd, bwd, total, num_tiles));
 
         // Print detailed breakdown for last run
@@ -917,14 +947,14 @@ fn main() {
     eprintln!("{}", "-".repeat(80));
     for &(ts, fwd, bwd, total, num_tiles) in &results {
         let ratio = if fwd > 0.0 { bwd / fwd } else { 0.0 };
-        eprintln!(
-            "{ts:<10} {num_tiles:>8} {fwd:>10.2} {bwd:>10.2} {total:>10.2} {ratio:>8.2}x"
-        );
+        eprintln!("{ts:<10} {num_tiles:>8} {fwd:>10.2} {bwd:>10.2} {total:>10.2} {ratio:>8.2}x");
     }
     eprintln!("{}", "-".repeat(80));
 
     // Find best
-    if let Some(&(best_ts, _, _, best_total, _)) = results.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap()) {
+    if let Some(&(best_ts, _, _, best_total, _)) =
+        results.iter().min_by(|a, b| a.3.partial_cmp(&b.3).unwrap())
+    {
         eprintln!("\nBest total: tile_size={best_ts} ({best_total:.2} ms)");
     }
 }

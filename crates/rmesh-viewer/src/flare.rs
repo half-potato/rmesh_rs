@@ -3,10 +3,10 @@
 //! Extracts a boundary surface mesh from dense tets (density ≥ threshold),
 //! builds a BVH for fast ray-segment collision, and renders a debug overlay.
 
-use std::collections::HashMap;
-use std::path::Path;
 use glam::{Quat, Vec3};
 use rmesh_interact::{Primitive, PrimitiveKind};
+use std::collections::HashMap;
+use std::path::Path;
 
 const GRAVITY: Vec3 = Vec3::new(0.0, 0.0, 9.81); // +Z is down in COLMAP coords (-Z up)
 const INITIAL_SPEED: f32 = 15.0;
@@ -26,12 +26,7 @@ const BVH_MAX_LEAF: usize = 4;
 // -----------------------------------------------------------------------
 
 /// Tet face vertex indices: [a, b, c, opposite].
-const TET_FACES: [[usize; 4]; 4] = [
-    [0, 2, 1, 3],
-    [1, 2, 3, 0],
-    [0, 3, 2, 1],
-    [3, 0, 1, 2],
-];
+const TET_FACES: [[usize; 4]; 4] = [[0, 2, 1, 3], [1, 2, 3, 0], [0, 3, 2, 1], [3, 0, 1, 2]];
 
 // -----------------------------------------------------------------------
 // Collision Mesh: boundary surface from dense tets + BVH
@@ -81,7 +76,12 @@ impl CollisionMesh {
             if scene_data.densities[t] < threshold {
                 continue;
             }
-            let ti = [idxs[t*4], idxs[t*4+1], idxs[t*4+2], idxs[t*4+3]];
+            let ti = [
+                idxs[t * 4],
+                idxs[t * 4 + 1],
+                idxs[t * 4 + 2],
+                idxs[t * 4 + 3],
+            ];
             for (fi, face) in TET_FACES.iter().enumerate() {
                 let mut key = [ti[face[0]], ti[face[1]], ti[face[2]]];
                 key.sort_unstable();
@@ -93,12 +93,17 @@ impl CollisionMesh {
         let mut triangles = Vec::new();
         let mut normals = Vec::new();
 
-        for (_key, entries) in &face_map {
+        for entries in face_map.values() {
             if entries.len() != 1 {
                 continue; // interior face (shared by two dense tets)
             }
             let (t, fi) = entries[0];
-            let ti = [idxs[t*4], idxs[t*4+1], idxs[t*4+2], idxs[t*4+3]];
+            let ti = [
+                idxs[t * 4],
+                idxs[t * 4 + 1],
+                idxs[t * 4 + 2],
+                idxs[t * 4 + 3],
+            ];
             let face = &TET_FACES[fi];
 
             let v0 = v3_from(verts, ti[face[0]] as usize);
@@ -134,7 +139,12 @@ impl CollisionMesh {
         // Build BVH
         let (bvh, tri_order) = build_bvh(&triangles);
 
-        Self { triangles, normals, bvh, tri_order }
+        Self {
+            triangles,
+            normals,
+            bvh,
+            tri_order,
+        }
     }
 
     /// Ray-segment intersection. Returns the closest hit distance t ∈ (0, t_max], or None.
@@ -144,9 +154,21 @@ impl CollisionMesh {
         }
 
         let inv_dir = Vec3::new(
-            if dir.x.abs() > 1e-20 { 1.0 / dir.x } else { f32::copysign(1e20, dir.x) },
-            if dir.y.abs() > 1e-20 { 1.0 / dir.y } else { f32::copysign(1e20, dir.y) },
-            if dir.z.abs() > 1e-20 { 1.0 / dir.z } else { f32::copysign(1e20, dir.z) },
+            if dir.x.abs() > 1e-20 {
+                1.0 / dir.x
+            } else {
+                f32::copysign(1e20, dir.x)
+            },
+            if dir.y.abs() > 1e-20 {
+                1.0 / dir.y
+            } else {
+                f32::copysign(1e20, dir.y)
+            },
+            if dir.z.abs() > 1e-20 {
+                1.0 / dir.z
+            } else {
+                f32::copysign(1e20, dir.z)
+            },
         );
 
         let mut closest = t_max;
@@ -189,7 +211,11 @@ impl CollisionMesh {
             }
         }
 
-        if hit { Some(closest) } else { None }
+        if hit {
+            Some(closest)
+        } else {
+            None
+        }
     }
 
     /// Convert to PrimitiveVertex triangles for debug visualization.
@@ -357,7 +383,7 @@ fn ray_triangle(origin: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option
     let f = 1.0 / a;
     let s = origin - v0;
     let u = f * s.dot(h);
-    if u < 0.0 || u > 1.0 {
+    if !(0.0..=1.0).contains(&u) {
         return None;
     }
     let q = s.cross(e1);
@@ -366,7 +392,11 @@ fn ray_triangle(origin: Vec3, dir: Vec3, v0: Vec3, v1: Vec3, v2: Vec3) -> Option
         return None;
     }
     let t = f * e2.dot(q);
-    if t > 1e-6 { Some(t) } else { None }
+    if t > 1e-6 {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -435,7 +465,11 @@ impl FlareSystem {
         let flare_id = *next_id;
         *next_id += 1;
 
-        let mesh_count = if self.has_flare_model { self.flare_mesh_count.max(1) } else { 1 };
+        let mesh_count = if self.has_flare_model {
+            self.flare_mesh_count.max(1)
+        } else {
+            1
+        };
         let mut indices = Vec::with_capacity(mesh_count);
 
         for mesh_i in 0..mesh_count {
@@ -450,7 +484,12 @@ impl FlareSystem {
             prim.transform.position = camera_pos;
             prim.transform.scale = Vec3::splat(FLARE_MODEL_SCALE);
             prim.transform.rotation = dir_to_rotation(camera_forward);
-            prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], FLARE_INTENSITY]);
+            prim.color = Some([
+                FLARE_COLOR[0],
+                FLARE_COLOR[1],
+                FLARE_COLOR[2],
+                FLARE_INTENSITY,
+            ]);
 
             if mesh_i < self.flare_material_indices.len() {
                 prim.material_index = Some(self.flare_material_indices[mesh_i]);
@@ -485,7 +524,9 @@ impl FlareSystem {
         if scene_data.tet_count == 0 {
             return;
         }
-        if self.collision_mesh.is_some() && (self.last_built_threshold - self.density_threshold).abs() < 1e-6 {
+        if self.collision_mesh.is_some()
+            && (self.last_built_threshold - self.density_threshold).abs() < 1e-6
+        {
             return;
         }
         self.collision_mesh = Some(CollisionMesh::build(scene_data, self.density_threshold));
@@ -524,16 +565,16 @@ impl FlareSystem {
 
                 let hit = if seg_len > 1e-8 {
                     let dir = segment / seg_len;
-                    self.collision_mesh.as_ref().and_then(|mesh| {
-                        mesh.ray_intersect(flare.position, dir, seg_len)
-                    })
+                    self.collision_mesh
+                        .as_ref()
+                        .and_then(|mesh| mesh.ray_intersect(flare.position, dir, seg_len))
                 } else {
                     None
                 };
 
                 if let Some(t) = hit {
                     let dir = segment / seg_len;
-                    flare.position = flare.position + dir * (t - FLARE_RADIUS).max(0.0);
+                    flare.position += dir * (t - FLARE_RADIUS).max(0.0);
                     flare.velocity = Vec3::ZERO;
                     flare.stuck = true;
                 } else {
@@ -596,7 +637,9 @@ impl FlareSystem {
     }
 
     pub fn clear(&mut self, primitives: &mut Vec<Primitive>) {
-        let mut prim_indices: Vec<usize> = self.flares.iter()
+        let mut prim_indices: Vec<usize> = self
+            .flares
+            .iter()
             .flat_map(|f| f.primitive_indices.iter().copied())
             .collect();
         prim_indices.sort_unstable();
@@ -623,15 +666,14 @@ impl FlareSystem {
     }
 
     pub fn collision_triangle_count(&self) -> usize {
-        self.collision_mesh.as_ref().map_or(0, |m| m.triangle_count())
+        self.collision_mesh
+            .as_ref()
+            .map_or(0, |m| m.triangle_count())
     }
 
     /// Load the flare 3D model from a glTF file. Returns the converted mesh vertices
     /// and material data for upload to the GPU. Call this once at startup.
-    pub fn load_model(
-        &mut self,
-        path: &Path,
-    ) -> Option<rmesh_anim::gltf_loader::GltfScene> {
+    pub fn load_model(&mut self, path: &Path) -> Option<rmesh_anim::gltf_loader::GltfScene> {
         match rmesh_anim::gltf_loader::load_gltf(path) {
             Ok(scene) => {
                 self.flare_mesh_count = scene.meshes.len();
@@ -716,26 +758,46 @@ mod tests {
             let i1 = indices[t * 4 + 1] as usize;
             let i2 = indices[t * 4 + 2] as usize;
             let i3 = indices[t * 4 + 3] as usize;
-            let v0 = glam::DVec3::new(vertices[i0*3] as f64, vertices[i0*3+1] as f64, vertices[i0*3+2] as f64);
-            let v1 = glam::DVec3::new(vertices[i1*3] as f64, vertices[i1*3+1] as f64, vertices[i1*3+2] as f64);
-            let v2 = glam::DVec3::new(vertices[i2*3] as f64, vertices[i2*3+1] as f64, vertices[i2*3+2] as f64);
-            let v3 = glam::DVec3::new(vertices[i3*3] as f64, vertices[i3*3+1] as f64, vertices[i3*3+2] as f64);
-            let a = v1 - v0; let b = v2 - v0; let c = v3 - v0;
+            let v0 = glam::DVec3::new(
+                vertices[i0 * 3] as f64,
+                vertices[i0 * 3 + 1] as f64,
+                vertices[i0 * 3 + 2] as f64,
+            );
+            let v1 = glam::DVec3::new(
+                vertices[i1 * 3] as f64,
+                vertices[i1 * 3 + 1] as f64,
+                vertices[i1 * 3 + 2] as f64,
+            );
+            let v2 = glam::DVec3::new(
+                vertices[i2 * 3] as f64,
+                vertices[i2 * 3 + 1] as f64,
+                vertices[i2 * 3 + 2] as f64,
+            );
+            let v3 = glam::DVec3::new(
+                vertices[i3 * 3] as f64,
+                vertices[i3 * 3 + 1] as f64,
+                vertices[i3 * 3 + 2] as f64,
+            );
+            let a = v1 - v0;
+            let b = v2 - v0;
+            let c = v3 - v0;
             let denom = 2.0 * a.dot(b.cross(c));
             if denom.abs() < 1e-10 {
                 let center = 0.25 * (v0 + v1 + v2 + v3);
-                circumdata[t*4]   = center.x as f32;
-                circumdata[t*4+1] = center.y as f32;
-                circumdata[t*4+2] = center.z as f32;
-                circumdata[t*4+3] = 1e20;
+                circumdata[t * 4] = center.x as f32;
+                circumdata[t * 4 + 1] = center.y as f32;
+                circumdata[t * 4 + 2] = center.z as f32;
+                circumdata[t * 4 + 3] = 1e20;
             } else {
-                let aa = a.dot(a); let bb = b.dot(b); let cc = c.dot(c);
+                let aa = a.dot(a);
+                let bb = b.dot(b);
+                let cc = c.dot(c);
                 let rel = (aa * b.cross(c) + bb * c.cross(a) + cc * a.cross(b)) / denom;
                 let center = v0 + rel;
-                circumdata[t*4]   = center.x as f32;
-                circumdata[t*4+1] = center.y as f32;
-                circumdata[t*4+2] = center.z as f32;
-                circumdata[t*4+3] = rel.dot(rel) as f32;
+                circumdata[t * 4] = center.x as f32;
+                circumdata[t * 4 + 1] = center.y as f32;
+                circumdata[t * 4 + 2] = center.z as f32;
+                circumdata[t * 4 + 3] = rel.dot(rel) as f32;
             }
         }
         circumdata
@@ -776,10 +838,10 @@ mod tests {
         // Two tets sharing face (v0,v1,v2). Must use same vertex indices
         // for the shared face so the face map detects the match.
         let vertices = vec![
-            0.0, 0.0, 0.0,  // v0
-            1.0, 0.0, 0.0,  // v1
-            0.0, 1.0, 0.0,  // v2
-            0.0, 0.0, 1.0,  // v3 (apex A)
+            0.0, 0.0, 0.0, // v0
+            1.0, 0.0, 0.0, // v1
+            0.0, 1.0, 0.0, // v2
+            0.0, 0.0, 1.0, // v3 (apex A)
             0.0, 0.0, -1.0, // v4 (apex B)
         ];
         let indices = vec![
@@ -852,7 +914,10 @@ mod tests {
         let origin = Vec3::new(0.0, 0.0, 0.0);
         let dir = Vec3::X;
         let hit = mesh.ray_intersect(origin, dir, 10.0);
-        assert!(hit.is_some(), "ray should catch the thin tet surface (tunneling fix)");
+        assert!(
+            hit.is_some(),
+            "ray should catch the thin tet surface (tunneling fix)"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -891,7 +956,10 @@ mod tests {
             }
         }
 
-        assert!(stuck, "flare should hit the small tet surface (ray-segment collision)");
+        assert!(
+            stuck,
+            "flare should hit the small tet surface (ray-segment collision)"
+        );
     }
 
     #[test]
@@ -908,7 +976,12 @@ mod tests {
         let mut primitives = Vec::new();
         let mut next_id = 0u32;
 
-        system.shoot(Vec3::new(-10.0, 0.0, 0.0), Vec3::X, &mut primitives, &mut next_id);
+        system.shoot(
+            Vec3::new(-10.0, 0.0, 0.0),
+            Vec3::X,
+            &mut primitives,
+            &mut next_id,
+        );
 
         let dt = 1.0 / 60.0;
         let mut stuck = false;

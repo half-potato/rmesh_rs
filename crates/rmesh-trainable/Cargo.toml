@@ -1,5 +1,5 @@
 [package]
-name = "rmesh-backward"
+name = "rmesh-trainable"
 version = "0.1.0"
 edition = "2021"
 
@@ -23,11 +23,9 @@ env_logger = "0.11"
 rmesh-data = { path = "../rmesh-data" }
 rmesh-train = { path = "../rmesh-train" }
 rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+rmesh-tile = { path = "../rmesh-tile" }
 
 [[bench]]
-name = "tiled_pipeline"
+name = "trainable_pipeline"
 harness = false
 
-[[bench]]
-name = "compute_interval"
-harness = false

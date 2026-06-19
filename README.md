@@ -27,7 +27,7 @@ cargo test
 
 # Run tests for a specific crate
 cargo test -p rmesh-render
-cargo test -p rmesh-backward
+cargo test -p rmesh-trainable
 
 # Run a specific test
 cargo test -p rmesh-render test_center_view
@@ -77,7 +77,7 @@ Controls: left-drag to orbit, scroll to zoom, Escape to quit.
 | `rmesh-shaders` | WGSL shader sources + shared CPU/GPU types |
 | `rmesh-data` | `.rmesh` file loading, PCA decompression |
 | `rmesh-render` | Forward pipeline: compute, sort, rasterize |
-| `rmesh-backward` | Backward pipeline: loss, backward compute, Adam |
+| `rmesh-trainable` | Trainable pipeline: compute-based tiled forward, backward, gradient accumulation |
 | `rmesh-train` | GPU-only training loop |
 | `rmesh-viewer` | Interactive winit/wgpu viewer |
 | `rmesh-python` | PyO3/maturin bindings for Python/PyTorch |

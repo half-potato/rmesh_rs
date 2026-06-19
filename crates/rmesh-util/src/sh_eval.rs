@@ -27,12 +27,9 @@ pub struct ShEvalPipeline {
 impl ShEvalPipeline {
     /// Create the SH eval compute pipeline.
     pub fn new(device: &wgpu::Device) -> Self {
-        let shader_module = crate::compose::create_shader_module(
-            device,
-            "sh_eval_compute.wgsl",
-            SH_EVAL_WGSL,
-        )
-        .expect("Failed to compose sh_eval_compute shader");
+        let shader_module =
+            crate::compose::create_shader_module(device, "sh_eval_compute.wgsl", SH_EVAL_WGSL)
+                .expect("Failed to compose sh_eval_compute shader");
 
         let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("sh_eval bg_layout"),
@@ -128,6 +125,7 @@ impl ShEvalPipeline {
     }
 
     /// Create a bind group for the SH eval pipeline.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_bind_group(
         &self,
         device: &wgpu::Device,
@@ -185,9 +183,9 @@ impl ShEvalPipeline {
         const WG_SIZE: u32 = 256;
         const MAX_DIM: u32 = 65535;
 
-        let total_wgs = (tet_count + WG_SIZE - 1) / WG_SIZE;
+        let total_wgs = tet_count.div_ceil(WG_SIZE);
         let wg_x = total_wgs.min(MAX_DIM);
-        let wg_y = (total_wgs + wg_x - 1) / wg_x;
+        let wg_y = total_wgs.div_ceil(wg_x);
 
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("sh_eval compute"),

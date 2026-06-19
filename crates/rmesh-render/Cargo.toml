@@ -19,5 +19,12 @@ rand = "0.9"
 rand_chacha = "0.9"
 pollster = { workspace = true }
 half = { workspace = true }
+criterion = { version = "0.5", features = ["html_reports"] }
 rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
 rmesh-tile = { path = "../rmesh-tile" }
+# Tests exercise the compute-forward tiled rasterizers, which live in rmesh-trainable.
+rmesh-trainable = { path = "../rmesh-trainable" }
+
+[[bench]]
+name = "interval_pipeline"
+harness = false

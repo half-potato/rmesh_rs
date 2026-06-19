@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 rmesh-util = { path = "../rmesh-util" }
 rmesh-render = { path = "../rmesh-render" }
-rmesh-backward = { path = "../rmesh-backward" }
+rmesh-trainable = { path = "../rmesh-trainable" }
 rmesh-data = { path = "../rmesh-data" }
 wgpu = { workspace = true }
 pollster = { workspace = true }

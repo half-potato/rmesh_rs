@@ -6,40 +6,63 @@
 //!   - `train_step()`: full forward+loss+backward+adam on GPU, return loss
 //!   - `update_params()` / `get_params()`: parameter transfer for PyTorch optimizer path
 
+#![allow(clippy::too_many_arguments)]
+#![allow(dead_code)]
+
 use numpy::ndarray::{Array1, Array2, Array3};
 use numpy::{IntoPyArray, PyArray1, PyArray3, PyReadonlyArray1, PyReadonlyArray3};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
 use glam::{Mat3, Mat4, Vec3, Vec4};
-use rmesh_backward::{
+use rmesh_trainable::{
+    create_backward_interval_tiled_bind_groups,
     create_backward_tiled_bind_groups,
-    create_prepare_dispatch_bind_group, create_rts_bind_group,
-    create_tile_fill_bind_group, create_tile_gen_scan_bind_group,
+    create_interval_chain_back_bind_groups,
+    create_interval_generate_bind_group,
+    create_interval_tiled_rasterize_bind_group,
+    create_prepare_dispatch_bind_group,
+    create_rasterize_bind_group,
+    create_rts_bind_group,
+    create_tile_fill_bind_group,
+    create_tile_gen_scan_bind_group,
     create_tile_ranges_bind_group_with_keys,
-    BackwardTiledPipelines, GradientBuffers, MaterialGradBuffers, RadixSortPipelines, RadixSortState,
-    ScanBuffers, ScanPipelines, SortBackend, TileBuffers, TilePipelines, TileUniforms,
+    record_backward_interval_tiled,
+    record_interval_chain_back,
+    record_interval_generate,
+    record_interval_tiled_rasterize,
+    record_rasterize_compute,
+    BackwardIntervalTiledPipeline,
+    BackwardTiledPipelines,
+    GradientBuffers,
+    IntervalChainBackPipeline,
     // Interval tiled backward
-    IntervalGradBuffers, BackwardIntervalTiledPipeline, IntervalChainBackPipeline,
-    create_backward_interval_tiled_bind_groups, record_backward_interval_tiled,
-    create_interval_chain_back_bind_groups, record_interval_chain_back,
-};
-use rmesh_render::{
-    build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group,
-    create_locate_bind_group, create_rasterize_bind_group, create_raytrace_bind_group,
-    create_render_bind_group, find_containing_tet_walk, make_uniforms, record_locate,
-    record_project_compute, record_forward_pass, record_rasterize_compute, record_raytrace,
-    record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms,
-    RasterizeComputePipeline, MaterialBuffers, RayTraceBuffers, RayTracePipeline, RenderTargets,
-    SceneBuffers, TexToBufferPipeline,
+    IntervalGradBuffers,
+    IntervalGeneratePipeline,
     // Interval tiled forward
-    IntervalTiledBuffers, IntervalGeneratePipeline, IntervalTiledRasterizePipeline,
-    create_interval_generate_bind_group, record_interval_generate,
-    create_interval_tiled_rasterize_bind_group, record_interval_tiled_rasterize,
+    IntervalTiledBuffers,
+    IntervalTiledRasterizePipeline,
+    MaterialGradBuffers,
+    RadixSortPipelines,
+    RadixSortState,
+    RasterizeComputePipeline,
+    ScanBuffers,
+    ScanPipelines,
+    SortBackend,
+    TileBuffers,
+    TilePipelines,
+    TileUniforms,
 };
 use rmesh_error::{
-    ErrorPipeline, ErrorBuffers, ErrorInputBuffers,
-    create_error_bg0, create_error_bg1, record_error_pass,
+    create_error_bg0, create_error_bg1, record_error_pass, ErrorBuffers, ErrorInputBuffers,
+    ErrorPipeline,
+};
+use rmesh_render::{
+    build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group, create_locate_bind_group,
+    create_raytrace_bind_group, create_render_bind_group, find_containing_tet_walk, make_uniforms,
+    record_forward_pass, record_locate, record_project_compute, record_raytrace,
+    record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms, MaterialBuffers,
+    RayTraceBuffers, RayTracePipeline, RenderTargets, SceneBuffers, TexToBufferPipeline,
 };
 use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,
@@ -79,11 +102,7 @@ fn read_buffer_f32(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Bu
 }
 
 /// Helper: read back a GPU buffer to a Vec<u8>.
-fn read_buffer_raw(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    buffer: &wgpu::Buffer,
-) -> Vec<u8> {
+fn read_buffer_raw(device: &wgpu::Device, queue: &wgpu::Queue, buffer: &wgpu::Buffer) -> Vec<u8> {
     let size = buffer.size();
     let staging = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback_staging"),
@@ -309,23 +328,23 @@ impl RMeshRenderer {
             compatible_surface: None,
         }))
         .map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("Failed to find a suitable GPU adapter: {e}"))
+            pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Failed to find a suitable GPU adapter: {e}"
+            ))
         })?;
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("rmesh_renderer"),
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30, // 1 GiB
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                memory_hints: wgpu::MemoryHints::Performance,
-                ..Default::default()
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("rmesh_renderer"),
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30, // 1 GiB
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        ))
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        }))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Device error: {e}")))?;
 
         let color_format = wgpu::TextureFormat::Rgba16Float;
@@ -340,7 +359,8 @@ impl RMeshRenderer {
         let scene_buffers = SceneBuffers::upload(&device, &queue, &scene);
 
         // Upload material data separately
-        let material_buffers = MaterialBuffers::upload(&device, base_colors_slice, color_grads_slice, tet_count);
+        let material_buffers =
+            MaterialBuffers::upload(&device, base_colors_slice, color_grads_slice, tet_count);
 
         // Render targets
         let targets = RenderTargets::new(&device, width, height);
@@ -348,7 +368,11 @@ impl RMeshRenderer {
         // Dummy depth texture (cleared to 1.0 = all-pass) for forward pass depth attachment
         let dummy_depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("dummy_depth"),
-            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -356,7 +380,8 @@ impl RMeshRenderer {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        let dummy_depth_view = dummy_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let dummy_depth_view =
+            dummy_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Dummy sh_coeffs buffer (Python training uses sh_degree=0 / base_colors path)
         let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
@@ -366,15 +391,21 @@ impl RMeshRenderer {
             mapped_at_creation: false,
         });
         // Forward bind groups
-        let compute_bg = create_compute_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers, &dummy_sh);
-        let render_bg = create_render_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);
+        let compute_bg = create_compute_bind_group(
+            &device,
+            &fwd_pipelines,
+            &scene_buffers,
+            &material_buffers,
+            &dummy_sh,
+        );
+        let render_bg =
+            create_render_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);
 
         // Tex-to-buffer
         let ttb = TexToBufferPipeline::new(&device, &queue, &targets.color_view, width, height);
 
         // Gradient + optimizer state
-        let grad_buffers =
-            GradientBuffers::new(&device, vertex_count, tet_count);
+        let grad_buffers = GradientBuffers::new(&device, vertex_count, tet_count);
         let mat_grad_buffers = MaterialGradBuffers::new(&device, tet_count);
         let adam_state = AdamState::new(&device, vertex_count, tet_count);
         let mat_adam_state = MaterialAdamState::new(&device, tet_count);
@@ -383,12 +414,8 @@ impl RMeshRenderer {
         let loss_buffers = LossBuffers::new(&device, width, height);
 
         // Loss bind group (non-tiled path, unused but kept for API compat)
-        let _loss_bg = create_loss_bind_group(
-            &device,
-            &loss_pipeline,
-            &loss_buffers,
-            &ttb.rendered_image,
-        );
+        let _loss_bg =
+            create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &ttb.rendered_image);
 
         // Adam bind groups + per-group uniform buffers (separate to avoid overwrite)
         let adam_uniforms_bufs: Vec<wgpu::Buffer> = (0..3)
@@ -432,11 +459,7 @@ impl RMeshRenderer {
             ),
         ];
 
-        let param_counts = [
-            vertex_count * 3,
-            tet_count,
-            tet_count * 3,
-        ];
+        let param_counts = [vertex_count * 3, tet_count, tet_count * 3];
 
         // Tiled backward infrastructure
         let tile_size = 12u32;
@@ -444,9 +467,18 @@ impl RMeshRenderer {
         let tile_buffers = TileBuffers::new(&device, tet_count, width, height, tile_size);
 
         // Radix sort — 64-bit keys: lo=depth(32 bits), hi=tile_id
-        let sorting_bits = rmesh_backward::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_backward::SortBackend::Drs);
+        let sorting_bits = rmesh_trainable::sorting_bits_for_tiles(
+            tile_buffers.num_tiles,
+            rmesh_trainable::SortBackend::Drs,
+        );
         let radix_pipelines = RadixSortPipelines::new(&device, 2, SortBackend::Drs);
-        let radix_state = RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, SortBackend::Drs);
+        let radix_state = RadixSortState::new(
+            &device,
+            tile_buffers.max_pairs_pow2,
+            sorting_bits,
+            2,
+            SortBackend::Drs,
+        );
         radix_state.upload_configs(&queue);
 
         let tile_fill_bg = create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
@@ -591,12 +623,8 @@ impl RMeshRenderer {
         );
 
         // Loss bind group using ttb.rendered_image (HW raster path)
-        let loss_bg_hw = create_loss_bind_group(
-            &device,
-            &loss_pipeline,
-            &loss_buffers,
-            &ttb.rendered_image,
-        );
+        let loss_bg_hw =
+            create_loss_bind_group(&device, &loss_pipeline, &loss_buffers, &ttb.rendered_image);
 
         // Scan-based tile pipeline infrastructure (RTS prefix scan)
         let scan_pipelines = ScanPipelines::new(&device);
@@ -629,10 +657,21 @@ impl RMeshRenderer {
 
         // Ray trace setup
         let neighbors = compute_tet_neighbors(&scene.indices, tet_count as usize);
-        let bvh = build_boundary_bvh(&scene.vertices, &scene.indices, &neighbors, tet_count as usize);
+        let bvh = build_boundary_bvh(
+            &scene.vertices,
+            &scene.indices,
+            &neighbors,
+            tet_count as usize,
+        );
         let rt_pipeline = RayTracePipeline::new(&device, width, height, 0);
         let rt_buffers = RayTraceBuffers::new(&device, &neighbors, &bvh);
-        let rt_bind_group = create_raytrace_bind_group(&device, &rt_pipeline, &scene_buffers, &material_buffers, &rt_buffers);
+        let rt_bind_group = create_raytrace_bind_group(
+            &device,
+            &rt_pipeline,
+            &scene_buffers,
+            &material_buffers,
+            &rt_buffers,
+        );
 
         // Point location pipeline
         let locate_pipeline = LocatePipeline::new(&device);
@@ -666,28 +705,49 @@ impl RMeshRenderer {
         let error_buffers = ErrorBuffers::new(&device, tet_count);
         let error_input_buffers = ErrorInputBuffers::new(&device, width, height);
         let error_bg0 = create_error_bg0(
-            &device, &error_pipeline,
-            &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
-            &material_buffers.colors, &scene_buffers.densities, &material_buffers.color_grads,
-            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &device,
+            &error_pipeline,
+            &scene_buffers.uniforms,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &material_buffers.colors,
+            &scene_buffers.densities,
+            &material_buffers.color_grads,
+            &tile_buffers.tile_sort_values,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
         );
         let error_bg0_b = create_error_bg0(
-            &device, &error_pipeline,
-            &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
-            &material_buffers.colors, &scene_buffers.densities, &material_buffers.color_grads,
-            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+            &device,
+            &error_pipeline,
+            &scene_buffers.uniforms,
+            &scene_buffers.vertices,
+            &scene_buffers.indices,
+            &material_buffers.colors,
+            &scene_buffers.densities,
+            &material_buffers.color_grads,
+            radix_state.values_b(),
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
         );
         let error_bg1 = create_error_bg1(
-            &device, &error_pipeline,
-            &error_input_buffers, &error_buffers,
+            &device,
+            &error_pipeline,
+            &error_input_buffers,
+            &error_buffers,
         );
 
         // Interval tiled forward pipelines
         let interval_buffers = IntervalTiledBuffers::new(&device, tet_count);
         let interval_generate = IntervalGeneratePipeline::new(&device);
-        let interval_rasterize = IntervalTiledRasterizePipeline::new(&device, width, height, aux_dim);
+        let interval_rasterize =
+            IntervalTiledRasterizePipeline::new(&device, width, height, aux_dim);
         let interval_generate_bg = create_interval_generate_bind_group(
-            &device, &interval_generate, &scene_buffers, &material_buffers, &interval_buffers,
+            &device,
+            &interval_generate,
+            &scene_buffers,
+            &material_buffers,
+            &interval_buffers,
         );
 
         // Custom aux channel buffers
@@ -695,85 +755,135 @@ impl RMeshRenderer {
         let storage_rw = wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_DST
             | wgpu::BufferUsages::COPY_SRC;
-        let aux_buf_size = if aux_dim > 0 { (tet_count as u64) * (aux_dim as u64) * 4 } else { 4 };
+        let aux_buf_size = if aux_dim > 0 {
+            (tet_count as u64) * (aux_dim as u64) * 4
+        } else {
+            4
+        };
         let aux_data_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("aux_data"), size: aux_buf_size, usage: storage_rw, mapped_at_creation: false,
+            label: Some("aux_data"),
+            size: aux_buf_size,
+            usage: storage_rw,
+            mapped_at_creation: false,
         });
-        let dl_d_aux_size = if aux_dim > 0 { n_pixels_u64 * (aux_dim as u64) * 4 } else { 4 };
+        let dl_d_aux_size = if aux_dim > 0 {
+            n_pixels_u64 * (aux_dim as u64) * 4
+        } else {
+            4
+        };
         let dl_d_aux_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dl_d_aux"), size: dl_d_aux_size, usage: storage_rw, mapped_at_creation: false,
+            label: Some("dl_d_aux"),
+            size: dl_d_aux_size,
+            usage: storage_rw,
+            mapped_at_creation: false,
         });
 
         let interval_rasterize_bg = create_interval_tiled_rasterize_bind_group(
-            &device, &interval_rasterize, &scene_buffers.uniforms, &interval_buffers,
-            &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-            &aux_data_buf, &interval_rasterize.aux_image,
+            &device,
+            &interval_rasterize,
+            &scene_buffers.uniforms,
+            &interval_buffers,
+            &tile_buffers.tile_sort_values,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+            &aux_data_buf,
+            &interval_rasterize.aux_image,
         );
         let interval_rasterize_bg_b = create_interval_tiled_rasterize_bind_group(
-            &device, &interval_rasterize, &scene_buffers.uniforms, &interval_buffers,
-            radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-            &aux_data_buf, &interval_rasterize.aux_image,
+            &device,
+            &interval_rasterize,
+            &scene_buffers.uniforms,
+            &interval_buffers,
+            radix_state.values_b(),
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+            &aux_data_buf,
+            &interval_rasterize.aux_image,
         );
 
         // Backward interval tiled pipelines
         let bwd_interval_tiled = BackwardIntervalTiledPipeline::new(&device, aux_dim);
         let interval_chain_back = IntervalChainBackPipeline::new(&device);
-        let interval_grad_buffers = IntervalGradBuffers::new(&device, tet_count, vertex_count, tet_count, aux_dim);
+        let interval_grad_buffers =
+            IntervalGradBuffers::new(&device, tet_count, vertex_count, tet_count, aux_dim);
 
         // Gradient input buffers for xyzd/distortion backward
         let dl_d_xyzd = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dl_d_xyzd"), size: n_pixels_u64 * 4 * 4, usage: storage_rw, mapped_at_creation: false,
+            label: Some("dl_d_xyzd"),
+            size: n_pixels_u64 * 4 * 4,
+            usage: storage_rw,
+            mapped_at_creation: false,
         });
         let dl_d_distortion = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("dl_d_distortion"), size: n_pixels_u64 * 5 * 4, usage: storage_rw, mapped_at_creation: false,
+            label: Some("dl_d_distortion"),
+            size: n_pixels_u64 * 5 * 4,
+            usage: storage_rw,
+            mapped_at_creation: false,
         });
 
         let (bwd_interval_tiled_bg0, bwd_interval_tiled_bg1) =
             create_backward_interval_tiled_bind_groups(
-                &device, &bwd_interval_tiled,
-                &scene_buffers.uniforms, &loss_buffers.dl_d_image,
+                &device,
+                &bwd_interval_tiled,
+                &scene_buffers.uniforms,
+                &loss_buffers.dl_d_image,
                 &interval_rasterize.rendered_image,
-                &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
+                &interval_buffers.interval_verts,
+                &interval_buffers.interval_tet_data,
                 &interval_buffers.interval_meta,
                 &tile_buffers.tile_sort_values,
                 &interval_grad_buffers.d_interval_verts,
                 &interval_grad_buffers.d_interval_tet_data,
-                &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-                &dl_d_xyzd, &dl_d_distortion,
-                &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
+                &tile_buffers.tile_ranges,
+                &tile_buffers.tile_uniforms,
+                &dl_d_xyzd,
+                &dl_d_distortion,
+                &interval_rasterize.xyzd_image,
+                &interval_rasterize.distortion_image,
                 &aux_data_buf,
                 &dl_d_aux_buf,
                 &interval_grad_buffers.d_aux_data,
             );
-        let (bwd_interval_tiled_bg0_b, _) =
-            create_backward_interval_tiled_bind_groups(
-                &device, &bwd_interval_tiled,
-                &scene_buffers.uniforms, &loss_buffers.dl_d_image,
-                &interval_rasterize.rendered_image,
-                &interval_buffers.interval_verts, &interval_buffers.interval_tet_data,
-                &interval_buffers.interval_meta,
-                radix_state.values_b(),
-                &interval_grad_buffers.d_interval_verts,
-                &interval_grad_buffers.d_interval_tet_data,
-                &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-                &dl_d_xyzd, &dl_d_distortion,
-                &interval_rasterize.xyzd_image, &interval_rasterize.distortion_image,
-                &aux_data_buf,
-                &dl_d_aux_buf,
-                &interval_grad_buffers.d_aux_data,
-            );
+        let (bwd_interval_tiled_bg0_b, _) = create_backward_interval_tiled_bind_groups(
+            &device,
+            &bwd_interval_tiled,
+            &scene_buffers.uniforms,
+            &loss_buffers.dl_d_image,
+            &interval_rasterize.rendered_image,
+            &interval_buffers.interval_verts,
+            &interval_buffers.interval_tet_data,
+            &interval_buffers.interval_meta,
+            radix_state.values_b(),
+            &interval_grad_buffers.d_interval_verts,
+            &interval_grad_buffers.d_interval_tet_data,
+            &tile_buffers.tile_ranges,
+            &tile_buffers.tile_uniforms,
+            &dl_d_xyzd,
+            &dl_d_distortion,
+            &interval_rasterize.xyzd_image,
+            &interval_rasterize.distortion_image,
+            &aux_data_buf,
+            &dl_d_aux_buf,
+            &interval_grad_buffers.d_aux_data,
+        );
         let (interval_chain_back_bg0, interval_chain_back_bg1) =
             create_interval_chain_back_bind_groups(
-                &device, &interval_chain_back,
-                &scene_buffers.uniforms, &scene_buffers.vertices, &scene_buffers.indices,
+                &device,
+                &interval_chain_back,
+                &scene_buffers.uniforms,
+                &scene_buffers.vertices,
+                &scene_buffers.indices,
                 &material_buffers.color_grads,
-                &scene_buffers.compact_tet_ids, &scene_buffers.indirect_args,
+                &scene_buffers.compact_tet_ids,
+                &scene_buffers.indirect_args,
                 &interval_buffers.interval_meta,
                 &interval_grad_buffers.d_interval_verts,
                 &interval_grad_buffers.d_interval_tet_data,
                 &scene_buffers.vertex_normals,
-                &grad_buffers.d_vertices, &grad_buffers.d_densities,
-                &mat_grad_buffers.d_color_grads, &mat_grad_buffers.d_base_colors,
+                &grad_buffers.d_vertices,
+                &grad_buffers.d_densities,
+                &mat_grad_buffers.d_color_grads,
+                &mat_grad_buffers.d_base_colors,
                 &interval_grad_buffers.d_vertex_normals,
             );
 
@@ -878,14 +988,20 @@ impl RMeshRenderer {
     fn set_vertex_normals(&mut self, normals: PyReadonlyArray1<f32>) -> PyResult<()> {
         let data = normals.as_slice()?;
         self.queue.write_buffer(
-            &self.scene_buffers.vertex_normals, 0, bytemuck::cast_slice(data),
+            &self.scene_buffers.vertex_normals,
+            0,
+            bytemuck::cast_slice(data),
         );
         Ok(())
     }
 
     /// Read back per-vertex normals [N*3] f32.
     fn get_vertex_normals<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f32>>> {
-        let data = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.vertex_normals);
+        let data = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.scene_buffers.vertex_normals,
+        );
         Ok(Array1::from_vec(data).into_pyarray(py))
     }
 
@@ -899,13 +1015,16 @@ impl RMeshRenderer {
         let data = aux_data.as_slice()?;
         let expected = self.tet_count as usize * self.aux_dim;
         if data.len() != expected {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("Expected {} elements (tet_count={} * aux_dim={}), got {}", expected, self.tet_count, self.aux_dim, data.len()),
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "Expected {} elements (tet_count={} * aux_dim={}), got {}",
+                expected,
+                self.tet_count,
+                self.aux_dim,
+                data.len()
+            )));
         }
-        self.queue.write_buffer(
-            &self.aux_data_buf, 0, bytemuck::cast_slice(data),
-        );
+        self.queue
+            .write_buffer(&self.aux_data_buf, 0, bytemuck::cast_slice(data));
         Ok(())
     }
 
@@ -1015,11 +1134,8 @@ impl RMeshRenderer {
         let data = read_buffer_f32(&self.device, &self.queue, &self.ttb.rendered_image);
 
         // Convert to [H, W, 4] numpy array
-        let array = Array3::from_shape_vec(
-            (self.height as usize, self.width as usize, 4),
-            data,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let array = Array3::from_shape_vec((self.height as usize, self.width as usize, 4), data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         Ok(array.into_pyarray(py))
     }
@@ -1120,7 +1236,7 @@ impl RMeshRenderer {
             );
 
             // RTS scan-based tile pipeline
-            rmesh_backward::record_scan_tile_pipeline(
+            rmesh_trainable::record_scan_tile_pipeline(
                 &mut encoder,
                 &self.scan_pipelines,
                 &self.tile_pipelines,
@@ -1133,7 +1249,7 @@ impl RMeshRenderer {
             );
 
             // Radix sort
-            let result_in_b = rmesh_backward::record_radix_sort(
+            let result_in_b = rmesh_trainable::record_radix_sort(
                 &mut encoder,
                 &self.device,
                 &self.radix_pipelines,
@@ -1157,11 +1273,11 @@ impl RMeshRenderer {
                 });
                 pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
                 pass.set_bind_group(0, ranges_bg, &[]);
-                let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+                let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
                 if total <= 65535 {
                     pass.dispatch_workgroups(total, 1, 1);
                 } else {
-                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                    pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
                 }
             }
 
@@ -1179,11 +1295,8 @@ impl RMeshRenderer {
         // Read back rendered image
         let data = read_buffer_f32(&self.device, &self.queue, &self.rasterize.rendered_image);
 
-        let rgba = Array3::from_shape_vec(
-            (self.height as usize, self.width as usize, 4),
-            data,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let rgba = Array3::from_shape_vec((self.height as usize, self.width as usize, 4), data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         if render_aux {
             let aux_stride = self.rasterize.aux_stride as usize;
@@ -1193,10 +1306,13 @@ impl RMeshRenderer {
                 aux_data,
             )
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
-            let tuple = pyo3::types::PyTuple::new(py, &[
-                rgba.into_pyarray(py).into_any(),
-                aux.into_pyarray(py).into_any(),
-            ])?;
+            let tuple = pyo3::types::PyTuple::new(
+                py,
+                &[
+                    rgba.into_pyarray(py).into_any(),
+                    aux.into_pyarray(py).into_any(),
+                ],
+            )?;
             Ok(tuple.into())
         } else {
             Ok(rgba.into_pyarray(py).into_any().unbind())
@@ -1305,7 +1421,7 @@ impl RMeshRenderer {
             );
 
             // RTS scan-based tile pipeline
-            rmesh_backward::record_scan_tile_pipeline(
+            rmesh_trainable::record_scan_tile_pipeline(
                 &mut encoder,
                 &self.scan_pipelines,
                 &self.tile_pipelines,
@@ -1318,7 +1434,7 @@ impl RMeshRenderer {
             );
 
             // Radix sort
-            let result_in_b = rmesh_backward::record_radix_sort(
+            let result_in_b = rmesh_trainable::record_radix_sort(
                 &mut encoder,
                 &self.device,
                 &self.radix_pipelines,
@@ -1342,11 +1458,11 @@ impl RMeshRenderer {
                 });
                 pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
                 pass.set_bind_group(0, ranges_bg, &[]);
-                let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+                let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
                 if total <= 65535 {
                     pass.dispatch_workgroups(total, 1, 1);
                 } else {
-                    pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                    pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
                 }
             }
 
@@ -1362,9 +1478,21 @@ impl RMeshRenderer {
         }
 
         // Read back rendered images
-        let rgba_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.rendered_image);
-        let xyzd_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.xyzd_image);
-        let dist_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.distortion_image);
+        let rgba_data = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.interval_rasterize.rendered_image,
+        );
+        let xyzd_data = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.interval_rasterize.xyzd_image,
+        );
+        let dist_data = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.interval_rasterize.distortion_image,
+        );
 
         let h = self.height as usize;
         let w = self.width as usize;
@@ -1381,9 +1509,14 @@ impl RMeshRenderer {
         dict.set_item("xyzd", xyzd.into_pyarray(py))?;
         dict.set_item("distortion", dist.into_pyarray(py))?;
         if self.aux_dim > 0 {
-            let aux_data = read_buffer_f32(&self.device, &self.queue, &self.interval_rasterize.aux_image);
-            let aux = Array3::from_shape_vec((h, w, self.aux_dim), aux_data)
-                .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+            let aux_data = read_buffer_f32(
+                &self.device,
+                &self.queue,
+                &self.interval_rasterize.aux_image,
+            );
+            let aux = Array3::from_shape_vec((h, w, self.aux_dim), aux_data).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}"))
+            })?;
             dict.set_item("aux", aux.into_pyarray(py))?;
         }
         Ok(dict)
@@ -1448,14 +1581,18 @@ impl RMeshRenderer {
             let n_pixels = (self.width * self.height) as usize;
 
             if origins_slice.len() != n_pixels * 3 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("ray_origins must be [W*H*3] = {} elements, got {}", n_pixels * 3, origins_slice.len())
-                ));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ray_origins must be [W*H*3] = {} elements, got {}",
+                    n_pixels * 3,
+                    origins_slice.len()
+                )));
             }
             if dirs_slice.len() != n_pixels * 3 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    format!("ray_dirs must be [W*H*3] = {} elements, got {}", n_pixels * 3, dirs_slice.len())
-                ));
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ray_dirs must be [W*H*3] = {} elements, got {}",
+                    n_pixels * 3,
+                    dirs_slice.len()
+                )));
             }
 
             // Resize and upload ray buffers
@@ -1475,47 +1612,74 @@ impl RMeshRenderer {
                 });
                 // Recreate bind group with new buffers
                 self.rt_bind_group = create_raytrace_bind_group(
-                    &self.device, &self.rt_pipeline, &self.scene_buffers,
-                    &self.material_buffers, &self.rt_buffers,
+                    &self.device,
+                    &self.rt_pipeline,
+                    &self.scene_buffers,
+                    &self.material_buffers,
+                    &self.rt_buffers,
                 );
             }
-            self.queue.write_buffer(&self.rt_buffers.ray_origins, 0, bytemuck::cast_slice(origins_slice));
-            self.queue.write_buffer(&self.rt_buffers.ray_dirs, 0, bytemuck::cast_slice(dirs_slice));
+            self.queue.write_buffer(
+                &self.rt_buffers.ray_origins,
+                0,
+                bytemuck::cast_slice(origins_slice),
+            );
+            self.queue.write_buffer(
+                &self.rt_buffers.ray_dirs,
+                0,
+                bytemuck::cast_slice(dirs_slice),
+            );
 
             // Upload per-pixel start tets
             if let Some(ref tets) = start_tets {
                 let tets_slice = tets.as_slice()?;
                 let start_tet_size = (n_pixels * 4) as u64;
                 if self.rt_buffers.start_tet.size() < start_tet_size {
-                    self.rt_buffers.start_tet = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("start_tet"),
-                        size: start_tet_size,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                    self.rt_buffers.start_tet =
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("start_tet"),
+                            size: start_tet_size,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
                     self.rt_bind_group = create_raytrace_bind_group(
-                        &self.device, &self.rt_pipeline, &self.scene_buffers,
-                        &self.material_buffers, &self.rt_buffers,
+                        &self.device,
+                        &self.rt_pipeline,
+                        &self.scene_buffers,
+                        &self.material_buffers,
+                        &self.rt_buffers,
                     );
                 }
-                self.queue.write_buffer(&self.rt_buffers.start_tet, 0, bytemuck::cast_slice(tets_slice));
+                self.queue.write_buffer(
+                    &self.rt_buffers.start_tet,
+                    0,
+                    bytemuck::cast_slice(tets_slice),
+                );
             } else {
                 // All -1 (use BVH entry for all rays)
                 let neg_ones = vec![-1i32; n_pixels];
                 let start_tet_size = (n_pixels * 4) as u64;
                 if self.rt_buffers.start_tet.size() < start_tet_size {
-                    self.rt_buffers.start_tet = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("start_tet"),
-                        size: start_tet_size,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
+                    self.rt_buffers.start_tet =
+                        self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("start_tet"),
+                            size: start_tet_size,
+                            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
                     self.rt_bind_group = create_raytrace_bind_group(
-                        &self.device, &self.rt_pipeline, &self.scene_buffers,
-                        &self.material_buffers, &self.rt_buffers,
+                        &self.device,
+                        &self.rt_pipeline,
+                        &self.scene_buffers,
+                        &self.material_buffers,
+                        &self.rt_buffers,
                     );
                 }
-                self.queue.write_buffer(&self.rt_buffers.start_tet, 0, bytemuck::cast_slice(&neg_ones));
+                self.queue.write_buffer(
+                    &self.rt_buffers.start_tet,
+                    0,
+                    bytemuck::cast_slice(&neg_ones),
+                );
             }
         } else {
             uniforms.ray_mode = 0;
@@ -1583,11 +1747,8 @@ impl RMeshRenderer {
         // Read back rendered image
         let data = read_buffer_f32(&self.device, &self.queue, &self.rt_pipeline.rendered_image);
 
-        let rgba = Array3::from_shape_vec(
-            (self.height as usize, self.width as usize, 4),
-            data,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let rgba = Array3::from_shape_vec((self.height as usize, self.width as usize, 4), data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         if render_aux {
             let aux_stride = self.rt_pipeline.aux_stride as usize;
@@ -1597,10 +1758,13 @@ impl RMeshRenderer {
                 aux_data,
             )
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
-            let tuple = pyo3::types::PyTuple::new(py, &[
-                rgba.into_pyarray(py).into_any(),
-                aux.into_pyarray(py).into_any(),
-            ])?;
+            let tuple = pyo3::types::PyTuple::new(
+                py,
+                &[
+                    rgba.into_pyarray(py).into_any(),
+                    aux.into_pyarray(py).into_any(),
+                ],
+            )?;
             Ok(tuple.into())
         } else {
             Ok(rgba.into_pyarray(py).into_any().unbind())
@@ -1629,14 +1793,18 @@ impl RMeshRenderer {
 
         let n_pixels = (self.width * self.height) as usize;
         if pe.len() != n_pixels {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("pixel_err must have {} elements, got {}", n_pixels, pe.len())
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "pixel_err must have {} elements, got {}",
+                n_pixels,
+                pe.len()
+            )));
         }
         if se.len() != n_pixels {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("ssim_err must have {} elements, got {}", n_pixels, se.len())
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "ssim_err must have {} elements, got {}",
+                n_pixels,
+                se.len()
+            )));
         }
 
         // Upload pixel errors
@@ -1652,11 +1820,11 @@ impl RMeshRenderer {
         );
 
         // Build encoder
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("forward_error"),
-            },
-        );
+            });
 
         // Clear error output buffers
         encoder.clear_buffer(&self.error_buffers.tet_err, 0, None);
@@ -1681,32 +1849,28 @@ impl RMeshRenderer {
         self.queue.submit(std::iter::once(encoder.finish()));
 
         // Read back tet_err as [T, 16] f32
-        let tet_err_data = read_buffer_f32(
-            &self.device, &self.queue, &self.error_buffers.tet_err,
-        );
+        let tet_err_data = read_buffer_f32(&self.device, &self.queue, &self.error_buffers.tet_err);
 
-        let tet_err_array = Array2::from_shape_vec(
-            (self.tet_count as usize, 16),
-            tet_err_data,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let tet_err_array = Array2::from_shape_vec((self.tet_count as usize, 16), tet_err_data)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         // Read back tet_count as [T, 2] i32
-        let tet_count_raw = read_buffer_raw(
-            &self.device, &self.queue, &self.error_buffers.tet_count,
-        );
+        let tet_count_raw =
+            read_buffer_raw(&self.device, &self.queue, &self.error_buffers.tet_count);
         let tet_count_i32: &[i32] = bytemuck::cast_slice(&tet_count_raw);
 
-        let tet_count_array = Array2::from_shape_vec(
-            (self.tet_count as usize, 2),
-            tet_count_i32.to_vec(),
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let tet_count_array =
+            Array2::from_shape_vec((self.tet_count as usize, 2), tet_count_i32.to_vec()).map_err(
+                |e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")),
+            )?;
 
-        let tuple = pyo3::types::PyTuple::new(py, &[
-            tet_err_array.into_pyarray(py).into_any(),
-            tet_count_array.into_pyarray(py).into_any(),
-        ])?;
+        let tuple = pyo3::types::PyTuple::new(
+            py,
+            &[
+                tet_err_array.into_pyarray(py).into_any(),
+                tet_count_array.into_pyarray(py).into_any(),
+            ],
+        )?;
         Ok(tuple.into())
     }
 
@@ -1727,9 +1891,10 @@ impl RMeshRenderer {
     ) -> PyResult<Bound<'py, PyArray1<i32>>> {
         let pts = query_points.as_slice()?;
         if pts.len() % 3 != 0 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("query_points length must be divisible by 3, got {}", pts.len())
-            ));
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "query_points length must be divisible by 3, got {}",
+                pts.len()
+            )));
         }
         let n = (pts.len() / 3) as u32;
         if n == 0 {
@@ -1760,7 +1925,8 @@ impl RMeshRenderer {
         }
 
         // Upload query points
-        self.queue.write_buffer(&self.locate_query_buf, 0, bytemuck::cast_slice(pts));
+        self.queue
+            .write_buffer(&self.locate_query_buf, 0, bytemuck::cast_slice(pts));
 
         // Upload uniforms (use global hint_tet, so hint_tets buffer is unused)
         let uni = LocateUniforms {
@@ -1769,7 +1935,8 @@ impl RMeshRenderer {
             tet_count: self.tet_count,
             _pad: 0,
         };
-        self.queue.write_buffer(&self.locate_uniforms_buf, 0, bytemuck::bytes_of(&uni));
+        self.queue
+            .write_buffer(&self.locate_uniforms_buf, 0, bytemuck::bytes_of(&uni));
 
         // Create bind group
         let bg = create_locate_bind_group(
@@ -1785,9 +1952,11 @@ impl RMeshRenderer {
         );
 
         // Record and submit
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("locate_tets"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("locate_tets"),
+            });
         record_locate(&mut encoder, &self.locate_pipeline, &bg, n);
         self.queue.submit(std::iter::once(encoder.finish()));
 
@@ -1817,9 +1986,11 @@ impl RMeshRenderer {
             mapped_at_creation: false,
         });
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("aux_copy"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("aux_copy"),
+            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.targets.aux0_texture,
@@ -1865,11 +2036,8 @@ impl RMeshRenderer {
         drop(data);
         staging.unmap();
 
-        let array = Array3::from_shape_vec(
-            (self.height as usize, self.width as usize, 4),
-            result,
-        )
-        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
+        let array = Array3::from_shape_vec((self.height as usize, self.width as usize, 4), result)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("Shape error: {e}")))?;
 
         Ok(array.into_pyarray(py))
     }
@@ -1935,7 +2103,7 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
 
         // RTS scan-based tile pipeline (reads compact_tet_ids + tiles_touched from forward compute)
-        rmesh_backward::record_scan_tile_pipeline(
+        rmesh_trainable::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
@@ -1948,7 +2116,7 @@ impl RMeshRenderer {
         );
 
         // Radix sort
-        let result_in_b = rmesh_backward::record_radix_sort(
+        let result_in_b = rmesh_trainable::record_radix_sort(
             &mut encoder,
             &self.device,
             &self.radix_pipelines,
@@ -1973,11 +2141,11 @@ impl RMeshRenderer {
             });
             pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
             pass.set_bind_group(0, ranges_bg, &[]);
-            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
             if total <= 65535 {
                 pass.dispatch_workgroups(total, 1, 1);
             } else {
-                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
             }
         }
 
@@ -1995,7 +2163,7 @@ impl RMeshRenderer {
                 pass.dispatch_workgroups(num_tiles, 1, 1);
             } else {
                 let x = 65535u32;
-                let y = (num_tiles + x - 1) / x;
+                let y = num_tiles.div_ceil(x);
                 pass.dispatch_workgroups(x, y, 1);
             }
         }
@@ -2005,28 +2173,25 @@ impl RMeshRenderer {
         // bitcast f32. The raw bytes are already valid f32 on readback.
         let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
         let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
-        let d_base_cols =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
-        let d_grads =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
+        let d_base_cols = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_base_colors,
+        );
+        let d_grads = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_color_grads,
+        );
 
         let dict = PyDict::new(py);
-        dict.set_item(
-            "d_vertices",
-            Array1::from_vec(d_verts).into_pyarray(py),
-        )?;
-        dict.set_item(
-            "d_densities",
-            Array1::from_vec(d_dens).into_pyarray(py),
-        )?;
+        dict.set_item("d_vertices", Array1::from_vec(d_verts).into_pyarray(py))?;
+        dict.set_item("d_densities", Array1::from_vec(d_dens).into_pyarray(py))?;
         dict.set_item(
             "d_base_colors",
             Array1::from_vec(d_base_cols).into_pyarray(py),
         )?;
-        dict.set_item(
-            "d_color_grads",
-            Array1::from_vec(d_grads).into_pyarray(py),
-        )?;
+        dict.set_item("d_color_grads", Array1::from_vec(d_grads).into_pyarray(py))?;
         Ok(dict)
     }
 
@@ -2066,10 +2231,14 @@ impl RMeshRenderer {
         // Upload xyzd gradient (zero if not provided)
         if let Some(ref xyzd_grad) = dl_d_xyzd {
             self.queue.write_buffer(
-                &self.dl_d_xyzd, 0, bytemuck::cast_slice(xyzd_grad.as_slice()?),
+                &self.dl_d_xyzd,
+                0,
+                bytemuck::cast_slice(xyzd_grad.as_slice()?),
             );
         } else {
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             encoder.clear_buffer(&self.dl_d_xyzd, 0, None);
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -2077,10 +2246,14 @@ impl RMeshRenderer {
         // Upload distortion gradient (zero if not provided)
         if let Some(ref dist_grad) = dl_d_distortion {
             self.queue.write_buffer(
-                &self.dl_d_distortion, 0, bytemuck::cast_slice(dist_grad.as_slice()?),
+                &self.dl_d_distortion,
+                0,
+                bytemuck::cast_slice(dist_grad.as_slice()?),
             );
         } else {
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
             encoder.clear_buffer(&self.dl_d_distortion, 0, None);
             self.queue.submit(std::iter::once(encoder.finish()));
         }
@@ -2089,10 +2262,14 @@ impl RMeshRenderer {
         if self.aux_dim > 0 {
             if let Some(ref aux_grad) = dl_d_aux {
                 self.queue.write_buffer(
-                    &self.dl_d_aux_buf, 0, bytemuck::cast_slice(aux_grad.as_slice()?),
+                    &self.dl_d_aux_buf,
+                    0,
+                    bytemuck::cast_slice(aux_grad.as_slice()?),
                 );
             } else {
-                let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+                let mut encoder = self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
                 encoder.clear_buffer(&self.dl_d_aux_buf, 0, None);
                 self.queue.submit(std::iter::once(encoder.finish()));
             }
@@ -2134,7 +2311,7 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
 
         // RTS scan-based tile pipeline
-        rmesh_backward::record_scan_tile_pipeline(
+        rmesh_trainable::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
@@ -2147,7 +2324,7 @@ impl RMeshRenderer {
         );
 
         // Radix sort
-        let result_in_b = rmesh_backward::record_radix_sort(
+        let result_in_b = rmesh_trainable::record_radix_sort(
             &mut encoder,
             &self.device,
             &self.radix_pipelines,
@@ -2170,11 +2347,11 @@ impl RMeshRenderer {
             });
             pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
             pass.set_bind_group(0, ranges_bg, &[]);
-            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
             if total <= 65535 {
                 pass.dispatch_workgroups(total, 1, 1);
             } else {
-                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
             }
         }
 
@@ -2201,40 +2378,41 @@ impl RMeshRenderer {
         // Read back gradients
         let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
         let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
-        let d_base_cols =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
-        let d_grads =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
-        let d_vnormals =
-            read_buffer_f32(&self.device, &self.queue, &self.interval_grad_buffers.d_vertex_normals);
+        let d_base_cols = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_base_colors,
+        );
+        let d_grads = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_color_grads,
+        );
+        let d_vnormals = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.interval_grad_buffers.d_vertex_normals,
+        );
 
         let dict = PyDict::new(py);
-        dict.set_item(
-            "d_vertices",
-            Array1::from_vec(d_verts).into_pyarray(py),
-        )?;
-        dict.set_item(
-            "d_densities",
-            Array1::from_vec(d_dens).into_pyarray(py),
-        )?;
+        dict.set_item("d_vertices", Array1::from_vec(d_verts).into_pyarray(py))?;
+        dict.set_item("d_densities", Array1::from_vec(d_dens).into_pyarray(py))?;
         dict.set_item(
             "d_base_colors",
             Array1::from_vec(d_base_cols).into_pyarray(py),
         )?;
-        dict.set_item(
-            "d_color_grads",
-            Array1::from_vec(d_grads).into_pyarray(py),
-        )?;
+        dict.set_item("d_color_grads", Array1::from_vec(d_grads).into_pyarray(py))?;
         dict.set_item(
             "d_vertex_normals",
             Array1::from_vec(d_vnormals).into_pyarray(py),
         )?;
         if self.aux_dim > 0 {
-            let d_aux = read_buffer_f32(&self.device, &self.queue, &self.interval_grad_buffers.d_aux_data);
-            dict.set_item(
-                "d_aux_data",
-                Array1::from_vec(d_aux).into_pyarray(py),
-            )?;
+            let d_aux = read_buffer_f32(
+                &self.device,
+                &self.queue,
+                &self.interval_grad_buffers.d_aux_data,
+            );
+            dict.set_item("d_aux_data", Array1::from_vec(d_aux).into_pyarray(py))?;
         }
         Ok(dict)
     }
@@ -2296,7 +2474,7 @@ impl RMeshRenderer {
         encoder.clear_buffer(&self.tile_buffers.tile_ranges, 0, None);
 
         // RTS scan-based tile pipeline
-        rmesh_backward::record_scan_tile_pipeline(
+        rmesh_trainable::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
@@ -2309,7 +2487,7 @@ impl RMeshRenderer {
         );
 
         // Radix sort
-        let result_in_b = rmesh_backward::record_radix_sort(
+        let result_in_b = rmesh_trainable::record_radix_sort(
             &mut encoder,
             &self.device,
             &self.radix_pipelines,
@@ -2333,11 +2511,11 @@ impl RMeshRenderer {
             });
             pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
             pass.set_bind_group(0, ranges_bg, &[]);
-            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
             if total <= 65535 {
                 pass.dispatch_workgroups(total, 1, 1);
             } else {
-                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
             }
         }
 
@@ -2355,7 +2533,7 @@ impl RMeshRenderer {
                 pass.dispatch_workgroups(num_tiles, 1, 1);
             } else {
                 let x = 65535u32;
-                let y = (num_tiles + x - 1) / x;
+                let y = num_tiles.div_ceil(x);
                 pass.dispatch_workgroups(x, y, 1);
             }
         }
@@ -2364,15 +2542,24 @@ impl RMeshRenderer {
         // Read back gradients
         let d_verts = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_vertices);
         let d_dens = read_buffer_f32(&self.device, &self.queue, &self.grad_buffers.d_densities);
-        let d_base_cols =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_base_colors);
-        let d_grads =
-            read_buffer_f32(&self.device, &self.queue, &self.mat_grad_buffers.d_color_grads);
+        let d_base_cols = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_base_colors,
+        );
+        let d_grads = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.mat_grad_buffers.d_color_grads,
+        );
 
         let dict = PyDict::new(py);
         dict.set_item("d_vertices", Array1::from_vec(d_verts).into_pyarray(py))?;
         dict.set_item("d_densities", Array1::from_vec(d_dens).into_pyarray(py))?;
-        dict.set_item("d_base_colors", Array1::from_vec(d_base_cols).into_pyarray(py))?;
+        dict.set_item(
+            "d_base_colors",
+            Array1::from_vec(d_base_cols).into_pyarray(py),
+        )?;
         dict.set_item("d_color_grads", Array1::from_vec(d_grads).into_pyarray(py))?;
         Ok(dict)
     }
@@ -2384,7 +2571,7 @@ impl RMeshRenderer {
         _dl_d_image: PyReadonlyArray3<f32>,
     ) -> PyResult<Bound<'py, PyDict>> {
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "Raytrace backward not yet implemented"
+            "Raytrace backward not yet implemented",
         ))
     }
 
@@ -2507,7 +2694,7 @@ impl RMeshRenderer {
 
         // RTS scan-based tile pipeline: prepare_dispatch → rts_reduce → rts_spine_scan
         // → rts_downsweep → tile_fill → tile_gen_scan (writes total_pairs to num_keys_buf)
-        rmesh_backward::record_scan_tile_pipeline(
+        rmesh_trainable::record_scan_tile_pipeline(
             &mut encoder,
             &self.scan_pipelines,
             &self.tile_pipelines,
@@ -2520,7 +2707,7 @@ impl RMeshRenderer {
         );
 
         // Radix sort (ONCE — shared between forward and backward)
-        let result_in_b = rmesh_backward::record_radix_sort(
+        let result_in_b = rmesh_trainable::record_radix_sort(
             &mut encoder,
             &self.device,
             &self.radix_pipelines,
@@ -2530,9 +2717,17 @@ impl RMeshRenderer {
         );
 
         let (ranges_bg, fwd_bg, bwd_bg0) = if result_in_b {
-            (&self.tile_ranges_bg_b, &self.rasterize_bg_b, &self.bwd_tiled_bg0_tiled_b)
+            (
+                &self.tile_ranges_bg_b,
+                &self.rasterize_bg_b,
+                &self.bwd_tiled_bg0_tiled_b,
+            )
         } else {
-            (&self.tile_ranges_bg, &self.rasterize_bg, &self.bwd_tiled_bg0_tiled)
+            (
+                &self.tile_ranges_bg,
+                &self.rasterize_bg,
+                &self.bwd_tiled_bg0_tiled,
+            )
         };
 
         // Tile ranges
@@ -2543,11 +2738,11 @@ impl RMeshRenderer {
             });
             pass.set_pipeline(&self.tile_pipelines.tile_ranges_pipeline);
             pass.set_bind_group(0, ranges_bg, &[]);
-            let total = (self.tile_buffers.max_pairs_pow2 + 255) / 256;
+            let total = self.tile_buffers.max_pairs_pow2.div_ceil(256);
             if total <= 65535 {
                 pass.dispatch_workgroups(total, 1, 1);
             } else {
-                pass.dispatch_workgroups(65535, (total + 65534) / 65535, 1);
+                pass.dispatch_workgroups(65535, total.div_ceil(65535), 1);
             }
         }
 
@@ -2582,7 +2777,7 @@ impl RMeshRenderer {
                 pass.dispatch_workgroups(num_tiles, 1, 1);
             } else {
                 let x = 65535u32;
-                let y = (num_tiles + x - 1) / x;
+                let y = num_tiles.div_ceil(x);
                 pass.dispatch_workgroups(x, y, 1);
             }
         }
@@ -2617,11 +2812,11 @@ impl RMeshRenderer {
             });
             pass.set_pipeline(&self.adam_pipeline.pipeline);
             pass.set_bind_group(0, bg, &[]);
-            let wg_count = (count + 255) / 256;
+            let wg_count = count.div_ceil(256);
             if wg_count <= 65535 {
                 pass.dispatch_workgroups(wg_count, 1, 1);
             } else {
-                pass.dispatch_workgroups(65535, (wg_count + 65534) / 65535, 1);
+                pass.dispatch_workgroups(65535, wg_count.div_ceil(65535), 1);
             }
         }
 
@@ -2673,9 +2868,17 @@ impl RMeshRenderer {
     /// Use this after wgpu-only training to get the optimized parameters.
     fn get_params<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let verts = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.vertices);
-        let base_cols = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.base_colors);
+        let base_cols = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.material_buffers.base_colors,
+        );
         let dens = read_buffer_f32(&self.device, &self.queue, &self.scene_buffers.densities);
-        let grads = read_buffer_f32(&self.device, &self.queue, &self.material_buffers.color_grads);
+        let grads = read_buffer_f32(
+            &self.device,
+            &self.queue,
+            &self.material_buffers.color_grads,
+        );
 
         let dict = PyDict::new(py);
         dict.set_item("vertices", Array1::from_vec(verts).into_pyarray(py))?;

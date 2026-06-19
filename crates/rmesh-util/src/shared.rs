@@ -4,7 +4,6 @@
 /// Matches the FrozenTetModel layout from delaunay_splatting:
 ///   - Per-tet: density (1), rgb (3), gradient (3×3), sh ((deg+1)^2 × 3)
 ///   - No iNGP network — direct parameter storage
-
 use bytemuck::{Pod, Zeroable};
 
 /// Per-frame uniforms.
@@ -113,22 +112,22 @@ pub const TET_FACE_INDICES: [u32; 12] = [
 ];
 
 // --- SH basis constants ---
-pub const C0: f32 = 0.28209479177387814;
-pub const C1: f32 = 0.4886025119029199;
+pub const C0: f32 = 0.282_094_8;
+pub const C1: f32 = 0.488_602_52;
 
-pub const C2_0: f32 = 1.0925484305920792;
-pub const C2_1: f32 = -1.0925484305920792;
-pub const C2_2: f32 = 0.31539156525252005;
-pub const C2_3: f32 = -1.0925484305920792;
-pub const C2_4: f32 = 0.5462742152960396;
+pub const C2_0: f32 = 1.092_548_5;
+pub const C2_1: f32 = -1.092_548_5;
+pub const C2_2: f32 = 0.315_391_57;
+pub const C2_3: f32 = -1.092_548_5;
+pub const C2_4: f32 = 0.546_274_24;
 
-pub const C3_0: f32 = -0.5900435899266435;
-pub const C3_1: f32 = 2.890611442640554;
-pub const C3_2: f32 = -0.4570457994644658;
-pub const C3_3: f32 = 0.3731763325901154;
-pub const C3_4: f32 = -0.4570457994644658;
-pub const C3_5: f32 = 1.445305721320277;
-pub const C3_6: f32 = -0.5900435899266435;
+pub const C3_0: f32 = -0.590_043_6;
+pub const C3_1: f32 = 2.890_611_4;
+pub const C3_2: f32 = -0.457_045_8;
+pub const C3_3: f32 = 0.373_176_34;
+pub const C3_4: f32 = -0.457_045_8;
+pub const C3_5: f32 = 1.445_305_7;
+pub const C3_6: f32 = -0.590_043_6;
 
 /// Tile-based backward pass uniforms.
 #[repr(C)]

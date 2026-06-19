@@ -3,14 +3,14 @@
 //! Implements the same math as the WGSL shaders (project_compute, forward_vertex,
 //! forward_fragment) in pure Rust with glam. No GPU required.
 
-#![allow(dead_code, unused_imports)]
+#![allow(clippy::too_many_arguments, dead_code, unused_imports)]
 
 use glam::{Mat3, Mat4, Vec3, Vec4};
 pub use rand::Rng;
 pub use rmesh_data::SceneData;
 
 // Re-export shared camera utilities from rmesh-util
-pub use rmesh_util::camera::{perspective_matrix, look_at, pixel_ray_intrinsics, TET_FACES};
+pub use rmesh_util::camera::{look_at, perspective_matrix, pixel_ray_intrinsics, TET_FACES};
 
 // Re-export test utilities from rmesh-util
 pub use rmesh_util::test_util::{build_test_scene, random_single_tet_scene};
@@ -36,11 +36,9 @@ fn phi(x: f32) -> f32 {
 /// No activation — raw base colors are passed through, matching the GPU path.
 /// Per-pixel ReLU clamping (max(0)) is applied later in render_tet_pixel.
 fn compute_tet_color(_scene: &SceneData, _tet_id: usize, _cam_pos: Vec3) -> Vec3 {
-    let result_color = Vec3::splat(0.5);
-
     // In the GPU path, base_colors_buf is passed through directly.
     // The test uses 0.5 as the base color.
-    result_color
+    Vec3::splat(0.5)
 }
 
 // ---------------------------------------------------------------------------
@@ -279,7 +277,11 @@ pub fn pixel_ray_dir(c2w: Mat3, intrinsics: [f32; 4], cam_pos: Vec3, px: f32, py
 /// Uses the same LH look_at convention (up = Vec3::Z) as the test setup_camera functions.
 /// c2w maps from pinhole camera space (x=right, y=down, z=forward) to world space.
 pub fn test_camera_c2w_intrinsics(
-    eye: Vec3, target: Vec3, fov_y: f32, w: f32, h: f32,
+    eye: Vec3,
+    target: Vec3,
+    fov_y: f32,
+    w: f32,
+    h: f32,
 ) -> (Mat3, [f32; 4]) {
     let f = (target - eye).normalize();
     let r = f.cross(Vec3::Z).normalize();
@@ -390,12 +392,8 @@ pub fn cpu_render_scene(
                 let base_color = td.color + Vec3::splat(offset);
 
                 let [cr, cg, cb, ca] = render_tet_pixel(
-                    cam_pos,
-                    ray_dir, // already normalized, d=1
-                    &td.verts,
-                    td.density,
-                    base_color,
-                    td.grad,
+                    cam_pos, ray_dir, // already normalized, d=1
+                    &td.verts, td.density, base_color, td.grad,
                 );
 
                 // Premultiplied alpha blend: dst = src + dst * (1 - src_alpha)
@@ -427,7 +425,9 @@ pub fn gpu_render_scene(
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_render_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_render_scene_async(
@@ -450,34 +450,46 @@ async fn gpu_render_scene_async(
         .ok()?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30,
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                ..Default::default()
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        )
+            ..Default::default()
+        })
         .await
         .ok()?;
 
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     // Sort infrastructure for sorted HW raster forward pass (32-bit keys)
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    let sort_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state =
+        rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(&queue);
 
     // B-variant render bind group (uses sort_state.values_b)
     let render_bg_b = rmesh_render::create_render_bind_group_with_sort_values(
-        &device, &pipelines, &buffers, &material, sort_state.values_b(),
+        &device,
+        &pipelines,
+        &buffers,
+        &material,
+        sort_state.values_b(),
     );
 
     // Write uniforms
@@ -501,7 +513,11 @@ async fn gpu_render_scene_async(
     // Create dummy depth texture (all-pass) for forward pass depth attachment
     let dummy_depth_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test_dummy_depth"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -555,7 +571,9 @@ async fn gpu_render_scene_async(
         &dummy_depth_view,
         None,
         false,
-        None, None, None,
+        None,
+        None,
+        None,
         None,
         true,
     );
@@ -645,7 +663,9 @@ pub fn gpu_raytrace_scene(
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_raytrace_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_raytrace_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_raytrace_scene_async(
@@ -668,18 +688,16 @@ async fn gpu_raytrace_scene_async(
         .ok()?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30,
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                ..Default::default()
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        )
+            ..Default::default()
+        })
         .await
         .ok()?;
 
@@ -687,7 +705,12 @@ async fn gpu_raytrace_scene_async(
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let material = rmesh_render::MaterialBuffers::upload(&device, &zero_base_colors, &scene.color_grads, scene.tet_count);
+    let material = rmesh_render::MaterialBuffers::upload(
+        &device,
+        &zero_base_colors,
+        &scene.color_grads,
+        scene.tet_count,
+    );
     let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format);
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
@@ -695,27 +718,55 @@ async fn gpu_raytrace_scene_async(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    let compute_bg = rmesh_render::create_compute_bind_group(&device, &pipelines, &buffers, &material, &dummy_sh);
+    let compute_bg = rmesh_render::create_compute_bind_group(
+        &device, &pipelines, &buffers, &material, &dummy_sh,
+    );
 
     // Build ray trace data
     let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
     let bvh = rmesh_render::build_boundary_bvh(
-        &scene.vertices, &scene.indices, &neighbors, scene.tet_count as usize,
+        &scene.vertices,
+        &scene.indices,
+        &neighbors,
+        scene.tet_count as usize,
     );
     let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, w, h, 0);
     let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &neighbors, &bvh);
 
     // Determine start tet
     let start_tet = rmesh_render::find_containing_tet(
-        &scene.vertices, &scene.indices, scene.tet_count as usize, cam_pos,
-    ).map(|t| t as i32).unwrap_or(-1);
+        &scene.vertices,
+        &scene.indices,
+        scene.tet_count as usize,
+        cam_pos,
+    )
+    .map(|t| t as i32)
+    .unwrap_or(-1);
     queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
 
-    let rt_bg = rmesh_render::create_raytrace_bind_group(&device, &rt_pipeline, &buffers, &material, &rt_buffers);
+    let rt_bg = rmesh_render::create_raytrace_bind_group(
+        &device,
+        &rt_pipeline,
+        &buffers,
+        &material,
+        &rt_buffers,
+    );
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0, 12, 0.0, 0, 0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0,
+        12,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -729,7 +780,12 @@ async fn gpu_raytrace_scene_async(
 
     // Forward compute (color eval → colors_buf)
     rmesh_render::record_project_compute(
-        &mut encoder, &pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+        &mut encoder,
+        &pipelines,
+        &buffers,
+        &compute_bg,
+        scene.tet_count,
+        &queue,
     );
 
     // Ray trace
@@ -743,7 +799,11 @@ async fn gpu_raytrace_scene_async(
         mapped_at_creation: false,
     });
     encoder.copy_buffer_to_buffer(
-        &rt_pipeline.rendered_image, 0, &readback, 0, readback.size(),
+        &rt_pipeline.rendered_image,
+        0,
+        &readback,
+        0,
+        readback.size(),
     );
     queue.submit(std::iter::once(encoder.finish()));
 
@@ -759,7 +819,12 @@ async fn gpu_raytrace_scene_async(
     let floats: &[f32] = bytemuck::cast_slice(&data);
     let mut image = vec![[0.0f32; 4]; (w * h) as usize];
     for i in 0..(w * h) as usize {
-        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+        image[i] = [
+            floats[i * 4],
+            floats[i * 4 + 1],
+            floats[i * 4 + 2],
+            floats[i * 4 + 3],
+        ];
     }
     drop(data);
     readback.unmap();
@@ -785,7 +850,9 @@ pub fn gpu_tiled_render_scene(
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_tiled_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_tiled_render_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_tiled_render_scene_async(
@@ -808,18 +875,16 @@ async fn gpu_tiled_render_scene_async(
         .ok()?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30,
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                ..Default::default()
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        )
+            ..Default::default()
+        })
         .await
         .ok()?;
 
@@ -828,26 +893,59 @@ async fn gpu_tiled_render_scene_async(
     // Forward compute setup
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0u32,
+        12,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Run forward compute
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     rmesh_render::record_project_compute(
-        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+        &mut encoder,
+        &fwd_pipelines,
+        &buffers,
+        &compute_bg,
+        scene.tet_count,
+        &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
+    let radix_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_sort::SortBackend::Drs);
+    let sorting_bits =
+        rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
+    let radix_state = rmesh_sort::RadixSortState::new(
+        &device,
+        tile_buffers.max_pairs_pow2,
+        sorting_bits,
+        2,
+        rmesh_sort::SortBackend::Drs,
+    );
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
@@ -863,45 +961,85 @@ async fn gpu_tiled_render_scene_async(
         visible_tet_count: 0,
         _pad: [0; 5],
     };
-    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+    queue.write_buffer(
+        &tile_buffers.tile_uniforms,
+        0,
+        bytemuck::bytes_of(&tile_uni),
+    );
 
     // Create bind groups
     let prepare_dispatch_bg = rmesh_tile::create_prepare_dispatch_bind_group(
-        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.indirect_args,
+        &scan_buffers,
     );
     let rts_bg = rmesh_tile::create_rts_bind_group(
-        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.tiles_touched,
+        &scan_buffers,
     );
-    let tile_fill_bg = rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_fill_bg =
+        rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_tile::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers,
-        &buffers.uniforms, &buffers.vertices, &buffers.indices,
-        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, radix_state.num_keys_buf(),
+        &device,
+        &scan_pipelines,
+        &tile_buffers,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &buffers.compact_tet_ids,
+        &buffers.circumdata,
+        &buffers.tiles_touched,
+        &scan_buffers,
+        radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, radix_state.keys_b(),
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        radix_state.keys_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
 
     // Forward tiled pipeline
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h, 0);
-    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
-        &device, &rasterize, &buffers.uniforms,
-        &buffers.vertices, &buffers.indices, &material.colors,
-        &buffers.densities, &material.color_grads,
-        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    let rasterize = rmesh_trainable::RasterizeComputePipeline::new(&device, w, h, 0);
+    let rasterize_bg_a = rmesh_trainable::create_rasterize_bind_group(
+        &device,
+        &rasterize,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &material.colors,
+        &buffers.densities,
+        &material.color_grads,
+        &tile_buffers.tile_sort_values,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
     );
-    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
-        &device, &rasterize, &buffers.uniforms,
-        &buffers.vertices, &buffers.indices, &material.colors,
-        &buffers.densities, &material.color_grads,
-        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    let rasterize_bg_b = rmesh_trainable::create_rasterize_bind_group(
+        &device,
+        &rasterize,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &material.colors,
+        &buffers.densities,
+        &material.color_grads,
+        radix_state.values_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
     );
 
     // Dispatch tiled forward pipeline
@@ -911,33 +1049,57 @@ async fn gpu_tiled_render_scene_async(
 
     // 1. Scan-based tile pipeline
     rmesh_tile::record_scan_tile_pipeline(
-        &mut encoder, &scan_pipelines, &tile_pipelines,
-        &prepare_dispatch_bg, &rts_bg,
-        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+        &mut encoder,
+        &scan_pipelines,
+        &tile_pipelines,
+        &prepare_dispatch_bg,
+        &rts_bg,
+        &tile_fill_bg,
+        &tile_gen_scan_bg,
+        &scan_buffers,
+        &tile_buffers,
     );
 
     // 2. Radix sort
     let result_in_b = rmesh_sort::record_radix_sort(
-        &mut encoder, &device, &radix_pipelines, &radix_state,
-        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+        &mut encoder,
+        &device,
+        &radix_pipelines,
+        &radix_state,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_sort_values,
     );
 
     // 3. Tile ranges
     {
-        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let ranges_bg = if result_in_b {
+            &tile_ranges_bg_b
+        } else {
+            &tile_ranges_bg_a
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_ranges"), timestamp_writes: None,
+            label: Some("tile_ranges"),
+            timestamp_writes: None,
         });
         pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
-        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+        let wgs = tile_buffers.max_pairs_pow2.div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535).max(1), 1);
     }
 
     // 4. Forward tiled
     {
-        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
-        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
+        let fwd_bg = if result_in_b {
+            &rasterize_bg_b
+        } else {
+            &rasterize_bg_a
+        };
+        rmesh_trainable::record_rasterize_compute(
+            &mut encoder,
+            &rasterize,
+            fwd_bg,
+            tile_buffers.num_tiles,
+        );
     }
 
     queue.submit(std::iter::once(encoder.finish()));
@@ -967,7 +1129,12 @@ async fn gpu_tiled_render_scene_async(
     let floats: &[f32] = bytemuck::cast_slice(&data);
     let mut image = vec![[0.0f32; 4]; pixel_count];
     for i in 0..pixel_count {
-        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+        image[i] = [
+            floats[i * 4],
+            floats[i * 4 + 1],
+            floats[i * 4 + 2],
+            floats[i * 4 + 3],
+        ];
     }
     drop(data);
     readback.unmap();
@@ -994,7 +1161,9 @@ pub fn gpu_tiled_render_with_stats(
     w: u32,
     h: u32,
 ) -> Option<(Vec<[f32; 4]>, Vec<OverdrawStats>)> {
-    pollster::block_on(gpu_tiled_render_with_stats_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_tiled_render_with_stats_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_tiled_render_with_stats_async(
@@ -1017,18 +1186,16 @@ async fn gpu_tiled_render_with_stats_async(
         .ok()?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30,
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                ..Default::default()
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        )
+            ..Default::default()
+        })
         .await
         .ok()?;
 
@@ -1037,26 +1204,59 @@ async fn gpu_tiled_render_with_stats_async(
     // Forward compute setup
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0u32,
+        12,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Run forward compute
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     rmesh_render::record_project_compute(
-        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+        &mut encoder,
+        &fwd_pipelines,
+        &buffers,
+        &compute_bg,
+        scene.tet_count,
+        &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
+    let radix_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_sort::SortBackend::Drs);
+    let sorting_bits =
+        rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
+    let radix_state = rmesh_sort::RadixSortState::new(
+        &device,
+        tile_buffers.max_pairs_pow2,
+        sorting_bits,
+        2,
+        rmesh_sort::SortBackend::Drs,
+    );
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
@@ -1072,45 +1272,85 @@ async fn gpu_tiled_render_with_stats_async(
         visible_tet_count: 0,
         _pad: [0; 5],
     };
-    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+    queue.write_buffer(
+        &tile_buffers.tile_uniforms,
+        0,
+        bytemuck::bytes_of(&tile_uni),
+    );
 
     // Create bind groups
     let prepare_dispatch_bg = rmesh_tile::create_prepare_dispatch_bind_group(
-        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.indirect_args,
+        &scan_buffers,
     );
     let rts_bg = rmesh_tile::create_rts_bind_group(
-        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.tiles_touched,
+        &scan_buffers,
     );
-    let tile_fill_bg = rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_fill_bg =
+        rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_tile::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers,
-        &buffers.uniforms, &buffers.vertices, &buffers.indices,
-        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, radix_state.num_keys_buf(),
+        &device,
+        &scan_pipelines,
+        &tile_buffers,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &buffers.compact_tet_ids,
+        &buffers.circumdata,
+        &buffers.tiles_touched,
+        &scan_buffers,
+        radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, radix_state.keys_b(),
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        radix_state.keys_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
 
     // Forward tiled pipeline
-    let rasterize = rmesh_render::RasterizeComputePipeline::new(&device, w, h, 0);
-    let rasterize_bg_a = rmesh_render::create_rasterize_bind_group(
-        &device, &rasterize, &buffers.uniforms,
-        &buffers.vertices, &buffers.indices, &material.colors,
-        &buffers.densities, &material.color_grads,
-        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    let rasterize = rmesh_trainable::RasterizeComputePipeline::new(&device, w, h, 0);
+    let rasterize_bg_a = rmesh_trainable::create_rasterize_bind_group(
+        &device,
+        &rasterize,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &material.colors,
+        &buffers.densities,
+        &material.color_grads,
+        &tile_buffers.tile_sort_values,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
     );
-    let rasterize_bg_b = rmesh_render::create_rasterize_bind_group(
-        &device, &rasterize, &buffers.uniforms,
-        &buffers.vertices, &buffers.indices, &material.colors,
-        &buffers.densities, &material.color_grads,
-        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
+    let rasterize_bg_b = rmesh_trainable::create_rasterize_bind_group(
+        &device,
+        &rasterize,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &material.colors,
+        &buffers.densities,
+        &material.color_grads,
+        radix_state.values_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
     );
 
     // Dispatch tiled forward pipeline
@@ -1121,33 +1361,57 @@ async fn gpu_tiled_render_with_stats_async(
 
     // 1. Scan-based tile pipeline
     rmesh_tile::record_scan_tile_pipeline(
-        &mut encoder, &scan_pipelines, &tile_pipelines,
-        &prepare_dispatch_bg, &rts_bg,
-        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+        &mut encoder,
+        &scan_pipelines,
+        &tile_pipelines,
+        &prepare_dispatch_bg,
+        &rts_bg,
+        &tile_fill_bg,
+        &tile_gen_scan_bg,
+        &scan_buffers,
+        &tile_buffers,
     );
 
     // 2. Radix sort
     let result_in_b = rmesh_sort::record_radix_sort(
-        &mut encoder, &device, &radix_pipelines, &radix_state,
-        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+        &mut encoder,
+        &device,
+        &radix_pipelines,
+        &radix_state,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_sort_values,
     );
 
     // 3. Tile ranges
     {
-        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let ranges_bg = if result_in_b {
+            &tile_ranges_bg_b
+        } else {
+            &tile_ranges_bg_a
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_ranges"), timestamp_writes: None,
+            label: Some("tile_ranges"),
+            timestamp_writes: None,
         });
         pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
-        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+        let wgs = tile_buffers.max_pairs_pow2.div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535).max(1), 1);
     }
 
     // 4. Forward tiled
     {
-        let fwd_bg = if result_in_b { &rasterize_bg_b } else { &rasterize_bg_a };
-        rmesh_render::record_rasterize_compute(&mut encoder, &rasterize, fwd_bg, tile_buffers.num_tiles);
+        let fwd_bg = if result_in_b {
+            &rasterize_bg_b
+        } else {
+            &rasterize_bg_a
+        };
+        rmesh_trainable::record_rasterize_compute(
+            &mut encoder,
+            &rasterize,
+            fwd_bg,
+            tile_buffers.num_tiles,
+        );
     }
 
     queue.submit(std::iter::once(encoder.finish()));
@@ -1176,10 +1440,14 @@ async fn gpu_tiled_render_with_stats_async(
     // Map image buffer
     let slice_img = readback_img.slice(..);
     let (tx1, rx1) = std::sync::mpsc::channel();
-    slice_img.map_async(wgpu::MapMode::Read, move |r| { tx1.send(r).unwrap(); });
+    slice_img.map_async(wgpu::MapMode::Read, move |r| {
+        tx1.send(r).unwrap();
+    });
     let slice_dbg = readback_dbg.slice(..);
     let (tx2, rx2) = std::sync::mpsc::channel();
-    slice_dbg.map_async(wgpu::MapMode::Read, move |r| { tx2.send(r).unwrap(); });
+    slice_dbg.map_async(wgpu::MapMode::Read, move |r| {
+        tx2.send(r).unwrap();
+    });
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     rx1.recv().unwrap().ok()?;
     rx2.recv().unwrap().ok()?;
@@ -1188,7 +1456,12 @@ async fn gpu_tiled_render_with_stats_async(
     let floats: &[f32] = bytemuck::cast_slice(&img_data);
     let mut image = vec![[0.0f32; 4]; pixel_count];
     for i in 0..pixel_count {
-        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+        image[i] = [
+            floats[i * 4],
+            floats[i * 4 + 1],
+            floats[i * 4 + 2],
+            floats[i * 4 + 3],
+        ];
     }
     drop(img_data);
     readback_img.unmap();
@@ -1197,7 +1470,12 @@ async fn gpu_tiled_render_with_stats_async(
     let uints: &[u32] = bytemuck::cast_slice(&dbg_data);
     let mut stats = vec![[0u32; 4]; pixel_count];
     for i in 0..pixel_count {
-        stats[i] = [uints[i * 4], uints[i * 4 + 1], uints[i * 4 + 2], uints[i * 4 + 3]];
+        stats[i] = [
+            uints[i * 4],
+            uints[i * 4 + 1],
+            uints[i * 4 + 2],
+            uints[i * 4 + 3],
+        ];
     }
     drop(dbg_data);
     readback_dbg.unmap();
@@ -1270,62 +1548,94 @@ async fn gpu_interval_render_scene_async(
     limits.max_mesh_output_primitives = supported_limits.max_mesh_output_primitives;
     limits.max_mesh_output_layers = supported_limits.max_mesh_output_layers;
     limits.max_mesh_multiview_view_count = supported_limits.max_mesh_multiview_view_count;
-    limits.max_task_mesh_workgroup_total_count = supported_limits.max_task_mesh_workgroup_total_count;
-    limits.max_task_mesh_workgroups_per_dimension = supported_limits.max_task_mesh_workgroups_per_dimension;
+    limits.max_task_mesh_workgroup_total_count =
+        supported_limits.max_task_mesh_workgroup_total_count;
+    limits.max_task_mesh_workgroups_per_dimension =
+        supported_limits.max_task_mesh_workgroups_per_dimension;
 
     // Mesh shaders are experimental — must opt in
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP
-                    | wgpu::Features::SHADER_FLOAT32_ATOMIC
-                    | wgpu::Features::EXPERIMENTAL_MESH_SHADER,
-                required_limits: limits,
-                experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
-                ..Default::default()
-            },
-        )
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP
+                | wgpu::Features::SHADER_FLOAT32_ATOMIC
+                | wgpu::Features::EXPERIMENTAL_MESH_SHADER,
+            required_limits: limits,
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        })
         .await
         .ok()?;
 
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     // Interval shading pipelines
     let interval_pipelines = rmesh_render::IntervalPipelines::new(&device, color_format);
 
     // Sort infrastructure (32-bit keys)
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    let sort_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state =
+        rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(&queue);
 
     // Interval bind groups (A and B for sort buffer swapping)
     let interval_render_bg_a = rmesh_render::create_interval_render_bind_group(
-        &device, &interval_pipelines, &buffers, &material,
+        &device,
+        &interval_pipelines,
+        &buffers,
+        &material,
     );
     let interval_render_bg_b = rmesh_render::create_interval_render_bind_group_with_sort_values(
-        &device, &interval_pipelines, &buffers, &material, sort_state.values_b(),
+        &device,
+        &interval_pipelines,
+        &buffers,
+        &material,
+        sort_state.values_b(),
     );
     let indirect_convert_bg = rmesh_render::create_interval_indirect_convert_bind_group(
-        &device, &interval_pipelines, &buffers,
+        &device,
+        &interval_pipelines,
+        &buffers,
     );
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos,
-        w as f32, h as f32,
-        scene.tet_count, 0, 16, 0.0, 0,
-        0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0,
+        16,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Depth texture for the render pass
     let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test_interval_depth"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1438,9 +1748,12 @@ async fn gpu_interval_render_scene_async(
         for col in 0..w {
             let pixel_start = row_start + (col * bytes_per_pixel) as usize;
             let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
-            let g = half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
-            let b = half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
-            let a = half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
+            let g =
+                half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
+            let b =
+                half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
+            let a =
+                half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
             image[(row * w + col) as usize] = [r, g, b, a];
         }
     }
@@ -1470,7 +1783,9 @@ pub fn gpu_interval_tiled_render_scene(
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_interval_tiled_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_interval_tiled_render_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_interval_tiled_render_scene_async(
@@ -1493,18 +1808,16 @@ async fn gpu_interval_tiled_render_scene_async(
         .ok()?;
 
     let (device, queue) = adapter
-        .request_device(
-            &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-                required_limits: wgpu::Limits {
-                    max_storage_buffers_per_shader_stage: 20,
-                    max_storage_buffer_binding_size: 1 << 30,
-                    max_buffer_size: 1 << 30,
-                    ..wgpu::Limits::default()
-                },
-                ..Default::default()
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
             },
-        )
+            ..Default::default()
+        })
         .await
         .ok()?;
 
@@ -1513,33 +1826,70 @@ async fn gpu_interval_tiled_render_scene_async(
     // Forward compute setup
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, _targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos, w as f32, h as f32, scene.tet_count, 0u32, 12, 0.0, 0, 0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0u32,
+        12,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Run forward compute
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
     rmesh_render::record_project_compute(
-        &mut encoder, &fwd_pipelines, &buffers, &compute_bg, scene.tet_count, &queue,
+        &mut encoder,
+        &fwd_pipelines,
+        &buffers,
+        &compute_bg,
+        scene.tet_count,
+        &queue,
     );
     queue.submit(std::iter::once(encoder.finish()));
 
     // Interval tiled buffers + pipelines
-    let interval_buffers = rmesh_render::IntervalTiledBuffers::new(&device, scene.tet_count);
-    let interval_gen = rmesh_render::IntervalGeneratePipeline::new(&device);
-    let interval_gen_bg = rmesh_render::create_interval_generate_bind_group(
-        &device, &interval_gen, &buffers, &material, &interval_buffers,
+    let interval_buffers = rmesh_trainable::IntervalTiledBuffers::new(&device, scene.tet_count);
+    let interval_gen = rmesh_trainable::IntervalGeneratePipeline::new(&device);
+    let interval_gen_bg = rmesh_trainable::create_interval_generate_bind_group(
+        &device,
+        &interval_gen,
+        &buffers,
+        &material,
+        &interval_buffers,
     );
 
     // Tile pipeline setup
     let tile_pipelines = rmesh_tile::TilePipelines::new(&device);
-    let radix_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
+    let radix_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 2, rmesh_sort::SortBackend::Drs);
     let tile_buffers = rmesh_tile::TileBuffers::new(&device, scene.tet_count, w, h, tile_size);
-    let sorting_bits = rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
-    let radix_state = rmesh_sort::RadixSortState::new(&device, tile_buffers.max_pairs_pow2, sorting_bits, 2, rmesh_sort::SortBackend::Drs);
+    let sorting_bits =
+        rmesh_sort::sorting_bits_for_tiles(tile_buffers.num_tiles, rmesh_sort::SortBackend::Drs);
+    let radix_state = rmesh_sort::RadixSortState::new(
+        &device,
+        tile_buffers.max_pairs_pow2,
+        sorting_bits,
+        2,
+        rmesh_sort::SortBackend::Drs,
+    );
     radix_state.upload_configs(&queue);
 
     let scan_pipelines = rmesh_tile::ScanPipelines::new(&device);
@@ -1555,43 +1905,81 @@ async fn gpu_interval_tiled_render_scene_async(
         visible_tet_count: 0,
         _pad: [0; 5],
     };
-    queue.write_buffer(&tile_buffers.tile_uniforms, 0, bytemuck::bytes_of(&tile_uni));
+    queue.write_buffer(
+        &tile_buffers.tile_uniforms,
+        0,
+        bytemuck::bytes_of(&tile_uni),
+    );
 
     // Create bind groups
     let prepare_dispatch_bg = rmesh_tile::create_prepare_dispatch_bind_group(
-        &device, &scan_pipelines, &buffers.indirect_args, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.indirect_args,
+        &scan_buffers,
     );
     let rts_bg = rmesh_tile::create_rts_bind_group(
-        &device, &scan_pipelines, &buffers.tiles_touched, &scan_buffers,
+        &device,
+        &scan_pipelines,
+        &buffers.tiles_touched,
+        &scan_buffers,
     );
-    let tile_fill_bg = rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
+    let tile_fill_bg =
+        rmesh_tile::create_tile_fill_bind_group(&device, &tile_pipelines, &tile_buffers);
     let tile_gen_scan_bg = rmesh_tile::create_tile_gen_scan_bind_group(
-        &device, &scan_pipelines, &tile_buffers,
-        &buffers.uniforms, &buffers.vertices, &buffers.indices,
-        &buffers.compact_tet_ids, &buffers.circumdata, &buffers.tiles_touched,
-        &scan_buffers, radix_state.num_keys_buf(),
+        &device,
+        &scan_pipelines,
+        &tile_buffers,
+        &buffers.uniforms,
+        &buffers.vertices,
+        &buffers.indices,
+        &buffers.compact_tet_ids,
+        &buffers.circumdata,
+        &buffers.tiles_touched,
+        &scan_buffers,
+        radix_state.num_keys_buf(),
     );
 
     let tile_ranges_bg_a = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, &tile_buffers.tile_sort_keys,
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
     let tile_ranges_bg_b = rmesh_tile::create_tile_ranges_bind_group_with_keys(
-        &device, &tile_pipelines, radix_state.keys_b(),
-        &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms, radix_state.num_keys_buf(),
+        &device,
+        &tile_pipelines,
+        radix_state.keys_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        radix_state.num_keys_buf(),
     );
 
     // Interval tiled rasterize (replaces rasterize_compute)
-    let interval_rasterize = rmesh_render::IntervalTiledRasterizePipeline::new(&device, w, h, 0);
-    let interval_rasterize_bg_a = rmesh_render::create_interval_tiled_rasterize_bind_group(
-        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
-        &tile_buffers.tile_sort_values, &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    let interval_rasterize = rmesh_trainable::IntervalTiledRasterizePipeline::new(&device, w, h, 0);
+    let interval_rasterize_bg_a = rmesh_trainable::create_interval_tiled_rasterize_bind_group(
+        &device,
+        &interval_rasterize,
+        &buffers.uniforms,
+        &interval_buffers,
+        &tile_buffers.tile_sort_values,
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy,
+        &interval_rasterize.aux_image,
     );
-    let interval_rasterize_bg_b = rmesh_render::create_interval_tiled_rasterize_bind_group(
-        &device, &interval_rasterize, &buffers.uniforms, &interval_buffers,
-        radix_state.values_b(), &tile_buffers.tile_ranges, &tile_buffers.tile_uniforms,
-        &interval_rasterize.aux_data_dummy, &interval_rasterize.aux_image,
+    let interval_rasterize_bg_b = rmesh_trainable::create_interval_tiled_rasterize_bind_group(
+        &device,
+        &interval_rasterize,
+        &buffers.uniforms,
+        &interval_buffers,
+        radix_state.values_b(),
+        &tile_buffers.tile_ranges,
+        &tile_buffers.tile_uniforms,
+        &interval_rasterize.aux_data_dummy,
+        &interval_rasterize.aux_image,
     );
 
     // Dispatch tiled forward pipeline
@@ -1602,40 +1990,65 @@ async fn gpu_interval_tiled_render_scene_async(
     encoder.clear_buffer(&tile_buffers.tile_ranges, 0, None);
 
     // 1. Interval generate (needs compact_tet_ids from project_compute)
-    rmesh_render::record_interval_generate(
-        &mut encoder, &interval_gen, &interval_gen_bg, scene.tet_count,
+    rmesh_trainable::record_interval_generate(
+        &mut encoder,
+        &interval_gen,
+        &interval_gen_bg,
+        scene.tet_count,
     );
 
     // 2. Scan-based tile pipeline
     rmesh_tile::record_scan_tile_pipeline(
-        &mut encoder, &scan_pipelines, &tile_pipelines,
-        &prepare_dispatch_bg, &rts_bg,
-        &tile_fill_bg, &tile_gen_scan_bg, &scan_buffers, &tile_buffers,
+        &mut encoder,
+        &scan_pipelines,
+        &tile_pipelines,
+        &prepare_dispatch_bg,
+        &rts_bg,
+        &tile_fill_bg,
+        &tile_gen_scan_bg,
+        &scan_buffers,
+        &tile_buffers,
     );
 
     // 3. Radix sort
     let result_in_b = rmesh_sort::record_radix_sort(
-        &mut encoder, &device, &radix_pipelines, &radix_state,
-        &tile_buffers.tile_sort_keys, &tile_buffers.tile_sort_values,
+        &mut encoder,
+        &device,
+        &radix_pipelines,
+        &radix_state,
+        &tile_buffers.tile_sort_keys,
+        &tile_buffers.tile_sort_values,
     );
 
     // 4. Tile ranges
     {
-        let ranges_bg = if result_in_b { &tile_ranges_bg_b } else { &tile_ranges_bg_a };
+        let ranges_bg = if result_in_b {
+            &tile_ranges_bg_b
+        } else {
+            &tile_ranges_bg_a
+        };
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("tile_ranges"), timestamp_writes: None,
+            label: Some("tile_ranges"),
+            timestamp_writes: None,
         });
         pass.set_pipeline(&tile_pipelines.tile_ranges_pipeline);
         pass.set_bind_group(0, ranges_bg, &[]);
-        let wgs = (tile_buffers.max_pairs_pow2 + 255) / 256;
-        pass.dispatch_workgroups(wgs.min(65535), ((wgs + 65534) / 65535).max(1), 1);
+        let wgs = tile_buffers.max_pairs_pow2.div_ceil(256);
+        pass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535).max(1), 1);
     }
 
     // 5. Interval tiled rasterize
     {
-        let fwd_bg = if result_in_b { &interval_rasterize_bg_b } else { &interval_rasterize_bg_a };
-        rmesh_render::record_interval_tiled_rasterize(
-            &mut encoder, &interval_rasterize, fwd_bg, tile_buffers.num_tiles,
+        let fwd_bg = if result_in_b {
+            &interval_rasterize_bg_b
+        } else {
+            &interval_rasterize_bg_a
+        };
+        rmesh_trainable::record_interval_tiled_rasterize(
+            &mut encoder,
+            &interval_rasterize,
+            fwd_bg,
+            tile_buffers.num_tiles,
         );
     }
 
@@ -1651,7 +2064,13 @@ async fn gpu_interval_tiled_render_scene_async(
     });
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.copy_buffer_to_buffer(&interval_rasterize.rendered_image, 0, &readback, 0, readback.size());
+    encoder.copy_buffer_to_buffer(
+        &interval_rasterize.rendered_image,
+        0,
+        &readback,
+        0,
+        readback.size(),
+    );
     queue.submit(std::iter::once(encoder.finish()));
 
     let slice = readback.slice(..);
@@ -1666,7 +2085,12 @@ async fn gpu_interval_tiled_render_scene_async(
     let floats: &[f32] = bytemuck::cast_slice(&data);
     let mut image = vec![[0.0f32; 4]; pixel_count];
     for i in 0..pixel_count {
-        image[i] = [floats[i * 4], floats[i * 4 + 1], floats[i * 4 + 2], floats[i * 4 + 3]];
+        image[i] = [
+            floats[i * 4],
+            floats[i * 4 + 1],
+            floats[i * 4 + 2],
+            floats[i * 4 + 3],
+        ];
     }
     drop(data);
     readback.unmap();
@@ -1683,10 +2107,10 @@ async fn gpu_interval_tiled_render_scene_async(
 /// This produces analytically predictable output.
 pub fn known_single_tet_scene() -> SceneData {
     let vertices = vec![
-        0.5, 0.5, 0.5,    // v0
-        -0.5, -0.5, 0.5,  // v1
-        -0.5, 0.5, -0.5,  // v2
-        0.5, -0.5, -0.5,  // v3
+        0.5, 0.5, 0.5, // v0
+        -0.5, -0.5, 0.5, // v1
+        -0.5, 0.5, -0.5, // v2
+        0.5, -0.5, -0.5, // v3
     ];
     let indices = vec![0u32, 1, 2, 3];
     let densities = vec![3.0f32];
@@ -1696,10 +2120,7 @@ pub fn known_single_tet_scene() -> SceneData {
 
 /// Comparison helper: check if two images match within tolerance.
 /// Returns (max_abs_diff, mean_abs_diff, num_pixels_compared).
-pub fn compare_images(
-    cpu: &[[f32; 4]],
-    gpu: &[[f32; 4]],
-) -> (f32, f32, usize) {
+pub fn compare_images(cpu: &[[f32; 4]], gpu: &[[f32; 4]]) -> (f32, f32, usize) {
     assert_eq!(cpu.len(), gpu.len());
     let mut max_diff = 0.0f32;
     let mut sum_diff = 0.0f32;
@@ -1727,7 +2148,9 @@ pub fn compare_images(
 // Compute-based interval rendering (no mesh shader required)
 // ---------------------------------------------------------------------------
 
-/// GPU render using compute-based interval shading (available on all GPUs).
+/// GPU render using compute-based interval shading via the legacy
+/// `project_compute.wgsl` (storage-uniforms) project pass. Used as the
+/// reference path for most cross-renderer tests.
 pub fn gpu_compute_interval_render_scene(
     scene: &SceneData,
     cam_pos: Vec3,
@@ -1737,7 +2160,31 @@ pub fn gpu_compute_interval_render_scene(
     w: u32,
     h: u32,
 ) -> Option<Vec<[f32; 4]>> {
-    pollster::block_on(gpu_compute_interval_render_scene_async(scene, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_compute_interval_render_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h, false,
+    ))
+}
+
+/// GPU render via the **HW compute** project path (`project_compute_hw.wgsl`,
+/// uniform-buffer uniforms) — the same pipeline `rmesh-viewer` uses for the
+/// interval shader. Diverges from `gpu_compute_interval_render_scene` only in
+/// which project compute runs; everything downstream (sort, indirect convert,
+/// interval gen, interval render) is shared.
+///
+/// Exists specifically so the test suite covers the viewer's path; before
+/// this, every interval test ran the legacy `project_compute.wgsl` instead.
+pub fn gpu_hw_compute_interval_render_scene(
+    scene: &SceneData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
+) -> Option<Vec<[f32; 4]>> {
+    pollster::block_on(gpu_compute_interval_render_scene_async(
+        scene, cam_pos, vp, c2w, intrinsics, w, h, true,
+    ))
 }
 
 async fn gpu_compute_interval_render_scene_async(
@@ -1748,6 +2195,7 @@ async fn gpu_compute_interval_render_scene_async(
     intrinsics: [f32; 4],
     w: u32,
     h: u32,
+    use_hw_compute: bool,
 ) -> Option<Vec<[f32; 4]>> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
@@ -1764,8 +2212,7 @@ async fn gpu_compute_interval_render_scene_async(
 
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::SUBGROUP
-                | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
             required_limits: wgpu::Limits {
                 max_storage_buffers_per_shader_stage: 20,
                 max_storage_buffer_binding_size: 1 << 30,
@@ -1780,44 +2227,96 @@ async fn gpu_compute_interval_render_scene_async(
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, _render_bg) =
-        rmesh_render::setup_forward(&device, &queue, scene, &zero_base_colors, &scene.color_grads, w, h);
+        rmesh_render::setup_forward(
+            &device,
+            &queue,
+            scene,
+            &zero_base_colors,
+            &scene.color_grads,
+            w,
+            h,
+        );
 
     // Compute-interval pipelines (no mesh shader needed)
     let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
 
     // Sort infrastructure
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    let sort_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state =
+        rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(&queue);
 
     // Bind groups
     let gen_bg_a = rmesh_render::create_compute_interval_gen_bind_group(
-        &device, &ci_pipelines, &buffers, &material,
+        &device,
+        &ci_pipelines,
+        &buffers,
+        &material,
     );
     let gen_bg_b = rmesh_render::create_compute_interval_gen_bind_group_with_sort_values(
-        &device, &ci_pipelines, &buffers, &material, sort_state.values_b(),
+        &device,
+        &ci_pipelines,
+        &buffers,
+        &material,
+        sort_state.values_b(),
     );
-    let ci_render_bg = rmesh_render::create_compute_interval_render_bind_group(
-        &device, &ci_pipelines, &buffers,
-    );
+    let ci_render_bg =
+        rmesh_render::create_compute_interval_render_bind_group(&device, &ci_pipelines, &buffers);
     let ci_convert_bg = rmesh_render::create_compute_interval_indirect_convert_bind_group(
-        &device, &ci_pipelines, &buffers,
+        &device,
+        &ci_pipelines,
+        &buffers,
     );
+
+    // For the HW-compute path the project pass uses uniform-buffer uniforms
+    // and a different bind group layout (project_compute_hw.wgsl). Built only
+    // when needed so we keep the legacy path's setup unchanged.
+    let hw_compute_bg = if use_hw_compute {
+        let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("hw_dummy_sh_coeffs"),
+            size: 4, // arrayLength==1 → shader takes the base_colors branch
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+        Some(rmesh_render::create_hw_compute_bind_group(
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &dummy_sh,
+        ))
+    } else {
+        None
+    };
 
     // Write uniforms
     let uniforms = rmesh_render::make_uniforms(
-        vp, c2w, intrinsics, cam_pos,
-        w as f32, h as f32,
-        scene.tet_count, 0, 16, 0.0, 0,
-        0.01, 100.0,
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0,
+        16,
+        0.0,
+        0,
+        0.01,
+        100.0,
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     // Depth texture
     let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test_ci_depth"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -1874,7 +2373,7 @@ async fn gpu_compute_interval_render_scene_async(
         scene.tet_count,
         &queue,
         &depth_view,
-        None,
+        hw_compute_bg.as_ref(),
         None,
         false,
         true,
@@ -1933,9 +2432,12 @@ async fn gpu_compute_interval_render_scene_async(
         for col in 0..w {
             let pixel_start = row_start + (col * bytes_per_pixel) as usize;
             let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
-            let g = half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
-            let b = half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
-            let a = half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
+            let g =
+                half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
+            let b =
+                half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
+            let a =
+                half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
             image[(row * w + col) as usize] = [r, g, b, a];
         }
     }
@@ -1968,11 +2470,14 @@ pub struct MrtImages {
 
 fn oct_encode_cpu(n: Vec3) -> [f32; 2] {
     let s = n.x.abs() + n.y.abs() + n.z.abs();
-    if s < 1e-12 { return [0.5, 0.5]; }
+    if s < 1e-12 {
+        return [0.5, 0.5];
+    }
     let mut px = n.x / s;
     let mut py = n.y / s;
     if n.z < 0.0 {
-        let ox = px; let oy = py;
+        let ox = px;
+        let oy = py;
         px = (1.0 - oy.abs()) * if ox >= 0.0 { 1.0 } else { -1.0 };
         py = (1.0 - ox.abs()) * if oy >= 0.0 { 1.0 } else { -1.0 };
     }
@@ -1987,35 +2492,51 @@ fn pack_2f_cpu(a: f32, b: f32) -> f32 {
 pub fn cpu_render_scene_with_mrt(
     scene: &SceneData,
     aux: &MrtAuxData,
-    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
 ) -> MrtImages {
     let n = scene.tet_count as usize;
     let sorted = sort_tets_back_to_front(scene, cam_pos);
 
-    struct TD { verts: [Vec3; 4], color: Vec3, grad: Vec3, density: f32 }
-    let tets: Vec<TD> = (0..n).map(|i| TD {
-        verts: load_tet_verts(scene, i),
-        color: compute_tet_color(scene, i, cam_pos),
-        grad: load_color_grad(scene, i),
-        density: scene.densities[i],
-    }).collect();
+    struct TD {
+        verts: [Vec3; 4],
+        color: Vec3,
+        grad: Vec3,
+        density: f32,
+    }
+    let tets: Vec<TD> = (0..n)
+        .map(|i| TD {
+            verts: load_tet_verts(scene, i),
+            color: compute_tet_color(scene, i, cam_pos),
+            grad: load_color_grad(scene, i),
+            density: scene.densities[i],
+        })
+        .collect();
 
-    let visible: Vec<bool> = (0..n).map(|i| {
-        let td = &tets[i];
-        let (mut mn_x, mut mx_x) = (f32::INFINITY, f32::NEG_INFINITY);
-        let (mut mn_y, mut mx_y) = (f32::INFINITY, f32::NEG_INFINITY);
-        let mut mn_z = f32::INFINITY;
-        for v in &td.verts {
-            let clip = vp * Vec4::new(v.x, v.y, v.z, 1.0);
-            let iw = 1.0 / (clip.w + 1e-6);
-            let nd = clip.truncate() * iw;
-            mn_x = mn_x.min(nd.x); mx_x = mx_x.max(nd.x);
-            mn_y = mn_y.min(nd.y); mx_y = mx_y.max(nd.y);
-            mn_z = mn_z.min(nd.z);
-        }
-        !(mx_x < -1.0 || mn_x > 1.0 || mx_y < -1.0 || mn_y > 1.0 || mn_z > 1.0)
-            && (mx_x - mn_x) * w as f32 * (mx_y - mn_y) * h as f32 >= 1.0
-    }).collect();
+    let visible: Vec<bool> = (0..n)
+        .map(|i| {
+            let td = &tets[i];
+            let (mut mn_x, mut mx_x) = (f32::INFINITY, f32::NEG_INFINITY);
+            let (mut mn_y, mut mx_y) = (f32::INFINITY, f32::NEG_INFINITY);
+            let mut mn_z = f32::INFINITY;
+            for v in &td.verts {
+                let clip = vp * Vec4::new(v.x, v.y, v.z, 1.0);
+                let iw = 1.0 / (clip.w + 1e-6);
+                let nd = clip.truncate() * iw;
+                mn_x = mn_x.min(nd.x);
+                mx_x = mx_x.max(nd.x);
+                mn_y = mn_y.min(nd.y);
+                mx_y = mx_y.max(nd.y);
+                mn_z = mn_z.min(nd.z);
+            }
+            !(mx_x < -1.0 || mn_x > 1.0 || mx_y < -1.0 || mn_y > 1.0 || mn_z > 1.0)
+                && (mx_x - mn_x) * w as f32 * (mx_y - mn_y) * h as f32 >= 1.0
+        })
+        .collect();
 
     let npix = (w * h) as usize;
     let mut col = vec![[0.0f32; 4]; npix];
@@ -2029,128 +2550,252 @@ pub fn cpu_render_scene_with_mrt(
             let pi = (py * w + px) as usize;
             for &tid in &sorted {
                 let ti = tid as usize;
-                if !visible[ti] { continue; }
+                if !visible[ti] {
+                    continue;
+                }
                 let td = &tets[ti];
                 let off = td.grad.dot(cam_pos - td.verts[0]);
                 let bc = td.color + Vec3::splat(off);
-                let [cr, cg, cb, ca] = render_tet_pixel(cam_pos, ray, &td.verts, td.density, bc, td.grad);
-                if ca < 1e-7 { continue; }
+                let [cr, cg, cb, ca] =
+                    render_tet_pixel(cam_pos, ray, &td.verts, td.density, bc, td.grad);
+                if ca < 1e-7 {
+                    continue;
+                }
 
                 let ab = ti * 8;
-                let g = |i: usize| if ab + i < aux.aux_flat.len() { aux.aux_flat[ab + i] } else { 0.0 };
-
-                let i0 = scene.indices[ti*4] as usize;
-                let i1 = scene.indices[ti*4+1] as usize;
-                let i2 = scene.indices[ti*4+2] as usize;
-                let i3 = scene.indices[ti*4+3] as usize;
-                let vn = |vi: usize| -> Vec3 {
-                    if vi*3+2 < aux.vertex_normals.len() {
-                        Vec3::new(aux.vertex_normals[vi*3], aux.vertex_normals[vi*3+1], aux.vertex_normals[vi*3+2])
-                    } else { Vec3::ZERO }
+                let g = |i: usize| {
+                    if ab + i < aux.aux_flat.len() {
+                        aux.aux_flat[ab + i]
+                    } else {
+                        0.0
+                    }
                 };
-                let normal = (vn(i0)+vn(i1)+vn(i2)+vn(i3)).normalize_or_zero();
+
+                let i0 = scene.indices[ti * 4] as usize;
+                let i1 = scene.indices[ti * 4 + 1] as usize;
+                let i2 = scene.indices[ti * 4 + 2] as usize;
+                let i3 = scene.indices[ti * 4 + 3] as usize;
+                let vn = |vi: usize| -> Vec3 {
+                    if vi * 3 + 2 < aux.vertex_normals.len() {
+                        Vec3::new(
+                            aux.vertex_normals[vi * 3],
+                            aux.vertex_normals[vi * 3 + 1],
+                            aux.vertex_normals[vi * 3 + 2],
+                        )
+                    } else {
+                        Vec3::ZERO
+                    }
+                };
+                let normal = (vn(i0) + vn(i1) + vn(i2) + vn(i3)).normalize_or_zero();
                 let [ox, oy] = oct_encode_cpu(normal);
                 let ep = pack_2f_cpu(g(3), g(4));
 
                 let blend = |acc: &mut [f32; 4], s: [f32; 4]| {
                     let a = s[3];
-                    for c in 0..4 { acc[c] = s[c] + acc[c] * (1.0 - a); }
+                    for c in 0..4 {
+                        acc[c] = s[c] + acc[c] * (1.0 - a);
+                    }
                 };
                 blend(&mut col[pi], [cr, cg, cb, ca]);
-                blend(&mut a0[pi], [g(0)*ca, g(1)*ca, g(2)*ca, ca]);
-                blend(&mut nm[pi], [ox*ca, oy*ca, ep*ca, ca]);
-                blend(&mut al[pi], [g(5)*ca, g(6)*ca, g(7)*ca, ca]);
+                blend(&mut a0[pi], [g(0) * ca, g(1) * ca, g(2) * ca, ca]);
+                blend(&mut nm[pi], [ox * ca, oy * ca, ep * ca, ca]);
+                blend(&mut al[pi], [g(5) * ca, g(6) * ca, g(7) * ca, ca]);
             }
         }
     }
-    MrtImages { color: col, aux0: a0, normals: nm, albedo: al }
+    MrtImages {
+        color: col,
+        aux0: a0,
+        normals: nm,
+        albedo: al,
+    }
 }
 
 /// GPU compute-interval render with MRT, returning all 4 targets.
 pub fn gpu_compute_interval_render_scene_with_mrt(
-    scene: &SceneData, aux: &MrtAuxData,
-    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+    scene: &SceneData,
+    aux: &MrtAuxData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
 ) -> Option<MrtImages> {
-    pollster::block_on(gpu_ci_mrt_async(scene, aux, cam_pos, vp, c2w, intrinsics, w, h))
+    pollster::block_on(gpu_ci_mrt_async(
+        scene, aux, cam_pos, vp, c2w, intrinsics, w, h,
+    ))
 }
 
 async fn gpu_ci_mrt_async(
-    scene: &SceneData, aux: &MrtAuxData,
-    cam_pos: Vec3, vp: Mat4, c2w: Mat3, intrinsics: [f32; 4], w: u32, h: u32,
+    scene: &SceneData,
+    aux: &MrtAuxData,
+    cam_pos: Vec3,
+    vp: Mat4,
+    c2w: Mat3,
+    intrinsics: [f32; 4],
+    w: u32,
+    h: u32,
 ) -> Option<MrtImages> {
     let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
         backends: wgpu::Backends::VULKAN | wgpu::Backends::METAL,
         ..Default::default()
     });
-    let adapter = instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        compatible_surface: None, force_fallback_adapter: false,
-    }).await.ok()?;
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
-        required_limits: wgpu::Limits {
-            max_storage_buffers_per_shader_stage: 20,
-            max_storage_buffer_binding_size: 1 << 30,
-            max_buffer_size: 1 << 30,
-            ..wgpu::Limits::default()
-        },
-        ..Default::default()
-    }).await.ok()?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .ok()?;
+    let (device, queue) = adapter
+        .request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::SUBGROUP | wgpu::Features::SHADER_FLOAT32_ATOMIC,
+            required_limits: wgpu::Limits {
+                max_storage_buffers_per_shader_stage: 20,
+                max_storage_buffer_binding_size: 1 << 30,
+                max_buffer_size: 1 << 30,
+                ..wgpu::Limits::default()
+            },
+            ..Default::default()
+        })
+        .await
+        .ok()?;
 
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, pipelines, targets, compute_bg, _) =
-        rmesh_render::setup_forward(&device, &queue, scene, &base_colors, &scene.color_grads, w, h);
+    let (buffers, material, pipelines, targets, compute_bg, _) = rmesh_render::setup_forward(
+        &device,
+        &queue,
+        scene,
+        &base_colors,
+        &scene.color_grads,
+        w,
+        h,
+    );
     let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
 
     let n_pow2 = scene.tet_count.next_power_of_two();
-    let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
-    let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
+    let sort_pipelines =
+        rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
+    let sort_state =
+        rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, rmesh_sort::SortBackend::Drs);
     sort_state.upload_configs(&queue);
 
     use wgpu::util::DeviceExt;
     let aux_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("test_aux"), contents: bytemuck::cast_slice(&aux.aux_flat),
+        label: Some("test_aux"),
+        contents: bytemuck::cast_slice(&aux.aux_flat),
         usage: wgpu::BufferUsages::STORAGE,
     });
-    queue.write_buffer(&buffers.vertex_normals, 0, bytemuck::cast_slice(&aux.vertex_normals));
+    queue.write_buffer(
+        &buffers.vertex_normals,
+        0,
+        bytemuck::cast_slice(&aux.vertex_normals),
+    );
 
-    let gen_bg_a = rmesh_render::create_compute_interval_gen_bind_group(&device, &ci_pipelines, &buffers, &material);
+    let gen_bg_a = rmesh_render::create_compute_interval_gen_bind_group(
+        &device,
+        &ci_pipelines,
+        &buffers,
+        &material,
+    );
     let gen_bg_b = rmesh_render::create_compute_interval_gen_bind_group_with_sort_values(
-        &device, &ci_pipelines, &buffers, &material, sort_state.values_b(),
+        &device,
+        &ci_pipelines,
+        &buffers,
+        &material,
+        sort_state.values_b(),
     );
     let ci_render_bg = rmesh_render::create_compute_interval_render_bind_group_pbr(
-        &device, &ci_pipelines, &buffers, &aux_buf, &buffers.indices,
+        &device,
+        &ci_pipelines,
+        &buffers,
+        &aux_buf,
+        &buffers.indices,
     );
-    let ci_convert_bg = rmesh_render::create_compute_interval_indirect_convert_bind_group(&device, &ci_pipelines, &buffers);
+    let ci_convert_bg = rmesh_render::create_compute_interval_indirect_convert_bind_group(
+        &device,
+        &ci_pipelines,
+        &buffers,
+    );
 
-    let uniforms = rmesh_render::make_uniforms(vp, c2w, intrinsics, cam_pos, w as f32, h as f32,
-        scene.tet_count, 0, 16, 0.0, 0, 0.01, 100.0);
+    let uniforms = rmesh_render::make_uniforms(
+        vp,
+        c2w,
+        intrinsics,
+        cam_pos,
+        w as f32,
+        h as f32,
+        scene.tet_count,
+        0,
+        16,
+        0.0,
+        0,
+        0.01,
+        100.0,
+    );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
     let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test_mrt_depth"),
-        size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT, view_formats: &[],
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
     });
     let depth_view = depth_tex.create_view(&wgpu::TextureViewDescriptor::default());
 
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("test_mrt") });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("test_mrt"),
+    });
     {
-        let clear = wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store };
+        let clear = wgpu::Operations {
+            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            store: wgpu::StoreOp::Store,
+        };
         let _rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("mrt_clear"),
             color_attachments: &[
-                Some(wgpu::RenderPassColorAttachment { view: &targets.color_view, resolve_target: None, ops: clear, depth_slice: None }),
-                Some(wgpu::RenderPassColorAttachment { view: &targets.aux0_view, resolve_target: None, ops: clear, depth_slice: None }),
-                Some(wgpu::RenderPassColorAttachment { view: &targets.normals_view, resolve_target: None, ops: clear, depth_slice: None }),
-                Some(wgpu::RenderPassColorAttachment { view: &targets.depth_view, resolve_target: None, ops: clear, depth_slice: None }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.color_view,
+                    resolve_target: None,
+                    ops: clear,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.aux0_view,
+                    resolve_target: None,
+                    ops: clear,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.normals_view,
+                    resolve_target: None,
+                    ops: clear,
+                    depth_slice: None,
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.depth_view,
+                    resolve_target: None,
+                    ops: clear,
+                    depth_slice: None,
+                }),
             ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &depth_view,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
                 stencil_ops: None,
             }),
             ..Default::default()
@@ -2158,28 +2803,70 @@ async fn gpu_ci_mrt_async(
     }
 
     rmesh_render::record_sorted_compute_interval_forward_pass(
-        &mut encoder, &device, &pipelines, &ci_pipelines,
-        &sort_pipelines, &sort_state, &buffers, &targets, &compute_bg,
-        &gen_bg_a, &gen_bg_b, &ci_render_bg, &ci_convert_bg,
-        scene.tet_count, &queue, &depth_view, None, None, false, true,
+        &mut encoder,
+        &device,
+        &pipelines,
+        &ci_pipelines,
+        &sort_pipelines,
+        &sort_state,
+        &buffers,
+        &targets,
+        &compute_bg,
+        &gen_bg_a,
+        &gen_bg_b,
+        &ci_render_bg,
+        &ci_convert_bg,
+        scene.tet_count,
+        &queue,
+        &depth_view,
+        None,
+        None,
+        false,
+        true,
     );
 
-    let tex_list = [&targets.color_texture, &targets.aux0_texture, &targets.normals_texture, &targets.depth_texture];
+    let tex_list = [
+        &targets.color_texture,
+        &targets.aux0_texture,
+        &targets.normals_texture,
+        &targets.depth_texture,
+    ];
     let bpp = 8u32;
     let abpr = ((w * bpp) + 255) & !255;
     let bsz = (abpr * h) as u64;
 
-    let rbs: Vec<wgpu::Buffer> = (0..4).map(|i| device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(&format!("rb{i}")), size: bsz,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    })).collect();
+    let rbs: Vec<wgpu::Buffer> = (0..4)
+        .map(|i| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("rb{i}")),
+                size: bsz,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
 
     for (i, tex) in tex_list.iter().enumerate() {
         encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            wgpu::TexelCopyBufferInfo { buffer: &rbs[i], layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(abpr), rows_per_image: Some(h) } },
-            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            wgpu::TexelCopyTextureInfo {
+                texture: tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &rbs[i],
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(abpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
         );
     }
     queue.submit(std::iter::once(encoder.finish()));
@@ -2188,25 +2875,32 @@ async fn gpu_ci_mrt_async(
     for rb in &rbs {
         let slice = rb.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| { tx.send(r).unwrap(); });
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).unwrap();
+        });
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().ok()?;
         let data = slice.get_mapped_range();
-        let mut img = vec![[0.0f32; 4]; (w*h) as usize];
+        let mut img = vec![[0.0f32; 4]; (w * h) as usize];
         for row in 0..h {
             let rs = (row * abpr) as usize;
             for col in 0..w {
                 let ps = rs + (col * bpp) as usize;
-                let r = half::f16::from_le_bytes([data[ps], data[ps+1]]).to_f32();
-                let g = half::f16::from_le_bytes([data[ps+2], data[ps+3]]).to_f32();
-                let b = half::f16::from_le_bytes([data[ps+4], data[ps+5]]).to_f32();
-                let a = half::f16::from_le_bytes([data[ps+6], data[ps+7]]).to_f32();
-                img[(row*w+col) as usize] = [r, g, b, a];
+                let r = half::f16::from_le_bytes([data[ps], data[ps + 1]]).to_f32();
+                let g = half::f16::from_le_bytes([data[ps + 2], data[ps + 3]]).to_f32();
+                let b = half::f16::from_le_bytes([data[ps + 4], data[ps + 5]]).to_f32();
+                let a = half::f16::from_le_bytes([data[ps + 6], data[ps + 7]]).to_f32();
+                img[(row * w + col) as usize] = [r, g, b, a];
             }
         }
         drop(data);
         rb.unmap();
         imgs.push(img);
     }
-    Some(MrtImages { color: imgs.remove(0), aux0: imgs.remove(0), normals: imgs.remove(0), albedo: imgs.remove(0) })
+    Some(MrtImages {
+        color: imgs.remove(0),
+        aux0: imgs.remove(0),
+        normals: imgs.remove(0),
+        albedo: imgs.remove(0),
+    })
 }

@@ -256,6 +256,33 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         );
     }
 
+    // Per-view frustum cull (AABB outside [-1,1]² × (−∞, 1] or sub-pixel
+    // extent). Same predicate as project_compute_hw — moved here so per-view
+    // visibility is a *rasterization-time* filter, while the upstream
+    // circumsphere-power sort (project_compute_hw / dsm_project_compute) is a
+    // pure function of the camera origin. One global sort then serves any
+    // number of cameras / cubemap faces sharing that origin, with each face's
+    // off-frustum tets dropping out cheaply here. See RADIANCE_MESHES.md.
+    {
+        let min_x = min(min(ndc_xy[0].x, ndc_xy[1].x), min(ndc_xy[2].x, ndc_xy[3].x));
+        let max_x = max(max(ndc_xy[0].x, ndc_xy[1].x), max(ndc_xy[2].x, ndc_xy[3].x));
+        let min_y = min(min(ndc_xy[0].y, ndc_xy[1].y), min(ndc_xy[2].y, ndc_xy[3].y));
+        let max_y = max(max(ndc_xy[0].y, ndc_xy[1].y), max(ndc_xy[2].y, ndc_xy[3].y));
+        let min_z = min(min(ndc_z[0], ndc_z[1]), min(ndc_z[2], ndc_z[3]));
+        let out_of_frustum = max_x < -1.0 || min_x > 1.0
+                          || max_y < -1.0 || min_y > 1.0
+                          || min_z > 1.0;
+        let ext_x = (max_x - min_x) * W;
+        let ext_y = (max_y - min_y) * H;
+        let sub_pixel = ext_x * ext_y < 1.0;
+        if out_of_frustum || sub_pixel {
+            for (var i = 0u; i < 5u; i++) { write_degenerate_vertex(v_base + i); }
+            interval_tet_data[vis_idx] = vec4<f32>(0.0);
+            interval_meta[vis_idx] = 0u;
+            return;
+        }
+    }
+
     // Material data
     let tet_density = densities[tet_id];
     let color = load_color(tet_id);

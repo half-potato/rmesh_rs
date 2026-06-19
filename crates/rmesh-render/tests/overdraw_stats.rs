@@ -21,9 +21,8 @@ fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
     let proj = perspective_matrix(std::f32::consts::FRAC_PI_2, aspect, 0.01, 100.0);
     let view = look_at(eye, target, Vec3::new(0.0, 0.0, 1.0));
     let vp = proj * view;
-    let (c2w, intrinsics) = test_camera_c2w_intrinsics(
-        eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32,
-    );
+    let (c2w, intrinsics) =
+        test_camera_c2w_intrinsics(eye, target, std::f32::consts::FRAC_PI_2, W as f32, H as f32);
     (vp, c2w, intrinsics)
 }
 
@@ -51,14 +50,36 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
     }
 
     let grand_total = total_miss + total_ghost + total_occluded + total_useful;
-    let pct = |v: u64| if grand_total > 0 { v as f64 / grand_total as f64 * 100.0 } else { 0.0 };
+    let pct = |v: u64| {
+        if grand_total > 0 {
+            v as f64 / grand_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    };
 
     println!("\n===== Overdraw Stats ({w}x{h} = {pixel_count} pixels) =====");
     println!("Total tet-pixel pairs: {grand_total}");
-    println!("  Ray miss:   {:>12} ({:5.1}%)", total_miss, pct(total_miss));
-    println!("  Ghost:      {:>12} ({:5.1}%)", total_ghost, pct(total_ghost));
-    println!("  Occluded:   {:>12} ({:5.1}%)", total_occluded, pct(total_occluded));
-    println!("  Useful:     {:>12} ({:5.1}%)", total_useful, pct(total_useful));
+    println!(
+        "  Ray miss:   {:>12} ({:5.1}%)",
+        total_miss,
+        pct(total_miss)
+    );
+    println!(
+        "  Ghost:      {:>12} ({:5.1}%)",
+        total_ghost,
+        pct(total_ghost)
+    );
+    println!(
+        "  Occluded:   {:>12} ({:5.1}%)",
+        total_occluded,
+        pct(total_occluded)
+    );
+    println!(
+        "  Useful:     {:>12} ({:5.1}%)",
+        total_useful,
+        pct(total_useful)
+    );
 
     // Per-pixel statistics
     per_pixel_total.sort_unstable();
@@ -86,7 +107,10 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
         for i in 0..buckets.len() - 1 {
             let lo = buckets[i];
             let hi = buckets[i + 1];
-            let count = per_pixel_total.iter().filter(|&&v| v >= lo && v < hi).count();
+            let count = per_pixel_total
+                .iter()
+                .filter(|&&v| v >= lo && v < hi)
+                .count();
             if count > 0 {
                 let label = if hi == u32::MAX {
                     format!("{lo}+")
@@ -95,7 +119,10 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
                 };
                 let bar_len = (count as f64 / pixel_count as f64 * 60.0) as usize;
                 let bar: String = "#".repeat(bar_len);
-                println!("  {label:>8}: {count:>6} ({:5.1}%) {bar}", count as f64 / pixel_count as f64 * 100.0);
+                println!(
+                    "  {label:>8}: {count:>6} ({:5.1}%) {bar}",
+                    count as f64 / pixel_count as f64 * 100.0
+                );
             }
         }
     } else {
@@ -104,8 +131,8 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
 
     // --- Per-tile statistics ---
     let ts = TILE_SIZE;
-    let tiles_x = (w + ts - 1) / ts;
-    let tiles_y = (h + ts - 1) / ts;
+    let tiles_x = w.div_ceil(ts);
+    let tiles_y = h.div_ceil(ts);
     let num_tiles = (tiles_x * tiles_y) as usize;
 
     // Aggregate per-pixel stats into per-tile totals
@@ -132,7 +159,9 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
     per_tile_total.sort_unstable();
     let non_zero_tiles = per_tile_total.iter().filter(|&&v| v > 0).count();
 
-    println!("\n----- Per-tile Stats ({tiles_x}x{tiles_y} = {num_tiles} tiles, {ts}x{ts} px) -----");
+    println!(
+        "\n----- Per-tile Stats ({tiles_x}x{tiles_y} = {num_tiles} tiles, {ts}x{ts} px) -----"
+    );
     if non_zero_tiles > 0 {
         let tile_mean = grand_total as f64 / num_tiles as f64;
         let tile_median = per_tile_total[num_tiles / 2];
@@ -149,12 +178,28 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
         println!("    Non-zero tiles: {non_zero_tiles} / {num_tiles}");
 
         // Histogram of per-tile total pairs
-        let buckets: [u64; 12] = [0, 100, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000, u64::MAX];
+        let buckets: [u64; 12] = [
+            0,
+            100,
+            500,
+            1000,
+            2000,
+            5000,
+            10000,
+            20000,
+            50000,
+            100000,
+            200000,
+            u64::MAX,
+        ];
         println!("\n  Histogram (per-tile total tet-pixel pairs):");
         for i in 0..buckets.len() - 1 {
             let lo = buckets[i];
             let hi = buckets[i + 1];
-            let count = per_tile_total.iter().filter(|&&v| v >= lo && v < hi).count();
+            let count = per_tile_total
+                .iter()
+                .filter(|&&v| v >= lo && v < hi)
+                .count();
             if count > 0 {
                 let label = if hi == u64::MAX {
                     format!("{}+", lo)
@@ -163,7 +208,10 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
                 };
                 let bar_len = (count as f64 / num_tiles as f64 * 50.0) as usize;
                 let bar: String = "#".repeat(bar_len);
-                println!("    {label:>12}: {count:>5} ({:5.1}%) {bar}", count as f64 / num_tiles as f64 * 100.0);
+                println!(
+                    "    {label:>12}: {count:>5} ({:5.1}%) {bar}",
+                    count as f64 / num_tiles as f64 * 100.0
+                );
             }
         }
 
@@ -171,13 +219,17 @@ fn print_stats(stats: &[[u32; 4]], w: u32, h: u32) {
         let mut indexed: Vec<(usize, &[u64; 6])> = tile_stats.iter().enumerate().collect();
         indexed.sort_by(|a, b| b.1[4].cmp(&a.1[4]));
         println!("\n  Top 10 hottest tiles:");
-        println!("    {:>4} {:>4}  {:>8}  {:>7} {:>7} {:>7} {:>7}  {:>6}",
-            "tx", "ty", "total", "miss", "ghost", "occl", "useful", "max_px");
+        println!(
+            "    {:>4} {:>4}  {:>8}  {:>7} {:>7} {:>7} {:>7}  {:>6}",
+            "tx", "ty", "total", "miss", "ghost", "occl", "useful", "max_px"
+        );
         for &(tile_idx, ts_data) in indexed.iter().take(10) {
             let tx = tile_idx as u32 % tiles_x;
             let ty = tile_idx as u32 / tiles_x;
-            println!("    {:>4} {:>4}  {:>8}  {:>7} {:>7} {:>7} {:>7}  {:>6}",
-                tx, ty, ts_data[4], ts_data[0], ts_data[1], ts_data[2], ts_data[3], ts_data[5]);
+            println!(
+                "    {:>4} {:>4}  {:>8}  {:>7} {:>7} {:>7} {:>7}  {:>6}",
+                tx, ty, ts_data[4], ts_data[0], ts_data[1], ts_data[2], ts_data[3], ts_data[5]
+            );
         }
     } else {
         println!("  No tiles had any tet evaluations.");
@@ -236,7 +288,11 @@ fn overdraw_stats_rmesh() {
 
     let data = std::fs::read(&path).expect("Failed to read .rmesh file");
     let (scene, _sh, _pbr) = rmesh_data::load_rmesh(&data).expect("Failed to parse .rmesh file");
-    println!("Loaded scene: {} verts, {} tets", scene.vertices.len() / 3, scene.tet_count);
+    println!(
+        "Loaded scene: {} verts, {} tets",
+        scene.vertices.len() / 3,
+        scene.tet_count
+    );
 
     let eye = Vec3::new(0.0, -3.0, 1.5);
     let target = Vec3::ZERO;

@@ -10,15 +10,15 @@ const H: u32 = 64;
 fn make_mrt_test_scene() -> (SceneData, MrtAuxData) {
     // Two tets sharing a face, centered at origin, radius ~1
     let vertices = vec![
-        0.0, 0.0, 1.0,   // 0: top
-        1.0, 0.0, -0.5,  // 1: front-right
-       -1.0, 0.0, -0.5,  // 2: front-left
-        0.0, 1.0, -0.5,  // 3: back-up
+        0.0, 0.0, 1.0, // 0: top
+        1.0, 0.0, -0.5, // 1: front-right
+        -1.0, 0.0, -0.5, // 2: front-left
+        0.0, 1.0, -0.5, // 3: back-up
         0.0, -1.0, -0.5, // 4: back-down
     ];
     let indices = vec![
-        0, 1, 2, 3,  // tet 0
-        0, 1, 2, 4,  // tet 1
+        0, 1, 2, 3, // tet 0
+        0, 1, 2, 4, // tet 1
     ];
     let densities = vec![2.0, 3.0];
     let color_grads = vec![0.1, 0.0, 0.0, 0.0, 0.1, 0.0]; // per-tet [3]
@@ -30,14 +30,14 @@ fn make_mrt_test_scene() -> (SceneData, MrtAuxData) {
     let mut aux_flat = vec![0.0f32; n * 8];
     for t in 0..n {
         let base = t * 8;
-        aux_flat[base]     = 0.3 + 0.2 * t as f32; // roughness
+        aux_flat[base] = 0.3 + 0.2 * t as f32; // roughness
         aux_flat[base + 1] = 0.1 + 0.1 * t as f32; // env_f0
-        aux_flat[base + 2] = 0.25;                  // env_f1
-        aux_flat[base + 3] = 0.4;                   // env_f2
-        aux_flat[base + 4] = 0.6;                   // env_f3
-        aux_flat[base + 5] = 0.8;                   // albedo_r
-        aux_flat[base + 6] = 0.5;                   // albedo_g
-        aux_flat[base + 7] = 0.3;                   // albedo_b
+        aux_flat[base + 2] = 0.25; // env_f1
+        aux_flat[base + 3] = 0.4; // env_f2
+        aux_flat[base + 4] = 0.6; // env_f3
+        aux_flat[base + 5] = 0.8; // albedo_r
+        aux_flat[base + 6] = 0.5; // albedo_g
+        aux_flat[base + 7] = 0.3; // albedo_b
     }
 
     // Vertex normals pointing +Z
@@ -46,7 +46,13 @@ fn make_mrt_test_scene() -> (SceneData, MrtAuxData) {
         vertex_normals[vi * 3 + 2] = 1.0;
     }
 
-    (scene, MrtAuxData { aux_flat, vertex_normals })
+    (
+        scene,
+        MrtAuxData {
+            aux_flat,
+            vertex_normals,
+        },
+    )
 }
 
 fn setup_camera(eye: Vec3, target: Vec3) -> (glam::Mat4, glam::Mat3, [f32; 4]) {
@@ -72,7 +78,10 @@ fn test_mrt_compositing() {
 
     let cpu_alpha_sum: f32 = cpu.color.iter().map(|p| p[3]).sum();
     println!("CPU: color alpha sum = {cpu_alpha_sum:.4}");
-    assert!(cpu_alpha_sum > 0.0, "CPU color is all zero — scene not visible");
+    assert!(
+        cpu_alpha_sum > 0.0,
+        "CPU color is all zero — scene not visible"
+    );
 
     // GPU
     let gpu = match gpu_compute_interval_render_scene_with_mrt(
@@ -86,10 +95,10 @@ fn test_mrt_compositing() {
     };
 
     let targets = [
-        ("color",   &cpu.color,   &gpu.color),
-        ("aux0",    &cpu.aux0,    &gpu.aux0),
+        ("color", &cpu.color, &gpu.color),
+        ("aux0", &cpu.aux0, &gpu.aux0),
         ("normals", &cpu.normals, &gpu.normals),
-        ("albedo",  &cpu.albedo,  &gpu.albedo),
+        ("albedo", &cpu.albedo, &gpu.albedo),
     ];
 
     let mut any_zero = false;

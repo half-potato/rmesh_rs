@@ -4,6 +4,8 @@
 //! per-tet error statistics via `atomic<f32>` instead of compositing colors.
 //! Used during densification to decide which vertices to clone/split.
 
+#![allow(clippy::too_many_arguments)]
+
 use rmesh_tile::{dispatch_2d, storage_entry};
 
 const ERROR_TILED_WGSL: &str = include_str!("wgsl/error_tiled_compute.wgsl");
@@ -46,16 +48,8 @@ fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu:
 impl ErrorBuffers {
     pub fn new(device: &wgpu::Device, tet_count: u32) -> Self {
         Self {
-            tet_err: create_storage_buffer(
-                device,
-                "tet_err",
-                (tet_count as u64) * 16 * 4,
-            ),
-            tet_count: create_storage_buffer(
-                device,
-                "tet_count",
-                (tet_count as u64) * 2 * 4,
-            ),
+            tet_err: create_storage_buffer(device, "tet_err", (tet_count as u64) * 16 * 4),
+            tet_count: create_storage_buffer(device, "tet_count", (tet_count as u64) * 2 * 4),
         }
     }
 }
@@ -89,52 +83,52 @@ impl ErrorPipeline {
         });
 
         // Group 0: 9 read-only bindings (scene + tile data)
-        let bg_layout_0 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("error_tiled_bgl_0"),
-                entries: &[
-                    storage_entry(0, true),  // uniforms
-                    storage_entry(1, true),  // vertices
-                    storage_entry(2, true),  // indices
-                    storage_entry(3, true),  // colors_buf
-                    storage_entry(4, true),  // densities
-                    storage_entry(5, true),  // color_grads
-                    storage_entry(6, true),  // tile_sort_values
-                    storage_entry(7, true),  // tile_ranges
-                    storage_entry(8, true),  // tile_uniforms
-                ],
-            });
+        let bg_layout_0 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("error_tiled_bgl_0"),
+            entries: &[
+                storage_entry(0, true), // uniforms
+                storage_entry(1, true), // vertices
+                storage_entry(2, true), // indices
+                storage_entry(3, true), // colors_buf
+                storage_entry(4, true), // densities
+                storage_entry(5, true), // color_grads
+                storage_entry(6, true), // tile_sort_values
+                storage_entry(7, true), // tile_ranges
+                storage_entry(8, true), // tile_uniforms
+            ],
+        });
 
         // Group 1: 2 read + 2 read-write
-        let bg_layout_1 =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("error_tiled_bgl_1"),
-                entries: &[
-                    storage_entry(0, true),  // pixel_err
-                    storage_entry(1, true),  // ssim_err
-                    storage_entry(2, false), // tet_err (rw atomic)
-                    storage_entry(3, false), // tet_count (rw atomic)
-                ],
-            });
+        let bg_layout_1 = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("error_tiled_bgl_1"),
+            entries: &[
+                storage_entry(0, true),  // pixel_err
+                storage_entry(1, true),  // ssim_err
+                storage_entry(2, false), // tet_err (rw atomic)
+                storage_entry(3, false), // tet_count (rw atomic)
+            ],
+        });
 
-        let pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("error_tiled_pl"),
-                bind_group_layouts: &[&bg_layout_0, &bg_layout_1],
-                immediate_size: 0,
-            });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("error_tiled_pl"),
+            bind_group_layouts: &[&bg_layout_0, &bg_layout_1],
+            immediate_size: 0,
+        });
 
-        let pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("error_tiled_pipeline"),
-                layout: Some(&pipeline_layout),
-                module: &shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache: None,
-            });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("error_tiled_pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
 
-        Self { pipeline, bg_layout_0, bg_layout_1 }
+        Self {
+            pipeline,
+            bg_layout_0,
+            bg_layout_1,
+        }
     }
 }
 
@@ -162,15 +156,42 @@ pub fn create_error_bg0(
         label: Some("error_tiled_bg_0"),
         layout: &pipeline.bg_layout_0,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: uniforms.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: vertices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: indices.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: colors.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 4, resource: densities.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 5, resource: color_grads.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 6, resource: tile_sort_values.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 7, resource: tile_ranges.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 8, resource: tile_uniforms.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: vertices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: indices.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: colors.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: densities.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 5,
+                resource: color_grads.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 6,
+                resource: tile_sort_values.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 7,
+                resource: tile_ranges.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 8,
+                resource: tile_uniforms.as_entire_binding(),
+            },
         ],
     })
 }
@@ -186,10 +207,22 @@ pub fn create_error_bg1(
         label: Some("error_tiled_bg_1"),
         layout: &pipeline.bg_layout_1,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: input_buffers.pixel_err.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: input_buffers.ssim_err.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: error_buffers.tet_err.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: error_buffers.tet_count.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffers.pixel_err.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: input_buffers.ssim_err.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: error_buffers.tet_err.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: error_buffers.tet_count.as_entire_binding(),
+            },
         ],
     })
 }

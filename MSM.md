@@ -42,7 +42,11 @@ this is one cubemap (6 layers, 4 channels × 16 bits) per light.
 ## Generation (per light face, single pass)
 
 Render all visible tet intervals from the light's viewpoint. **Premul-alpha
-back-to-front blending**, depth pre-test against opaque-primitive depth:
+back-to-front blending**, depth pre-test against opaque-primitive depth.
+
+The back-to-front order comes from the circumsphere power sort with
+`P = light.position`; for point and spot lights one sort suffices across all
+six cubemap faces because they share an origin. See `RADIANCE_MESHES.md`.
 
 ```
 fragment.out = vec4(depth_premul, depth_sq_premul, 0, α)

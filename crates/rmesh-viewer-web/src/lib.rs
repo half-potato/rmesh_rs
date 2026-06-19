@@ -3,32 +3,27 @@
 //! Exposes a `WebViewer` struct to JavaScript via wasm-bindgen.
 //! Uses the same rendering pipeline as the native rmesh-viewer.
 
+#![allow(dead_code)]
+
 use wasm_bindgen::prelude::*;
 use wgpu::util::DeviceExt;
 
 use rmesh_render::{
     create_blit_bind_group, create_compute_bind_group, create_compute_interval_gen_bind_group,
-    create_compute_interval_indirect_convert_bind_group,
-    create_compute_interval_render_bind_group, create_hw_compute_bind_group,
-    create_render_bind_group, create_render_bind_group_with_sort_values, record_blit,
-    record_compute_interval_after_sort, record_compute_interval_project, BlitPipeline,
-    ComputeIntervalPipelines, ForwardComputeBindGroups, ForwardHwComputeBindGroups,
-    ForwardPipelines, MaterialBuffers, RenderTargets, SceneBuffers, Uniforms,
+    create_compute_interval_indirect_convert_bind_group, create_compute_interval_render_bind_group,
+    create_hw_compute_bind_group, create_render_bind_group,
+    create_render_bind_group_with_sort_values, BlitPipeline, ComputeIntervalPipelines,
+    ForwardComputeBindGroups, ForwardHwComputeBindGroups, ForwardPipelines, MaterialBuffers,
+    RenderTargets, SceneBuffers,
 };
 use rmesh_sort::CpuSorter;
-use std::sync::Arc;
 use rmesh_util::camera::Camera;
+use std::sync::Arc;
 
 use glam::Vec3;
 
-use rmesh_interact::{
-    InteractContext, InteractEvent, InteractKey, InteractResult, Primitive, PrimitiveKind,
-    TransformInteraction,
-};
-use rmesh_compositor::{
-    MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets,
-    record_primitive_pass,
-};
+use rmesh_compositor::{MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
+use rmesh_interact::{InteractContext, InteractKey, Primitive, TransformInteraction};
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -38,7 +33,7 @@ pub fn main() {
 
 /// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
 fn pack_sh_coeffs_f16(coeffs: &[f32]) -> Vec<u32> {
-    let mut packed = vec![0u32; (coeffs.len() + 1) / 2];
+    let mut packed = vec![0u32; coeffs.len().div_ceil(2)];
     for i in (0..coeffs.len()).step_by(2) {
         let lo = half::f16::from_f32(coeffs[i]);
         let hi = if i + 1 < coeffs.len() {
@@ -153,9 +148,8 @@ impl WebViewer {
         let canvas = document
             .get_element_by_id(canvas_id)
             .ok_or_else(|| format!("no element with id '{canvas_id}'"))?;
-        let canvas: web_sys::HtmlCanvasElement = canvas
-            .dyn_into()
-            .map_err(|_| "element is not a canvas")?;
+        let canvas: web_sys::HtmlCanvasElement =
+            canvas.dyn_into().map_err(|_| "element is not a canvas")?;
 
         let width = canvas.client_width().max(1) as u32;
         let height = canvas.client_height().max(1) as u32;
@@ -232,7 +226,8 @@ impl WebViewer {
         // option on the GPU. It produces visibly out-of-order rendering on
         // large scenes (room.rmesh = 4.8M tets), so the web viewer needs a
         // CPU-side sort to feed `buffers.sort_values` correctly (planned).
-        let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Basic);
+        let sort_pipelines =
+            rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Basic);
         let targets = RenderTargets::new(&device, width, height);
 
         let camera = Camera::new(Vec3::new(0.0, 3.0, -2.0));
@@ -240,7 +235,8 @@ impl WebViewer {
         // Primitive setup
         let primitive_geometry = PrimitiveGeometry::new(&device);
         let material_registry = MaterialRegistry::new(&device, &queue);
-        let primitive_pipeline = PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
+        let primitive_pipeline =
+            PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
         let primitive_targets = PrimitiveTargets::new(&device, width, height);
 
         log::info!("WebViewer initialized ({width}×{height})");
@@ -421,7 +417,11 @@ impl WebViewer {
             &self.primitive_geometry,
             &self.targets.color_view,
             &self.primitive_targets.depth_view,
-            if self.show_primitives { &self.primitives } else { &[] },
+            if self.show_primitives {
+                &self.primitives
+            } else {
+                &[]
+            },
             &vp,
             None,
             Some(&self.material_registry),
@@ -528,12 +528,7 @@ impl WebViewer {
         };
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("web forward render"),
-            color_attachments: &[
-                Some(color_attachment),
-                None,
-                None,
-                None,
-            ],
+            color_attachments: &[Some(color_attachment), None, None, None],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -575,11 +570,8 @@ impl WebViewer {
 
         // Recreate blit bind group since color_view changed
         if let Some(scene) = &mut self.scene {
-            scene.blit_bg = create_blit_bind_group(
-                &self.device,
-                &self.blit_pipeline,
-                &self.targets.color_view,
-            );
+            scene.blit_bg =
+                create_blit_bind_group(&self.device, &self.blit_pipeline, &self.targets.color_view);
         }
     }
 
@@ -608,7 +600,9 @@ impl WebViewer {
         let ctx = self.interact_ctx();
         if let Some(ikey) = js_key_to_interact(key) {
             self.sync_current_transform();
-            let result = self.interaction.process_event(&InteractEvent::KeyDown(ikey), &ctx);
+            let result = self
+                .interaction
+                .process_event(&InteractEvent::KeyDown(ikey), &ctx);
             if let InteractResult::Confirmed(t) = result {
                 self.apply_committed_transform(t);
             }
@@ -620,7 +614,9 @@ impl WebViewer {
             let ch = key.chars().next().unwrap();
             if matches!(ch, '0'..='9' | '.' | '-') {
                 self.sync_current_transform();
-                let result = self.interaction.process_event(&InteractEvent::CharInput(ch), &ctx);
+                let result = self
+                    .interaction
+                    .process_event(&InteractEvent::CharInput(ch), &ctx);
                 if let InteractResult::Confirmed(t) = result {
                     self.apply_committed_transform(t);
                 }
@@ -635,7 +631,8 @@ impl WebViewer {
         if let Some(ikey) = js_key_to_interact(key) {
             let ctx = self.interact_ctx();
             self.sync_current_transform();
-            self.interaction.process_event(&InteractEvent::KeyUp(ikey), &ctx);
+            self.interaction
+                .process_event(&InteractEvent::KeyUp(ikey), &ctx);
         }
     }
 
@@ -643,7 +640,8 @@ impl WebViewer {
     pub fn on_interact_mouse_move(&mut self, dx: f32, dy: f32) {
         let ctx = self.interact_ctx();
         self.sync_current_transform();
-        self.interaction.process_event(&InteractEvent::MouseMove { dx, dy }, &ctx);
+        self.interaction
+            .process_event(&InteractEvent::MouseMove { dx, dy }, &ctx);
     }
 
     /// Feed mouse button to interaction. button: 0=left, 1=middle, 2=right.
@@ -728,7 +726,9 @@ impl WebViewer {
 
     /// Get primitive name by index.
     pub fn primitive_name(&self, idx: u32) -> String {
-        self.primitives.get(idx as usize).map_or(String::new(), |p| p.name.clone())
+        self.primitives
+            .get(idx as usize)
+            .map_or(String::new(), |p| p.name.clone())
     }
 
     /// Toggle the primitive compositor overlay.
@@ -826,12 +826,23 @@ impl WebViewer {
                 usage: wgpu::BufferUsages::STORAGE,
             });
 
-        let n_pow2 = (tet_count as u32).next_power_of_two();
-        let sort_state = rmesh_sort::RadixSortState::new(&self.device, n_pow2, 32, 1, rmesh_sort::SortBackend::Basic);
+        let n_pow2 = tet_count.next_power_of_two();
+        let sort_state = rmesh_sort::RadixSortState::new(
+            &self.device,
+            n_pow2,
+            32,
+            1,
+            rmesh_sort::SortBackend::Basic,
+        );
         sort_state.upload_configs(&self.queue);
 
-        let compute_bg =
-            create_compute_bind_group(&self.device, &self.pipelines, &buffers, &material, &sh_coeffs_buf);
+        let compute_bg = create_compute_bind_group(
+            &self.device,
+            &self.pipelines,
+            &buffers,
+            &material,
+            &sh_coeffs_buf,
+        );
         let hw_compute_bg = create_hw_compute_bind_group(
             &self.device,
             &self.pipelines,
@@ -862,12 +873,8 @@ impl WebViewer {
         // `buffers.sort_values` (which the CPU sort writes); B reads from
         // the radix-sort ping-pong buffer (unused on web since we skip GPU
         // sort, but kept so we can compile the existing API).
-        let render_bg = create_render_bind_group(
-            &self.device,
-            &self.pipelines,
-            &buffers,
-            &material,
-        );
+        let render_bg =
+            create_render_bind_group(&self.device, &self.pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
             &self.device,
             &self.pipelines,
@@ -875,11 +882,8 @@ impl WebViewer {
             &material,
             sort_state.values_b(),
         );
-        let blit_bg = create_blit_bind_group(
-            &self.device,
-            &self.blit_pipeline,
-            &self.targets.color_view,
-        );
+        let blit_bg =
+            create_blit_bind_group(&self.device, &self.blit_pipeline, &self.targets.color_view);
 
         let arrays = Arc::new(SceneArrays {
             vertices: scene_data.vertices.clone(),

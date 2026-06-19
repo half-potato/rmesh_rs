@@ -56,7 +56,7 @@ pub fn dispatch_2d(total_workgroups: u32) -> (u32, u32) {
         (total_workgroups, 1)
     } else {
         let x = 65535u32;
-        let y = (total_workgroups + x - 1) / x;
+        let y = total_workgroups.div_ceil(x);
         (x, y)
     }
 }
@@ -66,7 +66,9 @@ pub fn create_storage_buffer(device: &wgpu::Device, label: &str, size: u64) -> w
     device.create_buffer(&wgpu::BufferDescriptor {
         label: Some(label),
         size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+        usage: wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     })
 }
@@ -101,8 +103,12 @@ pub enum RadixSortPipelines {
 impl RadixSortPipelines {
     pub fn new(device: &wgpu::Device, key_stride: u32, backend: SortBackend) -> Self {
         match backend {
-            SortBackend::Basic => RadixSortPipelines::Basic(basic::RadixSortPipelines::new(device, key_stride)),
-            SortBackend::Drs => RadixSortPipelines::Drs(drs::RadixSortPipelines::new(device, key_stride)),
+            SortBackend::Basic => {
+                RadixSortPipelines::Basic(basic::RadixSortPipelines::new(device, key_stride))
+            }
+            SortBackend::Drs => {
+                RadixSortPipelines::Drs(drs::RadixSortPipelines::new(device, key_stride))
+            }
         }
     }
 }
@@ -114,10 +120,26 @@ pub enum RadixSortState {
 }
 
 impl RadixSortState {
-    pub fn new(device: &wgpu::Device, sort_buf_size: u32, sorting_bits: u32, key_stride: u32, backend: SortBackend) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        sort_buf_size: u32,
+        sorting_bits: u32,
+        key_stride: u32,
+        backend: SortBackend,
+    ) -> Self {
         match backend {
-            SortBackend::Basic => RadixSortState::Basic(basic::RadixSortState::new(device, sort_buf_size, sorting_bits, key_stride)),
-            SortBackend::Drs => RadixSortState::Drs(drs::RadixSortState::new(device, sort_buf_size, sorting_bits, key_stride)),
+            SortBackend::Basic => RadixSortState::Basic(basic::RadixSortState::new(
+                device,
+                sort_buf_size,
+                sorting_bits,
+                key_stride,
+            )),
+            SortBackend::Drs => RadixSortState::Drs(drs::RadixSortState::new(
+                device,
+                sort_buf_size,
+                sorting_bits,
+                key_stride,
+            )),
         }
     }
 

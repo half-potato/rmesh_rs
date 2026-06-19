@@ -21,33 +21,28 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
-use rmesh_interact::{
-    InteractContext, InteractEvent, InteractKey, InteractResult, Primitive,
-    TransformInteraction,
-};
 use rmesh_anim::{AnimatedScene, AnimationClock};
+use rmesh_interact::{
+    InteractContext, InteractEvent, InteractKey, InteractResult, Primitive, TransformInteraction,
+};
 use rmesh_sim::{FluidParams, FluidSim};
 use rmesh_util::camera::Camera;
 use wgpu::util::DeviceExt;
 
-use rmesh_render::{
-    BlitPipeline, ForwardPipelines, MaterialBuffers,
-    MeshForwardPipelines, IntervalPipelines, ComputeIntervalPipelines, RenderTargets,
-    SceneBuffers,
-    create_compute_bind_group, create_hw_compute_bind_group, create_render_bind_group,
-    create_render_bind_group_with_sort_values,
-    create_blit_bind_group,
-    create_indirect_convert_bind_group, create_mesh_render_bind_group,
-    create_mesh_render_bind_group_with_sort_values,
-    create_prepass_bind_group, create_quad_render_bind_group,
-    create_interval_render_bind_group, create_interval_render_bind_group_with_sort_values,
-    create_interval_indirect_convert_bind_group,
-    create_compute_interval_gen_bind_group,
-    create_compute_interval_gen_bind_group_with_sort_values,
-    create_compute_interval_render_bind_group,
-    create_compute_interval_indirect_convert_bind_group,
-};
 use rmesh_compositor::{PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
+use rmesh_render::{
+    create_blit_bind_group, create_compute_bind_group, create_compute_interval_gen_bind_group,
+    create_compute_interval_gen_bind_group_with_sort_values,
+    create_compute_interval_indirect_convert_bind_group, create_compute_interval_render_bind_group,
+    create_hw_compute_bind_group, create_indirect_convert_bind_group,
+    create_interval_indirect_convert_bind_group, create_interval_render_bind_group,
+    create_interval_render_bind_group_with_sort_values, create_mesh_render_bind_group,
+    create_mesh_render_bind_group_with_sort_values, create_prepass_bind_group,
+    create_quad_render_bind_group, create_render_bind_group,
+    create_render_bind_group_with_sort_values, BlitPipeline, ComputeIntervalPipelines,
+    ForwardPipelines, IntervalPipelines, MaterialBuffers, MeshForwardPipelines, RenderTargets,
+    SceneBuffers,
+};
 
 mod flare;
 mod gpu_state;
@@ -62,14 +57,15 @@ use gpu_state::*;
 /// the deferred shader has no way to render those, so refuse to upload garbage.
 fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
     let lens = [
-        ("roughness",     pbr.roughness.len()),
-        ("metallic",      pbr.metallic.len()),
+        ("roughness", pbr.roughness.len()),
+        ("metallic", pbr.metallic.len()),
         ("f0_dielectric", pbr.f0_dielectric.len()),
-        ("albedo",        pbr.albedo.len() / 3),
+        ("albedo", pbr.albedo.len() / 3),
     ];
     let bad: Vec<_> = lens.iter().filter(|(_, l)| *l != tet_count).collect();
     if !bad.is_empty() {
-        let detail = bad.iter()
+        let detail = bad
+            .iter()
             .map(|(name, l)| format!("{}={}", name, l))
             .collect::<Vec<_>>()
             .join(", ");
@@ -83,10 +79,18 @@ fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
     }
 }
 
-fn create_rt_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+fn create_rt_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let tex = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("rt_output_texture"),
-        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -163,8 +167,16 @@ struct App {
 }
 
 impl App {
-    fn new(scene: rmesh_data::SceneData, sh: rmesh_data::ShCoeffs, pbr: Option<rmesh_data::PbrData>) -> Self {
-        let pos = Vec3::new(scene.start_pose[0], scene.start_pose[1], scene.start_pose[2]);
+    fn new(
+        scene: rmesh_data::SceneData,
+        sh: rmesh_data::ShCoeffs,
+        pbr: Option<rmesh_data::PbrData>,
+    ) -> Self {
+        let pos = Vec3::new(
+            scene.start_pose[0],
+            scene.start_pose[1],
+            scene.start_pose[2],
+        );
         let cam_pos = if pos.length() < 0.001 {
             Vec3::new(0.0, 3.0, -2.0)
         } else {
@@ -193,7 +205,11 @@ impl App {
             // channels the deferred shader expects. Other modes write
             // legacy (t_min, t_max, od, dist) into aux0 and the deferred shader
             // would misread them as PBR values (metallic ≈ t_max → all green).
-            render_mode: if pbr.is_some() { RenderMode::IntervalShader } else { RenderMode::Regular },
+            render_mode: if pbr.is_some() {
+                RenderMode::IntervalShader
+            } else {
+                RenderMode::Regular
+            },
             mesh_shader_supported: false,
             fluid_enabled: false,
             fluid_params: FluidParams::default(),
@@ -242,79 +258,93 @@ impl App {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let (adapter, device, queue, mesh_shader_supported, subgroup_supported) = pollster::block_on(async {
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: Some(&surface),
-                    force_fallback_adapter: false,
-                })
-                .await
-                .expect("No suitable GPU adapter found");
+        let (adapter, device, queue, mesh_shader_supported, subgroup_supported) =
+            pollster::block_on(async {
+                let adapter = instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .expect("No suitable GPU adapter found");
 
-            let info = adapter.get_info();
-            log::info!("GPU: {:?} (backend: {:?}, driver: {:?})", info.name, info.backend, info.driver_info);
+                let info = adapter.get_info();
+                log::info!(
+                    "GPU: {:?} (backend: {:?}, driver: {:?})",
+                    info.name,
+                    info.backend,
+                    info.driver_info
+                );
 
-            let adapter_features = adapter.features();
-            let backend = info.backend;
-            let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
-            let mesh_shader_supported = false;
-            //subgroup_supported
+                let adapter_features = adapter.features();
+                let _backend = info.backend;
+                let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
+                let mesh_shader_supported = false;
+                //subgroup_supported
                 // && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
                 // && backend != wgpu::Backend::Metal; // naga MSL backend doesn't implement mesh shaders
-            log::info!("Subgroup support: {}", subgroup_supported);
-            log::info!("Mesh shader support: {}", mesh_shader_supported);
+                log::info!("Subgroup support: {}", subgroup_supported);
+                log::info!("Mesh shader support: {}", mesh_shader_supported);
 
-            let mut required_features = wgpu::Features::SHADER_FLOAT32_ATOMIC
-                | wgpu::Features::TIMESTAMP_QUERY;
-            if subgroup_supported {
-                required_features |= wgpu::Features::SUBGROUP;
-            }
-            if mesh_shader_supported {
-                required_features |= wgpu::Features::EXPERIMENTAL_MESH_SHADER;
-            }
+                let mut required_features =
+                    wgpu::Features::SHADER_FLOAT32_ATOMIC | wgpu::Features::TIMESTAMP_QUERY;
+                if subgroup_supported {
+                    required_features |= wgpu::Features::SUBGROUP;
+                }
+                if mesh_shader_supported {
+                    required_features |= wgpu::Features::EXPERIMENTAL_MESH_SHADER;
+                }
 
-            let mut limits = wgpu::Limits::default();
-            limits.max_storage_buffers_per_shader_stage = 20;
-            limits.max_storage_buffer_binding_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
-            limits.max_buffer_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
+                let mut limits = wgpu::Limits::default();
+                limits.max_storage_buffers_per_shader_stage = 20;
+                limits.max_storage_buffer_binding_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
+                limits.max_buffer_size = 2 * 1024 * 1024 * 1024 - 4; // 1 GB
 
-            // Copy mesh shader limits from adapter (they default to 0 = disabled)
-            if mesh_shader_supported {
-                let supported = adapter.limits();
-                limits.max_mesh_invocations_per_workgroup = supported.max_mesh_invocations_per_workgroup;
-                limits.max_mesh_invocations_per_dimension = supported.max_mesh_invocations_per_dimension;
-                limits.max_mesh_output_vertices = supported.max_mesh_output_vertices;
-                limits.max_mesh_output_primitives = supported.max_mesh_output_primitives;
-                limits.max_mesh_output_layers = supported.max_mesh_output_layers;
-                limits.max_mesh_multiview_view_count = supported.max_mesh_multiview_view_count;
-                limits.max_task_mesh_workgroup_total_count = supported.max_task_mesh_workgroup_total_count;
-                limits.max_task_mesh_workgroups_per_dimension = supported.max_task_mesh_workgroups_per_dimension;
-            }
+                // Copy mesh shader limits from adapter (they default to 0 = disabled)
+                if mesh_shader_supported {
+                    let supported = adapter.limits();
+                    limits.max_mesh_invocations_per_workgroup =
+                        supported.max_mesh_invocations_per_workgroup;
+                    limits.max_mesh_invocations_per_dimension =
+                        supported.max_mesh_invocations_per_dimension;
+                    limits.max_mesh_output_vertices = supported.max_mesh_output_vertices;
+                    limits.max_mesh_output_primitives = supported.max_mesh_output_primitives;
+                    limits.max_mesh_output_layers = supported.max_mesh_output_layers;
+                    limits.max_mesh_multiview_view_count = supported.max_mesh_multiview_view_count;
+                    limits.max_task_mesh_workgroup_total_count =
+                        supported.max_task_mesh_workgroup_total_count;
+                    limits.max_task_mesh_workgroups_per_dimension =
+                        supported.max_task_mesh_workgroups_per_dimension;
+                }
 
-            // SAFETY: We opt into experimental features (mesh shaders) and accept
-            // that the API surface may change in future wgpu releases.
-            let experimental = if mesh_shader_supported {
-                unsafe { wgpu::ExperimentalFeatures::enabled() }
-            } else {
-                wgpu::ExperimentalFeatures::disabled()
-            };
+                // SAFETY: We opt into experimental features (mesh shaders) and accept
+                // that the API surface may change in future wgpu releases.
+                let experimental = if mesh_shader_supported {
+                    unsafe { wgpu::ExperimentalFeatures::enabled() }
+                } else {
+                    wgpu::ExperimentalFeatures::disabled()
+                };
 
-            let (device, queue) = adapter
-                .request_device(
-                    &wgpu::DeviceDescriptor {
+                let (device, queue) = adapter
+                    .request_device(&wgpu::DeviceDescriptor {
                         label: Some("rmesh device"),
                         required_features,
                         required_limits: limits,
                         experimental_features: experimental,
                         ..Default::default()
-                    },
-                )
-                .await
-                .expect("Failed to create device");
+                    })
+                    .await
+                    .expect("Failed to create device");
 
-            (adapter, device, queue, mesh_shader_supported, subgroup_supported)
-        });
+                (
+                    adapter,
+                    device,
+                    queue,
+                    mesh_shader_supported,
+                    subgroup_supported,
+                )
+            });
         self.mesh_shader_supported = mesh_shader_supported;
         self.render_mode = RenderMode::IntervalShader;
 
@@ -361,7 +391,10 @@ impl App {
         let compute_interval_pipelines = ComputeIntervalPipelines::new(&device, color_format);
         log::info!("Pipelines compiled: {:.2}s", t0.elapsed().as_secs_f64());
 
-        log::info!("Uploading scene buffers ({} tets)...", self.scene_data.tet_count);
+        log::info!(
+            "Uploading scene buffers ({} tets)...",
+            self.scene_data.tet_count
+        );
         let t0 = std::time::Instant::now();
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
 
@@ -375,7 +408,8 @@ impl App {
         );
 
         // Upload SH coefficients to GPU as f16-packed u32 array
-        let sh_total_dims = ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
+        let sh_total_dims =
+            ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
         let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
         let sh_coeffs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("sh_coeffs"),
@@ -392,7 +426,7 @@ impl App {
             require_parametric_pbr(pbr, tet_count);
             let mut aux = vec![0.0f32; tet_count * 6];
             for t in 0..tet_count {
-                aux[t * 6 + 0] = pbr.roughness[t];
+                aux[t * 6] = pbr.roughness[t];
                 aux[t * 6 + 1] = pbr.metallic[t];
                 aux[t * 6 + 2] = pbr.f0_dielectric[t];
                 for c in 0..3 {
@@ -401,7 +435,11 @@ impl App {
             }
             // Override vertex normals from PBR data
             if !pbr.vertex_normals.is_empty() {
-                queue.write_buffer(&buffers.vertex_normals, 0, bytemuck::cast_slice(&pbr.vertex_normals));
+                queue.write_buffer(
+                    &buffers.vertex_normals,
+                    0,
+                    bytemuck::cast_slice(&pbr.vertex_normals),
+                );
             }
             let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("aux_data"),
@@ -424,20 +462,26 @@ impl App {
         } else {
             rmesh_sort::SortBackend::Basic
         };
-        log::info!("Creating radix sort pipelines (backend: {:?})...", sort_backend);
+        log::info!(
+            "Creating radix sort pipelines (backend: {:?})...",
+            sort_backend
+        );
         let t0 = std::time::Instant::now();
         let sort_pipelines = rmesh_sort::RadixSortPipelines::new(&device, 1, sort_backend);
-        let n_pow2 = (self.scene_data.tet_count as u32).next_power_of_two();
+        let n_pow2 = self.scene_data.tet_count.next_power_of_two();
         let sort_state = rmesh_sort::RadixSortState::new(&device, n_pow2, 32, 1, sort_backend);
         sort_state.upload_configs(&queue);
-        let sort_state_16bit = rmesh_sort::RadixSortState::new(&device, n_pow2, 16, 1, sort_backend);
+        let sort_state_16bit =
+            rmesh_sort::RadixSortState::new(&device, n_pow2, 16, 1, sort_backend);
         sort_state_16bit.upload_configs(&queue);
         log::info!("Sort pipelines: {:.2}s", t0.elapsed().as_secs_f64());
 
         // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
 
-        let compute_bg = create_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
-        let hw_compute_bg = create_hw_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
+        let compute_bg =
+            create_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
+        let hw_compute_bg =
+            create_hw_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
             &device,
@@ -452,7 +496,11 @@ impl App {
             if let Some(ref mp) = mesh_pipelines {
                 let a = create_mesh_render_bind_group(&device, mp, &buffers, &material);
                 let b = create_mesh_render_bind_group_with_sort_values(
-                    &device, mp, &buffers, &material, sort_state.values_b(),
+                    &device,
+                    mp,
+                    &buffers,
+                    &material,
+                    sort_state.values_b(),
                 );
                 let ic = create_indirect_convert_bind_group(&device, mp, &buffers);
                 (Some(a), Some(b), Some(ic))
@@ -465,7 +513,11 @@ impl App {
             if let Some(ref ip) = interval_pipelines {
                 let a = create_interval_render_bind_group(&device, ip, &buffers, &material);
                 let b = create_interval_render_bind_group_with_sort_values(
-                    &device, ip, &buffers, &material, sort_state.values_b(),
+                    &device,
+                    ip,
+                    &buffers,
+                    &material,
+                    sort_state.values_b(),
                 );
                 let ic = create_interval_indirect_convert_bind_group(&device, ip, &buffers);
                 (Some(a), Some(b), Some(ic))
@@ -475,49 +527,80 @@ impl App {
 
         // Compute-interval bind groups (always available)
         let compute_interval_gen_bg_a = create_compute_interval_gen_bind_group(
-            &device, &compute_interval_pipelines, &buffers, &material,
+            &device,
+            &compute_interval_pipelines,
+            &buffers,
+            &material,
         );
         let compute_interval_gen_bg_b = create_compute_interval_gen_bind_group_with_sort_values(
-            &device, &compute_interval_pipelines, &buffers, &material, sort_state.values_b(),
+            &device,
+            &compute_interval_pipelines,
+            &buffers,
+            &material,
+            sort_state.values_b(),
         );
         // 16-bit sort variant: gen bind groups use sort_state_16bit's values_b
         let compute_interval_gen_bg_a_16bit = create_compute_interval_gen_bind_group(
-            &device, &compute_interval_pipelines, &buffers, &material,
+            &device,
+            &compute_interval_pipelines,
+            &buffers,
+            &material,
         );
-        let compute_interval_gen_bg_b_16bit = create_compute_interval_gen_bind_group_with_sort_values(
-            &device, &compute_interval_pipelines, &buffers, &material, sort_state_16bit.values_b(),
-        );
+        let compute_interval_gen_bg_b_16bit =
+            create_compute_interval_gen_bind_group_with_sort_values(
+                &device,
+                &compute_interval_pipelines,
+                &buffers,
+                &material,
+                sort_state_16bit.values_b(),
+            );
         let compute_interval_render_bg = if let Some(ref aux_buf) = aux_data_buf {
             rmesh_render::create_compute_interval_render_bind_group_pbr(
-                &device, &compute_interval_pipelines, &buffers, aux_buf, &buffers.indices,
+                &device,
+                &compute_interval_pipelines,
+                &buffers,
+                aux_buf,
+                &buffers.indices,
             )
         } else {
             create_compute_interval_render_bind_group(
-                &device, &compute_interval_pipelines, &buffers,
+                &device,
+                &compute_interval_pipelines,
+                &buffers,
             )
         };
         let compute_interval_convert_bg = create_compute_interval_indirect_convert_bind_group(
-            &device, &compute_interval_pipelines, &buffers,
+            &device,
+            &compute_interval_pipelines,
+            &buffers,
         );
 
         // Quad prepass + render bind groups (A/B for sort result location)
         let prepass_bg_a = create_prepass_bind_group(
-            &device, &pipelines, &buffers, &material, &buffers.sort_values,
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &buffers.sort_values,
         );
         let prepass_bg_b = create_prepass_bind_group(
-            &device, &pipelines, &buffers, &material, sort_state.values_b(),
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            sort_state.values_b(),
         );
-        let quad_render_bg = create_quad_render_bind_group(
-            &device, &pipelines, &buffers,
-        );
+        let quad_render_bg = create_quad_render_bind_group(&device, &pipelines, &buffers);
 
         let blit_bg = create_blit_bind_group(&device, &blit_pipeline, &targets.color_view);
 
         // Primitive setup (depth used for hardware early-z culling in forward pass)
         let mut primitive_geometry = PrimitiveGeometry::new(&device);
         let mut material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
-        let primitive_pipeline = PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
-        let primitive_targets = PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
+        let primitive_pipeline =
+            PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
+        let primitive_targets =
+            PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
 
         // Instance count readback buffer
         let instance_count_readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -542,7 +625,11 @@ impl App {
         });
         let ts_readback = std::array::from_fn(|i| {
             device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(if i == 0 { "ts_readback_a" } else { "ts_readback_b" }),
+                label: Some(if i == 0 {
+                    "ts_readback_a"
+                } else {
+                    "ts_readback_b"
+                }),
                 size: (TS_QUERY_COUNT as u64) * 8,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
@@ -572,23 +659,30 @@ impl App {
         // (and later SSGI). Pipelines are global; texture + bind groups are
         // resized when the surface size changes.
         let hiz_pipelines = rmesh_render::HizPipelines::new(&device);
-        let hiz_texture = rmesh_render::HizTexture::new(&device, size.width.max(1), size.height.max(1));
+        let hiz_texture =
+            rmesh_render::HizTexture::new(&device, size.width.max(1), size.height.max(1));
         let hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
-            &device, &hiz_pipelines,
+            &device,
+            &hiz_pipelines,
             &primitive_targets.depth_view,
             &targets.depth_view,
         );
         let hiz_downsample_bgs: Vec<wgpu::BindGroup> = (0..(hiz_texture.mip_count as usize - 1))
-            .map(|i| rmesh_render::create_hiz_downsample_bind_group(
-                &device, &hiz_pipelines, &hiz_texture.mip_views[i],
-            ))
+            .map(|i| {
+                rmesh_render::create_hiz_downsample_bind_group(
+                    &device,
+                    &hiz_pipelines,
+                    &hiz_texture.mip_views[i],
+                )
+            })
             .collect();
 
         // GTAO pass — always created. AO target is in `targets`. Reads Hi-Z
         // for fused depth (sample any mip) and the volume MRT for std.
         let gtao_pipeline = rmesh_render::GtaoPipeline::new(&device);
         let gtao_bg = rmesh_render::create_gtao_bind_group(
-            &device, &gtao_pipeline,
+            &device,
+            &gtao_pipeline,
             &hiz_texture.full_view,
             &targets.normals_view,
             &targets.depth_view,
@@ -599,14 +693,16 @@ impl App {
         // temporal-blended AO) and V writes back to ao_view (final).
         let ao_blur_pipeline = rmesh_render::AoBlurPipeline::new(&device);
         let ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
-            &device, &ao_blur_pipeline,
+            &device,
+            &ao_blur_pipeline,
             &ao_blur_pipeline.uniforms_h,
             &targets.ao_temporal_view,
             &hiz_texture.full_view,
             &targets.normals_view,
         );
         let ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
-            &device, &ao_blur_pipeline,
+            &device,
+            &ao_blur_pipeline,
             &ao_blur_pipeline.uniforms_v,
             &targets.ao_blur_temp_view,
             &hiz_texture.full_view,
@@ -616,7 +712,8 @@ impl App {
         // SSGI: compute (Hi-Z ray march, samples lit_history) + bilateral denoise.
         let ssgi_pipeline = rmesh_render::SsgiPipeline::new(&device);
         let ssgi_bg = rmesh_render::create_ssgi_bind_group(
-            &device, &ssgi_pipeline,
+            &device,
+            &ssgi_pipeline,
             &hiz_texture.full_view,
             &targets.normals_view,
             &targets.lit_history_view,
@@ -625,14 +722,16 @@ impl App {
         // the raw ssgi_view. V still writes back to ssgi_view (final).
         let ssgi_blur_pipeline = rmesh_render::SsgiBlurPipeline::new(&device);
         let ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
-            &device, &ssgi_blur_pipeline,
+            &device,
+            &ssgi_blur_pipeline,
             &ssgi_blur_pipeline.uniforms_h,
             &targets.ssgi_temporal_view,
             &hiz_texture.full_view,
             &targets.normals_view,
         );
         let ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
-            &device, &ssgi_blur_pipeline,
+            &device,
+            &ssgi_blur_pipeline,
             &ssgi_blur_pipeline.uniforms_v,
             &targets.ssgi_blur_temp_view,
             &hiz_texture.full_view,
@@ -640,16 +739,20 @@ impl App {
         );
 
         // Temporal accumulation pipelines (one per output format).
-        let ssgi_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+        let ssgi_temporal_pipeline =
+            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
         let ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device, &ssgi_temporal_pipeline,
+            &device,
+            &ssgi_temporal_pipeline,
             &targets.ssgi_view,
             &targets.ssgi_history_view,
             &hiz_texture.full_view,
         );
-        let ao_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
+        let ao_temporal_pipeline =
+            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
         let ao_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device, &ao_temporal_pipeline,
+            &device,
+            &ao_temporal_pipeline,
             &targets.ao_view,
             &targets.ao_history_view,
             &hiz_texture.full_view,
@@ -658,16 +761,19 @@ impl App {
         // SSR pipeline + temporal (third TemporalPipeline instance, Rgba16Float).
         let ssr_pipeline = rmesh_render::SsrPipeline::new(&device);
         let ssr_bg = rmesh_render::create_ssr_bind_group(
-            &device, &ssr_pipeline,
+            &device,
+            &ssr_pipeline,
             &hiz_texture.full_view,
             &targets.normals_view,
             &targets.lit_history_view,
             &targets.ssgi_view,
             &targets.depth_view,
         );
-        let ssr_temporal_pipeline = rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+        let ssr_temporal_pipeline =
+            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
         let ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device, &ssr_temporal_pipeline,
+            &device,
+            &ssr_temporal_pipeline,
             &targets.ssr_view,
             &targets.ssr_history_view,
             &hiz_texture.full_view,
@@ -679,7 +785,12 @@ impl App {
             let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("history_init_clear"),
             });
-            let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+            let black = wgpu::Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.0,
+            };
             rmesh_render::clear_texture_view(&mut enc, &targets.lit_history_view, black);
             rmesh_render::clear_texture_view(&mut enc, &targets.ssgi_history_view, black);
             rmesh_render::clear_texture_view(&mut enc, &targets.ao_history_view, black);
@@ -694,29 +805,61 @@ impl App {
 
         // Deferred PBR shading pipeline (only when PBR data is loaded)
         let has_pbr = self.pbr_data.is_some();
-        let (deferred_pipeline, deferred_bg, deferred_output, deferred_output_view, deferred_blit_bg, deferred_dsm_dummy_bg) = if has_pbr {
+        let (
+            deferred_pipeline,
+            deferred_bg,
+            deferred_output,
+            deferred_output_view,
+            deferred_blit_bg,
+            deferred_dsm_dummy_bg,
+        ) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(&device, &dp, &targets, &primitive_targets.depth_view, &targets.ao_view, &targets.ssgi_view, &targets.lit_history_view, &targets.ssr_view);
+            let bg = rmesh_render::create_deferred_bind_group(
+                &device,
+                &dp,
+                &targets,
+                &primitive_targets.depth_view,
+                &targets.ao_view,
+                &targets.ssgi_view,
+                &targets.lit_history_view,
+                &targets.ssr_view,
+            );
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
-                &device, &dp, &dummy_atlas.cubemap_views[0], &dummy_atlas.meta_buf,
+                &device,
+                &dp,
+                &dummy_atlas.cubemap_views[0],
+                &dummy_atlas.meta_buf,
             );
             // Separate output texture (can't read+write color_view in same pass)
             let out_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("deferred_output"),
-                size: wgpu::Extent3d { width: size.width.max(1), height: size.height.max(1), depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
                 view_formats: &[],
             });
             let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
             let d_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &out_view);
-            (Some(dp), Some(bg), Some(out_tex), Some(out_view), Some(d_blit_bg), Some(dummy_dsm_bg))
+            (
+                Some(dp),
+                Some(bg),
+                Some(out_tex),
+                Some(out_view),
+                Some(d_blit_bg),
+                Some(dummy_dsm_bg),
+            )
         } else {
             (None, None, None, None, None, None)
         };
@@ -725,48 +868,71 @@ impl App {
         log::info!("Building ray trace data... (STUBBED FOR DIAGNOSTIC)");
         let t0 = std::time::Instant::now();
         let rt_neighbors: Vec<i32> = vec![-1];
-        let rt_bvh = rmesh_render::BVHData { nodes: Vec::new(), boundary_faces: Vec::new() };
-        let rt_pipeline = rmesh_render::RayTracePipeline::new(
-            &device,
-            size.width.max(1),
-            size.height.max(1),
-            0,
-        );
+        let rt_bvh = rmesh_render::BVHData {
+            nodes: Vec::new(),
+            boundary_faces: Vec::new(),
+        };
+        let rt_pipeline =
+            rmesh_render::RayTracePipeline::new(&device, size.width.max(1), size.height.max(1), 0);
         let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
         let start_tet: i32 = -1; // DIAGNOSTIC: skip find_containing_tet
         queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
         self.rt_neighbors_cpu = rt_neighbors;
         self.rt_start_tet_hint = start_tet;
         let rt_bg = rmesh_render::create_raytrace_bind_group(
-            &device, &rt_pipeline, &buffers, &material, &rt_buffers,
+            &device,
+            &rt_pipeline,
+            &buffers,
+            &material,
+            &rt_buffers,
         );
-        let (rt_texture, rt_texture_view) = create_rt_texture(&device, size.width.max(1), size.height.max(1));
+        let (rt_texture, rt_texture_view) =
+            create_rt_texture(&device, size.width.max(1), size.height.max(1));
         let rt_blit_pipeline = rmesh_render::BlitPipelineNonFiltering::new(&device, surface_format);
-        let rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&device, &rt_blit_pipeline, &rt_texture_view);
+        let rt_blit_bg =
+            rmesh_render::create_blit_nf_bind_group(&device, &rt_blit_pipeline, &rt_texture_view);
         log::info!("Ray trace data: {:.2}s", t0.elapsed().as_secs_f64());
 
         // DSM debug view (2-moment deep shadow map from camera perspective)
         let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
         let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
+        let dsm_project_pipeline = rmesh_dsm::DsmProjectPipeline::new(&device);
         let dsm_resolve_pipeline = rmesh_dsm::DsmResolvePipeline::new(&device, color_format);
-        let (dsm_moments_texture, dsm_moments_view, dsm_depth_texture, dsm_depth_view,
-             dsm_resolve_output, dsm_resolve_output_view) = {
+        let (
+            dsm_moments_texture,
+            dsm_moments_view,
+            dsm_depth_texture,
+            dsm_depth_view,
+            dsm_resolve_output,
+            dsm_resolve_output_view,
+        ) = {
             let w = size.width.max(1);
             let h = size.height.max(1);
             let mtex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dsm_moments"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let mview = mtex.create_view(&wgpu::TextureViewDescriptor::default());
             let dtex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dsm_debug_depth"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: wgpu::TextureFormat::Depth32Float,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -775,24 +941,33 @@ impl App {
             let dview = dtex.create_view(&wgpu::TextureViewDescriptor::default());
             let resolve_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("dsm_resolve_output"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
+                size: wgpu::Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
                 format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             });
             let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
             (mtex, mview, dtex, dview, resolve_tex, resolve_view)
         };
         let dsm_render_bg = rmesh_dsm::create_dsm_render_bind_group(
-            &device, &dsm_pipeline,
+            &device,
+            &dsm_pipeline,
             &buffers.uniforms,
             &buffers.interval_vertex_buf,
             &buffers.interval_tet_data_buf,
         );
         let dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-            &device, &dsm_resolve_pipeline, &dsm_moments_view,
+            &device,
+            &dsm_resolve_pipeline,
+            &dsm_moments_view,
         );
         let dsm_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &dsm_resolve_output_view);
 
@@ -820,8 +995,16 @@ impl App {
                                 .map(|i| rmesh_compositor::PrimitiveVertex {
                                     position: m.vertices[i],
                                     normal: m.normals[i],
-                                    uv: if i < m.uvs.len() { m.uvs[i] } else { [0.0, 0.0] },
-                                    tangent: if i < m.tangents.len() { m.tangents[i] } else { [1.0, 0.0, 0.0, 1.0] },
+                                    uv: if i < m.uvs.len() {
+                                        m.uvs[i]
+                                    } else {
+                                        [0.0, 0.0]
+                                    },
+                                    tangent: if i < m.tangents.len() {
+                                        m.tangents[i]
+                                    } else {
+                                        [1.0, 0.0, 0.0, 1.0]
+                                    },
                                 })
                                 .collect()
                         })
@@ -964,6 +1147,7 @@ impl App {
             has_pbr_data: has_pbr,
             dsm_pipeline,
             dsm_prim_pipeline,
+            dsm_project_pipeline,
             dsm_resolve_pipeline,
             dsm_moments_texture,
             dsm_moments_view,
@@ -976,7 +1160,7 @@ impl App {
             dsm_blit_bg,
             dsm_atlas: None,
             deferred_dsm_bg: None,
-            deferred_dsm_dummy_bg: deferred_dsm_dummy_bg,
+            deferred_dsm_dummy_bg,
             rt_pipeline,
             rt_buffers,
             rt_bg,
@@ -1002,7 +1186,7 @@ impl App {
 
         let is_ply = path
             .extension()
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("ply"));
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("ply"));
 
         let (scene, sh, pbr) = if is_ply {
             match rmesh_data::load_ply(&file_data) {
@@ -1066,22 +1250,25 @@ impl App {
             gpu.tet_count = self.scene_data.tet_count;
 
             // Recreate SH coeffs buffer (f16-packed)
-            let sh_total_dims = ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
-        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
-            gpu.sh_coeffs_buf =
-                gpu.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("sh_coeffs"),
-                        contents: bytemuck::cast_slice(&sh_coeffs_packed),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    });
+            let sh_total_dims =
+                ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
+            let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
+            gpu.sh_coeffs_buf = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("sh_coeffs"),
+                    contents: bytemuck::cast_slice(&sh_coeffs_packed),
+                    usage: wgpu::BufferUsages::STORAGE,
+                });
             gpu.sh_degree = self.sh_coeffs.degree;
 
             // Recreate sort state for new tet count
-            let n_pow2 = (gpu.tet_count as u32).next_power_of_two();
-            gpu.sort_state = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, gpu.sort_backend);
+            let n_pow2 = gpu.tet_count.next_power_of_two();
+            gpu.sort_state =
+                rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 32, 1, gpu.sort_backend);
             gpu.sort_state.upload_configs(&gpu.queue);
-            gpu.sort_state_16bit = rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 16, 1, gpu.sort_backend);
+            gpu.sort_state_16bit =
+                rmesh_sort::RadixSortState::new(&gpu.device, n_pow2, 16, 1, gpu.sort_backend);
             gpu.sort_state_16bit.upload_configs(&gpu.queue);
 
             // Recreate bind groups
@@ -1115,60 +1302,93 @@ impl App {
 
             // Recreate quad prepass + render bind groups
             gpu.prepass_bg_a = create_prepass_bind_group(
-                &gpu.device, &gpu.pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
                 &gpu.buffers.sort_values,
             );
             gpu.prepass_bg_b = create_prepass_bind_group(
-                &gpu.device, &gpu.pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
                 gpu.sort_state.values_b(),
             );
-            gpu.quad_render_bg = create_quad_render_bind_group(
-                &gpu.device, &gpu.pipelines, &gpu.buffers,
-            );
+            gpu.quad_render_bg =
+                create_quad_render_bind_group(&gpu.device, &gpu.pipelines, &gpu.buffers);
 
             // Recreate mesh shader bind groups
             if let Some(ref mp) = gpu.mesh_pipelines {
                 gpu.mesh_render_bg_a = Some(create_mesh_render_bind_group(
-                    &gpu.device, mp, &gpu.buffers, &gpu.material_buffers,
+                    &gpu.device,
+                    mp,
+                    &gpu.buffers,
+                    &gpu.material_buffers,
                 ));
                 gpu.mesh_render_bg_b = Some(create_mesh_render_bind_group_with_sort_values(
-                    &gpu.device, mp, &gpu.buffers, &gpu.material_buffers,
+                    &gpu.device,
+                    mp,
+                    &gpu.buffers,
+                    &gpu.material_buffers,
                     gpu.sort_state.values_b(),
                 ));
                 gpu.indirect_convert_bg = Some(create_indirect_convert_bind_group(
-                    &gpu.device, mp, &gpu.buffers,
+                    &gpu.device,
+                    mp,
+                    &gpu.buffers,
                 ));
             }
 
             // Recreate interval shading bind groups
             if let Some(ref ip) = gpu.interval_pipelines {
                 gpu.interval_render_bg_a = Some(create_interval_render_bind_group(
-                    &gpu.device, ip, &gpu.buffers, &gpu.material_buffers,
+                    &gpu.device,
+                    ip,
+                    &gpu.buffers,
+                    &gpu.material_buffers,
                 ));
-                gpu.interval_render_bg_b = Some(create_interval_render_bind_group_with_sort_values(
-                    &gpu.device, ip, &gpu.buffers, &gpu.material_buffers,
-                    gpu.sort_state.values_b(),
-                ));
-                gpu.interval_indirect_convert_bg = Some(create_interval_indirect_convert_bind_group(
-                    &gpu.device, ip, &gpu.buffers,
-                ));
+                gpu.interval_render_bg_b =
+                    Some(create_interval_render_bind_group_with_sort_values(
+                        &gpu.device,
+                        ip,
+                        &gpu.buffers,
+                        &gpu.material_buffers,
+                        gpu.sort_state.values_b(),
+                    ));
+                gpu.interval_indirect_convert_bg = Some(
+                    create_interval_indirect_convert_bind_group(&gpu.device, ip, &gpu.buffers),
+                );
             }
 
             // Recreate compute-interval bind groups
             gpu.compute_interval_gen_bg_a = create_compute_interval_gen_bind_group(
-                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.device,
+                &gpu.compute_interval_pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
             );
             gpu.compute_interval_gen_bg_b = create_compute_interval_gen_bind_group_with_sort_values(
-                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.device,
+                &gpu.compute_interval_pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
                 gpu.sort_state.values_b(),
             );
             gpu.compute_interval_gen_bg_a_16bit = create_compute_interval_gen_bind_group(
-                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
+                &gpu.device,
+                &gpu.compute_interval_pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
             );
-            gpu.compute_interval_gen_bg_b_16bit = create_compute_interval_gen_bind_group_with_sort_values(
-                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &gpu.material_buffers,
-                gpu.sort_state_16bit.values_b(),
-            );
+            gpu.compute_interval_gen_bg_b_16bit =
+                create_compute_interval_gen_bind_group_with_sort_values(
+                    &gpu.device,
+                    &gpu.compute_interval_pipelines,
+                    &gpu.buffers,
+                    &gpu.material_buffers,
+                    gpu.sort_state_16bit.values_b(),
+                );
             // Upload PBR aux data if available
             gpu.has_pbr_data = self.pbr_data.is_some();
             if let Some(ref pbr) = self.pbr_data {
@@ -1177,7 +1397,7 @@ impl App {
                 require_parametric_pbr(pbr, tc);
                 let mut aux = vec![0.0f32; tc * 6];
                 for t in 0..tc {
-                    aux[t * 6 + 0] = pbr.roughness[t];
+                    aux[t * 6] = pbr.roughness[t];
                     aux[t * 6 + 1] = pbr.metallic[t];
                     aux[t * 6 + 2] = pbr.f0_dielectric[t];
                     for c in 0..3 {
@@ -1185,26 +1405,49 @@ impl App {
                     }
                 }
                 if !pbr.vertex_normals.is_empty() {
-                    gpu.queue.write_buffer(&gpu.buffers.vertex_normals, 0, bytemuck::cast_slice(&pbr.vertex_normals));
+                    gpu.queue.write_buffer(
+                        &gpu.buffers.vertex_normals,
+                        0,
+                        bytemuck::cast_slice(&pbr.vertex_normals),
+                    );
                 }
-                let aux_buf = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("aux_data"),
-                    contents: bytemuck::cast_slice(&aux),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-                gpu.compute_interval_render_bg = rmesh_render::create_compute_interval_render_bind_group_pbr(
-                    &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers, &aux_buf, &gpu.buffers.indices,
-                );
+                let aux_buf = gpu
+                    .device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("aux_data"),
+                        contents: bytemuck::cast_slice(&aux),
+                        usage: wgpu::BufferUsages::STORAGE,
+                    });
+                gpu.compute_interval_render_bg =
+                    rmesh_render::create_compute_interval_render_bind_group_pbr(
+                        &gpu.device,
+                        &gpu.compute_interval_pipelines,
+                        &gpu.buffers,
+                        &aux_buf,
+                        &gpu.buffers.indices,
+                    );
                 gpu.aux_data_buf = Some(aux_buf);
 
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(&gpu.device, &dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view, &gpu.targets.ssr_view));
+                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
+                    &gpu.device,
+                    &dp,
+                    &gpu.targets,
+                    &gpu.primitive_targets.depth_view,
+                    &gpu.targets.ao_view,
+                    &gpu.targets.ssgi_view,
+                    &gpu.targets.lit_history_view,
+                    &gpu.targets.ssr_view,
+                ));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
-                    &gpu.device, &dp, &dummy_atlas.cubemap_views[0], &dummy_atlas.meta_buf,
+                    &gpu.device,
+                    &dp,
+                    &dummy_atlas.cubemap_views[0],
+                    &dummy_atlas.meta_buf,
                 ));
                 gpu.deferred_dsm_bg = None;
                 gpu.dsm_atlas = None;
@@ -1214,21 +1457,34 @@ impl App {
                 let h = gpu.surface_config.height;
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.deferred_blit_bg = Some(create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &out_view));
+                gpu.deferred_blit_bg = Some(create_blit_bind_group(
+                    &gpu.device,
+                    &gpu.blit_pipeline,
+                    &out_view,
+                ));
                 gpu.deferred_output = Some(out_tex);
                 gpu.deferred_output_view = Some(out_view);
                 gpu.deferred_pipeline = Some(dp);
             } else {
                 gpu.compute_interval_render_bg = create_compute_interval_render_bind_group(
-                    &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers,
+                    &gpu.device,
+                    &gpu.compute_interval_pipelines,
+                    &gpu.buffers,
                 );
                 gpu.aux_data_buf = None;
                 gpu.deferred_pipeline = None;
@@ -1238,7 +1494,9 @@ impl App {
                 gpu.deferred_blit_bg = None;
             }
             gpu.compute_interval_convert_bg = create_compute_interval_indirect_convert_bind_group(
-                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers,
+                &gpu.device,
+                &gpu.compute_interval_pipelines,
+                &gpu.buffers,
             );
 
             // Recreate fluid simulation
@@ -1291,24 +1549,38 @@ impl App {
                 &self.scene_data.indices,
                 self.scene_data.tet_count as usize,
                 self.camera.position,
-            ).map(|t| t as i32).unwrap_or(-1);
-            gpu.queue.write_buffer(&gpu.rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
+            )
+            .map(|t| t as i32)
+            .unwrap_or(-1);
+            gpu.queue.write_buffer(
+                &gpu.rt_buffers.start_tet,
+                0,
+                bytemuck::cast_slice(&[start_tet]),
+            );
             self.rt_neighbors_cpu = neighbors.clone();
             self.rt_start_tet_hint = start_tet;
             gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
-                &gpu.device, &gpu.rt_pipeline, &gpu.buffers, &gpu.material_buffers, &gpu.rt_buffers,
+                &gpu.device,
+                &gpu.rt_pipeline,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.rt_buffers,
             );
             let (rt_tex, rt_view) = create_rt_texture(&gpu.device, w, h);
-            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&gpu.device, &gpu.rt_blit_pipeline, &rt_view);
+            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(
+                &gpu.device,
+                &gpu.rt_blit_pipeline,
+                &rt_view,
+            );
             gpu.rt_texture = rt_tex;
             gpu.rt_texture_view = rt_view;
         }
 
         // Update window title
         if let Some(window) = &self.window {
-            let name = path
-                .file_name()
-                .map_or("rmesh viewer".into(), |n| format!("rmesh viewer - {}", n.to_string_lossy()));
+            let name = path.file_name().map_or("rmesh viewer".into(), |n| {
+                format!("rmesh viewer - {}", n.to_string_lossy())
+            });
             window.set_title(&name);
         }
     }
@@ -1324,31 +1596,36 @@ impl App {
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
             gpu.targets = RenderTargets::new(&gpu.device, new_size.width, new_size.height);
             // Recreate blit bind group since color_view changed
-            gpu.blit_bg = create_blit_bind_group(
-                &gpu.device,
-                &gpu.blit_pipeline,
-                &gpu.targets.color_view,
-            );
+            gpu.blit_bg =
+                create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &gpu.targets.color_view);
 
             // Recreate primitive depth target
-            gpu.primitive_targets = PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
+            gpu.primitive_targets =
+                PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
 
             // Recreate Hi-Z (texture + per-mip bind groups) since size changed.
-            gpu.hiz_texture = rmesh_render::HizTexture::new(&gpu.device, new_size.width, new_size.height);
+            gpu.hiz_texture =
+                rmesh_render::HizTexture::new(&gpu.device, new_size.width, new_size.height);
             gpu.hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
-                &gpu.device, &gpu.hiz_pipelines,
+                &gpu.device,
+                &gpu.hiz_pipelines,
                 &gpu.primitive_targets.depth_view,
                 &gpu.targets.depth_view,
             );
             gpu.hiz_downsample_bgs = (0..(gpu.hiz_texture.mip_count as usize - 1))
-                .map(|i| rmesh_render::create_hiz_downsample_bind_group(
-                    &gpu.device, &gpu.hiz_pipelines, &gpu.hiz_texture.mip_views[i],
-                ))
+                .map(|i| {
+                    rmesh_render::create_hiz_downsample_bind_group(
+                        &gpu.device,
+                        &gpu.hiz_pipelines,
+                        &gpu.hiz_texture.mip_views[i],
+                    )
+                })
                 .collect();
 
             // Recreate GTAO bind group: Hi-Z full view + normals + volume depth.
             gpu.gtao_bg = rmesh_render::create_gtao_bind_group(
-                &gpu.device, &gpu.gtao_pipeline,
+                &gpu.device,
+                &gpu.gtao_pipeline,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
                 &gpu.targets.depth_view,
@@ -1356,14 +1633,16 @@ impl App {
 
             // Recreate AO blur bind groups. H reads ao_temporal_view (post-temporal).
             gpu.ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
-                &gpu.device, &gpu.ao_blur_pipeline,
+                &gpu.device,
+                &gpu.ao_blur_pipeline,
                 &gpu.ao_blur_pipeline.uniforms_h,
                 &gpu.targets.ao_temporal_view,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
             gpu.ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
-                &gpu.device, &gpu.ao_blur_pipeline,
+                &gpu.device,
+                &gpu.ao_blur_pipeline,
                 &gpu.ao_blur_pipeline.uniforms_v,
                 &gpu.targets.ao_blur_temp_view,
                 &gpu.hiz_texture.full_view,
@@ -1372,20 +1651,23 @@ impl App {
 
             // Recreate SSGI bind groups. H reads ssgi_temporal_view (post-temporal).
             gpu.ssgi_bg = rmesh_render::create_ssgi_bind_group(
-                &gpu.device, &gpu.ssgi_pipeline,
+                &gpu.device,
+                &gpu.ssgi_pipeline,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
                 &gpu.targets.lit_history_view,
             );
             gpu.ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
-                &gpu.device, &gpu.ssgi_blur_pipeline,
+                &gpu.device,
+                &gpu.ssgi_blur_pipeline,
                 &gpu.ssgi_blur_pipeline.uniforms_h,
                 &gpu.targets.ssgi_temporal_view,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
             gpu.ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
-                &gpu.device, &gpu.ssgi_blur_pipeline,
+                &gpu.device,
+                &gpu.ssgi_blur_pipeline,
                 &gpu.ssgi_blur_pipeline.uniforms_v,
                 &gpu.targets.ssgi_blur_temp_view,
                 &gpu.hiz_texture.full_view,
@@ -1394,13 +1676,15 @@ impl App {
 
             // Recreate temporal bind groups (input/history views changed).
             gpu.ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device, &gpu.ssgi_temporal_pipeline,
+                &gpu.device,
+                &gpu.ssgi_temporal_pipeline,
                 &gpu.targets.ssgi_view,
                 &gpu.targets.ssgi_history_view,
                 &gpu.hiz_texture.full_view,
             );
             gpu.ao_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device, &gpu.ao_temporal_pipeline,
+                &gpu.device,
+                &gpu.ao_temporal_pipeline,
                 &gpu.targets.ao_view,
                 &gpu.targets.ao_history_view,
                 &gpu.hiz_texture.full_view,
@@ -1408,7 +1692,8 @@ impl App {
 
             // Recreate SSR + SSR temporal bind groups.
             gpu.ssr_bg = rmesh_render::create_ssr_bind_group(
-                &gpu.device, &gpu.ssr_pipeline,
+                &gpu.device,
+                &gpu.ssr_pipeline,
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
                 &gpu.targets.lit_history_view,
@@ -1416,7 +1701,8 @@ impl App {
                 &gpu.targets.depth_view,
             );
             gpu.ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device, &gpu.ssr_temporal_pipeline,
+                &gpu.device,
+                &gpu.ssr_temporal_pipeline,
                 &gpu.targets.ssr_view,
                 &gpu.targets.ssr_history_view,
                 &gpu.hiz_texture.full_view,
@@ -1424,10 +1710,17 @@ impl App {
 
             // Re-clear history textures (resize gives new vendor-defined contents).
             {
-                let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("history_resize_clear"),
-                });
-                let black = wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 };
+                let mut enc = gpu
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("history_resize_clear"),
+                    });
+                let black = wgpu::Color {
+                    r: 0.0,
+                    g: 0.0,
+                    b: 0.0,
+                    a: 0.0,
+                };
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.lit_history_view, black);
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssgi_history_view, black);
                 rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ao_history_view, black);
@@ -1439,20 +1732,37 @@ impl App {
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device, dp, &gpu.targets, &gpu.primitive_targets.depth_view, &gpu.targets.ao_view, &gpu.targets.ssgi_view, &gpu.targets.lit_history_view, &gpu.targets.ssr_view,
+                    &gpu.device,
+                    dp,
+                    &gpu.targets,
+                    &gpu.primitive_targets.depth_view,
+                    &gpu.targets.ao_view,
+                    &gpu.targets.ssgi_view,
+                    &gpu.targets.lit_history_view,
+                    &gpu.targets.ssr_view,
                 ));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
-                    size: wgpu::Extent3d { width: new_size.width, height: new_size.height, depth_or_array_layers: 1 },
+                    size: wgpu::Extent3d {
+                        width: new_size.width,
+                        height: new_size.height,
+                        depth_or_array_layers: 1,
+                    },
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC,
                     view_formats: &[],
                 });
                 let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.deferred_blit_bg = Some(create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &out_view));
+                gpu.deferred_blit_bg = Some(create_blit_bind_group(
+                    &gpu.device,
+                    &gpu.blit_pipeline,
+                    &out_view,
+                ));
                 gpu.deferred_output = Some(out_tex);
                 gpu.deferred_output_view = Some(out_view);
             }
@@ -1464,55 +1774,96 @@ impl App {
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 gpu.dsm_moments_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dsm_moments"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                gpu.dsm_moments_view = gpu.dsm_moments_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                gpu.dsm_moments_view = gpu
+                    .dsm_moments_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 gpu.dsm_depth_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dsm_debug_depth"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: wgpu::TextureFormat::Depth32Float,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                     view_formats: &[],
                 });
-                gpu.dsm_depth_view = gpu.dsm_depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                gpu.dsm_depth_view = gpu
+                    .dsm_depth_texture
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 gpu.dsm_resolve_output = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("dsm_resolve_output"),
-                    size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1,
+                    size: wgpu::Extent3d {
+                        width: w,
+                        height: h,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 });
-                gpu.dsm_resolve_output_view = gpu.dsm_resolve_output.create_view(&wgpu::TextureViewDescriptor::default());
+                gpu.dsm_resolve_output_view = gpu
+                    .dsm_resolve_output
+                    .create_view(&wgpu::TextureViewDescriptor::default());
                 gpu.dsm_render_bg = rmesh_dsm::create_dsm_render_bind_group(
-                    &gpu.device, &gpu.dsm_pipeline,
+                    &gpu.device,
+                    &gpu.dsm_pipeline,
                     &gpu.buffers.uniforms,
                     &gpu.buffers.interval_vertex_buf,
                     &gpu.buffers.interval_tet_data_buf,
                 );
                 gpu.dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-                    &gpu.device, &gpu.dsm_resolve_pipeline, &gpu.dsm_moments_view,
+                    &gpu.device,
+                    &gpu.dsm_resolve_pipeline,
+                    &gpu.dsm_moments_view,
                 );
-                gpu.dsm_blit_bg = create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &gpu.dsm_resolve_output_view);
+                gpu.dsm_blit_bg = create_blit_bind_group(
+                    &gpu.device,
+                    &gpu.blit_pipeline,
+                    &gpu.dsm_resolve_output_view,
+                );
             }
 
             // Recreate ray trace pipeline + texture for new size
             gpu.rt_pipeline = rmesh_render::RayTracePipeline::new(
-                &gpu.device, new_size.width, new_size.height, 0,
+                &gpu.device,
+                new_size.width,
+                new_size.height,
+                0,
             );
             gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
-                &gpu.device, &gpu.rt_pipeline, &gpu.buffers, &gpu.material_buffers, &gpu.rt_buffers,
+                &gpu.device,
+                &gpu.rt_pipeline,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.rt_buffers,
             );
             let (rt_tex, rt_view) = create_rt_texture(&gpu.device, new_size.width, new_size.height);
-            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(&gpu.device, &gpu.rt_blit_pipeline, &rt_view);
+            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(
+                &gpu.device,
+                &gpu.rt_blit_pipeline,
+                &rt_view,
+            );
             gpu.rt_texture = rt_tex;
             gpu.rt_texture_view = rt_view;
         }
@@ -1697,10 +2048,7 @@ impl ApplicationHandler for App {
                 }
 
                 // Flare gun: L key shoots a flare from camera
-                if !consumed
-                    && code == KeyCode::KeyL
-                    && key_event.state == ElementState::Pressed
-                {
+                if !consumed && code == KeyCode::KeyL && key_event.state == ElementState::Pressed {
                     let fwd = (self.camera.orbit_target - self.camera.position).normalize();
                     self.flare_system.shoot(
                         self.camera.position,
@@ -1712,9 +2060,7 @@ impl ApplicationHandler for App {
                 }
 
                 // Fallback: Escape quits if not consumed by interaction
-                if !consumed
-                    && code == KeyCode::Escape
-                    && key_event.state == ElementState::Pressed
+                if !consumed && code == KeyCode::Escape && key_event.state == ElementState::Pressed
                 {
                     event_loop.exit();
                 }
@@ -1742,8 +2088,12 @@ impl ApplicationHandler for App {
                         // Only update camera button state if not consumed
                         match button {
                             MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
-                            MouseButton::Middle => self.middle_pressed = state == ElementState::Pressed,
-                            MouseButton::Right => self.right_pressed = state == ElementState::Pressed,
+                            MouseButton::Middle => {
+                                self.middle_pressed = state == ElementState::Pressed
+                            }
+                            MouseButton::Right => {
+                                self.right_pressed = state == ElementState::Pressed
+                            }
                             _ => {}
                         }
                     }
@@ -1819,7 +2169,7 @@ fn main() -> Result<()> {
 
     let is_ply = scene_path
         .extension()
-        .map_or(false, |ext| ext.eq_ignore_ascii_case("ply"));
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("ply"));
 
     let (scene, sh, pbr) = if is_ply {
         rmesh_data::load_ply(&file_data).context("Failed to parse PLY file")?
