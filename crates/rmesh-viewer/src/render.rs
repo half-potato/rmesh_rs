@@ -1,11 +1,9 @@
 //! Per-frame rendering: GPU readback, egui UI, command encoding, submit/present.
 
-use wgpu::util::DeviceExt;
 
 use rmesh_compositor::record_primitive_pass;
 use rmesh_interact::{InteractContext, Primitive, PrimitiveKind};
 use rmesh_render::{record_blit, Uniforms};
-use rmesh_sim::FluidSim;
 
 use crate::gpu_state::*;
 use crate::App;
@@ -217,12 +215,9 @@ impl App {
         let mut vsync = self.vsync;
         let mut render_mode = self.render_mode;
         let mesh_shader_supported = self.mesh_shader_supported;
-        let mut fluid_enabled = self.fluid_enabled;
         let mut show_primitives = self.show_primitives;
         let mut show_scene = self.show_scene;
         let mut sort_mode = self.sort_mode;
-        let mut fluid_reset = false;
-        let fluid_params = &mut self.fluid_params;
         let interact_display = self.interaction.display_info();
         let interact_selected = self.interaction.selected();
         let mut new_selected: Option<rmesh_interact::Selection> = interact_selected;
@@ -244,8 +239,10 @@ impl App {
         let mut sky_color = self.sky_color;
         let mut ground_color = self.ground_color;
         let mut exposure = self.exposure;
+        let mut ao_enabled = self.ao_enabled;
         let mut ao_strength = self.ao_strength;
         let mut gtao_radius = self.gtao_radius;
+        let mut ssgi_enabled = self.ssgi_enabled;
         let mut ssgi_strength = self.ssgi_strength;
         let mut ssgi_radius = self.ssgi_radius;
         let mut ssgi_temporal_alpha = self.ssgi_temporal_alpha;
@@ -294,19 +291,6 @@ impl App {
         let mut anim_goto_start = false;
         let mut anim_goto_end = false;
         let mut unload_scene = false;
-        // Get mesh bbox for dynamic slider ranges
-        let (fluid_bbox_min, fluid_bbox_max) = if let Some(ref sim) = gpu.fluid_sim {
-            (sim.mesh_bbox_min, sim.mesh_bbox_max)
-        } else {
-            ([-5.0; 3], [5.0; 3])
-        };
-        let fluid_extent = {
-            let dx = fluid_bbox_max[0] - fluid_bbox_min[0];
-            let dy = fluid_bbox_max[1] - fluid_bbox_min[1];
-            let dz = fluid_bbox_max[2] - fluid_bbox_min[2];
-            dx.max(dy).max(dz).max(0.1)
-        };
-        let margin = fluid_extent * 0.5;
         #[allow(deprecated)]
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
@@ -331,7 +315,6 @@ impl App {
                         }
                         ui.radio_value(&mut render_mode, RenderMode::IntervalShader, "Interval Shader");
                         ui.radio_value(&mut render_mode, RenderMode::RayTrace, "Ray Trace");
-                        ui.checkbox(&mut fluid_enabled, "Fluid Sim");
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                         ui.checkbox(&mut show_scene, "Show Scene");
                         ui.separator();
@@ -345,10 +328,12 @@ impl App {
                         if deferred_enabled && has_pbr {
                             ui.add(egui::Slider::new(&mut ambient, 0.0..=1.0).text("Ambient"));
                             ui.add(egui::Slider::new(&mut exposure, 0.05..=8.0).logarithmic(true).text("Exposure"));
-                            ui.add(egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
-                            ui.add(egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
-                            ui.add(egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
-                            ui.add(egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
+                            ui.checkbox(&mut ao_enabled, "AO");
+                            ui.add_enabled(ao_enabled, egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
+                            ui.add_enabled(ao_enabled, egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
+                            ui.checkbox(&mut ssgi_enabled, "SSGI");
+                            ui.add_enabled(ssgi_enabled, egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
+                            ui.add_enabled(ssgi_enabled, egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
                             ui.add(egui::Slider::new(&mut ao_temporal_alpha, 0.0..=1.0).text("AO Temporal α"));
                             ui.add(egui::Slider::new(&mut ssgi_temporal_alpha, 0.0..=1.0).text("SSGI Temporal α"));
                             ui.add(egui::Slider::new(&mut ssr_temporal_alpha, 0.0..=1.0).text("SSR Temporal α"));
@@ -608,32 +593,6 @@ impl App {
                 });
             }
 
-            // Fluid simulation panel (only shown when enabled)
-            if fluid_enabled {
-                egui::SidePanel::right("fluid_panel").default_width(200.0).show(ctx, |ui| {
-                    ui.heading("Fluid Simulation");
-                    if ui.button("Reset").clicked() {
-                        fluid_reset = true;
-                    }
-                    ui.separator();
-                    ui.add(egui::Slider::new(&mut fluid_params.dt, 0.001..=0.1).text("dt").logarithmic(true));
-                    ui.add(egui::Slider::new(&mut fluid_params.viscosity, 0.0..=0.1).text("Viscosity").logarithmic(true));
-                    ui.add(egui::Slider::new(&mut fluid_params.buoyancy, 0.0..=20.0).text("Buoyancy"));
-                    ui.add(egui::Slider::new(&mut fluid_params.density_scale, 0.1..=100.0).text("Density Scale").logarithmic(true));
-                    ui.separator();
-                    ui.label("Source");
-                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[0], (fluid_bbox_min[0] - margin)..=(fluid_bbox_max[0] + margin)).text("X"));
-                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[1], (fluid_bbox_min[1] - margin)..=(fluid_bbox_max[1] + margin)).text("Y"));
-                    ui.add(egui::Slider::new(&mut fluid_params.source_pos[2], (fluid_bbox_min[2] - margin)..=(fluid_bbox_max[2] + margin)).text("Z"));
-                    ui.add(egui::Slider::new(&mut fluid_params.source_radius, 0.001..=(fluid_extent * 0.5)).text("Radius"));
-                    ui.add(egui::Slider::new(&mut fluid_params.source_strength, 0.0..=50.0).text("Strength"));
-                    ui.separator();
-                    ui.label("Solver");
-                    ui.add(egui::Slider::new(&mut fluid_params.diffuse_iterations, 1..=100).text("Diffuse Iters"));
-                    ui.add(egui::Slider::new(&mut fluid_params.pressure_iterations, 1..=200).text("Pressure Iters"));
-                });
-            }
-
         });
         if open_file {
             if let Some(path) = rfd::FileDialog::new()
@@ -648,7 +607,6 @@ impl App {
             gpu.pending_reconfigure = true;
         }
         self.render_mode = render_mode;
-        self.fluid_enabled = fluid_enabled;
         self.show_primitives = show_primitives;
         if show_scene != self.show_scene {
             // Invalidate DSM cache when scene visibility changes
@@ -662,8 +620,10 @@ impl App {
         self.sky_color = sky_color;
         self.ground_color = ground_color;
         self.exposure = exposure;
+        self.ao_enabled = ao_enabled;
         self.ao_strength = ao_strength;
         self.gtao_radius = gtao_radius;
+        self.ssgi_enabled = ssgi_enabled;
         self.ssgi_strength = ssgi_strength;
         self.ssgi_radius = ssgi_radius;
         self.ssgi_temporal_alpha = ssgi_temporal_alpha;
@@ -973,12 +933,6 @@ impl App {
             self.interaction.set_selected(new_selected);
         }
 
-        if fluid_reset {
-            if let Some(ref mut sim) = gpu.fluid_sim {
-                sim.reset(&gpu.queue);
-                log::info!("[fluid] Reset simulation state");
-            }
-        }
         gpu.egui_state
             .handle_platform_output(window, full_output.platform_output);
 
@@ -1012,88 +966,50 @@ impl App {
             &screen_desc,
         );
 
-        // Fluid simulation step (if enabled)
-        if self.fluid_enabled {
-            // Lazy init: create FluidSim on first enable
-            if gpu.fluid_sim.is_none() {
-                log::info!("[fluid] Initializing fluid simulation...");
-                let t0_fluid = std::time::Instant::now();
-                let neighbors = rmesh_render::compute_tet_neighbors(
-                    &self.scene_data.indices,
-                    self.scene_data.tet_count as usize,
-                );
-                let tet_neighbors_buf =
-                    gpu.device
-                        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                            label: Some("tet_neighbors"),
-                            contents: bytemuck::cast_slice(&neighbors),
-                            usage: wgpu::BufferUsages::STORAGE,
-                        });
-                let mut fluid_sim = FluidSim::new(&gpu.device, gpu.tet_count);
-                {
-                    let mut precompute_encoder =
-                        gpu.device
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("precompute_geometry"),
-                            });
-                    fluid_sim.precompute_geometry(
-                        &gpu.device,
-                        &mut precompute_encoder,
-                        &gpu.buffers.vertices,
-                        &gpu.buffers.indices,
-                        &tet_neighbors_buf,
-                    );
-                    gpu.queue
-                        .submit(std::iter::once(precompute_encoder.finish()));
-                }
-                fluid_sim.compute_mesh_bbox(&gpu.device, &gpu.queue);
-                fluid_sim.log_precompute_stats(&gpu.device, &gpu.queue);
-                // Auto-set fluid params to match mesh geometry
-                self.fluid_params = fluid_sim.default_params_for_mesh();
-                log::info!(
-                    "[fluid] Auto-set source_pos=[{:.3},{:.3},{:.3}] radius={:.4} (mesh center=[{:.3},{:.3},{:.3}] extent={:.3})",
-                    self.fluid_params.source_pos[0], self.fluid_params.source_pos[1], self.fluid_params.source_pos[2],
-                    self.fluid_params.source_radius,
-                    fluid_sim.mesh_center()[0], fluid_sim.mesh_center()[1], fluid_sim.mesh_center()[2],
-                    fluid_sim.mesh_extent(),
-                );
-                log::info!(
-                    "[fluid] Fluid sim initialized: {:.2}s",
-                    t0_fluid.elapsed().as_secs_f64()
-                );
-                gpu.fluid_sim = Some(fluid_sim);
-                gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
-            }
+        // Record a PBD step if a vertex grab is in progress.
+        if self.vertex_select.is_grabbing() {
+            if let Some(solver) = gpu.pbd_solver.as_ref() {
+                let mouse_now = self.vertex_select.mouse_pos();
+                let mouse_start = self.vertex_select.mouse_start();
+                let surf_w = gpu.surface_config.width as f32;
+                let surf_h = gpu.surface_config.height as f32;
+                let view = self.camera.view_matrix();
+                let proj = self.camera.projection_matrix(surf_w / surf_h);
+                // FOV-aware world-per-pixel at the handle's view-space depth
+                // (same formula as TransformInteraction's free grab).
+                let focal_px = proj.col(1).y * surf_h * 0.5;
+                let cam_right = glam::Vec3::new(view.col(0).x, view.col(1).x, view.col(2).x).normalize();
+                let cam_up = glam::Vec3::new(view.col(0).y, view.col(1).y, view.col(2).y).normalize();
+                let mouse_dx = mouse_now[0] - mouse_start[0];
+                let mouse_dy = mouse_now[1] - mouse_start[1];
+                let mut max_drag = 0.0_f32;
+                let positions: Vec<[f32; 4]> = self
+                    .pbd_handle_initial
+                    .iter()
+                    .map(|(_, init)| {
+                        let anchor = glam::Vec3::new(init[0], init[1], init[2]);
+                        let view_pos = view * anchor.extend(1.0);
+                        let depth = (-view_pos.z).max(0.01);
+                        let world_per_px = depth / focal_px;
+                        let dx_w = mouse_dx * world_per_px;
+                        let dy_w = mouse_dy * world_per_px;
+                        // winit y is top-down, NDC up matches cam_up — flip dy.
+                        let d = cam_right * dx_w - cam_up * dy_w;
+                        let mag = d.length();
+                        if mag > max_drag { max_drag = mag; }
+                        [init[0] + d.x, init[1] + d.y, init[2] + d.z, 0.0]
+                    })
+                    .collect();
+                solver.step(&gpu.queue, &mut encoder, &gpu.pbd_pipelines, 0.016, &positions);
 
-            if let (Some(ref mut sim), Some(ref neighbors_buf)) =
-                (&mut gpu.fluid_sim, &gpu.tet_neighbors_buf)
-            {
-                let should_log = sim.step_count < 3 || sim.step_count % 60 == 0;
-                sim.step(
-                    &gpu.device,
-                    &mut encoder,
-                    &gpu.queue,
-                    &self.fluid_params,
-                    neighbors_buf,
-                    &gpu.buffers.densities,
-                    &gpu.material_buffers.base_colors,
-                );
-                // Log on first few frames + every 60 after that.
-                // Must submit first since step() only records commands.
-                if should_log {
-                    // Submit the encoder so far, log, then create a fresh encoder
-                    gpu.queue.submit(std::iter::once(encoder.finish()));
-                    sim.log_step_stats(
-                        &gpu.device,
-                        &gpu.queue,
-                        &gpu.buffers.densities,
-                        &gpu.material_buffers.base_colors,
+                // Rate-limited per-step log: first 3 frames, then every 30.
+                self.pbd_step_counter = self.pbd_step_counter.wrapping_add(1);
+                let n = self.pbd_step_counter;
+                if n <= 3 || n.is_multiple_of(30) {
+                    log::info!(
+                        "[pbd] step #{n} | {} particles, {} handles | mouseΔ=({:.1}, {:.1}) px | world drag={:.4}",
+                        solver.num_particles, solver.num_handles, mouse_dx, mouse_dy, max_drag,
                     );
-                    encoder = gpu
-                        .device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("forward pass (post-fluid)"),
-                        });
                 }
             }
         }
@@ -1688,6 +1604,11 @@ impl App {
 
                 // Upload deferred uniforms — DSM only for scene lights
                 let dsm_enabled = if gpu.dsm_atlas.is_some() { 1u32 } else { 0u32 };
+                // When AO/SSGI are disabled the compute passes below are
+                // skipped, so the textures hold stale data — zero the strengths
+                // so the deferred shader masks them out mathematically too.
+                let effective_ao_strength = if self.ao_enabled { self.ao_strength } else { 0.0 };
+                let effective_ssgi_strength = if self.ssgi_enabled { self.ssgi_strength } else { 0.0 };
                 let deferred_uniforms = rmesh_render::DeferredUniforms {
                     inv_vp: vp.inverse().to_cols_array_2d(),
                     cam_pos: pos,
@@ -1700,8 +1621,8 @@ impl App {
                     far_plane: self.camera.far_z,
                     dsm_enabled,
                     exposure: self.exposure,
-                    ao_strength: self.ao_strength,
-                    ssgi_strength: self.ssgi_strength,
+                    ao_strength: effective_ao_strength,
+                    ssgi_strength: effective_ssgi_strength,
                     _pad: [0.0; 2],
                 };
                 gpu.queue.write_buffer(
@@ -1751,6 +1672,15 @@ impl App {
                     &gpu.hiz_downsample_bgs,
                 );
 
+                // Per-frame matrices for the temporal passes: current inv_vp +
+                // previous-frame view-projection (inline camera motion vectors).
+                // Shared by AO and SSGI temporal stages, so hoisted above both
+                // so the gates below can skip the compute passes independently.
+                let cur_vp = vp;
+                let cur_inv_vp = cur_vp.inverse();
+                let prev_vp_mat = prev_vp_snapshot;
+
+                if self.ao_enabled {
                 // GTAO pass: Hi-Z + normals + volume depth → AO texture
                 rmesh_render::record_gtao_pass(
                     &mut encoder,
@@ -1758,12 +1688,6 @@ impl App {
                     &gpu.gtao_bg,
                     &gpu.targets.ao_view,
                 );
-
-                // Per-frame matrices for the temporal pass: current inv_vp +
-                // previous-frame view-projection (inline camera motion vectors).
-                let cur_vp = vp;
-                let cur_inv_vp = cur_vp.inverse();
-                let prev_vp_mat = prev_vp_snapshot;
 
                 // AO temporal: ao_view + ao_history → ao_temporal_view
                 let ao_temporal_uniforms = rmesh_render::TemporalUniforms {
@@ -1848,7 +1772,9 @@ impl App {
                         depth_or_array_layers: 1,
                     },
                 );
+                } // end if self.ao_enabled
 
+                if self.ssgi_enabled {
                 // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
                 // The ssgi_radius bounds ray length in world units; the
                 // bilateral's sigma_z follows (depth-stop scales with the AO
@@ -1966,6 +1892,7 @@ impl App {
                         depth_or_array_layers: 1,
                     },
                 );
+                } // end if self.ssgi_enabled
 
                 // -------- SSR (specular reflections) --------
                 // Single Hi-Z ray-march along reflect(view, N). Same matrices /

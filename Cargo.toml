@@ -9,7 +9,7 @@ members = [
     "crates/rmesh-error",
     "crates/rmesh-data",
     "crates/rmesh-train",
-    "crates/rmesh-sim",
+    "crates/rmesh-pbd",
     "crates/rmesh-interact",
     "crates/rmesh-compositor",
     "crates/rmesh-viewer",

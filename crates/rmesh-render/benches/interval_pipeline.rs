@@ -123,7 +123,8 @@ fn create_state() -> Option<State> {
         H as f32,
         scene.tet_count,
         0u32,
-        16,
+        0, // tile_size=0: skip the tile-counting scanline loop in project_compute.
+        //                The interval forward path doesn't read tiles_touched.
         0.0,
         0,
         0.01,
@@ -296,6 +297,14 @@ fn print_breakdown(s: &State) {
         };
         s.queue
             .write_buffer(&s.buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
+        s.queue.write_buffer(
+            &s.buffers.interval_args_buf,
+            0,
+            bytemuck::cast_slice(&[0u32; 8]),
+        );
+        let n_pow2 = s.tet_count.next_power_of_two();
+        s.queue
+            .write_buffer(s.sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
         encoder.clear_buffer(&s.buffers.tiles_touched, 0, None);
 
         let (b, e) = ts.allocate("project_compute");
@@ -349,7 +358,7 @@ fn print_breakdown(s: &State) {
         cpass.dispatch_workgroups(1, 1, 1);
     }
 
-    // interval_gen
+    // interval_gen (indirect dispatch driven by indirect_convert output)
     {
         let (b, e) = ts.allocate("interval_gen");
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -362,25 +371,29 @@ fn print_breakdown(s: &State) {
         });
         cpass.set_pipeline(&s.ci_pipelines.gen_pipeline);
         cpass.set_bind_group(0, gen_bg, &[]);
-        let n_pow2 = s.tet_count.next_power_of_two();
-        let wgs = n_pow2.div_ceil(64);
-        cpass.dispatch_workgroups(wgs.min(65535), wgs.div_ceil(65535), 1);
+        cpass.dispatch_workgroups_indirect(&s.buffers.interval_args_buf, 0);
     }
 
-    // interval_render (HW raster)
+    // interval_render (HW raster — color-only pipeline still declares 4 color
+    // targets; the unused slots must be present as `None` in the pass).
     {
         let (b, e) = ts.allocate("interval_render");
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("interval_render"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &s.targets.color_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: &s.targets.color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                }),
+                None,
+                None,
+                None,
+            ],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &s.depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -396,9 +409,23 @@ fn print_breakdown(s: &State) {
             }),
             ..Default::default()
         });
+        rpass.set_viewport(
+            0.0,
+            0.0,
+            s.targets.width as f32,
+            s.targets.height as f32,
+            0.0,
+            1.0,
+        );
+        rpass.set_scissor_rect(0, 0, s.targets.width, s.targets.height);
         rpass.set_pipeline(&s.ci_pipelines.render_pipeline_color_only);
         rpass.set_bind_group(0, &s.ci_render_bg, &[]);
-        rpass.draw_indirect(&s.buffers.indirect_args, 0);
+        rpass.set_index_buffer(
+            s.buffers.interval_fan_index_buf.slice(..),
+            wgpu::IndexFormat::Uint32,
+        );
+        // draw-indexed-indirect args start at byte offset 12 (skip 3 dispatch u32s).
+        rpass.draw_indexed_indirect(&s.buffers.interval_args_buf, 12);
     }
 
     ts.resolve(&mut encoder);

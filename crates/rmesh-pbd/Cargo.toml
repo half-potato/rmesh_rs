@@ -1,0 +1,11 @@
+[package]
+name = "rmesh-pbd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-data = { path = "../rmesh-data" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }

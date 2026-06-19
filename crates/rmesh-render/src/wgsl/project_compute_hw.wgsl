@@ -71,6 +71,12 @@ fn read_sh_f16(base: u32, i: u32) -> f32 {
     return select(unpacked.x, unpacked.y, (i & 1u) != 0u);
 }
 
+fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
+    let clip = vp * vec4<f32>(pos, 1.0);
+    let inv_w = 1.0 / (clip.w + 1e-6);
+    return vec4<f32>(clip.xyz * inv_w, clip.w);
+}
+
 fn load_vertex(idx: u32) -> vec3<f32> {
     let i = idx * 3u;
     return vec3<f32>(vertices[i], vertices[i + 1u], vertices[i + 2u]);
@@ -79,14 +85,6 @@ fn load_vertex(idx: u32) -> vec3<f32> {
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
-
-    // Thread 0 publishes the dispatched count. Per-view visibility is handled
-    // at rasterization time in `interval_generate.wgsl` (AABB + sub-pixel
-    // cull); the sort key here is the camera-origin power of the circumsphere
-    // and is valid for any frustum sharing that origin. See RADIANCE_MESHES.md.
-    if (tet_id == 0u) {
-        atomicStore(&indirect_args.instance_count, uniforms.tet_count);
-    }
 
     if (tet_id >= uniforms.tet_count) {
         if (tet_id < arrayLength(&sort_keys)) {
@@ -107,7 +105,43 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let v2 = load_vertex(i2);
     let v3 = load_vertex(i3);
 
-    // --- 2. Depth key from circumsphere ---
+    // --- 2. Frustum culling ---
+    let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
+    let p0 = project_to_ndc(v0, vp);
+    let p1 = project_to_ndc(v1, vp);
+    let p2 = project_to_ndc(v2, vp);
+    let p3 = project_to_ndc(v3, vp);
+
+    let all_behind = (p0.w <= 0.0) && (p1.w <= 0.0) && (p2.w <= 0.0) && (p3.w <= 0.0);
+    let any_behind = (p0.w <= 0.0) || (p1.w <= 0.0) || (p2.w <= 0.0) || (p3.w <= 0.0);
+
+    var visible = true;
+    if (all_behind) {
+        visible = false;
+    } else if (!any_behind) {
+        let min_x = min(min(p0.x, p1.x), min(p2.x, p3.x));
+        let max_x = max(max(p0.x, p1.x), max(p2.x, p3.x));
+        let min_y = min(min(p0.y, p1.y), min(p2.y, p3.y));
+        let max_y = max(max(p0.y, p1.y), max(p2.y, p3.y));
+        let min_z = min(min(p0.z, p1.z), min(p2.z, p3.z));
+
+        if (max_x < -1.0 || min_x > 1.0 || max_y < -1.0 || min_y > 1.0 || min_z > 1.0) {
+            visible = false;
+        }
+        let ext_x = (max_x - min_x) * uniforms.screen_width;
+        let ext_y = (max_y - min_y) * uniforms.screen_height;
+        if (ext_x * ext_y < 1.0) {
+            visible = false;
+        }
+    }
+
+    if (!visible) {
+        sort_keys[tet_id] = 0xFFFFFFFFu;
+        sort_values[tet_id] = tet_id;
+        return;
+    }
+
+    // --- 3. Depth key from circumsphere ---
     // Use algebraic identity: power(P) = (P-v0)·(P+v0-2C) to avoid catastrophic
     // cancellation when circumcenter is far from camera (sliver tets).
     let cx = circumdata[tet_id * 4u];
@@ -121,6 +155,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let depth_bits = bitcast<u32>(depth);
     sort_keys[tet_id] = ~depth_bits;
     sort_values[tet_id] = tet_id;
+
+    atomicAdd(&indirect_args.instance_count, 1u);
 
     // --- 4. Color evaluation (only for visible tets) ---
     // sh_degree >= 0 all need SH eval (degree 0 = DC only). Else branch is training-only.

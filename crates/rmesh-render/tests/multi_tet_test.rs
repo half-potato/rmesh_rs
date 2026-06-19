@@ -273,6 +273,169 @@ fn test_compute_interval_four_tet_multi_angle() {
     }
 }
 
+/// Build a procedural many-tet scene: an N×N×N grid of axis-aligned tetrahedra.
+///
+/// Used to exercise the GPU sort path at viewer-realistic scale, where the
+/// camera's frustum captures only a fraction of the tets. Each cell contributes
+/// one tetrahedron (4 vertices forming a regular-ish shape). The resulting
+/// scene has `n^3` tets and `4·n^3` vertices.
+fn grid_tet_scene(n: u32, rng: &mut ChaCha8Rng) -> SceneData {
+    let nf = n as f32;
+    let mut vertices: Vec<f32> = Vec::with_capacity(4 * 3 * (n * n * n) as usize);
+    let mut indices: Vec<u32> = Vec::with_capacity(4 * (n * n * n) as usize);
+    let mut densities: Vec<f32> = Vec::with_capacity((n * n * n) as usize);
+    let mut color_grads: Vec<f32> = Vec::with_capacity(3 * (n * n * n) as usize);
+
+    for k in 0..n {
+        for j in 0..n {
+            for i in 0..n {
+                let cx = (i as f32 - nf * 0.5) * 0.2;
+                let cy = (j as f32 - nf * 0.5) * 0.2;
+                let cz = (k as f32 - nf * 0.5) * 0.2;
+                let s = 0.08;
+                let base = vertices.len() as u32 / 3;
+                vertices.extend_from_slice(&[
+                    cx + s, cy + s, cz + s,
+                    cx + s, cy - s, cz - s,
+                    cx - s, cy + s, cz - s,
+                    cx - s, cy - s, cz + s,
+                ]);
+                indices.extend_from_slice(&[base, base + 1, base + 2, base + 3]);
+                densities.push(rng.random::<f32>() * 2.0 + 0.5);
+                color_grads.extend_from_slice(&[
+                    (rng.random::<f32>() - 0.5) * 0.1,
+                    (rng.random::<f32>() - 0.5) * 0.1,
+                    (rng.random::<f32>() - 0.5) * 0.1,
+                ]);
+            }
+        }
+    }
+
+    build_test_scene(vertices, indices, densities, color_grads)
+}
+
+/// Scaled-up HW-compute interval render test. Mirrors the viewer's GPU-sort
+/// path on a scene where the camera frustum sees only a fraction of the tets,
+/// so `instance_count = tet_count` (this codebase's current behavior) is much
+/// larger than `visible_count`. If something in the GPU sort → indirect_convert
+/// → interval_compute → render chain breaks at scale, the small 4-tet test
+/// passes while this one catches it.
+#[test]
+fn test_hw_compute_interval_grid_scene() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = grid_tet_scene(50, &mut rng); // 50^3 = 125k tets, viewer-scale
+
+    let eye = Vec3::new(2.5, 0.0, 0.0);
+    let target = Vec3::ZERO;
+    let (vp, c2w, intrinsics) = setup_camera(eye, target);
+
+    let cpu_image = cpu_render_scene(&scene, eye, vp, c2w, intrinsics, W, H);
+    let cpu_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+    assert!(
+        cpu_alpha > 1.0,
+        "CPU reference is essentially black ({cpu_alpha}) — bad test setup"
+    );
+
+    let Some(hw_image) =
+        gpu_hw_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+    else {
+        eprintln!("Skipping hw_compute_interval_grid_scene (no GPU adapter)");
+        return;
+    };
+    let hw_alpha: f32 = hw_image.iter().map(|p| p[3]).sum();
+
+    let legacy_image = gpu_compute_interval_render_scene(&scene, eye, vp, c2w, intrinsics, W, H)
+        .expect("legacy path should also be runnable");
+    let legacy_alpha: f32 = legacy_image.iter().map(|p| p[3]).sum();
+
+    eprintln!(
+        "grid({}) cpu_alpha={cpu_alpha:.2}, hw_alpha={hw_alpha:.2}, legacy_alpha={legacy_alpha:.2}",
+        scene.tet_count
+    );
+
+    assert!(
+        hw_alpha > cpu_alpha * 0.5,
+        "HW-compute on {}-tet grid is (near-)black (hw_alpha={hw_alpha}, legacy_alpha={legacy_alpha}, cpu_alpha={cpu_alpha}); \
+         GPU sort path is broken at scale",
+        scene.tet_count
+    );
+
+    let (max_diff, mean_diff, _) = compare_images(&cpu_image, &hw_image);
+    eprintln!("  HW vs CPU: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+    assert!(
+        mean_diff < ATOL * 2.0,
+        "grid HW mean_diff {mean_diff} >= {} (max_diff={max_diff})",
+        ATOL * 2.0
+    );
+}
+
+/// HW-compute interval shading on a four-tet scene from several angles.
+///
+/// Exercises `project_compute_hw.wgsl` (uniform-buffer uniforms — the path
+/// rmesh-viewer takes when sort_mode != CPU). Before this test existed, every
+/// interval/compute-interval test in the suite passed `hw_compute_bg = None`
+/// and fell through to the legacy `project_compute.wgsl` storage-uniforms
+/// path; the viewer's actual project shader was never exercised, so changes
+/// that broke only it could pass the test suite while rendering the viewer
+/// all-black.
+///
+/// Compares against both the CPU reference and the legacy GPU path: the HW
+/// and legacy GPU paths share their entire downstream (sort, indirect_convert,
+/// interval_compute, render). They must produce the same image, and that
+/// image must match the CPU reference.
+#[test]
+fn test_hw_compute_interval_four_tet_multi_angle() {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED);
+    let scene = four_tet_scene(&mut rng);
+
+    let viewpoints = [
+        (Vec3::new(3.0, 0.0, 0.0), Vec3::ZERO),
+        (Vec3::new(0.0, 3.0, 0.0), Vec3::ZERO),
+        (Vec3::new(2.0, 2.0, 2.0), Vec3::ZERO),
+    ];
+
+    for (i, (eye, target)) in viewpoints.iter().enumerate() {
+        let (vp, c2w, intrinsics) = setup_camera(*eye, *target);
+        let cpu_image = cpu_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H);
+        let cpu_alpha: f32 = cpu_image.iter().map(|p| p[3]).sum();
+        assert!(
+            cpu_alpha > 0.1,
+            "angle {i}: CPU reference is all-zero — bad test scene"
+        );
+
+        let Some(hw_image) =
+            gpu_hw_compute_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H)
+        else {
+            eprintln!("Skipping hw_compute_interval_four_tet_multi_angle (no GPU adapter)");
+            return;
+        };
+        let hw_alpha: f32 = hw_image.iter().map(|p| p[3]).sum();
+
+        let legacy_image =
+            gpu_compute_interval_render_scene(&scene, *eye, vp, c2w, intrinsics, W, H)
+                .expect("legacy path should also be runnable");
+        let legacy_alpha: f32 = legacy_image.iter().map(|p| p[3]).sum();
+
+        eprintln!(
+            "hw_compute_interval_four_tet angle {i}: cpu_alpha={cpu_alpha:.3}, hw_alpha={hw_alpha:.3}, legacy_alpha={legacy_alpha:.3}"
+        );
+
+        assert!(
+            hw_alpha > 0.1,
+            "angle {i}: HW-compute interval render is all-black \
+             (hw_alpha={hw_alpha}, legacy_alpha={legacy_alpha}); \
+             project_compute_hw.wgsl → sort → interval_compute chain is broken"
+        );
+
+        let (max_diff, mean_diff, _) = compare_images(&cpu_image, &hw_image);
+        eprintln!("  HW vs CPU: max_diff={max_diff:.4}, mean_diff={mean_diff:.6}");
+        assert!(
+            mean_diff < ATOL,
+            "angle {i}: HW-compute mean_diff {mean_diff} >= {ATOL} (max_diff={max_diff})"
+        );
+    }
+}
+
 /// Verify CPU sorting produces the same order as GPU.
 #[test]
 fn test_sort_order_matches() {

@@ -117,8 +117,11 @@ fn fresnel_schlick(cos_theta: f32, F0: vec3f) -> vec3f {
     return F0 + (vec3f(1.0) - F0) * c5;
 }
 
+// Canonical Disney/glTF GGX NDF. Parameter `a` is α (= roughness²); we square
+// internally to α². Matches `v_smith_ggx_correlated`'s convention so D and V
+// agree on the meaning of their input.
 fn d_ggx(n_dot_h: f32, a: f32) -> f32 {
-    let a2 = a;// * a;
+    let a2 = a * a;
     let n_h = clamp(n_dot_h, 0.0, 1.0);
     let denom = n_h * n_h * (a2 - 1.0) + 1.0;
     return a2 / (PI * denom * denom + 1e-7);
@@ -268,16 +271,18 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // metallic in aux0.b; aux0.g is 0 for primitives, falling back to the 0.04
     // dielectric default. Volumes that need a custom f0_dielectric can write
     // it into aux0.g.
-    let inv_alpha = 1.0 / max(alpha, 1e-6);
+    // alpha >= 0.01 is guaranteed by the early-out above, so the max() guard
+    // that used to wrap this division is dropped.
+    let inv_alpha = 1.0 / alpha;
     let albedo        = color_raw.rgb * inv_alpha;
     let roughness     = aux0_raw.r * inv_alpha;
     let metallic      = aux0_raw.b * inv_alpha;
     let f0_dielectric = max(aux0_raw.g * inv_alpha, 0.04);
 
-    // Un-premultiply and normalize raw field gradient to get surface normal.
-    // Transform from colmap (Y-down, Z-forward) to wgpu (Y-up, Z-backward).
-    let raw_gradient = normals_raw.rgb * inv_alpha;
-    let normal = -normalize(vec3f(raw_gradient.x, raw_gradient.y, raw_gradient.z));
+    // normalize() is scale-invariant, so the un-premultiply (* inv_alpha)
+    // cancels — feed the raw premultiplied gradient straight in.
+    // Negation transforms colmap (Y-down, Z-forward) to wgpu (Y-up, Z-back).
+    let normal = -normalize(normals_raw.rgb);
 
     // Volume's expected termination depth. Slot 3 is filtered ("thick tets
     // only") at the producer, so its α lags color's α — normalize by slot 3's
@@ -291,26 +296,28 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // HEAD's primitive_mrt writes per-pixel occlusion into depth_tex.g.
     // Volumes don't have a baked-occlusion concept (GTAO provides it), so we
     // gate on hw_depth: primitives use their channel value, volumes pass
-    // through with 1.0.
+    // through with 1.0. Using `if` instead of `select` so the un-premultiply
+    // mul is skipped on volume pixels (select would evaluate both arms).
     let is_prim = hw_depth < 0.999;
-    let prim_occlusion = select(1.0, depth_raw.g * inv_da, is_prim);
+    var prim_occlusion = 1.0;
+    if (is_prim) {
+        prim_occlusion = depth_raw.g * inv_da;
+    }
 
     let near = uniforms.near_plane;
     let far  = uniforms.far_plane;
 
     // Pick the closer of volume-depth and hw-depth, but only consider the
     // volume-depth when slot 3 actually has thick-tet coverage.
+    // Linear-depth reconstruction is the same on both branches — compute once.
+    let has_hw = hw_depth < 0.999;
+    let z_hw = near * far / (far - hw_depth * (far - near));
     var z_final: f32;
     if depth_alpha < 0.01 {
-        if hw_depth < 0.999 {
-            z_final = near * far / (far - hw_depth * (far - near));
-        } else {
-            z_final = far;
-        }
+        z_final = select(far, z_hw, has_hw);
     } else {
         z_final = max(z_expected, near);
-        if hw_depth < 0.999 {
-            let z_hw = near * far / (far - hw_depth * (far - near));
+        if has_hw {
             z_final = min(z_final, z_hw);
         }
     }
@@ -338,6 +345,9 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let F_view = fresnel_schlick(NoV, F0);
     let kd = (vec3f(1.0) - F_view) * (1.0 - metallic);
     // Note: no 1/π — matches pbr_renderer.render_relit (parametric branch).
+    // kd and albedo are per-pixel constants, fold them once so the per-light
+    // accumulation only multiplies the light-dependent terms.
+    let kd_albedo = kd * albedo;
 
     // Accumulate per-light direct lighting
     var total_diffuse  = vec3f(0.0);
@@ -370,6 +380,10 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
 
         let L = to_light;
         let NoL = max(dot(N, L), 0.0);
+        // Back-facing surfaces contribute no light — skip the H/D/V/F and
+        // DSM cubemap sample entirely. Significant win when scenes have any
+        // mix of light directions, since every light misses ~half the pixels.
+        if (NoL <= 0.0) { continue; }
 
         let H = normalize(L + V);
         let NoH = max(dot(N, H), 0.0);
@@ -379,9 +393,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         let F = fresnel_schlick(LoH, F0);
         let D = d_ggx(NoH, alpha_g);
         let Vis = v_smith_ggx_correlated(NoV, NoL, alpha_g);
-        // return (1.0 - metallic) * f0_d + metallic * albedo
-        // F0 = compute_F0(metallic, f0_diel, albedo_sel)
-        // spec_color = brdf_model(half_v, view_dir, norm_sel, rough_sel, F0)
         let spec = D * Vis * F * NoL;
 
         var T = 1.0;
@@ -392,8 +403,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
         // Plain Lambertian NoL.
         let l_color = light.color * light.intensity;
         let energy = T * atten;
-        total_diffuse  += kd * energy * l_color * albedo * NoL;
-        total_specular += spec      * energy * l_color;
+        total_diffuse  += kd_albedo * (energy * NoL) * l_color;
+        total_specular += spec      *  energy        * l_color;
     }
 
     // Hemispherical ambient × AO. Combine GTAO with per-pixel primitive

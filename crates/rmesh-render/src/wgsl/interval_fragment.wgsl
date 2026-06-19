@@ -135,10 +135,13 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     //   non-PBR: volume integral of the SH color through the tet, using the
     //   same w0/w1 transmittance weighting as `forward_fragment.wgsl` so the
     //   interval render matches the Regular path.
-    let phi_color = phi(od);
-    let w0_color = phi_color - alpha_t;  // back weight
-    let w1_color = 1.0 - phi_color;      // front weight
-    let integrated = c_back * w0_color + c_front * w1_color;  // already × α
+    // Shared w0/w1 across the color (slot 0) and depth-moment (slot 3) outputs —
+    // both blends use the same exponential-transmittance weights, so phi(od)
+    // only needs evaluating once.
+    let phi_val = phi(od);
+    let w0 = phi_val - alpha_t;   // back weight (z_b)
+    let w1 = 1.0 - phi_val;       // front weight (z_f)
+    let integrated = c_back * w0 + c_front * w1;  // already × α
     out.color = select(vec4f(integrated, alpha),
                        vec4f(albedo * alpha, alpha),
                        has_pbr);
@@ -161,31 +164,18 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     // 2-point upper bound at the extremes overshoots the true exponential.
     // For small od the direct form has catastrophic cancellation; Taylor:
     //   correction(od) ≈ od/6 − od²/12 + od³/40
-    //
-    // Thin-tet filter: emit (0,0,0,0) when fragment α is below threshold so
-    // premul-alpha blending becomes a pass-through (dst·(1-0) = dst). Slot 3
-    // therefore tracks "thick tets only" — its α lags color's α at pixels
-    // covered by thin haze, and consumers (pixel_std, the deferred shader's
-    // depth normalization) must divide by depth_raw.a, NOT color's alpha.
-    if (alpha >= 0.000) {
-        let phi_val = phi(od);
-        let w0 = phi_val - alpha_t;   // weight for back (z_b)
-        let w1 = 1.0 - phi_val;       // weight for front (z_f)
-        let depth_premul = w0 * z_b + w1 * z_f;
+    let depth_premul = w0 * z_b + w1 * z_f;
 
-        var correction: f32;
-        if (abs(od) < 0.02) {
-            correction = od * ((1.0/6.0) - od * ((1.0/12.0) - od * (1.0/40.0)));
-        } else {
-            correction = w0 + alpha_t - 2.0 * w0 / od;
-        }
-        let L = z_b - z_f;
-        let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
-
-        out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
+    var correction: f32;
+    if (abs(od) < 0.02) {
+        correction = od * ((1.0/6.0) - od * ((1.0/12.0) - od * (1.0/40.0)));
     } else {
-        out.expected_depth = vec4f(0.0, 0.0, 0.0, 0.0);
+        correction = w0 + alpha_t - 2.0 * w0 / od;
     }
+    let L = z_b - z_f;
+    let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
+
+    out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
 
     return out;
 }

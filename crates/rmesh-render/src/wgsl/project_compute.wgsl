@@ -187,13 +187,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     // Write compact tet id list for tiled path
     compact_tet_ids[vis_idx] = tet_id;
 
-    // Compute tiles_touched for prefix scan (conservative scanline)
+    // The interval-shading forward path doesn't consume tiles_touched (only the
+    // tiled training path does). Caller signals "skip tile work" by setting
+    // tile_size_u == 0, which lets us skip the scanline loop entirely — that
+    // loop is the dominant cost in this shader for the forward bench.
+    let skip_tile_work = uniforms.tile_size_u == 0u;
     let W = uniforms.screen_width;
     let H = uniforms.screen_height;
     let tile_size = f32(uniforms.tile_size_u);
 
-    if (any_behind) {
-        // Cull entirely — behind-camera tets would overflow pair buffers
+    if (skip_tile_work || any_behind) {
+        // Forward-only path skips tile work entirely; the any_behind path culls
+        // behind-camera tets that would overflow pair buffers downstream.
         tiles_touched[vis_idx] = 0u;
     } else {
         // NDC to pixel coords for all 4 vertices

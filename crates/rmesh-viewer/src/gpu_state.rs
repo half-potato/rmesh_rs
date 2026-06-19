@@ -8,7 +8,7 @@ use rmesh_render::{
     BlitPipeline, ComputeIntervalPipelines, ForwardPipelines, IntervalPipelines, MaterialBuffers,
     MeshForwardPipelines, RenderTargets, SceneBuffers,
 };
-use rmesh_sim::FluidSim;
+use rmesh_pbd::{PbdPipelines, PbdSolver};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RenderMode {
@@ -168,8 +168,10 @@ pub struct GpuState {
     pub prepass_bg_a: wgpu::BindGroup,
     pub prepass_bg_b: wgpu::BindGroup,
     pub quad_render_bg: wgpu::BindGroup,
-    // Fluid simulation
-    pub fluid_sim: Option<FluidSim>,
+    // Per-grab PBD solver (re-created on each BeginGrab).
+    pub pbd_solver: Option<PbdSolver>,
+    /// PBD compute pipelines (one per scene; cheap to create at startup).
+    pub pbd_pipelines: PbdPipelines,
     pub tet_neighbors_buf: Option<wgpu::Buffer>,
     // Primitives
     pub primitive_geometry: PrimitiveGeometry,

@@ -24,8 +24,11 @@ use winit::window::{Window, WindowId};
 use rmesh_anim::{AnimatedScene, AnimationClock};
 use rmesh_interact::{
     InteractContext, InteractEvent, InteractKey, InteractResult, Primitive, TransformInteraction,
+    VertexSelectInteraction, VertexSelectResult,
 };
-use rmesh_sim::{FluidParams, FluidSim};
+use rmesh_pbd::{
+    build_island, color_constraints, ConstraintColoring, Island, MeshTopology, PbdSolver,
+};
 use rmesh_util::camera::Camera;
 use wgpu::util::DeviceExt;
 
@@ -122,15 +125,25 @@ struct App {
     vsync: bool,
     render_mode: RenderMode,
     mesh_shader_supported: bool,
-    // Fluid simulation
-    fluid_enabled: bool,
-    fluid_params: FluidParams,
     // Rendering options
     show_primitives: bool,
     show_scene: bool,
     sort_mode: SortMode,
     // Transform interaction
     interaction: TransformInteraction,
+    // Vertex-pick + drag-to-PBD interaction
+    vertex_select: VertexSelectInteraction,
+    /// CPU mesh topology (adjacency + vertex→tets), built lazily on first
+    /// vertex-select grab and rebuilt on scene reload.
+    mesh_topology: Option<MeshTopology>,
+    /// Cached pre-grab vertex positions (flat f32 array, scene-global) so
+    /// CancelGrab can restore them on the GPU.
+    pbd_pre_grab_vertices: Option<Vec<f32>>,
+    /// World-space initial handle positions captured at BeginGrab. Used with
+    /// the per-frame mouse delta to compute new handle positions.
+    pbd_handle_initial: Vec<(u32, [f32; 3])>,
+    /// Number of PBD steps dispatched in the current grab (reset on init).
+    pbd_step_counter: u32,
     primitives: Vec<Primitive>,
     next_primitive_id: u32,
     // Animation
@@ -143,8 +156,10 @@ struct App {
     sky_color: [f32; 3],
     ground_color: [f32; 3],
     exposure: f32,
+    ao_enabled: bool,
     ao_strength: f32,
     gtao_radius: f32,
+    ssgi_enabled: bool,
     ssgi_strength: f32,
     ssgi_radius: f32,
     /// History blend factor: 1.0 = no temporal accumulation, 0.0 = frozen.
@@ -211,12 +226,15 @@ impl App {
                 RenderMode::Regular
             },
             mesh_shader_supported: false,
-            fluid_enabled: false,
-            fluid_params: FluidParams::default(),
             show_primitives: true,
             show_scene: true,
             sort_mode: SortMode::Gpu32,
             interaction: TransformInteraction::new(),
+            vertex_select: VertexSelectInteraction::new(),
+            mesh_topology: None,
+            pbd_pre_grab_vertices: None,
+            pbd_handle_initial: Vec::new(),
+            pbd_step_counter: 0,
             primitives: Vec::new(),
             next_primitive_id: 1,
             anim_clock: AnimationClock::new(),
@@ -227,8 +245,10 @@ impl App {
             sky_color: [0.0, 0.0, 0.0],
             ground_color: [0.0, 0.0, 0.0],
             exposure: 1.0,
+            ao_enabled: true,
             ao_strength: 1.0,
             gtao_radius: 0.5,
+            ssgi_enabled: true,
             ssgi_strength: 1.0,
             ssgi_radius: 1.5,
             ssgi_temporal_alpha: 0.2,
@@ -1051,6 +1071,8 @@ impl App {
         // chunks across frames so this is a one-shot allocation.
         let staging_belt = wgpu::util::StagingBelt::new(device.clone(), 32 * 1024 * 1024);
 
+        let pbd_pipelines = rmesh_pbd::PbdPipelines::new(&device);
+
         self.gpu = Some(GpuState {
             device,
             queue,
@@ -1094,7 +1116,8 @@ impl App {
             prepass_bg_a,
             prepass_bg_b,
             quad_render_bg,
-            fluid_sim: None,
+            pbd_solver: None,
+            pbd_pipelines,
             tet_neighbors_buf: None,
             primitive_geometry,
             material_registry,
@@ -1219,6 +1242,11 @@ impl App {
         self.scene_data = scene;
         self.sh_coeffs = sh;
         self.pbr_data = pbr;
+        // Drop topology/grab state from the previous scene.
+        self.mesh_topology = None;
+        self.pbd_pre_grab_vertices = None;
+        self.pbd_handle_initial.clear();
+        self.vertex_select.set_enabled(false);
 
         // Cache the flare collision mesh up front for the new scene (drops the
         // stale mesh from the previous scene and avoids a first-flare hitch).
@@ -1499,7 +1527,7 @@ impl App {
                 &gpu.buffers,
             );
 
-            // Recreate fluid simulation
+            // Recreate ray trace neighbors + state
             let neighbors = rmesh_render::compute_tet_neighbors(
                 &self.scene_data.indices,
                 self.scene_data.tet_count as usize,
@@ -1511,29 +1539,10 @@ impl App {
                         contents: bytemuck::cast_slice(&neighbors),
                         usage: wgpu::BufferUsages::STORAGE,
                     });
-            let mut fluid_sim = FluidSim::new(&gpu.device, self.scene_data.tet_count);
-            {
-                let mut encoder =
-                    gpu.device
-                        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                            label: Some("precompute_geometry_reload"),
-                        });
-                fluid_sim.precompute_geometry(
-                    &gpu.device,
-                    &mut encoder,
-                    &gpu.buffers.vertices,
-                    &gpu.buffers.indices,
-                    &tet_neighbors_buf,
-                );
-                gpu.queue.submit(std::iter::once(encoder.finish()));
-            }
-            fluid_sim.compute_mesh_bbox(&gpu.device, &gpu.queue);
-            fluid_sim.log_precompute_stats(&gpu.device, &gpu.queue);
-            self.fluid_params = fluid_sim.default_params_for_mesh();
-            gpu.fluid_sim = Some(fluid_sim);
+            gpu.pbd_solver = None;
             gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
 
-            // Recreate ray trace state (reuse neighbors from fluid sim)
+
             let rt_bvh = rmesh_render::build_boundary_bvh(
                 &self.scene_data.vertices,
                 &self.scene_data.indices,
@@ -1930,6 +1939,247 @@ impl App {
         }
         result
     }
+
+    // -------------------------------------------------------------------
+    // Vertex-select / PBD wiring
+    // -------------------------------------------------------------------
+
+    /// Lazily build the CPU mesh adjacency / vertex→tets map. Cleared on
+    /// scene reload (see `load_scene`).
+    fn ensure_mesh_topology(&mut self) {
+        if self.mesh_topology.is_none() {
+            log::info!("[pbd] Building mesh topology for {} vertices, {} tets",
+                self.scene_data.vertex_count, self.scene_data.tet_count);
+            let t0 = std::time::Instant::now();
+            self.mesh_topology = Some(MeshTopology::build(
+                &self.scene_data.indices,
+                self.scene_data.vertex_count,
+                self.scene_data.tet_count,
+            ));
+            log::info!("[pbd] Topology built in {:.2}s", t0.elapsed().as_secs_f64());
+        }
+    }
+
+    /// Project every vertex to screen and return the index of the one closest
+    /// to `mouse_px` within `radius_px`, breaking ties by depth (nearest wins).
+    /// Returns `None` if no vertex is within the radius. CPU-only for now;
+    /// fine for typical mesh sizes (≤ a few hundred k).
+    fn pick_vertex(&mut self, mouse_px: [f32; 2], radius_px: f32) -> Option<u32> {
+        let gpu = self.gpu.as_ref()?;
+        let w = gpu.surface_config.width as f32;
+        let h = gpu.surface_config.height as f32;
+        let view = self.camera.view_matrix();
+        let proj = self.camera.projection_matrix(w / h);
+        let vp = proj * view;
+        let r_sq = radius_px * radius_px;
+        let mut best: Option<(u32, f32, f32)> = None; // (idx, dist_sq, depth)
+        let verts = &self.scene_data.vertices;
+        let n = self.scene_data.vertex_count as usize;
+        for i in 0..n {
+            let b = i * 3;
+            let p = glam::Vec4::new(verts[b], verts[b + 1], verts[b + 2], 1.0);
+            let clip = vp * p;
+            if clip.w <= 0.0 {
+                continue;
+            }
+            let ndc = clip.truncate() / clip.w;
+            if ndc.z < 0.0 || ndc.z > 1.0 {
+                continue;
+            }
+            let sx = (ndc.x * 0.5 + 0.5) * w;
+            // winit y is top-down; NDC y is bottom-up. Flip to match.
+            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * h;
+            let dx = sx - mouse_px[0];
+            let dy = sy - mouse_px[1];
+            let d_sq = dx * dx + dy * dy;
+            if d_sq < r_sq {
+                let depth = ndc.z;
+                match best {
+                    Some((_, _, bd)) if depth >= bd => {}
+                    _ => best = Some((i as u32, d_sq, depth)),
+                }
+            }
+        }
+        best.map(|(i, _, _)| i)
+    }
+
+    /// React to a [`VertexSelectResult`] from the vertex-select state machine.
+    fn handle_vertex_select_result(&mut self, result: VertexSelectResult) {
+        match result {
+            VertexSelectResult::Pick => {
+                let mp = self.vertex_select.mouse_pos();
+                if let Some(idx) = self.pick_vertex(mp, 12.0) {
+                    let b = idx as usize * 3;
+                    let adj_count = self
+                        .mesh_topology
+                        .as_ref()
+                        .and_then(|t| t.adjacency.get(idx as usize))
+                        .map_or(0, |a| a.len());
+                    log::info!(
+                        "[pbd] Pick: vertex #{idx} at [{:.3}, {:.3}, {:.3}] (mouse=[{:.1}, {:.1}], {adj_count} neighbors)",
+                        self.scene_data.vertices[b],
+                        self.scene_data.vertices[b + 1],
+                        self.scene_data.vertices[b + 2],
+                        mp[0], mp[1],
+                    );
+                    self.vertex_select.set_selected(vec![idx]);
+                    self.vertex_select.begin_grab();
+                    self.init_pbd_grab();
+                } else {
+                    log::info!("[pbd] Pick: no vertex within 12px of mouse=[{:.1}, {:.1}]", mp[0], mp[1]);
+                    self.vertex_select.set_selected(Vec::new());
+                }
+            }
+            VertexSelectResult::UpdateGrab => {
+                // Encoded in render(): the PBD step dispatches each frame
+                // while is_grabbing(). render() handles per-frame drag logging.
+            }
+            VertexSelectResult::ConfirmGrab => {
+                let displacement = self.readback_pbd_vertices();
+                log::info!(
+                    "[pbd] ConfirmGrab: kept deformation ({} steps, max vertex Δ = {:.4})",
+                    self.pbd_step_counter, displacement,
+                );
+                self.pbd_pre_grab_vertices = None;
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.pbd_solver = None;
+                }
+                self.pbd_handle_initial.clear();
+            }
+            VertexSelectResult::CancelGrab => {
+                log::info!("[pbd] CancelGrab: restoring pre-grab vertices");
+                if let (Some(verts), Some(gpu)) =
+                    (self.pbd_pre_grab_vertices.take(), self.gpu.as_ref())
+                {
+                    gpu.queue.write_buffer(&gpu.buffers.vertices, 0, bytemuck::cast_slice(&verts));
+                    self.scene_data.vertices = verts;
+                }
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.pbd_solver = None;
+                }
+                self.pbd_handle_initial.clear();
+            }
+            _ => {}
+        }
+    }
+
+    /// Synchronously read the GPU `vertices` buffer back into
+    /// `scene_data.vertices`, so subsequent picks/grabs see the deformed
+    /// state. Blocks briefly (one submit + poll Wait + map). Returns the
+    /// max world-space delta vs the pre-grab snapshot, or 0 if no snapshot.
+    fn readback_pbd_vertices(&mut self) -> f32 {
+        let Some(gpu) = self.gpu.as_ref() else { return 0.0; };
+        let n_floats = self.scene_data.vertices.len();
+        let buf_size = (n_floats * std::mem::size_of::<f32>()) as u64;
+        if buf_size == 0 {
+            return 0.0;
+        }
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pbd_vertices_readback"),
+            size: buf_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pbd_vertices_readback_encoder"),
+            });
+        encoder.copy_buffer_to_buffer(&gpu.buffers.vertices, 0, &staging, 0, buf_size);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_res| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+
+        let data = slice.get_mapped_range();
+        let floats: &[f32] = bytemuck::cast_slice(&data);
+        let mut max_d_sq = 0.0_f32;
+        if let Some(prev) = self.pbd_pre_grab_vertices.as_ref() {
+            for (a, b) in prev.chunks_exact(3).zip(floats.chunks_exact(3)) {
+                let dx = a[0] - b[0];
+                let dy = a[1] - b[1];
+                let dz = a[2] - b[2];
+                let d_sq = dx * dx + dy * dy + dz * dz;
+                if d_sq > max_d_sq {
+                    max_d_sq = d_sq;
+                }
+            }
+        }
+        self.scene_data.vertices.copy_from_slice(floats);
+        drop(data);
+        staging.unmap();
+        max_d_sq.sqrt()
+    }
+
+    /// Build an island from the current selection and upload to GPU.
+    fn init_pbd_grab(&mut self) {
+        self.ensure_mesh_topology();
+        let handles: Vec<u32> = self.vertex_select.selected().to_vec();
+        if handles.is_empty() {
+            return;
+        }
+        let topology = self.mesh_topology.as_ref().unwrap();
+        let radius = 0.25_f32;
+        let t0 = std::time::Instant::now();
+        let island: Island = build_island(
+            topology,
+            &self.scene_data.indices,
+            &self.scene_data.vertices,
+            &handles,
+            radius,
+        );
+        let coloring: ConstraintColoring =
+            color_constraints(island.particles.len(), &island.distance_constraints);
+        let total = island.particles.len();
+        let handles_n = island.handle_local_indices.len();
+        let fixed_n = island.particles.iter().filter(|p| p.inv_mass == 0.0).count();
+        let active_n = total - fixed_n;
+        let boundary_n = fixed_n.saturating_sub(handles_n);
+        log::info!(
+            "[pbd] Grab island: {total} particles ({handles_n} handles, {boundary_n} boundary, {active_n} active), {} edges, {} colors (built in {:.1}ms)",
+            island.distance_constraints.len(),
+            coloring.num_colors(),
+            t0.elapsed().as_secs_f64() * 1e3,
+        );
+        if island.distance_constraints.is_empty() {
+            log::warn!(
+                "[pbd] Island has no constraints — picked vertex is isolated. Drag will move only the handle, no soft-body deformation."
+            );
+        }
+
+        // Cache initial handle world positions for the drag computation.
+        self.pbd_handle_initial = handles
+            .iter()
+            .map(|&h| {
+                let b = h as usize * 3;
+                (
+                    h,
+                    [
+                        self.scene_data.vertices[b],
+                        self.scene_data.vertices[b + 1],
+                        self.scene_data.vertices[b + 2],
+                    ],
+                )
+            })
+            .collect();
+
+        // Snapshot for cancel.
+        self.pbd_pre_grab_vertices = Some(self.scene_data.vertices.clone());
+        self.pbd_step_counter = 0;
+
+        if let Some(gpu) = &mut self.gpu {
+            let solver = PbdSolver::init_grab(
+                &gpu.device,
+                &gpu.pbd_pipelines,
+                &gpu.buffers.vertices,
+                &island,
+                &coloring,
+                16,
+            );
+            gpu.pbd_solver = Some(solver);
+        }
+    }
 }
 
 /// Map winit KeyCode to InteractKey.
@@ -2028,8 +2278,23 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => InteractEvent::KeyDown(ikey),
                         ElementState::Released => InteractEvent::KeyUp(ikey),
                     };
-                    let result = self.process_interact_event(&ie, &interact_ctx);
-                    consumed = !matches!(result, InteractResult::NotConsumed);
+                    // VertexSelect mode owns Tab + (when active) Escape.
+                    let was_enabled = self.vertex_select.is_enabled();
+                    let vs_result = self.vertex_select.process_event(&ie);
+                    if was_enabled != self.vertex_select.is_enabled() {
+                        if self.vertex_select.is_enabled() {
+                            log::info!("[pbd] VertexSelect mode ON  (Tab to exit, LMB to pick+drag)");
+                        } else {
+                            log::info!("[pbd] VertexSelect mode OFF");
+                        }
+                    }
+                    if !matches!(vs_result, VertexSelectResult::NotConsumed) {
+                        self.handle_vertex_select_result(vs_result);
+                        consumed = true;
+                    } else {
+                        let result = self.process_interact_event(&ie, &interact_ctx);
+                        consumed = !matches!(result, InteractResult::NotConsumed);
+                    }
                 }
 
                 // CharInput for numeric entry (only on press)
@@ -2083,18 +2348,34 @@ impl ApplicationHandler for App {
                         ElementState::Pressed => InteractEvent::MouseDown { button: mb },
                         ElementState::Released => InteractEvent::MouseUp { button: mb },
                     };
-                    let result = self.process_interact_event(&ie, &interact_ctx);
-                    if matches!(result, InteractResult::NotConsumed) {
-                        // Only update camera button state if not consumed
-                        match button {
-                            MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
-                            MouseButton::Middle => {
-                                self.middle_pressed = state == ElementState::Pressed
+                    // Route to vertex-select first when its mode is on.
+                    let mut consumed = false;
+                    if self.vertex_select.is_enabled() {
+                        // Sync absolute cursor position before LMB-down captures mouse_start.
+                        self.vertex_select.set_mouse_pos([
+                            self.last_mouse.0 as f32,
+                            self.last_mouse.1 as f32,
+                        ]);
+                        let vs_result = self.vertex_select.process_event(&ie);
+                        if !matches!(vs_result, VertexSelectResult::NotConsumed) {
+                            self.handle_vertex_select_result(vs_result);
+                            consumed = true;
+                        }
+                    }
+                    if !consumed {
+                        let result = self.process_interact_event(&ie, &interact_ctx);
+                        if matches!(result, InteractResult::NotConsumed) {
+                            // Only update camera button state if not consumed
+                            match button {
+                                MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
+                                MouseButton::Middle => {
+                                    self.middle_pressed = state == ElementState::Pressed
+                                }
+                                MouseButton::Right => {
+                                    self.right_pressed = state == ElementState::Pressed
+                                }
+                                _ => {}
                             }
-                            MouseButton::Right => {
-                                self.right_pressed = state == ElementState::Pressed
-                            }
-                            _ => {}
                         }
                     }
                 }
@@ -2105,7 +2386,15 @@ impl ApplicationHandler for App {
                 let dy = position.y - self.last_mouse.1;
 
                 if !egui_wants_pointer {
-                    if self.interaction.is_active() {
+                    if self.vertex_select.is_enabled() {
+                        // Snap to absolute pixel coords; ignore delta accumulation.
+                        self.vertex_select.set_mouse_pos([position.x as f32, position.y as f32]);
+                        // Feed a zero-delta MouseMove to drive the state machine
+                        // (emits UpdateGrab while grabbing, Noop otherwise).
+                        let ie = InteractEvent::MouseMove { dx: 0.0, dy: 0.0 };
+                        let vs_result = self.vertex_select.process_event(&ie);
+                        self.handle_vertex_select_result(vs_result);
+                    } else if self.interaction.is_active() {
                         // Feed mouse movement to interaction system
                         let ie = InteractEvent::MouseMove {
                             dx: dx as f32,

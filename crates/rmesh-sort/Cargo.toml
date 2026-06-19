@@ -7,3 +7,14 @@ edition = "2021"
 wgpu = { workspace = true }
 bytemuck = { workspace = true }
 glam = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+pollster = { workspace = true }
+rand = "0.9"
+rand_chacha = "0.9"
+rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+
+[[bench]]
+name = "radix_sort"
+harness = false

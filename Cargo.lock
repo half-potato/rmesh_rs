@@ -3425,6 +3425,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmesh-pbd"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "log",
+ "rmesh-data",
+ "wgpu",
+]
+
+[[package]]
 name = "rmesh-python"
 version = "0.1.0"
 dependencies = [
@@ -3466,21 +3477,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "rmesh-sim"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "glam",
- "log",
- "wgpu",
-]
-
-[[package]]
 name = "rmesh-sort"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "criterion",
  "glam",
+ "pollster",
+ "rand",
+ "rand_chacha",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -3568,8 +3574,8 @@ dependencies = [
  "rmesh-data",
  "rmesh-dsm",
  "rmesh-interact",
+ "rmesh-pbd",
  "rmesh-render",
- "rmesh-sim",
  "rmesh-sort",
  "rmesh-util",
  "wgpu",

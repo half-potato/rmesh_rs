@@ -3,6 +3,11 @@ name = "rmesh-trainable"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Opt-in: the trainable_pipeline benchmark is slow (~50–100s per sample at 10M tets).
+# Run with `cargo bench -p rmesh-trainable --features bench-trainable`.
+bench-trainable = []
+
 [dependencies]
 rmesh-util = { path = "../rmesh-util" }
 rmesh-render = { path = "../rmesh-render" }
@@ -28,4 +33,5 @@ rmesh-tile = { path = "../rmesh-tile" }
 [[bench]]
 name = "trainable_pipeline"
 harness = false
+required-features = ["bench-trainable"]
 
