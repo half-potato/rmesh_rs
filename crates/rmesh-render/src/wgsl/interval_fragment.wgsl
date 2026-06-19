@@ -150,8 +150,21 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     // .b to match primitive_mrt's glTF convention.
     out.aux0 = vec4f(roughness * alpha, f0_dielectric * alpha, metallic * alpha, alpha);
 
-    // Slot 2: normals (raw gradient, normalized in deferred)
-    out.normals = vec4f(in.field_gradient * alpha, alpha);
+    // Slot 2: normals — Rgba8Unorm bias-encoded.
+    // Pre-normalize the per-fragment gradient direction, then bias to [0,1] for
+    // the Unorm target: (n*0.5+0.5)*alpha premultiplies. Hardware blend gives
+    // Σ α_i·biased_i in rgb and Σ α_i in a; consumer divides, un-biases (*2-1),
+    // and re-normalizes. Zero-gradient fragments contribute (0.5,0.5,0.5)*α
+    // which decodes to (0,0,0) — a "no direction" vote that dilutes magnitude
+    // without skewing direction. Guard normalize() against zero gradients.
+    let g = in.field_gradient;
+    let g_len = length(g);
+    var n_unit = vec3f(0.0);
+    if (g_len > 1e-6) {
+        n_unit = g / g_len;
+    }
+    let n_biased = n_unit * 0.5 + 0.5;
+    out.normals = vec4f(n_biased * alpha, alpha);
 
     // Slot 3: expected termination depth + E[z²] (for std). .g is unused
     // (formerly retro * alpha; left at 0). .b holds the second-moment

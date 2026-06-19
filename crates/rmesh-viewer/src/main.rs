@@ -105,6 +105,21 @@ fn create_rt_texture(
     (tex, view)
 }
 
+/// Rich result from [`App::pick_vertex_info`]. The hover preview uses
+/// `screen_pos` to draw a marker; the click handler uses the other fields
+/// for the diagnostic log.
+#[derive(Clone, Copy, Debug)]
+pub struct PickInfo {
+    pub idx: u32,
+    pub screen_pos: [f32; 2],
+    pub screen_dist: f32,
+    pub view_depth: f32,
+    pub candidates_in_radius: u32,
+    pub candidates_passing_depth: u32,
+    pub visible_depth: Option<f32>,
+    pub depth_tol: f32,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -144,6 +159,14 @@ struct App {
     pbd_handle_initial: Vec<(u32, [f32; 3])>,
     /// Number of PBD steps dispatched in the current grab (reset on init).
     pbd_step_counter: u32,
+    /// Vertex that would be picked if user clicked now — refreshed each
+    /// frame while VertexSelect mode is on and not grabbing. Rendered as
+    /// a small overlay circle.
+    pbd_hover_vertex: Option<u32>,
+    /// Per-vertex max incident tet density (lazy; built once per scene
+    /// alongside topology). Used to reject picks on vertices that only
+    /// touch low-density (fog/empty) tets.
+    pbd_vertex_max_density: Option<Vec<f32>>,
     primitives: Vec<Primitive>,
     next_primitive_id: u32,
     // Animation
@@ -235,6 +258,8 @@ impl App {
             pbd_pre_grab_vertices: None,
             pbd_handle_initial: Vec::new(),
             pbd_step_counter: 0,
+            pbd_hover_vertex: None,
+            pbd_vertex_max_density: None,
             primitives: Vec::new(),
             next_primitive_id: 1,
             anim_clock: AnimationClock::new(),
@@ -730,14 +755,17 @@ impl App {
         );
 
         // SSGI: compute (Hi-Z ray march, samples lit_history) + bilateral denoise.
+        // lit_history rotates → bind group doubled, indexed by parity.
         let ssgi_pipeline = rmesh_render::SsgiPipeline::new(&device);
-        let ssgi_bg = rmesh_render::create_ssgi_bind_group(
-            &device,
-            &ssgi_pipeline,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-            &targets.lit_history_view,
-        );
+        let ssgi_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+            rmesh_render::create_ssgi_bind_group(
+                &device,
+                &ssgi_pipeline,
+                &hiz_texture.full_view,
+                &targets.normals_view,
+                targets.lit_history(p as u32),
+            )
+        });
         // SSGI blur reads the temporal-blended SSGI (ssgi_temporal_view), not
         // the raw ssgi_view. V still writes back to ssgi_view (final).
         let ssgi_blur_pipeline = rmesh_render::SsgiBlurPipeline::new(&device);
@@ -758,46 +786,58 @@ impl App {
             &targets.normals_view,
         );
 
-        // Temporal accumulation pipelines (one per output format).
+        // Temporal accumulation pipelines (one per output format). Bind groups
+        // doubled for parity: each variant binds (current, history) in the
+        // orientation appropriate for that frame.
         let ssgi_temporal_pipeline =
             rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
-        let ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device,
-            &ssgi_temporal_pipeline,
-            &targets.ssgi_view,
-            &targets.ssgi_history_view,
-            &hiz_texture.full_view,
-        );
+        let ssgi_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+            rmesh_render::create_temporal_bind_group(
+                &device,
+                &ssgi_temporal_pipeline,
+                targets.ssgi_current(p as u32),
+                targets.ssgi_history(p as u32),
+                &hiz_texture.full_view,
+            )
+        });
         let ao_temporal_pipeline =
             rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
-        let ao_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device,
-            &ao_temporal_pipeline,
-            &targets.ao_view,
-            &targets.ao_history_view,
-            &hiz_texture.full_view,
-        );
+        let ao_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+            rmesh_render::create_temporal_bind_group(
+                &device,
+                &ao_temporal_pipeline,
+                targets.ao_current(p as u32),
+                targets.ao_history(p as u32),
+                &hiz_texture.full_view,
+            )
+        });
 
         // SSR pipeline + temporal (third TemporalPipeline instance, Rgba16Float).
+        // lit_history + ssgi_current rotate → ssr_bg doubled. ssr_current /
+        // ssr_history rotate → ssr_temporal_bg doubled.
         let ssr_pipeline = rmesh_render::SsrPipeline::new(&device);
-        let ssr_bg = rmesh_render::create_ssr_bind_group(
-            &device,
-            &ssr_pipeline,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-            &targets.lit_history_view,
-            &targets.ssgi_view,
-            &targets.depth_view,
-        );
+        let ssr_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+            rmesh_render::create_ssr_bind_group(
+                &device,
+                &ssr_pipeline,
+                &hiz_texture.full_view,
+                &targets.normals_view,
+                targets.lit_history(p as u32),
+                targets.ssgi_current(p as u32),
+                &targets.depth_view,
+            )
+        });
         let ssr_temporal_pipeline =
             rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
-        let ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
-            &device,
-            &ssr_temporal_pipeline,
-            &targets.ssr_view,
-            &targets.ssr_history_view,
-            &hiz_texture.full_view,
-        );
+        let ssr_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+            rmesh_render::create_temporal_bind_group(
+                &device,
+                &ssr_temporal_pipeline,
+                targets.ssr_current(p as u32),
+                targets.ssr_history(p as u32),
+                &hiz_texture.full_view,
+            )
+        });
 
         // Clear history textures on first frame so SSGI/AO/SSR temporal reads
         // are deterministic. Without this, contents are vendor-defined.
@@ -811,15 +851,15 @@ impl App {
                 b: 0.0,
                 a: 0.0,
             };
-            rmesh_render::clear_texture_view(&mut enc, &targets.lit_history_view, black);
-            rmesh_render::clear_texture_view(&mut enc, &targets.ssgi_history_view, black);
-            rmesh_render::clear_texture_view(&mut enc, &targets.ao_history_view, black);
-            rmesh_render::clear_texture_view(&mut enc, &targets.ssr_history_view, black);
-            // Clear ssr_view too so the very first deferred read is deterministic
-            // (the SSR pass runs every frame, but its output goes through the
-            // temporal copy back to ssr_view — first frame's pre-temporal value
-            // is fine, but cleared seed avoids any vendor-defined garbage).
-            rmesh_render::clear_texture_view(&mut enc, &targets.ssr_view, black);
+            // Clear both slots of each ping-pong pair so whichever slot is
+            // "history" on frame 0 is deterministic regardless of parity.
+            for p in 0..2u32 {
+                rmesh_render::clear_texture_view(&mut enc, targets.lit_history(p), black);
+                rmesh_render::clear_texture_view(&mut enc, targets.ssgi_history(p), black);
+                rmesh_render::clear_texture_view(&mut enc, targets.ao_history(p), black);
+                rmesh_render::clear_texture_view(&mut enc, targets.ssr_history(p), black);
+                rmesh_render::clear_texture_view(&mut enc, targets.ssr_current(p), black);
+            }
             queue.submit(std::iter::once(enc.finish()));
         }
 
@@ -835,16 +875,19 @@ impl App {
         ) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
             let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
-            let bg = rmesh_render::create_deferred_bind_group(
-                &device,
-                &dp,
-                &targets,
-                &primitive_targets.depth_view,
-                &targets.ao_view,
-                &targets.ssgi_view,
-                &targets.lit_history_view,
-                &targets.ssr_view,
-            );
+            // Deferred BG doubled for parity: ao/ssgi/ssr_current rotate, lit_history rotates.
+            let bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
+                rmesh_render::create_deferred_bind_group(
+                    &device,
+                    &dp,
+                    &targets,
+                    &primitive_targets.depth_view,
+                    targets.ao_current(p as u32),
+                    targets.ssgi_current(p as u32),
+                    targets.lit_history(p as u32),
+                    targets.ssr_current(p as u32),
+                )
+            });
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
             let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
@@ -1164,6 +1207,7 @@ impl App {
             ssr_temporal_pipeline,
             ssr_temporal_bg,
             frame_counter: 0,
+            frame_parity: 0,
             deferred_output,
             deferred_output_view,
             deferred_blit_bg,
@@ -1244,6 +1288,7 @@ impl App {
         self.pbr_data = pbr;
         // Drop topology/grab state from the previous scene.
         self.mesh_topology = None;
+        self.pbd_vertex_max_density = None;
         self.pbd_pre_grab_vertices = None;
         self.pbd_handle_initial.clear();
         self.vertex_select.set_enabled(false);
@@ -1459,16 +1504,18 @@ impl App {
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
                 let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device,
-                    &dp,
-                    &gpu.targets,
-                    &gpu.primitive_targets.depth_view,
-                    &gpu.targets.ao_view,
-                    &gpu.targets.ssgi_view,
-                    &gpu.targets.lit_history_view,
-                    &gpu.targets.ssr_view,
-                ));
+                gpu.deferred_bg = Some(std::array::from_fn(|p| {
+                    rmesh_render::create_deferred_bind_group(
+                        &gpu.device,
+                        &dp,
+                        &gpu.targets,
+                        &gpu.primitive_targets.depth_view,
+                        gpu.targets.ao_current(p as u32),
+                        gpu.targets.ssgi_current(p as u32),
+                        gpu.targets.lit_history(p as u32),
+                        gpu.targets.ssr_current(p as u32),
+                    )
+                }));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
                 gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
@@ -1658,14 +1705,16 @@ impl App {
                 &gpu.targets.normals_view,
             );
 
-            // Recreate SSGI bind groups. H reads ssgi_temporal_view (post-temporal).
-            gpu.ssgi_bg = rmesh_render::create_ssgi_bind_group(
-                &gpu.device,
-                &gpu.ssgi_pipeline,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-                &gpu.targets.lit_history_view,
-            );
+            // Recreate SSGI bind groups (doubled for parity).
+            gpu.ssgi_bg = std::array::from_fn(|p| {
+                rmesh_render::create_ssgi_bind_group(
+                    &gpu.device,
+                    &gpu.ssgi_pipeline,
+                    &gpu.hiz_texture.full_view,
+                    &gpu.targets.normals_view,
+                    gpu.targets.lit_history(p as u32),
+                )
+            });
             gpu.ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
                 &gpu.device,
                 &gpu.ssgi_blur_pipeline,
@@ -1683,39 +1732,47 @@ impl App {
                 &gpu.targets.normals_view,
             );
 
-            // Recreate temporal bind groups (input/history views changed).
-            gpu.ssgi_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device,
-                &gpu.ssgi_temporal_pipeline,
-                &gpu.targets.ssgi_view,
-                &gpu.targets.ssgi_history_view,
-                &gpu.hiz_texture.full_view,
-            );
-            gpu.ao_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device,
-                &gpu.ao_temporal_pipeline,
-                &gpu.targets.ao_view,
-                &gpu.targets.ao_history_view,
-                &gpu.hiz_texture.full_view,
-            );
+            // Recreate temporal bind groups (doubled for parity).
+            gpu.ssgi_temporal_bg = std::array::from_fn(|p| {
+                rmesh_render::create_temporal_bind_group(
+                    &gpu.device,
+                    &gpu.ssgi_temporal_pipeline,
+                    gpu.targets.ssgi_current(p as u32),
+                    gpu.targets.ssgi_history(p as u32),
+                    &gpu.hiz_texture.full_view,
+                )
+            });
+            gpu.ao_temporal_bg = std::array::from_fn(|p| {
+                rmesh_render::create_temporal_bind_group(
+                    &gpu.device,
+                    &gpu.ao_temporal_pipeline,
+                    gpu.targets.ao_current(p as u32),
+                    gpu.targets.ao_history(p as u32),
+                    &gpu.hiz_texture.full_view,
+                )
+            });
 
-            // Recreate SSR + SSR temporal bind groups.
-            gpu.ssr_bg = rmesh_render::create_ssr_bind_group(
-                &gpu.device,
-                &gpu.ssr_pipeline,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-                &gpu.targets.lit_history_view,
-                &gpu.targets.ssgi_view,
-                &gpu.targets.depth_view,
-            );
-            gpu.ssr_temporal_bg = rmesh_render::create_temporal_bind_group(
-                &gpu.device,
-                &gpu.ssr_temporal_pipeline,
-                &gpu.targets.ssr_view,
-                &gpu.targets.ssr_history_view,
-                &gpu.hiz_texture.full_view,
-            );
+            // Recreate SSR + SSR temporal bind groups (doubled for parity).
+            gpu.ssr_bg = std::array::from_fn(|p| {
+                rmesh_render::create_ssr_bind_group(
+                    &gpu.device,
+                    &gpu.ssr_pipeline,
+                    &gpu.hiz_texture.full_view,
+                    &gpu.targets.normals_view,
+                    gpu.targets.lit_history(p as u32),
+                    gpu.targets.ssgi_current(p as u32),
+                    &gpu.targets.depth_view,
+                )
+            });
+            gpu.ssr_temporal_bg = std::array::from_fn(|p| {
+                rmesh_render::create_temporal_bind_group(
+                    &gpu.device,
+                    &gpu.ssr_temporal_pipeline,
+                    gpu.targets.ssr_current(p as u32),
+                    gpu.targets.ssr_history(p as u32),
+                    &gpu.hiz_texture.full_view,
+                )
+            });
 
             // Re-clear history textures (resize gives new vendor-defined contents).
             {
@@ -1730,26 +1787,30 @@ impl App {
                     b: 0.0,
                     a: 0.0,
                 };
-                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.lit_history_view, black);
-                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssgi_history_view, black);
-                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ao_history_view, black);
-                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssr_history_view, black);
-                rmesh_render::clear_texture_view(&mut enc, &gpu.targets.ssr_view, black);
+                for p in 0..2u32 {
+                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.lit_history(p), black);
+                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssgi_history(p), black);
+                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ao_history(p), black);
+                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssr_history(p), black);
+                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssr_current(p), black);
+                }
                 gpu.queue.submit(std::iter::once(enc.finish()));
             }
 
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
-                gpu.deferred_bg = Some(rmesh_render::create_deferred_bind_group(
-                    &gpu.device,
-                    dp,
-                    &gpu.targets,
-                    &gpu.primitive_targets.depth_view,
-                    &gpu.targets.ao_view,
-                    &gpu.targets.ssgi_view,
-                    &gpu.targets.lit_history_view,
-                    &gpu.targets.ssr_view,
-                ));
+                gpu.deferred_bg = Some(std::array::from_fn(|p| {
+                    rmesh_render::create_deferred_bind_group(
+                        &gpu.device,
+                        dp,
+                        &gpu.targets,
+                        &gpu.primitive_targets.depth_view,
+                        gpu.targets.ao_current(p as u32),
+                        gpu.targets.ssgi_current(p as u32),
+                        gpu.targets.lit_history(p as u32),
+                        gpu.targets.ssr_current(p as u32),
+                    )
+                }));
                 let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("deferred_output"),
                     size: wgpu::Extent3d {
@@ -1958,13 +2019,43 @@ impl App {
             ));
             log::info!("[pbd] Topology built in {:.2}s", t0.elapsed().as_secs_f64());
         }
+        if self.pbd_vertex_max_density.is_none() {
+            // Per-vertex max incident tet density. The volume renderer uses
+            // density in `od = density * dist`, so high-density tets are
+            // what's visually "there." Vertices that touch only low-density
+            // tets are basically in empty space and shouldn't be pickable.
+            let vc = self.scene_data.vertex_count as usize;
+            let mut max_d = vec![0.0_f32; vc];
+            let indices = &self.scene_data.indices;
+            let densities = &self.scene_data.densities;
+            for (t, dens) in densities.iter().enumerate() {
+                let base = t * 4;
+                for &vi in &indices[base..base + 4] {
+                    let slot = &mut max_d[vi as usize];
+                    if *dens > *slot {
+                        *slot = *dens;
+                    }
+                }
+            }
+            self.pbd_vertex_max_density = Some(max_d);
+        }
     }
 
     /// Project every vertex to screen and return the index of the one closest
     /// to `mouse_px` within `radius_px`, breaking ties by depth (nearest wins).
     /// Returns `None` if no vertex is within the radius. CPU-only for now;
     /// fine for typical mesh sizes (≤ a few hundred k).
+    #[allow(dead_code)]
     fn pick_vertex(&mut self, mouse_px: [f32; 2], radius_px: f32) -> Option<u32> {
+        self.pick_vertex_info(mouse_px, radius_px).map(|p| p.idx)
+    }
+
+    /// Same as [`pick_vertex`] but returns rich info for diagnostic logging
+    /// and the hover preview marker.
+    fn pick_vertex_info(&mut self, mouse_px: [f32; 2], radius_px: f32) -> Option<PickInfo> {
+        // Per-vertex max density is needed for the density filter.
+        self.ensure_mesh_topology();
+
         let gpu = self.gpu.as_ref()?;
         let w = gpu.surface_config.width as f32;
         let h = gpu.surface_config.height as f32;
@@ -1972,35 +2063,128 @@ impl App {
         let proj = self.camera.projection_matrix(w / h);
         let vp = proj * view;
         let r_sq = radius_px * radius_px;
-        let mut best: Option<(u32, f32, f32)> = None; // (idx, dist_sq, depth)
+
+        // Occlusion test: visible surface depth from the volume renderer.
+        let visible_depth = self.read_visible_depth_at(mouse_px);
+        let depth_tol = 0.15_f32;
+        // Density floor: in .rmesh's exp((val-100)/20) encoding, 1.0 = the
+        // middle value (val=100). Vertices touching only sub-1.0 tets are
+        // basically in empty fog space — reject.
+        let min_density = 1.0_f32;
+
+        let max_density = self.pbd_vertex_max_density.as_deref();
+        let mut best: Option<(u32, f32, f32, f32, f32)> = None;
+        let mut candidates_in_radius = 0u32;
+        let mut candidates_passing_depth = 0u32;
+        let mut candidates_passing_density = 0u32;
         let verts = &self.scene_data.vertices;
         let n = self.scene_data.vertex_count as usize;
         for i in 0..n {
             let b = i * 3;
             let p = glam::Vec4::new(verts[b], verts[b + 1], verts[b + 2], 1.0);
+            let view_pos = view * p;
+            if view_pos.z >= -0.001 {
+                continue;
+            }
+            let view_depth = -view_pos.z;
             let clip = vp * p;
             if clip.w <= 0.0 {
                 continue;
             }
             let ndc = clip.truncate() / clip.w;
-            if ndc.z < 0.0 || ndc.z > 1.0 {
-                continue;
-            }
             let sx = (ndc.x * 0.5 + 0.5) * w;
-            // winit y is top-down; NDC y is bottom-up. Flip to match.
             let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * h;
             let dx = sx - mouse_px[0];
             let dy = sy - mouse_px[1];
             let d_sq = dx * dx + dy * dy;
-            if d_sq < r_sq {
-                let depth = ndc.z;
-                match best {
-                    Some((_, _, bd)) if depth >= bd => {}
-                    _ => best = Some((i as u32, d_sq, depth)),
+            if d_sq >= r_sq {
+                continue;
+            }
+            candidates_in_radius += 1;
+            if let Some(vd) = visible_depth {
+                if (view_depth - vd).abs() > depth_tol {
+                    continue;
                 }
             }
+            candidates_passing_depth += 1;
+            if let Some(md) = max_density {
+                if md[i] < min_density {
+                    continue;
+                }
+            }
+            candidates_passing_density += 1;
+            match best {
+                Some((_, _, bd, _, _)) if view_depth >= bd => {}
+                _ => best = Some((i as u32, d_sq, view_depth, sx, sy)),
+            }
         }
-        best.map(|(i, _, _)| i)
+        let _ = candidates_passing_density; // tracked here for symmetry; could be surfaced
+        best.map(|(idx, d_sq, view_depth, sx, sy)| PickInfo {
+            idx,
+            screen_pos: [sx, sy],
+            screen_dist: d_sq.sqrt(),
+            view_depth,
+            candidates_in_radius,
+            candidates_passing_depth,
+            visible_depth,
+            depth_tol,
+        })
+    }
+
+    /// Read one pixel from the volume renderer's depth attachment
+    /// (`gpu.targets.depth_texture`, Rgba16Float, premul: `.r` = α·E[z_view],
+    /// `.a` = α). Returns `r / a` (view-space depth at the visible surface),
+    /// or `None` if the pixel has no volume contribution. Blocking 1-pixel
+    /// readback (~1 ms).
+    fn read_visible_depth_at(&self, mouse_px: [f32; 2]) -> Option<f32> {
+        let gpu = self.gpu.as_ref()?;
+        let tex_w = gpu.surface_config.width;
+        let tex_h = gpu.surface_config.height;
+        let mx = mouse_px[0] as i32;
+        let my = mouse_px[1] as i32;
+        if mx < 0 || my < 0 || mx as u32 >= tex_w || my as u32 >= tex_h {
+            return None;
+        }
+        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pbd_depth_pixel_readback"),
+            size: 256,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("pbd_depth_pixel_encoder"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu.targets.depth_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: mx as u32, y: my as u32, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+        );
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let data = slice.get_mapped_range();
+        let r = half::f16::from_le_bytes([data[0], data[1]]).to_f32();
+        let a = half::f16::from_le_bytes([data[6], data[7]]).to_f32();
+        drop(data);
+        staging.unmap();
+
+        if a < 1e-3 { None } else { Some(r / a) }
     }
 
     /// React to a [`VertexSelectResult`] from the vertex-select state machine.
@@ -2008,25 +2192,36 @@ impl App {
         match result {
             VertexSelectResult::Pick => {
                 let mp = self.vertex_select.mouse_pos();
-                if let Some(idx) = self.pick_vertex(mp, 12.0) {
+                let info = self.pick_vertex_info(mp, 30.0);
+                if let Some(info) = info {
+                    let idx = info.idx;
                     let b = idx as usize * 3;
                     let adj_count = self
                         .mesh_topology
                         .as_ref()
                         .and_then(|t| t.adjacency.get(idx as usize))
                         .map_or(0, |a| a.len());
+                    let vd_str = info
+                        .visible_depth
+                        .map_or("none".to_string(), |d| format!("{d:.3}"));
+                    let max_dens = self
+                        .pbd_vertex_max_density
+                        .as_ref()
+                        .map_or(0.0, |d| d[idx as usize]);
                     log::info!(
-                        "[pbd] Pick: vertex #{idx} at [{:.3}, {:.3}, {:.3}] (mouse=[{:.1}, {:.1}], {adj_count} neighbors)",
+                        "[pbd] Pick: vertex #{idx} at [{:.3}, {:.3}, {:.3}] (mouse=[{:.1}, {:.1}], {adj_count} neighbors, max_density={max_dens:.3}, {} in radius, {} passed depth, visible={vd_str})",
                         self.scene_data.vertices[b],
                         self.scene_data.vertices[b + 1],
                         self.scene_data.vertices[b + 2],
                         mp[0], mp[1],
+                        info.candidates_in_radius,
+                        info.candidates_passing_depth,
                     );
                     self.vertex_select.set_selected(vec![idx]);
                     self.vertex_select.begin_grab();
                     self.init_pbd_grab();
                 } else {
-                    log::info!("[pbd] Pick: no vertex within 12px of mouse=[{:.1}, {:.1}]", mp[0], mp[1]);
+                    log::info!("[pbd] Pick: no vertex within 30px of mouse=[{:.1}, {:.1}]", mp[0], mp[1]);
                     self.vertex_select.set_selected(Vec::new());
                 }
             }

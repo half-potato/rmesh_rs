@@ -214,6 +214,12 @@ impl PrimitivePipeline {
             blend: None,
             write_mask: wgpu::ColorWrites::ALL,
         });
+        // Normals: Rgba8Unorm bias-encoded (matches normals_texture).
+        let normals_target = Some(wgpu::ColorTargetState {
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            blend: None,
+            write_mask: wgpu::ColorWrites::ALL,
+        });
         let pipeline_mrt = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("prim_pipeline_mrt"),
             layout: Some(&pipeline_layout),
@@ -229,7 +235,7 @@ impl PrimitivePipeline {
                 targets: &[
                     opaque_target.clone(), // location(0): albedo
                     opaque_target.clone(), // location(1): roughness, 0, metallic
-                    opaque_target.clone(), // location(2): normals
+                    normals_target,        // location(2): normals
                     opaque_target,         // location(3): depth, occlusion, 0
                 ],
                 compilation_options: Default::default(),

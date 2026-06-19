@@ -72,14 +72,29 @@ Controls: left-drag to orbit, scroll to zoom, Escape to quit.
 
 ## Crate Overview
 
+The codebase has three rendering pathways — see `CLAUDE.md` for a detailed walkthrough:
+
+- **Interval shader** (`rmesh-render`, main) — the production renderer for the viewer and forward inference.
+- **Mesh-style shader** (`rmesh-render`, old) — the original vertex/fragment + mesh-shader paths, kept for reference and viewer toggles.
+- **Tile shader** (`rmesh-trainable`, trainable) — compute-based tiled forward + backward for training.
+
 | Crate | Purpose |
 |-------|---------|
-| `rmesh-shaders` | WGSL shader sources + shared CPU/GPU types |
-| `rmesh-data` | `.rmesh` file loading, PCA decompression |
-| `rmesh-render` | Forward pipeline: compute, sort, rasterize |
-| `rmesh-trainable` | Trainable pipeline: compute-based tiled forward, backward, gradient accumulation |
-| `rmesh-train` | GPU-only training loop |
-| `rmesh-viewer` | Interactive winit/wgpu viewer |
+| `rmesh-util` | Shared CPU/GPU types + WGSL utility shaders (math, SH, intersect) |
+| `rmesh-sort` | GPU radix sort pipelines (basic & DRS), CPU fallback |
+| `rmesh-tile` | Tile infrastructure (fill, ranges, scan, RTS prefix scan) |
+| `rmesh-data` | `.rmesh` file loading, PCA decompression, circumsphere computation |
+| `rmesh-render` | Interactive rendering: interval shader (main) + legacy mesh/HW raster paths |
+| `rmesh-trainable` | Tile shader: compute-based tiled forward + backward + gradient accumulation |
+| `rmesh-error` | Per-tet error statistics accumulation |
+| `rmesh-train` | GPU-only training loop (forward + loss + backward + Adam) |
+| `rmesh-dsm` | Deep shadow maps (power moments, per-light cubemap atlas) |
+| `rmesh-compositor` | Opaque primitives + depth compositing with translucent volumes |
+| `rmesh-pbd` | GPU XPBD distance-constraint solver for interactive vertex grabs |
+| `rmesh-anim` | Animation clock, keyframe evaluation, glTF scene loader |
+| `rmesh-interact` | Input handling, transform manipulators, vertex selection |
+| `rmesh-viewer` | Interactive winit/wgpu viewer (orbit camera, egui UI) |
+| `rmesh-viewer-web` | WebAssembly viewer |
 | `rmesh-python` | PyO3/maturin bindings for Python/PyTorch |
 
 ## Python API

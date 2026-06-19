@@ -39,17 +39,17 @@ rmesh-tile          ← Tile infrastructure (fill, ranges, scan, RTS prefix scan
     ↓
 rmesh-data          ← .rmesh file loading, PCA decompression, circumsphere computation
     ↓
-rmesh-render        ← Forward pipeline: project → sort → interval rasterize (wgpu orchestration)
+rmesh-render        ← Interactive rendering: interval shader (main) + legacy mesh-style/HW raster paths
     ↓
-rmesh-trainable     ← Trainable pipeline: compute-based tiled forward + backward + gradient accumulation
+rmesh-trainable     ← Trainable pipeline: tile shader (compute-based tiled forward + backward + gradient accumulation)
 rmesh-error         ← Per-tet error statistics accumulation
     ↓
 rmesh-train         ← Training loop (forward + loss + backward + Adam, all GPU)
 rmesh-dsm           ← Deep shadow maps (power moments, per-light cubemap atlas)
 rmesh-compositor    ← Opaque primitive rendering (cube, sphere, plane, cylinder) + depth compositing
-rmesh-neural        ← Neural material models (MLPBRDF, RetroHead via burn)
-rmesh-sim           ← Eulerian fluid simulation on tet mesh (Stable Fluids)
-rmesh-interact      ← Input handling & transform interactions (translate, rotate, scale)
+rmesh-pbd           ← GPU XPBD distance-constraint solver for interactive vertex grabs
+rmesh-anim          ← Animation clock, keyframe evaluation, glTF scene loader
+rmesh-interact      ← Input handling & transform interactions (translate, rotate, scale, vertex select)
 rmesh-viewer        ← Interactive winit/wgpu viewer (orbit camera, egui UI, loads .rmesh files)
 rmesh-viewer-web    ← WebAssembly viewer
 rmesh-python        ← PyO3/maturin bindings exposing RMeshRenderer to Python/PyTorch
@@ -57,19 +57,27 @@ rmesh-python        ← PyO3/maturin bindings exposing RMeshRenderer to Python/P
 
 ## Architecture
 
-### Rendering Pipeline (Interval Shading)
+The codebase has **three rendering pathways**, each tuned for a different use case:
 
-The interval shading path is the active rendering approach:
+| Pathway | Crate | Purpose | Status |
+|---------|-------|---------|--------|
+| **Interval shader** | `rmesh-render` | Interactive viewer / Python forward inference | **Main** — production renderer |
+| **Mesh-style shader** | `rmesh-render` | Original vertex/fragment & mesh shader paths | **Old** — kept for reference, viewer toggles |
+| **Tile shader** | `rmesh-trainable` | Differentiable forward + backward for training | **Trainable** — used by `rmesh-train` and `rmesh-python` |
 
-1. **Project compute** — Projects tet vertices, evaluates SH color, generates sort keys (`project_compute.wgsl`)
-2. **Radix sort** — GPU radix sort of tets by depth (rmesh-sort, 5-pass: count → reduce → scan → scan_add → scatter)
-3. **Interval generate** — Compute shader generates screen-space triangles per tet, writes vertex + per-tet data to buffers (`interval_generate.wgsl`)
-4. **Interval vertex/fragment** — Hardware rasterization of interval geometry with MRT output: color, depth, normals (`interval_vertex.wgsl`, `interval_fragment.wgsl`)
-5. **Deferred shading** — Fullscreen pass combining MRT G-buffer with PBR lighting and DSM shadows (`deferred_shade_frag.wgsl`)
+### Interval Shader (main pathway)
 
-There is also a **mesh shader pathway** (`interval_mesh.wgsl`, `IntervalPipelines`) that replaces steps 3–4 with a single mesh shader dispatch. **This path is untested** — it requires `Features::EXPERIMENTAL_MESH_SHADER` hardware support which is not currently available for testing.
+The interval shading path is the active rendering approach for the viewer and forward-only inference. It decomposes each tet into non-overlapping screen-space triangles with interpolated front/back NDC depths so the hardware rasterizer handles overdraw without sorting fragments.
 
-An alternative **interval tiled rasterize** compute path (`interval_tiled_rasterize.wgsl`, `IntervalTiledRasterizePipeline`) also exists for tile-based software rasterization of intervals.
+1. **Project compute** — Projects tet vertices, evaluates SH color, generates sort keys (`project_compute.wgsl`, or the lean `project_compute_hw.wgsl` when tile counts are not needed)
+2. **Radix sort** — GPU radix sort of tets by depth (`rmesh-sort`, 5-pass: count → reduce → scan → scan_add → scatter). Falls back to CPU `radsort` + sphere-frustum cull on backends without subgroups (Chrome WebGPU).
+3. **Interval compute** — Generates screen-space triangles per tet and writes vertex + per-tet data to fixed-slot buffers (`interval_compute.wgsl`)
+4. **Interval vertex/fragment** — Hardware rasterizes the interval geometry with MRT output: color, depth, normals (`interval_vertex.wgsl`, `interval_fragment.wgsl`)
+5. **Deferred shading** — Fullscreen pass combining the MRT G-buffer with PBR lighting and DSM shadows (`deferred_shade_frag.wgsl`)
+
+The two pipeline structs that drive this path:
+- `ComputeIntervalPipelines` — compute → vertex/fragment draw. **Universal** — works on every backend (Metal/Vulkan/DX12/WebGPU).
+- `IntervalPipelines` — single mesh-shader dispatch replacing steps 3–4 (`interval_mesh.wgsl` + `interval_fragment.wgsl`). Requires `Features::EXPERIMENTAL_MESH_SHADER`; currently untested due to lack of HW access.
 
 #### Deep Shadow Maps (rmesh-dsm)
 
@@ -81,28 +89,40 @@ Shadows use power moments stored in a per-light cubemap atlas:
 
 #### Compositing (rmesh-compositor)
 
-Opaque primitives (cubes, spheres, planes, cylinders) are rendered via `PrimitivePipeline` and depth-composited with translucent tet volumes via `CompositorPipeline`.
+Opaque primitives (cubes, spheres, planes, cylinders) are rendered via `PrimitivePipeline` and depth-composited with translucent tet volumes via the compositor.
 
-### Legacy / Dead Code Paths
+### Mesh-Style Shader (old pathway)
 
-Several older rendering approaches remain in the codebase but are not actively used:
+The original vertex/fragment and mesh-shader forward path predates interval shading. It still compiles and the viewer exposes it via `RenderMode::Regular`, `RenderMode::Quad`, `RenderMode::MeshShader`, and `RenderMode::RayTrace`, but is no longer the default and is not used by training or the Python bindings:
 
-- **Hardware rasterization path** (`forward_vertex.wgsl`, `forward_fragment.wgsl`, `ForwardPipelines`): The original vertex/fragment pipeline. Superseded by interval shading.
-- **Quad-based rendering** (`forward_vertex_quad.wgsl`, `forward_fragment_quad.wgsl`, `forward_prepass_compute.wgsl`): Quad billboard approach.
-- **Mesh shader forward** (`forward_mesh.wgsl`, `MeshForwardPipelines`): Non-interval mesh shader path.
-- **Ray tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`): Software ray-tet intersection.
-- **Rasterize compute** (`rasterize_compute.wgsl`, `RasterizeComputePipeline`): Software rasterization compute path.
-- **16-bit project** (`project_compute_16bit.wgsl`): Half-precision projection variant.
-- **Shadow ray gen** (`shadow_ray_gen.wgsl`): Pre-DSM shadow approach.
+- **Hardware rasterization** (`forward_vertex.wgsl`, `forward_fragment.wgsl`, `ForwardPipelines`) — the original 12-tri-per-tet draw with sorted indices.
+- **Quad billboard** (`forward_vertex_quad.wgsl`, `forward_fragment_quad.wgsl`, `forward_prepass_compute.wgsl`) — 4 verts/tet via triangle strip, reads a precomputed per-tet buffer.
+- **Mesh-shader forward** (`forward_mesh.wgsl`, `MeshForwardPipelines`) — non-interval mesh-shader path.
+- **Ray-tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`) — software ray-tet intersection used for the viewer's diagnostic mode.
 
-These are retained for reference and potential future use but are not part of the active pipeline.
+Also retained but not wired into the active viewer modes: `project_compute_16bit.wgsl` (half-precision projection) and `shadow_ray_gen.wgsl` (pre-DSM shadow approach).
 
-### Training Pipeline
+### Tile Shader (trainable pathway)
 
+`rmesh-trainable` implements the differentiable forward + backward pass used by `rmesh-train` and the Python bindings. Both halves are pure compute — no fixed-function rasterizer — so the forward intermediates are exactly the ones the backward kernel needs.
+
+**Forward (compute-based tiled rasterizer):**
+1. **Interval generate** — One thread per tet writes the same interval vertex/per-tet data the interactive path produces (`interval_generate.wgsl`, `IntervalGeneratePipeline`).
+2. **Interval tiled rasterize** — One workgroup per tile composites the visible intervals front-to-back into the output image (`interval_tiled_rasterize.wgsl`, `IntervalTiledRasterizePipeline`). Uses subgroup ops for warp-level shuffles.
+
+The older `rasterize_compute.wgsl` (`RasterizeComputePipeline`) — a pre-interval software rasterizer — is kept alongside as a baseline.
+
+**Backward:**
 1. **Loss compute** — L1/L2/SSIM loss + per-pixel dL/d(image) (`rmesh-train`)
-2. **Backward tiled compute** — Reverse-order traversal computing dL/d(params) (`rmesh-trainable`)
+2. **Backward interval tiled** — Reverse-order traversal of the same intervals computing dL/d(params) (`backward_interval_tiled.wgsl`, `backward_tiled_compute.wgsl`, with `interval_chain_back.wgsl` for the SH/color chain)
 3. **Error accumulation** — Per-tet error statistics (`rmesh-error`)
 4. **Adam compute** — Per-parameter-group Adam optimizer update (`rmesh-train`)
+
+### Interaction & Physics
+
+- **rmesh-interact** — Input handling, transform manipulators (translate/rotate/scale) and vertex-select picking for the viewer.
+- **rmesh-pbd** — GPU XPBD distance-constraint solver for localized vertex grabs. CPU BFS island construction + greedy edge coloring feed a per-step compute pipeline (`apply_handles`, `predict`, `solve_distance` × iters × colors, `finalize`). Ported from DelTetRenderer's `PBDMove.hpp`.
+- **rmesh-anim** — Animation clock, keyframe interpolation (step/linear/cubic spline), scene hierarchy, glTF loader.
 
 ### Key Design Patterns
 
@@ -127,7 +147,9 @@ Tests live in `crates/rmesh-render/tests/` with a shared `common/mod.rs` module 
 - GPU render helper (gracefully returns `None` if no adapter)
 - Image comparison utilities
 
-Test files: `single_tet_test.rs` (forward rendering), `multi_tet_test.rs` (multiple tets), `gradient_test.rs` (finite-difference gradient checks), `cross_renderer_test.rs`, `kernel_tests.rs`, `mrt_test.rs`, `overdraw_stats.rs`.
+Interval-shader (forward) tests: `single_tet_test.rs`, `multi_tet_test.rs`, `cross_renderer_test.rs`, `mrt_test.rs`, `overdraw_stats.rs`.
+
+Tile-shader (trainable) tests: `gradient_test.rs` (finite-difference gradient checks), `kernel_tests.rs`, and `crates/rmesh-trainable/tests/kernel_tests.rs`.
 
 ### Symbolic Backward Derivation
 

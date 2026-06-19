@@ -211,9 +211,10 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     let p_view = view_pos_from_linear_z(uv, z_view);
 
     // World normal → view-space (matches deferred shader's flip).
+    // Bias-encoded Rgba8Unorm: undo with (rgb/a)*2-1.
     let n_raw = textureLoad(normals_tex, coords, 0);
     if (n_raw.a < 0.01) { return vec4f(0.0, 0.0, 0.0, 0.0); }
-    let n_world = -normalize(n_raw.rgb / n_raw.a);
+    let n_world = -normalize((n_raw.rgb / n_raw.a) * 2.0 - 1.0);
     let n_view = normalize((u.view * vec4f(n_world, 0.0)).xyz);
 
     let tbn = make_tbn(n_view);

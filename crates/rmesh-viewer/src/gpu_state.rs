@@ -200,7 +200,8 @@ pub struct GpuState {
     pub aux_data_buf: Option<wgpu::Buffer>,
     // Deferred PBR shading (only when PBR data is loaded)
     pub deferred_pipeline: Option<rmesh_render::DeferredShadePipeline>,
-    pub deferred_bg: Option<wgpu::BindGroup>,
+    /// Deferred bind group, doubled for ping-pong parity. Index by frame_parity.
+    pub deferred_bg: Option<[wgpu::BindGroup; 2]>,
     /// GTAO ambient-occlusion pass (always created; AO target lives in `targets`).
     pub gtao_pipeline: rmesh_render::GtaoPipeline,
     pub gtao_bg: wgpu::BindGroup,
@@ -216,25 +217,30 @@ pub struct GpuState {
     pub ao_blur_bg_h: wgpu::BindGroup,
     pub ao_blur_bg_v: wgpu::BindGroup,
     /// SSGI compute (Hi-Z ray-march, samples lit_history) + bilateral denoise.
+    /// ssgi_bg doubled for parity (lit_history rotates each frame).
     pub ssgi_pipeline: rmesh_render::SsgiPipeline,
-    pub ssgi_bg: wgpu::BindGroup,
+    pub ssgi_bg: [wgpu::BindGroup; 2],
     pub ssgi_blur_pipeline: rmesh_render::SsgiBlurPipeline,
     pub ssgi_blur_bg_h: wgpu::BindGroup,
     pub ssgi_blur_bg_v: wgpu::BindGroup,
     /// Temporal accumulation pipelines for SSGI (Rgba16Float) and AO (R8Unorm).
-    /// One shared shader, two pipelines per output format.
+    /// Bind groups doubled for parity: each variant binds (current, history) in
+    /// the orientation appropriate for that frame.
     pub ssgi_temporal_pipeline: rmesh_render::TemporalPipeline,
-    pub ssgi_temporal_bg: wgpu::BindGroup,
+    pub ssgi_temporal_bg: [wgpu::BindGroup; 2],
     pub ao_temporal_pipeline: rmesh_render::TemporalPipeline,
-    pub ao_temporal_bg: wgpu::BindGroup,
+    pub ao_temporal_bg: [wgpu::BindGroup; 2],
     /// SSR (specular reflections via Hi-Z reflection-direction ray-march) +
-    /// its temporal pipeline (third instance of TemporalPipeline, Rgba16Float).
+    /// its temporal pipeline. Both bind groups doubled for parity.
     pub ssr_pipeline: rmesh_render::SsrPipeline,
-    pub ssr_bg: wgpu::BindGroup,
+    pub ssr_bg: [wgpu::BindGroup; 2],
     pub ssr_temporal_pipeline: rmesh_render::TemporalPipeline,
-    pub ssr_temporal_bg: wgpu::BindGroup,
+    pub ssr_temporal_bg: [wgpu::BindGroup; 2],
     /// Frame counter for SSGI per-pixel jitter rotation.
     pub frame_counter: u32,
+    /// Frame parity (0 or 1) — selects which slot of each ping-pong texture
+    /// pair is "current" this frame. Flipped at end of frame.
+    pub frame_parity: u32,
     /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
     pub deferred_output: Option<wgpu::Texture>,
     pub deferred_output_view: Option<wgpu::TextureView>,

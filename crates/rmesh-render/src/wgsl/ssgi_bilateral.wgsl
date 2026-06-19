@@ -43,7 +43,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     if (n_raw_c.a < 0.01 || z_c >= Z_SKY_HALF) {
         return center;
     }
-    let n_c = normalize(n_raw_c.rgb / n_raw_c.a);
+    // Bias-encoded Rgba8Unorm normals: undo with (rgb/a)*2-1.
+    let n_c = normalize((n_raw_c.rgb / n_raw_c.a) * 2.0 - 1.0);
 
     let inv_2sz2 = 1.0 / max(2.0 * u.sigma_z * u.sigma_z, 1e-8);
     let inv_2ss2 = 1.0 / (2.0 * SIGMA_S * SIGMA_S);
@@ -58,7 +59,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
         let z_p = textureLoad(depth_tex, p, 0).r;
         let n_raw_p = textureLoad(normals_tex, p, 0);
         if (n_raw_p.a < 0.01 || z_p >= Z_SKY_HALF) { continue; }
-        let n_p = normalize(n_raw_p.rgb / n_raw_p.a);
+        let n_p = normalize((n_raw_p.rgb / n_raw_p.a) * 2.0 - 1.0);
 
         let w_s = exp(-f32(i * i) * inv_2ss2);
         let dz = z_p - z_c;

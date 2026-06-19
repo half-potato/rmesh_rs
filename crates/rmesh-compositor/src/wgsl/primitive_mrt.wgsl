@@ -121,7 +121,8 @@ fn fs_main(in: VsOut) -> FragmentOutput {
     var out: FragmentOutput;
     out.color = vec4<f32>(base_color.rgb, 1.0);
     out.aux0 = vec4<f32>(roughness, 0.0, metallic, 1.0);
-    out.normals = vec4<f32>(-n, 1.0);
+    // Bias-encoded for Rgba8Unorm normals target. Consumers undo with *2-1.
+    out.normals = vec4<f32>(-n * 0.5 + 0.5, 1.0);
     out.expected_depth = vec4<f32>(in.view_depth, occlusion, 0.0, 1.0);
     return out;
 }

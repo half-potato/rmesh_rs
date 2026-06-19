@@ -674,10 +674,11 @@ impl ForwardPipelines {
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // Color attachment 2 (normals): premultiplied alpha blend
-                    // Uses color_format (Rgba16Float) because Rgba32Float is not blendable
+                    // Color attachment 2 (normals): premultiplied alpha blend.
+                    // Rgba8Unorm matches normals_texture (halved bandwidth vs
+                    // Rgba16Float; bias-encoded as (n*0.5+0.5)*alpha).
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -784,21 +785,25 @@ impl ForwardPipelines {
                 module: &fragment_shader,
                 entry_point: Some("main"),
                 targets: &[
+                    // location(0) color
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(1) aux0
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(2) normals — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(3) depth
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
@@ -1001,21 +1006,25 @@ impl MeshForwardPipelines {
                 module: &fragment_shader,
                 entry_point: Some("main"),
                 targets: &[
+                    // location(0) color
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(1) aux0
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(2) normals — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
+                    // location(3) depth
                     Some(wgpu::ColorTargetState {
                         format: color_format,
                         blend: Some(premul_blend),
@@ -1456,9 +1465,9 @@ impl ComputeIntervalPipelines {
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
-                    // location(2): normals (normal.xyz, env_feat[3])
+                    // location(2): normals (normal.xyz, env_feat[3]) — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: wgpu::TextureFormat::Rgba8Unorm,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -1640,27 +1649,61 @@ pub struct RenderTargets {
     pub normals_view: wgpu::TextureView,
     /// View into depth texture
     pub depth_view: wgpu::TextureView,
-    /// View into AO texture
-    pub ao_view: wgpu::TextureView,
-    /// View into AO blur intermediate.
     pub ao_blur_temp_view: wgpu::TextureView,
-    /// Views for SSGI textures.
-    pub ssgi_view: wgpu::TextureView,
     pub ssgi_blur_temp_view: wgpu::TextureView,
     pub ssgi_temporal_view: wgpu::TextureView,
-    pub ssgi_history_view: wgpu::TextureView,
     pub ao_temporal_view: wgpu::TextureView,
-    pub ao_history_view: wgpu::TextureView,
-    pub lit_current_view: wgpu::TextureView,
-    pub lit_history_view: wgpu::TextureView,
-    pub ssr_view: wgpu::TextureView,
     pub ssr_temporal_view: wgpu::TextureView,
-    pub ssr_history_view: wgpu::TextureView,
+    /// Ping-pong pairs: index 0 = primary texture's view, 1 = secondary.
+    /// Never index directly — use the `*_current(parity)` / `*_history(parity)`
+    /// helpers below. Replaces the old current/history pattern that needed a
+    /// per-frame copy_texture_to_texture; a single parity flip rotates roles.
+    pub ao_views: [wgpu::TextureView; 2],
+    pub ssgi_views: [wgpu::TextureView; 2],
+    pub ssr_views: [wgpu::TextureView; 2],
+    pub lit_views: [wgpu::TextureView; 2],
     pub width: u32,
     pub height: u32,
 }
 
 impl RenderTargets {
+    /// AO output for this frame (write target + same-frame deferred read).
+    #[inline]
+    pub fn ao_current(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ao_views[(parity & 1) as usize]
+    }
+    /// Previous frame's AO output, sampled by this frame's AO temporal pass.
+    #[inline]
+    pub fn ao_history(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ao_views[((parity ^ 1) & 1) as usize]
+    }
+    #[inline]
+    pub fn ssgi_current(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ssgi_views[(parity & 1) as usize]
+    }
+    #[inline]
+    pub fn ssgi_history(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ssgi_views[((parity ^ 1) & 1) as usize]
+    }
+    #[inline]
+    pub fn ssr_current(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ssr_views[(parity & 1) as usize]
+    }
+    #[inline]
+    pub fn ssr_history(&self, parity: u32) -> &wgpu::TextureView {
+        &self.ssr_views[((parity ^ 1) & 1) as usize]
+    }
+    /// Deferred shader's location(1) target this frame.
+    #[inline]
+    pub fn lit_current(&self, parity: u32) -> &wgpu::TextureView {
+        &self.lit_views[(parity & 1) as usize]
+    }
+    /// Previous frame's lit value — sampled by SSGI/SSR and by DBG_LIT_HISTORY.
+    #[inline]
+    pub fn lit_history(&self, parity: u32) -> &wgpu::TextureView {
+        &self.lit_views[((parity ^ 1) & 1) as usize]
+    }
+
     /// Create render target textures at the given resolution.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
         let color_format = wgpu::TextureFormat::Rgba16Float;
@@ -1699,7 +1742,11 @@ impl RenderTargets {
             view_formats: &[],
         });
 
-        // Normals and depth use Rgba16Float (blendable) instead of Rgba32Float
+        // Normals: Rgba8Unorm with bias encoding (n*0.5+0.5) halves bandwidth
+        // vs Rgba16Float in the forward MRT write and every consumer. Producers
+        // pre-normalize and bias the unit normal; consumers undo the bias and
+        // re-normalize. Volume's additive alpha-blend still works because the
+        // bias is linear (Σα·biased / Σα = biased of weighted-average direction).
         let normals_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("normals_target"),
             size: wgpu::Extent3d {
@@ -1710,7 +1757,7 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: color_format,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1734,6 +1781,8 @@ impl RenderTargets {
             view_formats: &[],
         });
 
+        // ao_texture is half of the ping-pong AO pair; copy flags are no longer
+        // needed because the per-frame copy is gone (parity flip rotates roles).
         let ao_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ao_target"),
             size: wgpu::Extent3d {
@@ -1745,9 +1794,7 @@ impl RenderTargets {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Unorm,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
 
@@ -1788,57 +1835,46 @@ impl RenderTargets {
         let none = wgpu::TextureUsages::empty();
         let cdst = wgpu::TextureUsages::COPY_DST;
         let csrc = wgpu::TextureUsages::COPY_SRC;
-        // ssgi_view is the post-blur final and gets copied to ssgi_history → COPY_SRC.
-        let ssgi_texture = make_target("ssgi", wgpu::TextureFormat::Rgba16Float, csrc);
+        // Ping-pong pairs no longer need COPY flags — the parity flip replaces
+        // the per-frame copies. Only ssr_texture keeps COPY_DST because the
+        // ssr_temporal → ssr copy is still in place (out of scope here).
+        let ssgi_texture = make_target("ssgi", wgpu::TextureFormat::Rgba16Float, none);
         let ssgi_blur_temp_texture =
             make_target("ssgi_blur_temp", wgpu::TextureFormat::Rgba16Float, none);
         let ssgi_temporal_texture =
             make_target("ssgi_temporal", wgpu::TextureFormat::Rgba16Float, none);
         let ssgi_history_texture =
-            make_target("ssgi_history", wgpu::TextureFormat::Rgba16Float, cdst);
-        // lit_current is the deferred shader's location(1) target — copied to
-        // lit_history each frame so SSGI feedback survives debug-mode overrides.
+            make_target("ssgi_history", wgpu::TextureFormat::Rgba16Float, none);
         let lit_current_texture =
-            make_target("lit_current", wgpu::TextureFormat::Rgba16Float, csrc);
+            make_target("lit_current", wgpu::TextureFormat::Rgba16Float, none);
         let lit_history_texture =
-            make_target("lit_history", wgpu::TextureFormat::Rgba16Float, cdst);
+            make_target("lit_history", wgpu::TextureFormat::Rgba16Float, none);
         let ao_temporal_texture = make_target("ao_temporal", wgpu::TextureFormat::R8Unorm, none);
-        let ao_history_texture = make_target("ao_history", wgpu::TextureFormat::R8Unorm, cdst);
-        // ssr_view receives the temporal copy AND is the source of the
-        // history copy each frame, so it needs both COPY_DST and COPY_SRC.
-        let ssr_texture = make_target("ssr", wgpu::TextureFormat::Rgba16Float, csrc | cdst);
+        let ao_history_texture = make_target("ao_history", wgpu::TextureFormat::R8Unorm, none);
+        // Both halves of the SSR ping-pong need COPY_DST because the still-in-
+        // place ssr_temporal → ssr_current copy can target either slot depending
+        // on parity. Killing that copy is the remaining SSR cleanup, out of
+        // scope here.
+        let ssr_texture = make_target("ssr", wgpu::TextureFormat::Rgba16Float, cdst);
         let ssr_temporal_texture =
             make_target("ssr_temporal", wgpu::TextureFormat::Rgba16Float, csrc);
         let ssr_history_texture =
             make_target("ssr_history", wgpu::TextureFormat::Rgba16Float, cdst);
 
-        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let aux0_view = aux0_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let normals_view = normals_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let depth_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_view = ao_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_blur_temp_view =
-            ao_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_view = ssgi_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_blur_temp_view =
-            ssgi_blur_temp_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_temporal_view =
-            ssgi_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssgi_history_view =
-            ssgi_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_temporal_view =
-            ao_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ao_history_view =
-            ao_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let lit_current_view =
-            lit_current_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let lit_history_view =
-            lit_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssr_view = ssr_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssr_temporal_view =
-            ssr_temporal_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let ssr_history_view =
-            ssr_history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let v = |t: &wgpu::Texture| t.create_view(&wgpu::TextureViewDescriptor::default());
+        let color_view = v(&color_texture);
+        let aux0_view = v(&aux0_texture);
+        let normals_view = v(&normals_texture);
+        let depth_view = v(&depth_texture);
+        let ao_blur_temp_view = v(&ao_blur_temp_texture);
+        let ssgi_blur_temp_view = v(&ssgi_blur_temp_texture);
+        let ssgi_temporal_view = v(&ssgi_temporal_texture);
+        let ao_temporal_view = v(&ao_temporal_texture);
+        let ssr_temporal_view = v(&ssr_temporal_texture);
+        let ao_views = [v(&ao_texture), v(&ao_history_texture)];
+        let ssgi_views = [v(&ssgi_texture), v(&ssgi_history_texture)];
+        let ssr_views = [v(&ssr_texture), v(&ssr_history_texture)];
+        let lit_views = [v(&lit_current_texture), v(&lit_history_texture)];
         Self {
             color_texture,
             aux0_texture,
@@ -1861,19 +1897,15 @@ impl RenderTargets {
             aux0_view,
             normals_view,
             depth_view,
-            ao_view,
             ao_blur_temp_view,
-            ssgi_view,
             ssgi_blur_temp_view,
             ssgi_temporal_view,
-            ssgi_history_view,
             ao_temporal_view,
-            ao_history_view,
-            lit_current_view,
-            lit_history_view,
-            ssr_view,
             ssr_temporal_view,
-            ssr_history_view,
+            ao_views,
+            ssgi_views,
+            ssr_views,
+            lit_views,
             width,
             height,
         }

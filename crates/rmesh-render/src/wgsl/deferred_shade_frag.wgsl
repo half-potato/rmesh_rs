@@ -279,10 +279,12 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let metallic      = aux0_raw.b * inv_alpha;
     let f0_dielectric = max(aux0_raw.g * inv_alpha, 0.04);
 
-    // normalize() is scale-invariant, so the un-premultiply (* inv_alpha)
-    // cancels — feed the raw premultiplied gradient straight in.
-    // Negation transforms colmap (Y-down, Z-forward) to wgpu (Y-up, Z-back).
-    let normal = -normalize(normals_raw.rgb);
+    // Normals are bias-encoded as (n*0.5+0.5)*alpha into an Rgba8Unorm target.
+    // Un-premultiply by normals_raw.a (which equals color alpha for volumes and
+    // 1.0 for primitives), un-bias (*2-1), then renormalize. The negation
+    // transforms colmap (Y-down, Z-forward) to wgpu (Y-up, Z-back).
+    let n_biased = normals_raw.rgb / max(normals_raw.a, 1e-6);
+    let normal = -normalize(n_biased * 2.0 - 1.0);
 
     // Volume's expected termination depth. Slot 3 is filtered ("thick tets
     // only") at the producer, so its α lags color's α — normalize by slot 3's

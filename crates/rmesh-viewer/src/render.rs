@@ -207,6 +207,28 @@ impl App {
 
         let t_before_egui = std::time::Instant::now();
 
+        // --- Vertex-select hover preview ---
+        // Refresh which vertex would be picked if the user clicked now.
+        // Skipped while grabbing (the handle is fixed) and when in egui's
+        // pointer focus (avoid expensive scan when the cursor is in the UI).
+        let hover_marker: Option<egui::Pos2> = if self.vertex_select.is_enabled()
+            && !self.vertex_select.is_grabbing()
+            && !self.egui_ctx.is_pointer_over_egui()
+        {
+            let mp = self.vertex_select.mouse_pos();
+            let info = self.pick_vertex_info(mp, 30.0);
+            self.pbd_hover_vertex = info.as_ref().map(|i| i.idx);
+            // Convert from physical surface pixels to egui logical points.
+            let ppp = self.egui_ctx.pixels_per_point().max(0.01);
+            info.map(|i| egui::pos2(i.screen_pos[0] / ppp, i.screen_pos[1] / ppp))
+        } else {
+            self.pbd_hover_vertex = None;
+            None
+        };
+
+        // Borrow `gpu` again (the hover call took &mut self → had to drop it).
+        let gpu = self.gpu.as_mut().unwrap();
+
         // --- egui frame ---
         let window = self.window.as_ref().unwrap();
         let raw_input = gpu.egui_state.take_egui_input(window);
@@ -564,6 +586,21 @@ impl App {
                         ui.add(egui::DragValue::new(&mut anim_speed).range(0.0..=5.0).speed(0.05).suffix("x"));
                     });
                 });
+            }
+
+            // VertexSelect hover preview: solid yellow dot at the vertex
+            // that would be picked if the user clicked now.
+            if let Some(pos) = hover_marker {
+                let painter = ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("pbd_hover_marker"),
+                ));
+                painter.circle_filled(pos, 6.0, egui::Color32::from_rgb(255, 230, 0));
+                painter.circle_stroke(
+                    pos,
+                    6.0,
+                    egui::Stroke::new(1.5, egui::Color32::BLACK),
+                );
             }
 
             // Transform HUD overlay (centered at bottom, below timeline if present)
@@ -1680,16 +1717,20 @@ impl App {
                 let cur_inv_vp = cur_vp.inverse();
                 let prev_vp_mat = prev_vp_snapshot;
 
+                // Ping-pong parity for this frame. Flipped at end of frame.
+                let p = gpu.frame_parity;
+                let pu = p as usize;
+
                 if self.ao_enabled {
-                // GTAO pass: Hi-Z + normals + volume depth → AO texture
+                // GTAO pass writes the parity-current AO slot.
                 rmesh_render::record_gtao_pass(
                     &mut encoder,
                     &gpu.gtao_pipeline,
                     &gpu.gtao_bg,
-                    &gpu.targets.ao_view,
+                    gpu.targets.ao_current(p),
                 );
 
-                // AO temporal: ao_view + ao_history → ao_temporal_view
+                // AO temporal: ao_current + ao_history → ao_temporal_view
                 let ao_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
@@ -1710,11 +1751,11 @@ impl App {
                 rmesh_render::record_temporal_pass(
                     &mut encoder,
                     &gpu.ao_temporal_pipeline,
-                    &gpu.ao_temporal_bg,
+                    &gpu.ao_temporal_bg[pu],
                     &gpu.targets.ao_temporal_view,
                 );
 
-                // Bilateral AO blur — H reads ao_temporal_view, V writes ao_view.
+                // Bilateral AO blur — H reads ao_temporal_view, V writes ao_current.
                 let blur_h = rmesh_render::AoBlurUniforms {
                     dir_x: 1,
                     dir_y: 0,
@@ -1744,33 +1785,13 @@ impl App {
                     &gpu.ao_blur_bg_h,
                     &gpu.targets.ao_blur_temp_view,
                 );
-                // V: ao_blur_temp_view → ao_view (final, deferred reads this)
+                // V: ao_blur_temp_view → ao_current (deferred reads this).
+                // Next frame, ao_current rotates to be ao_history — no copy.
                 rmesh_render::record_ao_blur_pass(
                     &mut encoder,
                     &gpu.ao_blur_pipeline,
                     &gpu.ao_blur_bg_v,
-                    &gpu.targets.ao_view,
-                );
-
-                // Copy ao_view → ao_history for next frame's temporal pass.
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ao_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ao_history_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
+                    gpu.targets.ao_current(p),
                 );
                 } // end if self.ao_enabled
 
@@ -1806,11 +1827,11 @@ impl App {
                 rmesh_render::record_ssgi_pass(
                     &mut encoder,
                     &gpu.ssgi_pipeline,
-                    &gpu.ssgi_bg,
-                    &gpu.targets.ssgi_view,
+                    &gpu.ssgi_bg[pu],
+                    gpu.targets.ssgi_current(p),
                 );
 
-                // SSGI temporal: ssgi_view + ssgi_history → ssgi_temporal_view
+                // SSGI temporal: ssgi_current + ssgi_history → ssgi_temporal_view
                 let ssgi_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
@@ -1831,7 +1852,7 @@ impl App {
                 rmesh_render::record_temporal_pass(
                     &mut encoder,
                     &gpu.ssgi_temporal_pipeline,
-                    &gpu.ssgi_temporal_bg,
+                    &gpu.ssgi_temporal_bg[pu],
                     &gpu.targets.ssgi_temporal_view,
                 );
 
@@ -1864,33 +1885,13 @@ impl App {
                     &gpu.ssgi_blur_bg_h,
                     &gpu.targets.ssgi_blur_temp_view,
                 );
-                // V: ssgi_blur_temp_view → ssgi_view (deferred reads this)
+                // V: ssgi_blur_temp_view → ssgi_current (deferred reads this).
+                // Next frame, ssgi_current rotates to be ssgi_history — no copy.
                 rmesh_render::record_ssgi_blur_pass(
                     &mut encoder,
                     &gpu.ssgi_blur_pipeline,
                     &gpu.ssgi_blur_bg_v,
-                    &gpu.targets.ssgi_view,
-                );
-
-                // Copy ssgi_view → ssgi_history for next frame's temporal pass.
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ssgi_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ssgi_history_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
+                    gpu.targets.ssgi_current(p),
                 );
                 } // end if self.ssgi_enabled
 
@@ -1924,11 +1925,11 @@ impl App {
                 rmesh_render::record_ssr_pass(
                     &mut encoder,
                     &gpu.ssr_pipeline,
-                    &gpu.ssr_bg,
-                    &gpu.targets.ssr_view,
+                    &gpu.ssr_bg[pu],
+                    gpu.targets.ssr_current(p),
                 );
 
-                // SSR temporal: ssr_view (current) + ssr_history → ssr_temporal_view
+                // SSR temporal: ssr_current + ssr_history → ssr_temporal_view
                 let ssr_temporal_uniforms = rmesh_render::TemporalUniforms {
                     inv_vp: cur_inv_vp.to_cols_array_2d(),
                     prev_vp: prev_vp_mat.to_cols_array_2d(),
@@ -1949,11 +1950,20 @@ impl App {
                 rmesh_render::record_temporal_pass(
                     &mut encoder,
                     &gpu.ssr_temporal_pipeline,
-                    &gpu.ssr_temporal_bg,
+                    &gpu.ssr_temporal_bg[pu],
                     &gpu.targets.ssr_temporal_view,
                 );
 
-                // Copy ssr_temporal_view → ssr_view (final readable form for deferred).
+                // Copy ssr_temporal_view → ssr_current(p) (final readable form
+                // for deferred). The destination texture depends on parity since
+                // both halves of the SSR ping-pong are alternately "current".
+                // This copy is the SSR cleanup that's still outstanding —
+                // killing it requires restructuring the temporal pass.
+                let ssr_dst_tex = if pu == 0 {
+                    &gpu.targets.ssr_texture
+                } else {
+                    &gpu.targets.ssr_history_texture
+                };
                 encoder.copy_texture_to_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &gpu.targets.ssr_temporal_texture,
@@ -1962,28 +1972,7 @@ impl App {
                         aspect: wgpu::TextureAspect::All,
                     },
                     wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ssr_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
-
-                // Copy ssr_view → ssr_history for next frame's temporal pass.
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ssr_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.ssr_history_texture,
+                        texture: ssr_dst_tex,
                         mip_level: 0,
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
@@ -2010,33 +1999,17 @@ impl App {
                 rmesh_render::record_deferred_shade(
                     &mut encoder,
                     deferred,
-                    bg,
+                    &bg[pu],
                     dsm_bg,
                     out_view,
-                    &gpu.targets.lit_current_view,
+                    gpu.targets.lit_current(p),
                 );
-
-                // Copy lit_current → lit_history for next frame's SSGI to sample.
-                encoder.copy_texture_to_texture(
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.lit_current_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &gpu.targets.lit_history_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                );
+                // No lit copy: next frame, lit_current rotates to lit_history.
             }
+            // Flip parity for next frame's deferred branch. Must happen outside
+            // the `if let` so we can re-borrow gpu mutably without aliasing the
+            // shared refs taken above.
+            gpu.frame_parity ^= 1;
         }
 
         // 3b. DSM debug view
