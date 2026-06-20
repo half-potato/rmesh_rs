@@ -1207,7 +1207,10 @@ impl ComputeIntervalPipelines {
                 multisample: wgpu::MultisampleState::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_shader,
-                    entry_point: Some("main"),
+                    // Lean entry: writes only @location(0), skipping the 3 dead
+                    // MRT outputs (aux0 / normals / expected-depth) this pipeline
+                    // doesn't bind.
+                    entry_point: Some("main_color_only"),
                     targets: color_only_targets,
                     compilation_options: Default::default(),
                 }),
@@ -2947,8 +2950,14 @@ pub fn record_compute_interval_project(
         bytemuck::cast_slice(&[0u32; 8]),
     );
 
-    let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+    // The DRS/basic radix sorts are counting sorts: they honor `num_keys` and
+    // early-out any thread-blocks past `ceil(num_keys / PART_SIZE)`. The old
+    // power-of-two padding (for a never-implemented bitonic path) just made the
+    // sort and projection chew through ~42% more elements. Size both to exactly
+    // `tet_count`. The sort buffers stay over-allocated at n_pow2, so the
+    // now-uninitialized [tet_count, n_pow2) tail is simply never read.
+    let sort_count = tet_count;
+    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&sort_count));
 
     // ----- 2. Compute pass (projection + SH eval) -----
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -2973,7 +2982,7 @@ pub fn record_compute_interval_project(
     }
 
     let workgroup_size = 64u32;
-    let total_workgroups = n_pow2.div_ceil(workgroup_size);
+    let total_workgroups = sort_count.div_ceil(workgroup_size);
     let max_per_dim = 65535u32;
     let dispatch_x = total_workgroups.min(max_per_dim);
     let dispatch_y = total_workgroups.div_ceil(max_per_dim);

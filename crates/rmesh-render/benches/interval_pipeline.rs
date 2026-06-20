@@ -134,7 +134,10 @@ fn create_state() -> Option<State> {
 
     let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
 
-    // 32-bit tet-level sort (1 payload).
+    // 32-bit tet-level sort (1 payload). Buffers stay over-allocated at the
+    // power-of-two size (mirroring SceneBuffers / the viewer); the DRS counting
+    // sort then runs over only `num_keys = tet_count` keys (set per-frame in
+    // record_compute_interval_project), early-outing the padding thread-blocks.
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =
         rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);
@@ -302,9 +305,11 @@ fn print_breakdown(s: &State) {
             0,
             bytemuck::cast_slice(&[0u32; 8]),
         );
-        let n_pow2 = s.tet_count.next_power_of_two();
-        s.queue
-            .write_buffer(s.sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+        s.queue.write_buffer(
+            s.sort_state.num_keys_buf(),
+            0,
+            bytemuck::bytes_of(&s.tet_count),
+        );
         encoder.clear_buffer(&s.buffers.tiles_touched, 0, None);
 
         let (b, e) = ts.allocate("project_compute");
@@ -319,8 +324,7 @@ fn print_breakdown(s: &State) {
         cpass.set_pipeline(&s.fwd_pipelines.compute_pipeline);
         cpass.set_bind_group(0, &s.compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &s.compute_bg.bg1, &[]);
-        let n_pow2 = s.tet_count.next_power_of_two();
-        let total_workgroups = n_pow2.div_ceil(64);
+        let total_workgroups = s.tet_count.div_ceil(64);
         let dispatch_x = total_workgroups.min(65535);
         let dispatch_y = total_workgroups.div_ceil(65535);
         cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);

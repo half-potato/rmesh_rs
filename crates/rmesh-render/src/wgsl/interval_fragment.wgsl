@@ -59,29 +59,33 @@ struct FragmentOutput {
     @location(3) expected_depth: vec4<f32>,
 };
 
-// phi(x) = (1 - exp(-x)) / x
-// Taylor with 4 terms for |x| < 0.02 avoids catastrophic cancellation.
-fn phi(x: f32) -> f32 {
+// phi(x) = (1 - exp(-x)) / x, but reusing an already-computed alpha = 1 - exp(-x)
+// to avoid a second exp(). Taylor (4 terms) for |x| < 0.02 avoids catastrophic
+// cancellation. For |x| >= 0.02, phi = (1 - exp(-x))/x = alpha / x.
+fn phi_from_alpha(x: f32, alpha: f32) -> f32 {
     if (abs(x) < 0.02) {
         return 1.0 + x * (-0.5 + x * (1.0 / 6.0 + x * (-1.0 / 24.0)));
     }
-    return (1.0 - exp(-x)) / x;
+    return alpha / x;
 }
 
-// Volume rendering integral for a ray segment through a tet.
-fn compute_integral(c0: vec3<f32>, c1: vec3<f32>, optical_depth: f32) -> vec4<f32> {
-    let alpha = exp(-optical_depth);
-    let phi_val = phi(optical_depth);
-    let w0 = phi_val - alpha;
-    let w1 = 1.0 - phi_val;
-    let c = c0 * w0 + c1 * w1;
-    return vec4<f32>(c, 1.0 - alpha);
+// Shared front-to-back volume integral for a tet's ray segment. Produces the
+// premultiplied slot-0 color plus the intermediates (alpha, weights, view-space
+// depths) that the MRT outputs need. Both the MRT `main` and the lean
+// `main_color_only` entry call this, so slot-0 color is byte-identical between
+// them.
+struct ShadeCommon {
+    color: vec4<f32>,   // location(0): premultiplied-alpha color
+    alpha: f32,
+    alpha_t: f32,
+    w0: f32,            // back weight  (z_b)
+    w1: f32,            // front weight (z_f)
+    od: f32,
+    z_f: f32,
+    z_b: f32,
 }
 
-@fragment
-fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FragmentOutput {
-    var out: FragmentOutput;
-
+fn shade_common(frag_coord: vec4<f32>, in: FragmentInput) -> ShadeCommon {
     let near = uniforms.near_plane;
     let far = uniforms.far_plane;
 
@@ -117,34 +121,59 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     // Per-tet aux channels lookup (parametric BRDF layout, AUX_DIM=6).
     // For non-PBR scenes, aux_data is bound to a 4-byte dummy buffer (see
     // `create_compute_interval_render_bind_group`); detect that and use the
-    // proper volume-integrated SH color for `out.color` so the color-only
-    // path matches what the Regular forward pass produces.
+    // proper volume-integrated SH color so the color-only path matches what the
+    // Regular forward pass produces.
+    let has_pbr = arrayLength(&aux_data) > 1u;
+    let aux_base = in.tet_id * AUX_DIM;
+    let albedo = select(in.base_color,
+                        vec3f(aux_data[aux_base + 3u],
+                              aux_data[aux_base + 4u],
+                              aux_data[aux_base + 5u]),
+                        has_pbr);
+
+    // Shared w0/w1 across the color (slot 0) and depth-moment (slot 3) outputs —
+    // both blends use the same exponential-transmittance weights, so phi(od)
+    // only needs evaluating once (and reuses alpha to dodge a second exp()).
+    let phi_val = phi_from_alpha(od, alpha);
+    let w0 = phi_val - alpha_t;   // back weight (z_b)
+    let w1 = 1.0 - phi_val;       // front weight (z_f)
+    let integrated = c_back * w0 + c_front * w1;  // already × α
+    let color = select(vec4f(integrated, alpha),
+                       vec4f(albedo * alpha, alpha),
+                       has_pbr);
+
+    return ShadeCommon(color, alpha, alpha_t, w0, w1, od, z_f, z_b);
+}
+
+// Lean entry for the color-only path (forward inference / non-deferred): writes
+// only slot 0, skipping the aux0 / normals / expected-depth MRT work entirely.
+@fragment
+fn main_color_only(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput)
+    -> @location(0) vec4<f32> {
+    return shade_common(frag_coord, in).color;
+}
+
+@fragment
+fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FragmentOutput {
+    var out: FragmentOutput;
+
+    let sc = shade_common(frag_coord, in);
+    let alpha = sc.alpha;
+    let alpha_t = sc.alpha_t;
+    let w0 = sc.w0;
+    let w1 = sc.w1;
+    let od = sc.od;
+    let z_f = sc.z_f;
+    let z_b = sc.z_b;
+
+    out.color = sc.color;
+
+    // Per-tet PBR material channels (only needed for the MRT/deferred path).
     let has_pbr = arrayLength(&aux_data) > 1u;
     let aux_base = in.tet_id * AUX_DIM;
     let roughness     = select(0.5,  aux_data[aux_base + 0u], has_pbr);
     let metallic      = select(0.0,  aux_data[aux_base + 1u], has_pbr);
     let f0_dielectric = select(0.04, aux_data[aux_base + 2u], has_pbr);
-    let albedo        = select(in.base_color,
-                               vec3f(aux_data[aux_base + 3u],
-                                     aux_data[aux_base + 4u],
-                                     aux_data[aux_base + 5u]),
-                               has_pbr);
-
-    // Slot 0: color (premultiplied alpha).
-    //   PBR: flat per-tet albedo × α (deferred shader applies lighting).
-    //   non-PBR: volume integral of the SH color through the tet, using the
-    //   same w0/w1 transmittance weighting as `forward_fragment.wgsl` so the
-    //   interval render matches the Regular path.
-    // Shared w0/w1 across the color (slot 0) and depth-moment (slot 3) outputs —
-    // both blends use the same exponential-transmittance weights, so phi(od)
-    // only needs evaluating once.
-    let phi_val = phi(od);
-    let w0 = phi_val - alpha_t;   // back weight (z_b)
-    let w1 = 1.0 - phi_val;       // front weight (z_f)
-    let integrated = c_back * w0 + c_front * w1;  // already × α
-    out.color = select(vec4f(integrated, alpha),
-                       vec4f(albedo * alpha, alpha),
-                       has_pbr);
 
     // Slot 1: PBR material (roughness, f0_dielectric, metallic) — metallic in
     // .b to match primitive_mrt's glTF convention.
