@@ -24,6 +24,8 @@ rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
 rmesh-tile = { path = "../rmesh-tile" }
 # Tests exercise the compute-forward tiled rasterizers, which live in rmesh-trainable.
 rmesh-trainable = { path = "../rmesh-trainable" }
+# Cross-renderer tests compare against the software ray tracer, now in rmesh-raytrace.
+rmesh-raytrace = { path = "../rmesh-raytrace" }
 
 [[bench]]
 name = "interval_pipeline"

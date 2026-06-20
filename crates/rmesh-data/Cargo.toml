@@ -9,6 +9,7 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 bytemuck = { workspace = true }
+wgpu = { workspace = true }
 glam = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }

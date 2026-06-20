@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 rmesh-render = { path = "../rmesh-render" }
+rmesh-raytrace = { path = "../rmesh-raytrace" }
 rmesh-trainable = { path = "../rmesh-trainable" }
 rmesh-error = { path = "../rmesh-error" }
 rmesh-data = { path = "../rmesh-data" }

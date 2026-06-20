@@ -1,0 +1,12 @@
+[package]
+name = "rmesh-postprocess"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-util = { path = "../rmesh-util" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }

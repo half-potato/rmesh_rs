@@ -156,6 +156,26 @@ pub struct BVHNode {
     pub right_or_count: i32,
 }
 
+/// Per-light data for deferred shading (matches WGSL `Light` struct).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Pod, Zeroable)]
+pub struct GpuLight {
+    pub position: [f32; 3],
+    pub light_type: u32, // 0=point, 1=spot, 2=directional
+    pub color: [f32; 3],
+    pub intensity: f32,
+    /// Pre-normalized — shader skips the normalize.
+    pub direction: [f32; 3],
+    /// cos(inner_angle) — pre-computed so the shader avoids a per-pixel cos.
+    pub inner_cos: f32,
+    /// cos(outer_angle) — pre-computed so the shader avoids a per-pixel cos.
+    pub outer_cos: f32,
+    pub _pad: [f32; 3],
+}
+
+/// Maximum number of lights supported.
+pub const MAX_LIGHTS: usize = 16;
+
 // Safe math constants (from safe_math.slang)
 pub const SAFE_MIN: f32 = -1e20;
 pub const SAFE_MAX: f32 = 1e20;

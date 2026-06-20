@@ -1,5 +1,6 @@
 pub mod camera;
 pub mod compose;
+pub mod gpu_helpers;
 pub mod sh_eval;
 pub mod shared;
 

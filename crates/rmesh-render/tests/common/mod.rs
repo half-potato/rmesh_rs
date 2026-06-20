@@ -723,18 +723,18 @@ async fn gpu_raytrace_scene_async(
     );
 
     // Build ray trace data
-    let neighbors = rmesh_render::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
-    let bvh = rmesh_render::build_boundary_bvh(
+    let neighbors = rmesh_raytrace::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
+    let bvh = rmesh_raytrace::build_boundary_bvh(
         &scene.vertices,
         &scene.indices,
         &neighbors,
         scene.tet_count as usize,
     );
-    let rt_pipeline = rmesh_render::RayTracePipeline::new(&device, w, h, 0);
-    let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &neighbors, &bvh);
+    let rt_pipeline = rmesh_raytrace::RayTracePipeline::new(&device, w, h, 0);
+    let rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&device, &neighbors, &bvh);
 
     // Determine start tet
-    let start_tet = rmesh_render::find_containing_tet(
+    let start_tet = rmesh_raytrace::find_containing_tet(
         &scene.vertices,
         &scene.indices,
         scene.tet_count as usize,
@@ -744,7 +744,7 @@ async fn gpu_raytrace_scene_async(
     .unwrap_or(-1);
     queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
 
-    let rt_bg = rmesh_render::create_raytrace_bind_group(
+    let rt_bg = rmesh_raytrace::create_raytrace_bind_group(
         &device,
         &rt_pipeline,
         &buffers,
@@ -789,7 +789,7 @@ async fn gpu_raytrace_scene_async(
     );
 
     // Ray trace
-    rmesh_render::record_raytrace(&mut encoder, &rt_pipeline, &rt_bg, w, h);
+    rmesh_raytrace::record_raytrace(&mut encoder, &rt_pipeline, &rt_bg, w, h);
 
     // Readback
     let readback = device.create_buffer(&wgpu::BufferDescriptor {

@@ -3386,6 +3386,7 @@ dependencies = [
  "log",
  "rayon",
  "web-time",
+ "wgpu",
 ]
 
 [[package]]
@@ -3436,6 +3437,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rmesh-postprocess"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "log",
+ "rmesh-util",
+ "wgpu",
+]
+
+[[package]]
 name = "rmesh-python"
 version = "0.1.0"
 dependencies = [
@@ -3448,9 +3461,23 @@ dependencies = [
  "pyo3",
  "rmesh-data",
  "rmesh-error",
+ "rmesh-raytrace",
  "rmesh-render",
  "rmesh-train",
  "rmesh-trainable",
+ "rmesh-util",
+ "wgpu",
+]
+
+[[package]]
+name = "rmesh-raytrace"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "glam",
+ "log",
+ "rmesh-data",
  "rmesh-util",
  "wgpu",
 ]
@@ -3469,6 +3496,7 @@ dependencies = [
  "rand",
  "rand_chacha",
  "rmesh-data",
+ "rmesh-raytrace",
  "rmesh-sort",
  "rmesh-tile",
  "rmesh-trainable",
@@ -3575,6 +3603,8 @@ dependencies = [
  "rmesh-dsm",
  "rmesh-interact",
  "rmesh-pbd",
+ "rmesh-postprocess",
+ "rmesh-raytrace",
  "rmesh-render",
  "rmesh-sort",
  "rmesh-util",

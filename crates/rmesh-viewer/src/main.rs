@@ -708,10 +708,10 @@ impl App {
         // Hi-Z mip pyramid over fused linear-Z. Built each frame; feeds GTAO
         // (and later SSGI). Pipelines are global; texture + bind groups are
         // resized when the surface size changes.
-        let hiz_pipelines = rmesh_render::HizPipelines::new(&device);
+        let hiz_pipelines = rmesh_postprocess::HizPipelines::new(&device);
         let hiz_texture =
-            rmesh_render::HizTexture::new(&device, size.width.max(1), size.height.max(1));
-        let hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
+            rmesh_postprocess::HizTexture::new(&device, size.width.max(1), size.height.max(1));
+        let hiz_linearize_bg = rmesh_postprocess::create_hiz_linearize_bind_group(
             &device,
             &hiz_pipelines,
             &primitive_targets.depth_view,
@@ -719,7 +719,7 @@ impl App {
         );
         let hiz_downsample_bgs: Vec<wgpu::BindGroup> = (0..(hiz_texture.mip_count as usize - 1))
             .map(|i| {
-                rmesh_render::create_hiz_downsample_bind_group(
+                rmesh_postprocess::create_hiz_downsample_bind_group(
                     &device,
                     &hiz_pipelines,
                     &hiz_texture.mip_views[i],
@@ -729,8 +729,8 @@ impl App {
 
         // GTAO pass — always created. AO target is in `targets`. Reads Hi-Z
         // for fused depth (sample any mip) and the volume MRT for std.
-        let gtao_pipeline = rmesh_render::GtaoPipeline::new(&device);
-        let gtao_bg = rmesh_render::create_gtao_bind_group(
+        let gtao_pipeline = rmesh_postprocess::GtaoPipeline::new(&device);
+        let gtao_bg = rmesh_postprocess::create_gtao_bind_group(
             &device,
             &gtao_pipeline,
             &hiz_texture.full_view,
@@ -741,8 +741,8 @@ impl App {
         // AO bilateral blur (separable, depth+normal aware). With temporal
         // accumulation in front of it, H reads ao_temporal_view (the
         // temporal-blended AO) and V writes back to ao_view (final).
-        let ao_blur_pipeline = rmesh_render::AoBlurPipeline::new(&device);
-        let ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
+        let ao_blur_pipeline = rmesh_postprocess::AoBlurPipeline::new(&device);
+        let ao_blur_bg_h = rmesh_postprocess::create_ao_blur_bind_group(
             &device,
             &ao_blur_pipeline,
             &ao_blur_pipeline.uniforms_h,
@@ -750,7 +750,7 @@ impl App {
             &hiz_texture.full_view,
             &targets.normals_view,
         );
-        let ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
+        let ao_blur_bg_v = rmesh_postprocess::create_ao_blur_bind_group(
             &device,
             &ao_blur_pipeline,
             &ao_blur_pipeline.uniforms_v,
@@ -761,9 +761,9 @@ impl App {
 
         // SSGI: compute (Hi-Z ray march, samples lit_history) + bilateral denoise.
         // lit_history rotates → bind group doubled, indexed by parity.
-        let ssgi_pipeline = rmesh_render::SsgiPipeline::new(&device);
+        let ssgi_pipeline = rmesh_postprocess::SsgiPipeline::new(&device);
         let ssgi_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_render::create_ssgi_bind_group(
+            rmesh_postprocess::create_ssgi_bind_group(
                 &device,
                 &ssgi_pipeline,
                 &hiz_texture.full_view,
@@ -773,8 +773,8 @@ impl App {
         });
         // SSGI blur reads the temporal-blended SSGI (ssgi_temporal_view), not
         // the raw ssgi_view. V still writes back to ssgi_view (final).
-        let ssgi_blur_pipeline = rmesh_render::SsgiBlurPipeline::new(&device);
-        let ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
+        let ssgi_blur_pipeline = rmesh_postprocess::SsgiBlurPipeline::new(&device);
+        let ssgi_blur_bg_h = rmesh_postprocess::create_ssgi_blur_bind_group(
             &device,
             &ssgi_blur_pipeline,
             &ssgi_blur_pipeline.uniforms_h,
@@ -782,7 +782,7 @@ impl App {
             &hiz_texture.full_view,
             &targets.normals_view,
         );
-        let ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
+        let ssgi_blur_bg_v = rmesh_postprocess::create_ssgi_blur_bind_group(
             &device,
             &ssgi_blur_pipeline,
             &ssgi_blur_pipeline.uniforms_v,
@@ -795,9 +795,9 @@ impl App {
         // doubled for parity: each variant binds (current, history) in the
         // orientation appropriate for that frame.
         let ssgi_temporal_pipeline =
-            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
         let ssgi_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_render::create_temporal_bind_group(
+            rmesh_postprocess::create_temporal_bind_group(
                 &device,
                 &ssgi_temporal_pipeline,
                 targets.ssgi_current(p as u32),
@@ -806,9 +806,9 @@ impl App {
             )
         });
         let ao_temporal_pipeline =
-            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
+            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
         let ao_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_render::create_temporal_bind_group(
+            rmesh_postprocess::create_temporal_bind_group(
                 &device,
                 &ao_temporal_pipeline,
                 targets.ao_current(p as u32),
@@ -820,9 +820,9 @@ impl App {
         // SSR pipeline + temporal (third TemporalPipeline instance, Rgba16Float).
         // lit_history + ssgi_current rotate → ssr_bg doubled. ssr_current /
         // ssr_history rotate → ssr_temporal_bg doubled.
-        let ssr_pipeline = rmesh_render::SsrPipeline::new(&device);
+        let ssr_pipeline = rmesh_postprocess::SsrPipeline::new(&device);
         let ssr_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_render::create_ssr_bind_group(
+            rmesh_postprocess::create_ssr_bind_group(
                 &device,
                 &ssr_pipeline,
                 &hiz_texture.full_view,
@@ -833,9 +833,9 @@ impl App {
             )
         });
         let ssr_temporal_pipeline =
-            rmesh_render::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
+            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
         let ssr_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_render::create_temporal_bind_group(
+            rmesh_postprocess::create_temporal_bind_group(
                 &device,
                 &ssr_temporal_pipeline,
                 targets.ssr_current(p as u32),
@@ -859,11 +859,11 @@ impl App {
             // Clear both slots of each ping-pong pair so whichever slot is
             // "history" on frame 0 is deterministic regardless of parity.
             for p in 0..2u32 {
-                rmesh_render::clear_texture_view(&mut enc, targets.lit_history(p), black);
-                rmesh_render::clear_texture_view(&mut enc, targets.ssgi_history(p), black);
-                rmesh_render::clear_texture_view(&mut enc, targets.ao_history(p), black);
-                rmesh_render::clear_texture_view(&mut enc, targets.ssr_history(p), black);
-                rmesh_render::clear_texture_view(&mut enc, targets.ssr_current(p), black);
+                rmesh_postprocess::clear_texture_view(&mut enc, targets.lit_history(p), black);
+                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssgi_history(p), black);
+                rmesh_postprocess::clear_texture_view(&mut enc, targets.ao_history(p), black);
+                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssr_history(p), black);
+                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssr_current(p), black);
             }
             queue.submit(std::iter::once(enc.finish()));
         }
@@ -879,13 +879,16 @@ impl App {
             deferred_dsm_dummy_bg,
         ) = if has_pbr {
             log::info!("Creating deferred PBR shading pipeline...");
-            let dp = rmesh_render::DeferredShadePipeline::new(&device, color_format);
+            let dp = rmesh_postprocess::DeferredShadePipeline::new(&device, color_format);
             // Deferred BG doubled for parity: ao/ssgi/ssr_current rotate, lit_history rotates.
             let bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-                rmesh_render::create_deferred_bind_group(
+                rmesh_postprocess::create_deferred_bind_group(
                     &device,
                     &dp,
-                    &targets,
+                    &targets.color_view,
+                    &targets.aux0_view,
+                    &targets.normals_view,
+                    &targets.depth_view,
                     &primitive_targets.depth_view,
                     targets.ao_current(p as u32),
                     targets.ssgi_current(p as u32),
@@ -895,7 +898,7 @@ impl App {
             });
             // Dummy DSM bind group (1x1 atlas, no lights)
             let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
-            let dummy_dsm_bg = rmesh_render::create_deferred_dsm_bind_group(
+            let dummy_dsm_bg = rmesh_postprocess::create_deferred_dsm_bind_group(
                 &device,
                 &dp,
                 &dummy_atlas.cubemap_views[0],
@@ -936,18 +939,18 @@ impl App {
         log::info!("Building ray trace data... (STUBBED FOR DIAGNOSTIC)");
         let t0 = std::time::Instant::now();
         let rt_neighbors: Vec<i32> = vec![-1];
-        let rt_bvh = rmesh_render::BVHData {
+        let rt_bvh = rmesh_raytrace::BVHData {
             nodes: Vec::new(),
             boundary_faces: Vec::new(),
         };
         let rt_pipeline =
-            rmesh_render::RayTracePipeline::new(&device, size.width.max(1), size.height.max(1), 0);
-        let rt_buffers = rmesh_render::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
+            rmesh_raytrace::RayTracePipeline::new(&device, size.width.max(1), size.height.max(1), 0);
+        let rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
         let start_tet: i32 = -1; // DIAGNOSTIC: skip find_containing_tet
         queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
         self.rt_neighbors_cpu = rt_neighbors;
         self.rt_start_tet_hint = start_tet;
-        let rt_bg = rmesh_render::create_raytrace_bind_group(
+        let rt_bg = rmesh_raytrace::create_raytrace_bind_group(
             &device,
             &rt_pipeline,
             &buffers,
@@ -1508,12 +1511,15 @@ impl App {
 
                 // Recreate deferred pipeline
                 let color_format = wgpu::TextureFormat::Rgba16Float;
-                let dp = rmesh_render::DeferredShadePipeline::new(&gpu.device, color_format);
+                let dp = rmesh_postprocess::DeferredShadePipeline::new(&gpu.device, color_format);
                 gpu.deferred_bg = Some(std::array::from_fn(|p| {
-                    rmesh_render::create_deferred_bind_group(
+                    rmesh_postprocess::create_deferred_bind_group(
                         &gpu.device,
                         &dp,
-                        &gpu.targets,
+                        &gpu.targets.color_view,
+                        &gpu.targets.aux0_view,
+                        &gpu.targets.normals_view,
+                        &gpu.targets.depth_view,
                         &gpu.primitive_targets.depth_view,
                         gpu.targets.ao_current(p as u32),
                         gpu.targets.ssgi_current(p as u32),
@@ -1523,7 +1529,7 @@ impl App {
                 }));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
-                gpu.deferred_dsm_dummy_bg = Some(rmesh_render::create_deferred_dsm_bind_group(
+                gpu.deferred_dsm_dummy_bg = Some(rmesh_postprocess::create_deferred_dsm_bind_group(
                     &gpu.device,
                     &dp,
                     &dummy_atlas.cubemap_views[0],
@@ -1580,7 +1586,7 @@ impl App {
             );
 
             // Recreate ray trace neighbors + state
-            let neighbors = rmesh_render::compute_tet_neighbors(
+            let neighbors = rmesh_raytrace::compute_tet_neighbors(
                 &self.scene_data.indices,
                 self.scene_data.tet_count as usize,
             );
@@ -1595,7 +1601,7 @@ impl App {
             gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
 
 
-            let rt_bvh = rmesh_render::build_boundary_bvh(
+            let rt_bvh = rmesh_raytrace::build_boundary_bvh(
                 &self.scene_data.vertices,
                 &self.scene_data.indices,
                 &neighbors,
@@ -1603,9 +1609,9 @@ impl App {
             );
             let w = gpu.surface_config.width;
             let h = gpu.surface_config.height;
-            gpu.rt_pipeline = rmesh_render::RayTracePipeline::new(&gpu.device, w, h, 0);
-            gpu.rt_buffers = rmesh_render::RayTraceBuffers::new(&gpu.device, &neighbors, &rt_bvh);
-            let start_tet = rmesh_render::find_containing_tet(
+            gpu.rt_pipeline = rmesh_raytrace::RayTracePipeline::new(&gpu.device, w, h, 0);
+            gpu.rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&gpu.device, &neighbors, &rt_bvh);
+            let start_tet = rmesh_raytrace::find_containing_tet(
                 &self.scene_data.vertices,
                 &self.scene_data.indices,
                 self.scene_data.tet_count as usize,
@@ -1620,7 +1626,7 @@ impl App {
             );
             self.rt_neighbors_cpu = neighbors.clone();
             self.rt_start_tet_hint = start_tet;
-            gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
+            gpu.rt_bg = rmesh_raytrace::create_raytrace_bind_group(
                 &gpu.device,
                 &gpu.rt_pipeline,
                 &gpu.buffers,
@@ -1666,8 +1672,8 @@ impl App {
 
             // Recreate Hi-Z (texture + per-mip bind groups) since size changed.
             gpu.hiz_texture =
-                rmesh_render::HizTexture::new(&gpu.device, new_size.width, new_size.height);
-            gpu.hiz_linearize_bg = rmesh_render::create_hiz_linearize_bind_group(
+                rmesh_postprocess::HizTexture::new(&gpu.device, new_size.width, new_size.height);
+            gpu.hiz_linearize_bg = rmesh_postprocess::create_hiz_linearize_bind_group(
                 &gpu.device,
                 &gpu.hiz_pipelines,
                 &gpu.primitive_targets.depth_view,
@@ -1675,7 +1681,7 @@ impl App {
             );
             gpu.hiz_downsample_bgs = (0..(gpu.hiz_texture.mip_count as usize - 1))
                 .map(|i| {
-                    rmesh_render::create_hiz_downsample_bind_group(
+                    rmesh_postprocess::create_hiz_downsample_bind_group(
                         &gpu.device,
                         &gpu.hiz_pipelines,
                         &gpu.hiz_texture.mip_views[i],
@@ -1684,7 +1690,7 @@ impl App {
                 .collect();
 
             // Recreate GTAO bind group: Hi-Z full view + normals + volume depth.
-            gpu.gtao_bg = rmesh_render::create_gtao_bind_group(
+            gpu.gtao_bg = rmesh_postprocess::create_gtao_bind_group(
                 &gpu.device,
                 &gpu.gtao_pipeline,
                 &gpu.hiz_texture.full_view,
@@ -1693,7 +1699,7 @@ impl App {
             );
 
             // Recreate AO blur bind groups. H reads ao_temporal_view (post-temporal).
-            gpu.ao_blur_bg_h = rmesh_render::create_ao_blur_bind_group(
+            gpu.ao_blur_bg_h = rmesh_postprocess::create_ao_blur_bind_group(
                 &gpu.device,
                 &gpu.ao_blur_pipeline,
                 &gpu.ao_blur_pipeline.uniforms_h,
@@ -1701,7 +1707,7 @@ impl App {
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
-            gpu.ao_blur_bg_v = rmesh_render::create_ao_blur_bind_group(
+            gpu.ao_blur_bg_v = rmesh_postprocess::create_ao_blur_bind_group(
                 &gpu.device,
                 &gpu.ao_blur_pipeline,
                 &gpu.ao_blur_pipeline.uniforms_v,
@@ -1712,7 +1718,7 @@ impl App {
 
             // Recreate SSGI bind groups (doubled for parity).
             gpu.ssgi_bg = std::array::from_fn(|p| {
-                rmesh_render::create_ssgi_bind_group(
+                rmesh_postprocess::create_ssgi_bind_group(
                     &gpu.device,
                     &gpu.ssgi_pipeline,
                     &gpu.hiz_texture.full_view,
@@ -1720,7 +1726,7 @@ impl App {
                     gpu.targets.lit_history(p as u32),
                 )
             });
-            gpu.ssgi_blur_bg_h = rmesh_render::create_ssgi_blur_bind_group(
+            gpu.ssgi_blur_bg_h = rmesh_postprocess::create_ssgi_blur_bind_group(
                 &gpu.device,
                 &gpu.ssgi_blur_pipeline,
                 &gpu.ssgi_blur_pipeline.uniforms_h,
@@ -1728,7 +1734,7 @@ impl App {
                 &gpu.hiz_texture.full_view,
                 &gpu.targets.normals_view,
             );
-            gpu.ssgi_blur_bg_v = rmesh_render::create_ssgi_blur_bind_group(
+            gpu.ssgi_blur_bg_v = rmesh_postprocess::create_ssgi_blur_bind_group(
                 &gpu.device,
                 &gpu.ssgi_blur_pipeline,
                 &gpu.ssgi_blur_pipeline.uniforms_v,
@@ -1739,7 +1745,7 @@ impl App {
 
             // Recreate temporal bind groups (doubled for parity).
             gpu.ssgi_temporal_bg = std::array::from_fn(|p| {
-                rmesh_render::create_temporal_bind_group(
+                rmesh_postprocess::create_temporal_bind_group(
                     &gpu.device,
                     &gpu.ssgi_temporal_pipeline,
                     gpu.targets.ssgi_current(p as u32),
@@ -1748,7 +1754,7 @@ impl App {
                 )
             });
             gpu.ao_temporal_bg = std::array::from_fn(|p| {
-                rmesh_render::create_temporal_bind_group(
+                rmesh_postprocess::create_temporal_bind_group(
                     &gpu.device,
                     &gpu.ao_temporal_pipeline,
                     gpu.targets.ao_current(p as u32),
@@ -1759,7 +1765,7 @@ impl App {
 
             // Recreate SSR + SSR temporal bind groups (doubled for parity).
             gpu.ssr_bg = std::array::from_fn(|p| {
-                rmesh_render::create_ssr_bind_group(
+                rmesh_postprocess::create_ssr_bind_group(
                     &gpu.device,
                     &gpu.ssr_pipeline,
                     &gpu.hiz_texture.full_view,
@@ -1770,7 +1776,7 @@ impl App {
                 )
             });
             gpu.ssr_temporal_bg = std::array::from_fn(|p| {
-                rmesh_render::create_temporal_bind_group(
+                rmesh_postprocess::create_temporal_bind_group(
                     &gpu.device,
                     &gpu.ssr_temporal_pipeline,
                     gpu.targets.ssr_current(p as u32),
@@ -1793,11 +1799,11 @@ impl App {
                     a: 0.0,
                 };
                 for p in 0..2u32 {
-                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.lit_history(p), black);
-                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssgi_history(p), black);
-                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ao_history(p), black);
-                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssr_history(p), black);
-                    rmesh_render::clear_texture_view(&mut enc, gpu.targets.ssr_current(p), black);
+                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.lit_history(p), black);
+                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssgi_history(p), black);
+                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ao_history(p), black);
+                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssr_history(p), black);
+                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssr_current(p), black);
                 }
                 gpu.queue.submit(std::iter::once(enc.finish()));
             }
@@ -1805,10 +1811,13 @@ impl App {
             // Recreate deferred resources since MRT texture views changed
             if let Some(ref dp) = gpu.deferred_pipeline {
                 gpu.deferred_bg = Some(std::array::from_fn(|p| {
-                    rmesh_render::create_deferred_bind_group(
+                    rmesh_postprocess::create_deferred_bind_group(
                         &gpu.device,
                         dp,
-                        &gpu.targets,
+                        &gpu.targets.color_view,
+                        &gpu.targets.aux0_view,
+                        &gpu.targets.normals_view,
+                        &gpu.targets.depth_view,
                         &gpu.primitive_targets.depth_view,
                         gpu.targets.ao_current(p as u32),
                         gpu.targets.ssgi_current(p as u32),
@@ -1920,13 +1929,13 @@ impl App {
             }
 
             // Recreate ray trace pipeline + texture for new size
-            gpu.rt_pipeline = rmesh_render::RayTracePipeline::new(
+            gpu.rt_pipeline = rmesh_raytrace::RayTracePipeline::new(
                 &gpu.device,
                 new_size.width,
                 new_size.height,
                 0,
             );
-            gpu.rt_bg = rmesh_render::create_raytrace_bind_group(
+            gpu.rt_bg = rmesh_raytrace::create_raytrace_bind_group(
                 &gpu.device,
                 &gpu.rt_pipeline,
                 &gpu.buffers,

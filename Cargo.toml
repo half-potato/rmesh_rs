@@ -5,6 +5,8 @@ members = [
     "crates/rmesh-sort",
     "crates/rmesh-tile",
     "crates/rmesh-render",
+    "crates/rmesh-raytrace",
+    "crates/rmesh-postprocess",
     "crates/rmesh-trainable",
     "crates/rmesh-error",
     "crates/rmesh-data",

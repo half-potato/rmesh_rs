@@ -57,12 +57,15 @@ use rmesh_error::{
     create_error_bg0, create_error_bg1, record_error_pass, ErrorBuffers, ErrorInputBuffers,
     ErrorPipeline,
 };
+use rmesh_raytrace::{
+    build_boundary_bvh, compute_tet_neighbors, create_locate_bind_group,
+    create_raytrace_bind_group, find_containing_tet_walk, record_locate, record_raytrace,
+    LocatePipeline, LocateUniforms, RayTraceBuffers, RayTracePipeline,
+};
 use rmesh_render::{
-    build_boundary_bvh, compute_tet_neighbors, create_compute_bind_group, create_locate_bind_group,
-    create_raytrace_bind_group, create_render_bind_group, find_containing_tet_walk, make_uniforms,
-    record_forward_pass, record_locate, record_project_compute, record_raytrace,
-    record_tex_to_buffer, ForwardPipelines, LocatePipeline, LocateUniforms, MaterialBuffers,
-    RayTraceBuffers, RayTracePipeline, RenderTargets, SceneBuffers, TexToBufferPipeline,
+    create_compute_bind_group, create_render_bind_group, make_uniforms, record_forward_pass,
+    record_project_compute, record_tex_to_buffer, ForwardPipelines, MaterialBuffers, RenderTargets,
+    SceneBuffers, TexToBufferPipeline,
 };
 use rmesh_train::{
     create_adam_bind_group, create_loss_bind_group, AdamPipeline, AdamState, LossBuffers,

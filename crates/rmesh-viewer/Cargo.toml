@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 rmesh-render = { path = "../rmesh-render" }
+rmesh-raytrace = { path = "../rmesh-raytrace" }
+rmesh-postprocess = { path = "../rmesh-postprocess" }
 rmesh-data = { path = "../rmesh-data" }
 rmesh-sort = { path = "../rmesh-sort" }
 rmesh-pbd = { path = "../rmesh-pbd" }

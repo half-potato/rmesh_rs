@@ -199,42 +199,42 @@ pub struct GpuState {
     // PBR aux data (per-tet material channels, uploaded when PBR data present)
     pub aux_data_buf: Option<wgpu::Buffer>,
     // Deferred PBR shading (only when PBR data is loaded)
-    pub deferred_pipeline: Option<rmesh_render::DeferredShadePipeline>,
+    pub deferred_pipeline: Option<rmesh_postprocess::DeferredShadePipeline>,
     /// Deferred bind group, doubled for ping-pong parity. Index by frame_parity.
     pub deferred_bg: Option<[wgpu::BindGroup; 2]>,
     /// GTAO ambient-occlusion pass (always created; AO target lives in `targets`).
-    pub gtao_pipeline: rmesh_render::GtaoPipeline,
+    pub gtao_pipeline: rmesh_postprocess::GtaoPipeline,
     pub gtao_bg: wgpu::BindGroup,
     /// Hi-Z mip pyramid (linear view-space Z fused from hw + volume depth).
     /// Built each frame before GTAO; will also feed SSGI.
-    pub hiz_pipelines: rmesh_render::HizPipelines,
-    pub hiz_texture: rmesh_render::HizTexture,
+    pub hiz_pipelines: rmesh_postprocess::HizPipelines,
+    pub hiz_texture: rmesh_postprocess::HizTexture,
     pub hiz_linearize_bg: wgpu::BindGroup,
     pub hiz_downsample_bgs: Vec<wgpu::BindGroup>,
     /// AO bilateral blur (depth+normal aware). Two passes (H, V) using one
     /// pipeline; ping-pongs between `targets.ao_view` and `ao_blur_temp_view`.
-    pub ao_blur_pipeline: rmesh_render::AoBlurPipeline,
+    pub ao_blur_pipeline: rmesh_postprocess::AoBlurPipeline,
     pub ao_blur_bg_h: wgpu::BindGroup,
     pub ao_blur_bg_v: wgpu::BindGroup,
     /// SSGI compute (Hi-Z ray-march, samples lit_history) + bilateral denoise.
     /// ssgi_bg doubled for parity (lit_history rotates each frame).
-    pub ssgi_pipeline: rmesh_render::SsgiPipeline,
+    pub ssgi_pipeline: rmesh_postprocess::SsgiPipeline,
     pub ssgi_bg: [wgpu::BindGroup; 2],
-    pub ssgi_blur_pipeline: rmesh_render::SsgiBlurPipeline,
+    pub ssgi_blur_pipeline: rmesh_postprocess::SsgiBlurPipeline,
     pub ssgi_blur_bg_h: wgpu::BindGroup,
     pub ssgi_blur_bg_v: wgpu::BindGroup,
     /// Temporal accumulation pipelines for SSGI (Rgba16Float) and AO (R8Unorm).
     /// Bind groups doubled for parity: each variant binds (current, history) in
     /// the orientation appropriate for that frame.
-    pub ssgi_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssgi_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
     pub ssgi_temporal_bg: [wgpu::BindGroup; 2],
-    pub ao_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ao_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
     pub ao_temporal_bg: [wgpu::BindGroup; 2],
     /// SSR (specular reflections via Hi-Z reflection-direction ray-march) +
     /// its temporal pipeline. Both bind groups doubled for parity.
-    pub ssr_pipeline: rmesh_render::SsrPipeline,
+    pub ssr_pipeline: rmesh_postprocess::SsrPipeline,
     pub ssr_bg: [wgpu::BindGroup; 2],
-    pub ssr_temporal_pipeline: rmesh_render::TemporalPipeline,
+    pub ssr_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
     pub ssr_temporal_bg: [wgpu::BindGroup; 2],
     /// Frame counter for SSGI per-pixel jitter rotation.
     pub frame_counter: u32,
@@ -266,8 +266,8 @@ pub struct GpuState {
     pub deferred_dsm_bg: Option<wgpu::BindGroup>,
     pub deferred_dsm_dummy_bg: Option<wgpu::BindGroup>,
     // Ray trace
-    pub rt_pipeline: rmesh_render::RayTracePipeline,
-    pub rt_buffers: rmesh_render::RayTraceBuffers,
+    pub rt_pipeline: rmesh_raytrace::RayTracePipeline,
+    pub rt_buffers: rmesh_raytrace::RayTraceBuffers,
     pub rt_bg: wgpu::BindGroup,
     /// Rgba32Float texture for copying raytrace buffer output for blitting
     pub rt_texture: wgpu::Texture,

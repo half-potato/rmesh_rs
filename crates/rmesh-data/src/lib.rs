@@ -15,6 +15,9 @@
 //!
 //! For training, we decompress PCA back to direct SH coefficients per tet.
 
+pub mod gpu_buffers;
+pub use gpu_buffers::{MaterialBuffers, SceneBuffers, UNIFORMS_BUFFER_SIZE};
+
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use half::f16;
