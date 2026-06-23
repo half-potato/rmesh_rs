@@ -8,7 +8,8 @@
 
 use rmesh_tile::{dispatch_2d, storage_entry};
 
-const ERROR_TILED_WGSL: &str = include_str!("wgsl/error_tiled_compute.wgsl");
+static ERROR_TILED_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/error_tiled_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // Buffer types
@@ -79,7 +80,7 @@ impl ErrorPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("error_tiled_compute"),
-            source: wgpu::ShaderSource::Wgsl(ERROR_TILED_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(ERROR_TILED_WGSL.as_str().into()),
         });
 
         // Group 0: 9 read-only bindings (scene + tile data)

@@ -15,15 +15,19 @@ use rmesh_util::gpu_helpers::{record_fullscreen_pass, tex_entry};
 use rmesh_util::shared::{GpuLight, MAX_LIGHTS};
 
 // WGSL shader sources, embedded from crate-local files.
-const DEFERRED_SHADE_FRAG_WGSL: &str = include_str!("wgsl/deferred_shade_frag.wgsl");
-const GTAO_WGSL: &str = include_str!("wgsl/gtao.wgsl");
-const HIZ_LINEARIZE_WGSL: &str = include_str!("wgsl/hiz_linearize.wgsl");
-const HIZ_DOWNSAMPLE_WGSL: &str = include_str!("wgsl/hiz_downsample.wgsl");
-const AO_BILATERAL_WGSL: &str = include_str!("wgsl/ao_bilateral.wgsl");
-const SSGI_COMPUTE_WGSL: &str = include_str!("wgsl/ssgi_compute.wgsl");
-const SSGI_BILATERAL_WGSL: &str = include_str!("wgsl/ssgi_bilateral.wgsl");
-const SSR_COMPUTE_WGSL: &str = include_str!("wgsl/ssr_compute.wgsl");
-const TEMPORAL_WGSL: &str = include_str!("wgsl/temporal.wgsl");
+static DEFERRED_SHADE_FRAG_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/deferred_shade_frag.wgsl");
+static GTAO_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/gtao.wgsl");
+static HIZ_LINEARIZE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/hiz_linearize.wgsl");
+static HIZ_DOWNSAMPLE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/hiz_downsample.wgsl");
+static AO_BILATERAL_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/ao_bilateral.wgsl");
+static SSGI_COMPUTE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/ssgi_compute.wgsl");
+static SSGI_BILATERAL_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/ssgi_bilateral.wgsl");
+static SSR_COMPUTE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/ssr_compute.wgsl");
+static TEMPORAL_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/temporal.wgsl");
 
 // ---------------------------------------------------------------------------
 // PBR deferred shading types
@@ -82,7 +86,7 @@ impl DeferredShadePipeline {
     pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("deferred_shade_frag.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DEFERRED_SHADE_FRAG_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DEFERRED_SHADE_FRAG_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -451,7 +455,7 @@ impl GtaoPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gtao.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(GTAO_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(GTAO_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -639,11 +643,11 @@ impl HizPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
         let linearize_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("hiz_linearize.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(HIZ_LINEARIZE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(HIZ_LINEARIZE_WGSL.as_str().into()),
         });
         let downsample_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("hiz_downsample.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(HIZ_DOWNSAMPLE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(HIZ_DOWNSAMPLE_WGSL.as_str().into()),
         });
 
         let linearize_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -972,7 +976,7 @@ impl AoBlurPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ao_bilateral.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(AO_BILATERAL_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(AO_BILATERAL_WGSL.as_str().into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1170,7 +1174,7 @@ impl SsgiPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ssgi_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SSGI_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(SSGI_COMPUTE_WGSL.as_str().into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1332,7 +1336,7 @@ impl SsgiBlurPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ssgi_bilateral.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SSGI_BILATERAL_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(SSGI_BILATERAL_WGSL.as_str().into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1504,7 +1508,7 @@ impl SsrPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ssr_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SSR_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(SSR_COMPUTE_WGSL.as_str().into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1718,7 +1722,7 @@ impl TemporalPipeline {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("temporal.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(TEMPORAL_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TEMPORAL_WGSL.as_str().into()),
         });
 
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

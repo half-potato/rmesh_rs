@@ -6,7 +6,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-const SH_EVAL_WGSL: &str = include_str!("wgsl/sh_eval_compute.wgsl");
+static SH_EVAL_WGSL: crate::HotShader = crate::hot_shader!("wgsl/sh_eval_compute.wgsl");
 
 /// Uniforms for the SH evaluation compute shader (32 bytes, std140-compatible).
 #[repr(C)]
@@ -28,7 +28,7 @@ impl ShEvalPipeline {
     /// Create the SH eval compute pipeline.
     pub fn new(device: &wgpu::Device) -> Self {
         let shader_module =
-            crate::compose::create_shader_module(device, "sh_eval_compute.wgsl", SH_EVAL_WGSL)
+            crate::compose::create_shader_module(device, "sh_eval_compute.wgsl", &SH_EVAL_WGSL)
                 .expect("Failed to compose sh_eval_compute shader");
 
         let bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

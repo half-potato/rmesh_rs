@@ -26,9 +26,12 @@ pub use rmesh_tile::{
 };
 
 // WGSL shader sources, embedded from crate-local files.
-const BACKWARD_TILED_WGSL: &str = include_str!("wgsl/backward_tiled_compute.wgsl");
-const BACKWARD_INTERVAL_TILED_WGSL: &str = include_str!("wgsl/backward_interval_tiled.wgsl");
-const INTERVAL_CHAIN_BACK_WGSL: &str = include_str!("wgsl/interval_chain_back.wgsl");
+static BACKWARD_TILED_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/backward_tiled_compute.wgsl");
+static BACKWARD_INTERVAL_TILED_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/backward_interval_tiled.wgsl");
+static INTERVAL_CHAIN_BACK_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_chain_back.wgsl");
 
 // Forward (compute-based) tiled rasterizers — the forward half of the
 // trainable pipeline. Moved out of rmesh-render because they exist solely
@@ -120,7 +123,7 @@ impl BackwardTiledPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("backward_tiled_compute"),
-            source: wgpu::ShaderSource::Wgsl(BACKWARD_TILED_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(BACKWARD_TILED_WGSL.as_str().into()),
         });
 
         // Group 0: 9 read-only bindings
@@ -536,7 +539,7 @@ impl IntervalChainBackPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_chain_back"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_CHAIN_BACK_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_CHAIN_BACK_WGSL.as_str().into()),
         });
 
         // Group 0: 10 read-only bindings

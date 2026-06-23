@@ -94,7 +94,6 @@ impl CollisionMesh {
         tet_count: usize,
         threshold: f32,
     ) -> Self {
-
         // Collect faces from dense tets. Key = sorted (i, j, k).
         // Value = (tet_index, face_index, count).
         let mut face_map: HashMap<[u32; 3], Vec<(usize, usize)>> = HashMap::new();
@@ -177,7 +176,8 @@ impl CollisionMesh {
     /// Ray-segment intersection. Returns the closest hit distance t ∈ (0, t_max], or None.
     #[allow(dead_code)] // exercised by tests; kept on the public API
     pub fn ray_intersect(&self, origin: Vec3, dir: Vec3, t_max: f32) -> Option<f32> {
-        self.ray_intersect_with_normal(origin, dir, t_max).map(|(t, _)| t)
+        self.ray_intersect_with_normal(origin, dir, t_max)
+            .map(|(t, _)| t)
     }
 
     /// Like [`ray_intersect`] but also returns the outward surface normal of the hit triangle.
@@ -580,9 +580,8 @@ impl FlareSystem {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let t0 = std::time::Instant::now();
-            let mesh = CollisionMesh::build_from_slices(
-                &verts, &idxs, &densities, tet_count, threshold,
-            );
+            let mesh =
+                CollisionMesh::build_from_slices(&verts, &idxs, &densities, tet_count, threshold);
             log::info!(
                 "[flare] async collision-mesh rebuild done in {:.2}s",
                 t0.elapsed().as_secs_f64()
@@ -679,8 +678,8 @@ impl FlareSystem {
                     // outward along the surface normal by the model's lateral
                     // radius so the cylinder body doesn't clip into angled
                     // walls (purely-perpendicular hits get a negligible lift).
-                    flare.position += dir * (t - FLARE_RADIUS).max(0.0)
-                        + normal * FLARE_BODY_RADIUS;
+                    flare.position +=
+                        dir * (t - FLARE_RADIUS).max(0.0) + normal * FLARE_BODY_RADIUS;
                     flare.velocity = Vec3::ZERO;
                     flare.stuck = true;
                 } else {

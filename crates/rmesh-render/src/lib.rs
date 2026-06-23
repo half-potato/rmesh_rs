@@ -39,22 +39,36 @@ pub use rmesh_tile::{
 };
 
 // WGSL shader sources, embedded from crate-local files.
-const PROJECT_COMPUTE_WGSL: &str = include_str!("wgsl/project_compute.wgsl");
-const PROJECT_COMPUTE_HW_WGSL: &str = include_str!("wgsl/project_compute_hw.wgsl");
-const FORWARD_VERTEX_QUAD_WGSL: &str = include_str!("wgsl/forward_vertex_quad.wgsl");
-const FORWARD_PREPASS_COMPUTE_WGSL: &str = include_str!("wgsl/forward_prepass_compute.wgsl");
-const FORWARD_VERTEX_WGSL: &str = include_str!("wgsl/forward_vertex.wgsl");
-const FORWARD_FRAGMENT_WGSL: &str = include_str!("wgsl/forward_fragment.wgsl");
-const TEX_TO_BUFFER_WGSL: &str = include_str!("wgsl/tex_to_buffer.wgsl");
-const BLIT_WGSL: &str = include_str!("wgsl/blit.wgsl");
-const FORWARD_MESH_WGSL: &str = include_str!("wgsl/forward_mesh.wgsl");
-const INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/indirect_convert.wgsl");
-const INTERVAL_MESH_WGSL: &str = include_str!("wgsl/interval_mesh.wgsl");
-const INTERVAL_FRAGMENT_WGSL: &str = include_str!("wgsl/interval_fragment.wgsl");
-const INTERVAL_COMPUTE_WGSL: &str = include_str!("wgsl/interval_compute.wgsl");
-const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
-const INTERVAL_INDIRECT_CONVERT_WGSL: &str = include_str!("wgsl/interval_indirect_convert.wgsl");
-const PROJECT_COMPUTE_16BIT_WGSL: &str = include_str!("wgsl/project_compute_16bit.wgsl");
+static PROJECT_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/project_compute.wgsl");
+static PROJECT_COMPUTE_HW_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/project_compute_hw.wgsl");
+static FORWARD_VERTEX_QUAD_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/forward_vertex_quad.wgsl");
+static FORWARD_PREPASS_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/forward_prepass_compute.wgsl");
+static FORWARD_VERTEX_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/forward_vertex.wgsl");
+static FORWARD_FRAGMENT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/forward_fragment.wgsl");
+static TEX_TO_BUFFER_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/tex_to_buffer.wgsl");
+static BLIT_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/blit.wgsl");
+static FORWARD_MESH_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/forward_mesh.wgsl");
+static INDIRECT_CONVERT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/indirect_convert.wgsl");
+static INTERVAL_MESH_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_mesh.wgsl");
+static INTERVAL_FRAGMENT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_fragment.wgsl");
+static INTERVAL_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_compute.wgsl");
+static INTERVAL_VERTEX_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_vertex.wgsl");
+static INTERVAL_INDIRECT_CONVERT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_indirect_convert.wgsl");
+static PROJECT_COMPUTE_16BIT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/project_compute_16bit.wgsl");
 
 // ---------------------------------------------------------------------------
 // Pipelines
@@ -140,7 +154,7 @@ impl ForwardPipelines {
             });
         let compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("project_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_WGSL.as_str().into()),
         });
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("project_compute_pipeline"),
@@ -154,7 +168,7 @@ impl ForwardPipelines {
         // ----- 16-bit linear sort key variant (same layout, different shader) -----
         let compute_shader_16bit = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("project_compute_16bit.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_16BIT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_16BIT_WGSL.as_str().into()),
         });
         let compute_pipeline_16bit =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -213,7 +227,7 @@ impl ForwardPipelines {
             });
         let hw_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("project_compute_hw.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_HW_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_HW_WGSL.as_str().into()),
         });
         let hw_compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -247,11 +261,11 @@ impl ForwardPipelines {
             });
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_vertex.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_WGSL.as_str().into()),
         });
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.as_str().into()),
         });
 
         // Premultiplied alpha blend for color attachment 0
@@ -352,7 +366,7 @@ impl ForwardPipelines {
             });
         let prepass_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_prepass_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_PREPASS_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_PREPASS_COMPUTE_WGSL.as_str().into()),
         });
         let prepass_compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -389,7 +403,7 @@ impl ForwardPipelines {
         // Shares forward_fragment.wgsl — vertex output matches exactly.
         let quad_vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_vertex_quad.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_QUAD_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_VERTEX_QUAD_WGSL.as_str().into()),
         });
         let quad_render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("forward_quad_render_pipeline"),
@@ -591,11 +605,11 @@ impl MeshForwardPipelines {
         });
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_mesh.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_MESH_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_MESH_WGSL.as_str().into()),
         });
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("forward_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(FORWARD_FRAGMENT_WGSL.as_str().into()),
         });
 
         // Same blend state as ForwardPipelines
@@ -708,7 +722,7 @@ impl MeshForwardPipelines {
             });
         let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("indirect_convert.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.as_str().into()),
         });
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -817,11 +831,11 @@ impl IntervalPipelines {
         });
         let mesh_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_mesh.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_MESH_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_MESH_WGSL.as_str().into()),
         });
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.as_str().into()),
         });
 
         // Premultiplied alpha blend for single color attachment
@@ -917,7 +931,7 @@ impl IntervalPipelines {
             });
         let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_indirect_convert.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.as_str().into()),
         });
         // Override TETS_PER_GROUP to 16 for interval path
         let indirect_convert_pipeline =
@@ -1006,7 +1020,7 @@ impl ComputeIntervalPipelines {
         });
         let gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_WGSL.as_str().into()),
         });
         let gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("compute_interval_gen_pipeline"),
@@ -1039,11 +1053,11 @@ impl ComputeIntervalPipelines {
 
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_vertex.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.as_str().into()),
         });
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.as_str().into()),
         });
 
         let premul_blend = wgpu::BlendState {
@@ -1155,7 +1169,7 @@ impl ComputeIntervalPipelines {
             });
         let indirect_convert_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_indirect_convert.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_INDIRECT_CONVERT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_INDIRECT_CONVERT_WGSL.as_str().into()),
         });
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -1581,7 +1595,7 @@ impl TexToBufferPipeline {
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tex_to_buffer.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(TEX_TO_BUFFER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TEX_TO_BUFFER_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -2957,7 +2971,11 @@ pub fn record_compute_interval_project(
     // `tet_count`. The sort buffers stay over-allocated at n_pow2, so the
     // now-uninitialized [tet_count, n_pow2) tail is simply never read.
     let sort_count = tet_count;
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&sort_count));
+    queue.write_buffer(
+        sort_state.num_keys_buf(),
+        0,
+        bytemuck::bytes_of(&sort_count),
+    );
 
     // ----- 2. Compute pass (projection + SH eval) -----
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3319,7 +3337,7 @@ impl BlitPipeline {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(BLIT_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -3590,7 +3608,6 @@ pub fn record_blit_nf(
     rpass.set_bind_group(0, bind_group, &[]);
     rpass.draw(0..3, 0..1);
 }
-
 
 // Interval tiled pipeline (`IntervalTiledBuffers`, `IntervalGeneratePipeline`,
 // `IntervalTiledRasterizePipeline`) moved to `rmesh-trainable`.

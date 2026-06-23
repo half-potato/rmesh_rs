@@ -10,6 +10,11 @@
 
 use anyhow::Result;
 use glam::{Mat4, Quat, Vec3};
+use rmesh_data::SceneData;
+use rmesh_render::{
+    create_compute_bind_group, record_project_compute, ForwardPipelines, MaterialBuffers,
+    SceneBuffers, Uniforms,
+};
 use rmesh_trainable::{
     create_backward_tiled_bind_groups, create_prepare_dispatch_bind_group,
     create_rasterize_bind_group, create_rts_bind_group, create_tile_fill_bind_group,
@@ -19,11 +24,6 @@ use rmesh_trainable::{
     RadixSortState, RasterizeComputePipeline, ScanBuffers, ScanPipelines, SortBackend, TileBuffers,
     TilePipelines, TileUniforms,
 };
-use rmesh_data::SceneData;
-use rmesh_render::{
-    create_compute_bind_group, record_project_compute, ForwardPipelines, MaterialBuffers,
-    SceneBuffers, Uniforms,
-};
 use rmesh_util::shared::{AdamUniforms, LossUniforms};
 
 // Re-export these types so downstream crates (rmesh-python) can use them.
@@ -31,8 +31,8 @@ pub use rmesh_util::shared::AdamUniforms as AdamUniformsType;
 pub use rmesh_util::shared::LossUniforms as LossUniformsType;
 
 // WGSL shader sources.
-const LOSS_COMPUTE_WGSL: &str = include_str!("wgsl/loss_compute.wgsl");
-const ADAM_COMPUTE_WGSL: &str = include_str!("wgsl/adam_compute.wgsl");
+static LOSS_COMPUTE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/loss_compute.wgsl");
+static ADAM_COMPUTE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/adam_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -114,7 +114,7 @@ impl LossPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let loss_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("loss_compute"),
-            source: wgpu::ShaderSource::Wgsl(LOSS_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(LOSS_COMPUTE_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -249,7 +249,7 @@ impl AdamPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let adam_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("adam_compute"),
-            source: wgpu::ShaderSource::Wgsl(ADAM_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(ADAM_COMPUTE_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

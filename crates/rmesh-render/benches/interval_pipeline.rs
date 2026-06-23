@@ -250,10 +250,10 @@ fn record_frame(s: &State) {
         s.tet_count,
         &s.queue,
         &s.depth_view,
-        None,   // hw_compute_bg
-        None,   // profiler
-        false,  // use_16bit_sort
-        false,  // mrt_enabled — color-only keeps the bench focused on forward
+        None,  // hw_compute_bg
+        None,  // profiler
+        false, // use_16bit_sort
+        false, // mrt_enabled — color-only keeps the bench focused on forward
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));

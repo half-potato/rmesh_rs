@@ -177,6 +177,19 @@ const SHADOW_DEPTH_BIAS: f32   = 1.5e-3;
 const SHADOW_MIN_VARIANCE: f32 = 4.0e-4;
 const SHADOW_LBR: f32          = 0.15;
 
+// DEBUG knob: rotation applied to the DSM cube *lookup* direction only (see
+// evaluate_transmittance). Column-major. Swap in one of the commented variants
+// and reload (RMESH_HOT_SHADERS=1) to probe a write/read orientation mismatch.
+const SAMPLE_DIR_ROT: mat3x3<f32> = 
+    // mat3x3<f32>(vec3f(1.0, 0.0, 0.0), vec3f(0.0, 1.0, 0.0), vec3f(0.0, 0.0, 1.0)); // identity
+// +90° about X: 
+mat3x3<f32>(vec3f(1,0,0), vec3f(0,0,1), vec3f(0,-1,0));
+// -90° about X: mat3x3<f32>(vec3f(1,0,0), vec3f(0,0,-1), vec3f(0,1,0));
+// +90° about Y: mat3x3<f32>(vec3f(0,0,-1), vec3f(0,1,0), vec3f(1,0,0));
+// -90° about Y: mat3x3<f32>(vec3f(0,0,1), vec3f(0,1,0), vec3f(-1,0,0));
+// +90° about Z: mat3x3<f32>(vec3f(0,1,0), vec3f(-1,0,0), vec3f(0,0,1));
+// -90° about Z: mat3x3<f32>(vec3f(0,-1,0), vec3f(1,0,0), vec3f(0,0,1));
+
 fn linstep(lo: f32, hi: f32, v: f32) -> f32 {
     return clamp((v - lo) / (hi - lo), 0.0, 1.0);
 }
@@ -194,13 +207,19 @@ fn linstep(lo: f32, hi: f32, v: f32) -> f32 {
 fn evaluate_transmittance(world_pos: vec3f, li: u32) -> f32 {
     let sm = shadow_meta[li];
 
-    let dir = world_pos - lights[li].position;
+    let dir = (world_pos - lights[li].position);
     let face = select_cubemap_face(dir);
     // Only clip.w is needed for the receiver depth; pull it directly from the
     // precomputed W row instead of materializing the full mat4x4f.
     let clip_w = dot(sm.vp_w[face], vec4f(world_pos, 1.0));
 
-    let m = textureSample(dsm_moments, dsm_sampler, dir);
+    // DEBUG: read-only orientation probe. Rotates ONLY the cube lookup, not the
+    // receiver depth (face/clip_w above use the true dir). If a rotation here
+    // fixes the shadow, the cube is written rotated vs the sample convention —
+    // and the real fix belongs in CUBEMAP_DIRS. Identity = no change.
+    // Edit and reload with RMESH_HOT_SHADERS=1; no rebuild needed.
+    let sample_dir = dir;//SAMPLE_DIR_ROT * vec3f(-dir.x, dir.y, dir.z);
+    let m = textureSample(dsm_moments, dsm_sampler, sample_dir);
     let shadow_alpha = m.a;
     if shadow_alpha < 0.01 { return 1.0; }
 

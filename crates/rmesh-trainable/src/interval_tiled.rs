@@ -12,8 +12,10 @@ use crate::buf_entry;
 use rmesh_render::{MaterialBuffers, SceneBuffers};
 use rmesh_tile::dispatch_2d;
 
-const INTERVAL_GENERATE_WGSL: &str = include_str!("wgsl/interval_generate.wgsl");
-const INTERVAL_TILED_RASTERIZE_WGSL: &str = include_str!("wgsl/interval_tiled_rasterize.wgsl");
+static INTERVAL_GENERATE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_generate.wgsl");
+static INTERVAL_TILED_RASTERIZE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_tiled_rasterize.wgsl");
 
 // ---------------------------------------------------------------------------
 // Shared buffers
@@ -101,7 +103,7 @@ impl IntervalGeneratePipeline {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_generate.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_GENERATE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_GENERATE_WGSL.as_str().into()),
         });
 
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

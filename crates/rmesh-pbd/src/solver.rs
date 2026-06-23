@@ -8,6 +8,13 @@ use wgpu::util::DeviceExt;
 use crate::coloring::ConstraintColoring;
 use crate::island::Island;
 
+static APPLY_HANDLES_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("shaders/apply_handles.wgsl");
+static PREDICT_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("shaders/predict.wgsl");
+static SOLVE_DISTANCE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("shaders/solve_distance.wgsl");
+static FINALIZE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("shaders/finalize.wgsl");
+
 /// GPU layout for one particle. Matches the `Particle` WGSL struct: three
 /// vec4<f32>s, 48 bytes total, std430-natural.
 #[repr(C)]
@@ -57,19 +64,19 @@ impl PbdPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
         let apply_handles_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbd_apply_handles"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/apply_handles.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(APPLY_HANDLES_WGSL.as_str().into()),
         });
         let predict_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbd_predict"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/predict.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(PREDICT_WGSL.as_str().into()),
         });
         let solve_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbd_solve_distance"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/solve_distance.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(SOLVE_DISTANCE_WGSL.as_str().into()),
         });
         let finalize_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pbd_finalize"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/finalize.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(FINALIZE_WGSL.as_str().into()),
         });
 
         let storage_rw_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
@@ -103,25 +110,22 @@ impl PbdPipelines {
             count: None,
         };
 
-        let apply_handles_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("pbd_apply_handles_bgl"),
-            entries: &[
-                storage_rw_entry(0),
-                storage_ro_entry(1),
-                storage_ro_entry(2),
-            ],
-        });
+        let apply_handles_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("pbd_apply_handles_bgl"),
+                entries: &[
+                    storage_rw_entry(0),
+                    storage_ro_entry(1),
+                    storage_ro_entry(2),
+                ],
+            });
         let predict_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pbd_predict_bgl"),
             entries: &[storage_rw_entry(0), uniform_entry(1)],
         });
         let solve_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pbd_solve_bgl"),
-            entries: &[
-                storage_rw_entry(0),
-                storage_ro_entry(1),
-                uniform_entry(2),
-            ],
+            entries: &[storage_rw_entry(0), storage_ro_entry(1), uniform_entry(2)],
         });
         let finalize_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("pbd_finalize_bgl"),
@@ -256,7 +260,12 @@ impl PbdSolver {
                 // them. Never dispatched anyway — bind size excludes padding —
                 // but defensive.
                 padded.extend(std::iter::repeat_n(
-                    GpuDistanceConstraint { p1: 0, p2: 0, rest_length: 0.0, alpha: 0.0 },
+                    GpuDistanceConstraint {
+                        p1: 0,
+                        p2: 0,
+                        rest_length: 0.0,
+                        alpha: 0.0,
+                    },
                     pad,
                 ));
             }
@@ -287,11 +296,12 @@ impl PbdSolver {
         } else {
             bytemuck::cast_slice(&island.handle_local_indices).to_vec()
         };
-        let handle_local_indices_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("pbd_handle_local_indices"),
-            contents: &handle_indices_bytes,
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let handle_local_indices_buf =
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pbd_handle_local_indices"),
+                contents: &handle_indices_bytes,
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
         // Initial handle positions = handle particles' current positions.
         let initial_handle_positions: Vec<[f32; 4]> = island
@@ -324,9 +334,18 @@ impl PbdSolver {
             label: Some("pbd_apply_handles_bg"),
             layout: &pipelines.apply_handles_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: particles_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: handle_local_indices_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: handle_positions_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: particles_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: handle_local_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: handle_positions_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -334,8 +353,14 @@ impl PbdSolver {
             label: Some("pbd_predict_bg"),
             layout: &pipelines.predict_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: particles_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: uniforms_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: particles_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniforms_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -343,10 +368,22 @@ impl PbdSolver {
             label: Some("pbd_finalize_bg"),
             layout: &pipelines.finalize_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: particles_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: global_indices_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: scene_vertices_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: uniforms_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: particles_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: global_indices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: scene_vertices_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniforms_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -365,7 +402,10 @@ impl PbdSolver {
                 label: Some("pbd_solve_color_bg"),
                 layout: &pipelines.solve_layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: particles_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: particles_buf.as_entire_binding(),
+                    },
                     wgpu::BindGroupEntry {
                         binding: 1,
                         resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -374,7 +414,10 @@ impl PbdSolver {
                             size: wgpu::BufferSize::new(count as u64 * stride_u64),
                         }),
                     },
-                    wgpu::BindGroupEntry { binding: 2, resource: uniforms_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: uniforms_buf.as_entire_binding(),
+                    },
                 ],
             });
             solve_bgs.push((bg, count));
@@ -417,7 +460,12 @@ impl PbdSolver {
         if self.num_particles == 0 {
             return;
         }
-        let uniforms = PbdUniforms { dt, _pad0: 0, _pad1: 0, _pad2: 0 };
+        let uniforms = PbdUniforms {
+            dt,
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
         queue.write_buffer(&self.uniforms_buf, 0, bytemuck::bytes_of(&uniforms));
 
         if !handle_positions.is_empty() {

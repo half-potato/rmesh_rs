@@ -11,11 +11,15 @@ use rmesh_util::shared::TileUniforms;
 pub use rmesh_util::shared::TileUniforms as TileUniformsType;
 
 // WGSL shader sources.
-const TILE_FILL_WGSL: &str = include_str!("wgsl/tile_fill_compute.wgsl");
-const TILE_RANGES_WGSL: &str = include_str!("wgsl/tile_ranges_compute.wgsl");
-const TILE_GEN_SCAN_WGSL: &str = include_str!("wgsl/tile_gen_scan_compute.wgsl");
-const PREPARE_DISPATCH_WGSL: &str = include_str!("wgsl/prepare_dispatch.wgsl");
-const RTS_WGSL: &str = include_str!("wgsl/rts.wgsl");
+static TILE_FILL_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/tile_fill_compute.wgsl");
+static TILE_RANGES_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/tile_ranges_compute.wgsl");
+static TILE_GEN_SCAN_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/tile_gen_scan_compute.wgsl");
+static PREPARE_DISPATCH_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/prepare_dispatch.wgsl");
+static RTS_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/rts.wgsl");
 
 // ---------------------------------------------------------------------------
 // Helpers (crate-local duplicates of common patterns)
@@ -185,7 +189,7 @@ impl TilePipelines {
         // ----- Tile fill pipeline (3 bindings) -----
         let fill_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_fill_compute"),
-            source: wgpu::ShaderSource::Wgsl(TILE_FILL_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_FILL_WGSL.as_str().into()),
         });
         let fill_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -213,7 +217,7 @@ impl TilePipelines {
         // ----- Tile ranges pipeline (4 bindings) -----
         let tile_ranges_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_ranges_compute"),
-            source: wgpu::ShaderSource::Wgsl(TILE_RANGES_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_RANGES_WGSL.as_str().into()),
         });
         let tile_ranges_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -271,7 +275,7 @@ impl ScanPipelines {
         // Prepare dispatch
         let prepare_dispatch_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("prepare_dispatch"),
-            source: wgpu::ShaderSource::Wgsl(PREPARE_DISPATCH_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PREPARE_DISPATCH_WGSL.as_str().into()),
         });
         let prepare_dispatch_bgl =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -294,7 +298,7 @@ impl ScanPipelines {
         // RTS (Reduce Then Scan) — 3 entry points sharing one bind group layout
         let rts_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rts"),
-            source: wgpu::ShaderSource::Wgsl(RTS_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(RTS_WGSL.as_str().into()),
         });
         let rts_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("rts_bgl"),
@@ -343,7 +347,7 @@ impl ScanPipelines {
         // Tile gen scan
         let tile_gen_scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tile_gen_scan"),
-            source: wgpu::ShaderSource::Wgsl(TILE_GEN_SCAN_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(TILE_GEN_SCAN_WGSL.as_str().into()),
         });
         let tile_gen_scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tile_gen_scan_bgl"),

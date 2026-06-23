@@ -295,10 +295,18 @@ fn grid_tet_scene(n: u32, rng: &mut ChaCha8Rng) -> SceneData {
                 let s = 0.08;
                 let base = vertices.len() as u32 / 3;
                 vertices.extend_from_slice(&[
-                    cx + s, cy + s, cz + s,
-                    cx + s, cy - s, cz - s,
-                    cx - s, cy + s, cz - s,
-                    cx - s, cy - s, cz + s,
+                    cx + s,
+                    cy + s,
+                    cz + s,
+                    cx + s,
+                    cy - s,
+                    cz - s,
+                    cx - s,
+                    cy + s,
+                    cz - s,
+                    cx - s,
+                    cy - s,
+                    cz + s,
                 ]);
                 indices.extend_from_slice(&[base, base + 1, base + 2, base + 3]);
                 densities.push(rng.random::<f32>() * 2.0 + 0.5);

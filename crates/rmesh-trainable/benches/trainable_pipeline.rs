@@ -159,8 +159,7 @@ fn create_state() -> Option<State> {
     let tile_pipelines = rmesh_trainable::TilePipelines::new(&device);
     let radix_pipelines =
         rmesh_trainable::RadixSortPipelines::new(&device, 2, rmesh_trainable::SortBackend::Drs);
-    let tile_buffers =
-        rmesh_trainable::TileBuffers::new(&device, scene.tet_count, W, H, TILE_SIZE);
+    let tile_buffers = rmesh_trainable::TileBuffers::new(&device, scene.tet_count, W, H, TILE_SIZE);
     let sorting_bits = rmesh_trainable::sorting_bits_for_tiles(
         tile_buffers.num_tiles,
         rmesh_trainable::SortBackend::Drs,
@@ -430,7 +429,12 @@ fn record_forward_tiled(encoder: &mut wgpu::CommandEncoder, s: &State) -> bool {
     } else {
         &s.rasterize_bg_a
     };
-    rmesh_trainable::record_rasterize_compute(encoder, &s.rasterize, fwd_bg, s.tile_buffers.num_tiles);
+    rmesh_trainable::record_rasterize_compute(
+        encoder,
+        &s.rasterize,
+        fwd_bg,
+        s.tile_buffers.num_tiles,
+    );
     result_in_b
 }
 
@@ -520,7 +524,11 @@ fn print_breakdown(s: &State) {
         cpass.set_bind_group(1, &s.compute_bg.bg1, &[]);
         let n_pow2 = s.tet_count.next_power_of_two();
         let total_workgroups = n_pow2.div_ceil(64);
-        cpass.dispatch_workgroups(total_workgroups.min(65535), total_workgroups.div_ceil(65535), 1);
+        cpass.dispatch_workgroups(
+            total_workgroups.min(65535),
+            total_workgroups.div_ceil(65535),
+            1,
+        );
     }
     encoder.clear_buffer(&s.rasterize.rendered_image, 0, None);
     encoder.clear_buffer(&s.tile_buffers.tile_ranges, 0, None);

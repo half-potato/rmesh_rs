@@ -3370,6 +3370,7 @@ dependencies = [
  "glam",
  "log",
  "rmesh-interact",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -3415,6 +3416,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "rmesh-tile",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -3433,6 +3435,7 @@ dependencies = [
  "glam",
  "log",
  "rmesh-data",
+ "rmesh-util",
  "wgpu",
 ]
 
@@ -3443,7 +3446,16 @@ dependencies = [
  "anyhow",
  "bytemuck",
  "glam",
+ "half",
+ "image",
  "log",
+ "pollster",
+ "rmesh-compositor",
+ "rmesh-data",
+ "rmesh-dsm",
+ "rmesh-interact",
+ "rmesh-render",
+ "rmesh-sort",
  "rmesh-util",
  "wgpu",
 ]

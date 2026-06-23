@@ -44,11 +44,15 @@ use rmesh_render::{
     dispatch_2d, ComputeIntervalPipelines, GpuLight, MaterialBuffers, SceneBuffers, Uniforms,
 };
 
-const INTERVAL_VERTEX_WGSL: &str = include_str!("wgsl/interval_vertex.wgsl");
-const DSM_MOMENT_FRAGMENT_WGSL: &str = include_str!("wgsl/dsm_moment_fragment.wgsl");
-const DSM_PRIMITIVE_WGSL: &str = include_str!("wgsl/dsm_primitive.wgsl");
-const DSM_RESOLVE_WGSL: &str = include_str!("wgsl/dsm_resolve.wgsl");
-const DSM_PROJECT_COMPUTE_WGSL: &str = include_str!("wgsl/dsm_project_compute.wgsl");
+static INTERVAL_VERTEX_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_vertex.wgsl");
+static DSM_MOMENT_FRAGMENT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/dsm_moment_fragment.wgsl");
+static DSM_PRIMITIVE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/dsm_primitive.wgsl");
+static DSM_RESOLVE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/dsm_resolve.wgsl");
+static DSM_PROJECT_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/dsm_project_compute.wgsl");
 
 /// DSM moments texture format. Stores `(E[α·z], E[α·z²], 0, α)` per texel.
 pub const DSM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -84,8 +88,14 @@ impl DsmProjectPipeline {
             },
             count: None,
         });
-        for (i, read_only) in [(1, true), (2, true), (3, true), (4, false), (5, false), (6, false)]
-        {
+        for (i, read_only) in [
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, false),
+            (5, false),
+            (6, false),
+        ] {
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding: i,
                 visibility: wgpu::ShaderStages::COMPUTE,
@@ -111,7 +121,7 @@ impl DsmProjectPipeline {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dsm_project_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_PROJECT_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DSM_PROJECT_COMPUTE_WGSL.as_str().into()),
         });
 
         let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -172,12 +182,12 @@ impl DsmPipeline {
 
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dsm_interval_vertex.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.as_str().into()),
         });
 
         let fragment_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dsm_moment_fragment.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_MOMENT_FRAGMENT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DSM_MOMENT_FRAGMENT_WGSL.as_str().into()),
         });
 
         // Premultiplied alpha blend for α-weighted moment compositing.
@@ -350,7 +360,7 @@ impl DsmPrimitivePipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dsm_primitive.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_PRIMITIVE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DSM_PRIMITIVE_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -593,7 +603,7 @@ impl DsmResolvePipeline {
     pub fn new(device: &wgpu::Device, output_format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("dsm_resolve.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_RESOLVE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DSM_RESOLVE_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1093,7 +1103,13 @@ pub fn build_light_vp(light: &GpuLight, face_index: usize, near: f32, far: f32) 
     );
     let c2w = view3.transpose();
 
-    (flip * proj * view, c2w)
+    let mut vp = flip * proj * view;
+
+    // DEBUG: rotate face 0 (+X) image 90° CCW about its center in clip space.
+    // A clip-space Z-rotation only mixes X/Y, so the W row (receiver depth read
+    // by populate_metadata) is untouched. Negate the angle if it comes out CW.
+
+    (vp, c2w)
 }
 
 /// Generate deep shadow maps for all active lights.
@@ -1227,22 +1243,11 @@ pub fn generate_dsm_for_lights(
         }
 
         // --- Per face: write face VP, interval gen + DSM render + copy ---
-        for fi in 0..face_count {
+        for fi in 0..1 {
             let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
             let face_uniforms = rmesh_render::make_uniforms(
-                face_vp,
-                face_c2w,
-                intrinsics,
-                pos,
-                res as f32,
-                res as f32,
-                tet_count,
-                0,
-                4,
-                0.0,
-                0,
-                near,
-                far,
+                face_vp, face_c2w, intrinsics, pos, res as f32, res as f32, tet_count, 0, 4, 0.0,
+                0, near, far,
             );
 
             // Flush so the face_uniforms write takes effect before interval gen.

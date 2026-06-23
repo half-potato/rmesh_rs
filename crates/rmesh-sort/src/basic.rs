@@ -4,11 +4,16 @@
 
 use crate::{create_storage_buffer, dispatch_2d, make_compute_pipeline, storage_entry};
 
-const RADIX_SORT_COUNT_WGSL: &str = include_str!("wgsl/radix_sort_count.wgsl");
-const RADIX_SORT_REDUCE_WGSL: &str = include_str!("wgsl/radix_sort_reduce.wgsl");
-const RADIX_SORT_SCAN_WGSL: &str = include_str!("wgsl/radix_sort_scan.wgsl");
-const RADIX_SORT_SCAN_ADD_WGSL: &str = include_str!("wgsl/radix_sort_scan_add.wgsl");
-const RADIX_SORT_SCATTER_WGSL: &str = include_str!("wgsl/radix_sort_scatter.wgsl");
+static RADIX_SORT_COUNT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/radix_sort_count.wgsl");
+static RADIX_SORT_REDUCE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/radix_sort_reduce.wgsl");
+static RADIX_SORT_SCAN_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/radix_sort_scan.wgsl");
+static RADIX_SORT_SCAN_ADD_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/radix_sort_scan_add.wgsl");
+static RADIX_SORT_SCATTER_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/radix_sort_scatter.wgsl");
 
 /// Radix sort constants (must match WGSL shaders).
 pub const RADIX_WG: u32 = 256;
@@ -69,7 +74,7 @@ impl RadixSortPipelines {
         // Reduce: num_keys(r), counts(r), reduced(rw)
         let reduce_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort_reduce"),
-            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_REDUCE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_REDUCE_WGSL.as_str().into()),
         });
         let reduce_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("radix_reduce_bgl"),
@@ -85,7 +90,7 @@ impl RadixSortPipelines {
         // Scan: num_keys(r), reduced(rw)
         let scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort_scan"),
-            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_SCAN_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_SCAN_WGSL.as_str().into()),
         });
         let scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("radix_scan_bgl"),
@@ -96,7 +101,7 @@ impl RadixSortPipelines {
         // ScanAdd: num_keys(r), reduced(r), counts(rw)
         let scan_add_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("radix_sort_scan_add"),
-            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_SCAN_ADD_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(RADIX_SORT_SCAN_ADD_WGSL.as_str().into()),
         });
         let scan_add_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("radix_scan_add_bgl"),

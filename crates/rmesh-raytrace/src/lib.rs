@@ -19,8 +19,10 @@ use rmesh_util::gpu_helpers::{buf_entry, storage_entries};
 use rmesh_util::shared::BVHNode;
 
 // WGSL shader sources, embedded from crate-local files.
-const RAYTRACE_COMPUTE_WGSL: &str = include_str!("wgsl/raytrace_compute.wgsl");
-const LOCATE_COMPUTE_WGSL: &str = include_str!("wgsl/locate_compute.wgsl");
+static RAYTRACE_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/raytrace_compute.wgsl");
+static LOCATE_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/locate_compute.wgsl");
 
 // ---------------------------------------------------------------------------
 // Ray Tracing: Tet Neighbors
@@ -604,7 +606,7 @@ impl LocatePipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("locate_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(LOCATE_COMPUTE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(LOCATE_COMPUTE_WGSL.as_str().into()),
         });
 
         // 7 bindings: 0-5 read, 6 read_write

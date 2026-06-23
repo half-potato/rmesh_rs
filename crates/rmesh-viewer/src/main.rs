@@ -199,6 +199,9 @@ struct App {
     /// Cached light state for DSM dirty detection.
     cached_dsm_lights: Vec<rmesh_render::GpuLight>,
     cached_dsm_num_lights: u32,
+    /// Scene AABB (min, max) in world space, computed once for exact DSM
+    /// far-plane bounds. Lazily filled on first DSM build.
+    cached_scene_aabb: Option<(glam::Vec3, glam::Vec3)>,
     pbr_data: Option<rmesh_data::PbrData>,
     // Ray trace CPU-side state
     rt_neighbors_cpu: Vec<i32>,
@@ -288,6 +291,7 @@ impl App {
             dsm_query_depth: 1.0,
             cached_dsm_lights: Vec::new(),
             cached_dsm_num_lights: 0,
+            cached_scene_aabb: None,
             pbr_data: pbr,
             rt_neighbors_cpu: Vec::new(),
             rt_start_tet_hint: -1,
@@ -943,8 +947,12 @@ impl App {
             nodes: Vec::new(),
             boundary_faces: Vec::new(),
         };
-        let rt_pipeline =
-            rmesh_raytrace::RayTracePipeline::new(&device, size.width.max(1), size.height.max(1), 0);
+        let rt_pipeline = rmesh_raytrace::RayTracePipeline::new(
+            &device,
+            size.width.max(1),
+            size.height.max(1),
+            0,
+        );
         let rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
         let start_tet: i32 = -1; // DIAGNOSTIC: skip find_containing_tet
         queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
@@ -1529,12 +1537,13 @@ impl App {
                 }));
                 // Reset DSM state (will be regenerated on next frame with lights)
                 let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
-                gpu.deferred_dsm_dummy_bg = Some(rmesh_postprocess::create_deferred_dsm_bind_group(
-                    &gpu.device,
-                    &dp,
-                    &dummy_atlas.cubemap_views[0],
-                    &dummy_atlas.meta_buf,
-                ));
+                gpu.deferred_dsm_dummy_bg =
+                    Some(rmesh_postprocess::create_deferred_dsm_bind_group(
+                        &gpu.device,
+                        &dp,
+                        &dummy_atlas.cubemap_views[0],
+                        &dummy_atlas.meta_buf,
+                    ));
                 gpu.deferred_dsm_bg = None;
                 gpu.dsm_atlas = None;
                 self.cached_dsm_lights.clear();
@@ -1599,7 +1608,6 @@ impl App {
                     });
             gpu.pbd_solver = None;
             gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
-
 
             let rt_bvh = rmesh_raytrace::build_boundary_bvh(
                 &self.scene_data.vertices,
@@ -1799,11 +1807,31 @@ impl App {
                     a: 0.0,
                 };
                 for p in 0..2u32 {
-                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.lit_history(p), black);
-                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssgi_history(p), black);
-                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ao_history(p), black);
-                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssr_history(p), black);
-                    rmesh_postprocess::clear_texture_view(&mut enc, gpu.targets.ssr_current(p), black);
+                    rmesh_postprocess::clear_texture_view(
+                        &mut enc,
+                        gpu.targets.lit_history(p),
+                        black,
+                    );
+                    rmesh_postprocess::clear_texture_view(
+                        &mut enc,
+                        gpu.targets.ssgi_history(p),
+                        black,
+                    );
+                    rmesh_postprocess::clear_texture_view(
+                        &mut enc,
+                        gpu.targets.ao_history(p),
+                        black,
+                    );
+                    rmesh_postprocess::clear_texture_view(
+                        &mut enc,
+                        gpu.targets.ssr_history(p),
+                        black,
+                    );
+                    rmesh_postprocess::clear_texture_view(
+                        &mut enc,
+                        gpu.targets.ssr_current(p),
+                        black,
+                    );
                 }
                 gpu.queue.submit(std::iter::once(enc.finish()));
             }
@@ -2023,8 +2051,11 @@ impl App {
     /// scene reload (see `load_scene`).
     fn ensure_mesh_topology(&mut self) {
         if self.mesh_topology.is_none() {
-            log::info!("[pbd] Building mesh topology for {} vertices, {} tets",
-                self.scene_data.vertex_count, self.scene_data.tet_count);
+            log::info!(
+                "[pbd] Building mesh topology for {} vertices, {} tets",
+                self.scene_data.vertex_count,
+                self.scene_data.tet_count
+            );
             let t0 = std::time::Instant::now();
             self.mesh_topology = Some(MeshTopology::build(
                 &self.scene_data.indices,
@@ -2174,7 +2205,11 @@ impl App {
             wgpu::TexelCopyTextureInfo {
                 texture: &gpu.targets.depth_texture,
                 mip_level: 0,
-                origin: wgpu::Origin3d { x: mx as u32, y: my as u32, z: 0 },
+                origin: wgpu::Origin3d {
+                    x: mx as u32,
+                    y: my as u32,
+                    z: 0,
+                },
                 aspect: wgpu::TextureAspect::All,
             },
             wgpu::TexelCopyBufferInfo {
@@ -2185,7 +2220,11 @@ impl App {
                     rows_per_image: Some(1),
                 },
             },
-            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
         gpu.queue.submit(std::iter::once(encoder.finish()));
 
@@ -2198,7 +2237,11 @@ impl App {
         drop(data);
         staging.unmap();
 
-        if a < 1e-3 { None } else { Some(r / a) }
+        if a < 1e-3 {
+            None
+        } else {
+            Some(r / a)
+        }
     }
 
     /// React to a [`VertexSelectResult`] from the vertex-select state machine.
@@ -2235,7 +2278,11 @@ impl App {
                     self.vertex_select.begin_grab();
                     self.init_pbd_grab();
                 } else {
-                    log::info!("[pbd] Pick: no vertex within 30px of mouse=[{:.1}, {:.1}]", mp[0], mp[1]);
+                    log::info!(
+                        "[pbd] Pick: no vertex within 30px of mouse=[{:.1}, {:.1}]",
+                        mp[0],
+                        mp[1]
+                    );
                     self.vertex_select.set_selected(Vec::new());
                 }
             }
@@ -2247,7 +2294,8 @@ impl App {
                 let displacement = self.readback_pbd_vertices();
                 log::info!(
                     "[pbd] ConfirmGrab: kept deformation ({} steps, max vertex Δ = {:.4})",
-                    self.pbd_step_counter, displacement,
+                    self.pbd_step_counter,
+                    displacement,
                 );
                 self.pbd_pre_grab_vertices = None;
                 if let Some(gpu) = &mut self.gpu {
@@ -2269,7 +2317,8 @@ impl App {
                 if let (Some(verts), Some(gpu)) =
                     (self.pbd_pre_grab_vertices.take(), self.gpu.as_ref())
                 {
-                    gpu.queue.write_buffer(&gpu.buffers.vertices, 0, bytemuck::cast_slice(&verts));
+                    gpu.queue
+                        .write_buffer(&gpu.buffers.vertices, 0, bytemuck::cast_slice(&verts));
                     self.scene_data.vertices = verts;
                 }
                 if let Some(gpu) = &mut self.gpu {
@@ -2286,7 +2335,9 @@ impl App {
     /// state. Blocks briefly (one submit + poll Wait + map). Returns the
     /// max world-space delta vs the pre-grab snapshot, or 0 if no snapshot.
     fn readback_pbd_vertices(&mut self) -> f32 {
-        let Some(gpu) = self.gpu.as_ref() else { return 0.0; };
+        let Some(gpu) = self.gpu.as_ref() else {
+            return 0.0;
+        };
         let n_floats = self.scene_data.vertices.len();
         let buf_size = (n_floats * std::mem::size_of::<f32>()) as u64;
         if buf_size == 0 {
@@ -2351,7 +2402,11 @@ impl App {
             color_constraints(island.particles.len(), &island.distance_constraints);
         let total = island.particles.len();
         let handles_n = island.handle_local_indices.len();
-        let fixed_n = island.particles.iter().filter(|p| p.inv_mass == 0.0).count();
+        let fixed_n = island
+            .particles
+            .iter()
+            .filter(|p| p.inv_mass == 0.0)
+            .count();
         let active_n = total - fixed_n;
         let boundary_n = fixed_n.saturating_sub(handles_n);
         log::info!(
@@ -2501,7 +2556,9 @@ impl ApplicationHandler for App {
                     let vs_result = self.vertex_select.process_event(&ie);
                     if was_enabled != self.vertex_select.is_enabled() {
                         if self.vertex_select.is_enabled() {
-                            log::info!("[pbd] VertexSelect mode ON  (Tab to exit, LMB to pick+drag)");
+                            log::info!(
+                                "[pbd] VertexSelect mode ON  (Tab to exit, LMB to pick+drag)"
+                            );
                         } else {
                             log::info!("[pbd] VertexSelect mode OFF");
                         }
@@ -2570,10 +2627,8 @@ impl ApplicationHandler for App {
                     let mut consumed = false;
                     if self.vertex_select.is_enabled() {
                         // Sync absolute cursor position before LMB-down captures mouse_start.
-                        self.vertex_select.set_mouse_pos([
-                            self.last_mouse.0 as f32,
-                            self.last_mouse.1 as f32,
-                        ]);
+                        self.vertex_select
+                            .set_mouse_pos([self.last_mouse.0 as f32, self.last_mouse.1 as f32]);
                         let vs_result = self.vertex_select.process_event(&ie);
                         if !matches!(vs_result, VertexSelectResult::NotConsumed) {
                             self.handle_vertex_select_result(vs_result);
@@ -2585,7 +2640,9 @@ impl ApplicationHandler for App {
                         if matches!(result, InteractResult::NotConsumed) {
                             // Only update camera button state if not consumed
                             match button {
-                                MouseButton::Left => self.left_pressed = state == ElementState::Pressed,
+                                MouseButton::Left => {
+                                    self.left_pressed = state == ElementState::Pressed
+                                }
                                 MouseButton::Middle => {
                                     self.middle_pressed = state == ElementState::Pressed
                                 }
@@ -2606,7 +2663,8 @@ impl ApplicationHandler for App {
                 if !egui_wants_pointer {
                     if self.vertex_select.is_enabled() {
                         // Snap to absolute pixel coords; ignore delta accumulation.
-                        self.vertex_select.set_mouse_pos([position.x as f32, position.y as f32]);
+                        self.vertex_select
+                            .set_mouse_pos([position.x as f32, position.y as f32]);
                         // Feed a zero-delta MouseMove to drive the state machine
                         // (emits UpdateGrab while grabbing, Noop otherwise).
                         let ie = InteractEvent::MouseMove { dx: 0.0, dy: 0.0 };

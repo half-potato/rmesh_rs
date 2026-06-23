@@ -5,9 +5,10 @@
 
 use crate::{create_storage_buffer, dispatch_2d, make_compute_pipeline, storage_entry};
 
-const DRS_UPSWEEP_WGSL: &str = include_str!("wgsl/drs_upsweep.wgsl");
-const DRS_SCAN_WGSL: &str = include_str!("wgsl/drs_scan.wgsl");
-const DRS_DOWNSWEEP_WGSL: &str = include_str!("wgsl/drs_downsweep.wgsl");
+static DRS_UPSWEEP_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/drs_upsweep.wgsl");
+static DRS_SCAN_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/drs_scan.wgsl");
+static DRS_DOWNSWEEP_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/drs_downsweep.wgsl");
 
 /// Constants matching the WGSL shaders.
 pub const RADIX: u32 = 256;
@@ -66,7 +67,7 @@ impl RadixSortPipelines {
         // Scan: config(r), b_passHist(rw)
         let scan_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("drs_scan"),
-            source: wgpu::ShaderSource::Wgsl(DRS_SCAN_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(DRS_SCAN_WGSL.as_str().into()),
         });
         let scan_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("drs_scan_bgl"),

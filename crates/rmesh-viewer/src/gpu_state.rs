@@ -4,11 +4,11 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use rmesh_compositor::{MaterialRegistry, PrimitiveGeometry, PrimitivePipeline, PrimitiveTargets};
+use rmesh_pbd::{PbdPipelines, PbdSolver};
 use rmesh_render::{
     BlitPipeline, ComputeIntervalPipelines, ForwardPipelines, IntervalPipelines, MaterialBuffers,
     MeshForwardPipelines, RenderTargets, SceneBuffers,
 };
-use rmesh_pbd::{PbdPipelines, PbdSolver};
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum RenderMode {

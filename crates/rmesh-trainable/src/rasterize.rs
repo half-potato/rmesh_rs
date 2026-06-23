@@ -9,7 +9,8 @@
 use crate::buf_entry;
 use rmesh_tile::dispatch_2d;
 
-const RASTERIZE_COMPUTE_WGSL: &str = include_str!("wgsl/rasterize_compute.wgsl");
+static RASTERIZE_COMPUTE_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/rasterize_compute.wgsl");
 
 /// Compute-based forward renderer using tiles with warp-per-tile.
 pub struct RasterizeComputePipeline {

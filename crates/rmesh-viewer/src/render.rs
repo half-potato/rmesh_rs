@@ -1,6 +1,5 @@
 //! Per-frame rendering: GPU readback, egui UI, command encoding, submit/present.
 
-
 use rmesh_compositor::record_primitive_pass;
 use rmesh_interact::{InteractContext, Primitive, PrimitiveKind};
 use rmesh_render::{record_blit, Uniforms};
@@ -1034,8 +1033,10 @@ impl App {
                 // FOV-aware world-per-pixel at the handle's view-space depth
                 // (same formula as TransformInteraction's free grab).
                 let focal_px = proj.col(1).y * surf_h * 0.5;
-                let cam_right = glam::Vec3::new(view.col(0).x, view.col(1).x, view.col(2).x).normalize();
-                let cam_up = glam::Vec3::new(view.col(0).y, view.col(1).y, view.col(2).y).normalize();
+                let cam_right =
+                    glam::Vec3::new(view.col(0).x, view.col(1).x, view.col(2).x).normalize();
+                let cam_up =
+                    glam::Vec3::new(view.col(0).y, view.col(1).y, view.col(2).y).normalize();
                 let mouse_dx = mouse_now[0] - mouse_start[0];
                 let mouse_dy = mouse_now[1] - mouse_start[1];
                 let mut max_drag = 0.0_f32;
@@ -1052,11 +1053,19 @@ impl App {
                         // winit y is top-down, NDC up matches cam_up — flip dy.
                         let d = cam_right * dx_w - cam_up * dy_w;
                         let mag = d.length();
-                        if mag > max_drag { max_drag = mag; }
+                        if mag > max_drag {
+                            max_drag = mag;
+                        }
                         [init[0] + d.x, init[1] + d.y, init[2] + d.z, 0.0]
                     })
                     .collect();
-                solver.step(&gpu.queue, &mut encoder, &gpu.pbd_pipelines, 0.016, &positions);
+                solver.step(
+                    &gpu.queue,
+                    &mut encoder,
+                    &gpu.pbd_pipelines,
+                    0.016,
+                    &positions,
+                );
 
                 // Rate-limited per-step log: first 3 frames, then every 30.
                 self.pbd_step_counter = self.pbd_step_counter.wrapping_add(1);
@@ -1588,30 +1597,54 @@ impl App {
                                 Some(rmesh_dsm::DsmAtlas::new(&gpu.device, 1024, &light_types));
                         }
 
-                        // Compute scene-adaptive near/far for DSM
-                        // Use scene AABB to determine max extent from any light
+                        // Scene AABB in world space, computed once over all
+                        // vertices and cached (the per-frame cost below is only
+                        // the 8 corners, so a moving flare stays cheap).
+                        if self.cached_scene_aabb.is_none() {
+                            let verts = &self.scene_data.vertices;
+                            let n = verts.len() / 3;
+                            let aabb = if n == 0 {
+                                (glam::Vec3::splat(-10.0), glam::Vec3::splat(10.0))
+                            } else {
+                                let mut mn = glam::Vec3::splat(f32::INFINITY);
+                                let mut mx = glam::Vec3::splat(f32::NEG_INFINITY);
+                                for vi in 0..n {
+                                    let v = glam::Vec3::new(
+                                        verts[vi * 3],
+                                        verts[vi * 3 + 1],
+                                        verts[vi * 3 + 2],
+                                    );
+                                    mn = mn.min(v);
+                                    mx = mx.max(v);
+                                }
+                                (mn, mx)
+                            };
+                            self.cached_scene_aabb = Some(aabb);
+                        }
+                        let (aabb_min, aabb_max) = self.cached_scene_aabb.unwrap();
+
+                        // Scene-adaptive DSM depth range, shared by the caster
+                        // (generate_dsm_for_lights) and the receiver
+                        // (populate_metadata). dsm_far is an EXACT upper bound on
+                        // the distance from any light to any point in the scene
+                        // AABB (max over its 8 corners), so no receiver is ever
+                        // beyond it — which would otherwise read as z>1 against a
+                        // caster depth clamped to 1.0, i.e. a spurious shadow.
                         let dsm_near = 0.05f32;
                         let dsm_far = {
-                            let verts = &self.scene_data.vertices;
-                            if verts.len() >= 3 {
-                                let mut max_dist = 1.0f32;
-                                // Sample vertices to estimate extent (every 300th vertex for speed)
-                                let stride = (verts.len() / 3).max(1).min(1000);
-                                for li in 0..scene_light_count as usize {
-                                    let lp = glam::Vec3::from(scene_lights[li].position);
-                                    for vi in (0..verts.len() / 3).step_by(stride) {
-                                        let v = glam::Vec3::new(
-                                            verts[vi * 3],
-                                            verts[vi * 3 + 1],
-                                            verts[vi * 3 + 2],
-                                        );
-                                        max_dist = max_dist.max((v - lp).length());
+                            let mut max_dist = 1.0f32;
+                            for li in 0..scene_light_count as usize {
+                                let lp = glam::Vec3::from(scene_lights[li].position);
+                                for cx in [aabb_min.x, aabb_max.x] {
+                                    for cy in [aabb_min.y, aabb_max.y] {
+                                        for cz in [aabb_min.z, aabb_max.z] {
+                                            let corner = glam::Vec3::new(cx, cy, cz);
+                                            max_dist = max_dist.max((corner - lp).length());
+                                        }
                                     }
                                 }
-                                (max_dist * 1.1).max(1.0) // 10% margin
-                            } else {
-                                20.0
                             }
+                            (max_dist * 1.05).max(1.0) // small margin
                         };
 
                         // Generate DSMs for scene lights only
@@ -1674,8 +1707,16 @@ impl App {
                 // When AO/SSGI are disabled the compute passes below are
                 // skipped, so the textures hold stale data — zero the strengths
                 // so the deferred shader masks them out mathematically too.
-                let effective_ao_strength = if self.ao_enabled { self.ao_strength } else { 0.0 };
-                let effective_ssgi_strength = if self.ssgi_enabled { self.ssgi_strength } else { 0.0 };
+                let effective_ao_strength = if self.ao_enabled {
+                    self.ao_strength
+                } else {
+                    0.0
+                };
+                let effective_ssgi_strength = if self.ssgi_enabled {
+                    self.ssgi_strength
+                } else {
+                    0.0
+                };
                 let deferred_uniforms = rmesh_postprocess::DeferredUniforms {
                     inv_vp: vp.inverse().to_cols_array_2d(),
                     cam_pos: pos,
@@ -1752,177 +1793,177 @@ impl App {
                 let pu = p as usize;
 
                 if self.ao_enabled {
-                // GTAO pass writes the parity-current AO slot.
-                rmesh_postprocess::record_gtao_pass(
-                    &mut encoder,
-                    &gpu.gtao_pipeline,
-                    &gpu.gtao_bg,
-                    gpu.targets.ao_current(p),
-                );
+                    // GTAO pass writes the parity-current AO slot.
+                    rmesh_postprocess::record_gtao_pass(
+                        &mut encoder,
+                        &gpu.gtao_pipeline,
+                        &gpu.gtao_bg,
+                        gpu.targets.ao_current(p),
+                    );
 
-                // AO temporal: ao_current + ao_history → ao_temporal_view
-                let ao_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
-                    inv_vp: cur_inv_vp.to_cols_array_2d(),
-                    prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w,
-                    height: h,
-                    near: self.camera.near_z,
-                    far: self.camera.far_z,
-                    max_mip: gpu.hiz_texture.mip_count - 1,
-                    alpha: self.ao_temporal_alpha,
-                    _pad0: 0.0,
-                    _pad1: 0.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ao_temporal_pipeline.uniforms_buf,
-                    0,
-                    bytemuck::bytes_of(&ao_temporal_uniforms),
-                );
-                rmesh_postprocess::record_temporal_pass(
-                    &mut encoder,
-                    &gpu.ao_temporal_pipeline,
-                    &gpu.ao_temporal_bg[pu],
-                    &gpu.targets.ao_temporal_view,
-                );
+                    // AO temporal: ao_current + ao_history → ao_temporal_view
+                    let ao_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
+                        inv_vp: cur_inv_vp.to_cols_array_2d(),
+                        prev_vp: prev_vp_mat.to_cols_array_2d(),
+                        width: w,
+                        height: h,
+                        near: self.camera.near_z,
+                        far: self.camera.far_z,
+                        max_mip: gpu.hiz_texture.mip_count - 1,
+                        alpha: self.ao_temporal_alpha,
+                        _pad0: 0.0,
+                        _pad1: 0.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ao_temporal_pipeline.uniforms_buf,
+                        0,
+                        bytemuck::bytes_of(&ao_temporal_uniforms),
+                    );
+                    rmesh_postprocess::record_temporal_pass(
+                        &mut encoder,
+                        &gpu.ao_temporal_pipeline,
+                        &gpu.ao_temporal_bg[pu],
+                        &gpu.targets.ao_temporal_view,
+                    );
 
-                // Bilateral AO blur — H reads ao_temporal_view, V writes ao_current.
-                let blur_h = rmesh_postprocess::AoBlurUniforms {
-                    dir_x: 1,
-                    dir_y: 0,
-                    sigma_z: self.gtao_radius * 0.25,
-                    sigma_n: 8.0,
-                };
-                let blur_v = rmesh_postprocess::AoBlurUniforms {
-                    dir_x: 0,
-                    dir_y: 1,
-                    sigma_z: self.gtao_radius * 0.25,
-                    sigma_n: 8.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ao_blur_pipeline.uniforms_h,
-                    0,
-                    bytemuck::bytes_of(&blur_h),
-                );
-                gpu.queue.write_buffer(
-                    &gpu.ao_blur_pipeline.uniforms_v,
-                    0,
-                    bytemuck::bytes_of(&blur_v),
-                );
-                // H: ao_temporal_view → ao_blur_temp_view
-                rmesh_postprocess::record_ao_blur_pass(
-                    &mut encoder,
-                    &gpu.ao_blur_pipeline,
-                    &gpu.ao_blur_bg_h,
-                    &gpu.targets.ao_blur_temp_view,
-                );
-                // V: ao_blur_temp_view → ao_current (deferred reads this).
-                // Next frame, ao_current rotates to be ao_history — no copy.
-                rmesh_postprocess::record_ao_blur_pass(
-                    &mut encoder,
-                    &gpu.ao_blur_pipeline,
-                    &gpu.ao_blur_bg_v,
-                    gpu.targets.ao_current(p),
-                );
+                    // Bilateral AO blur — H reads ao_temporal_view, V writes ao_current.
+                    let blur_h = rmesh_postprocess::AoBlurUniforms {
+                        dir_x: 1,
+                        dir_y: 0,
+                        sigma_z: self.gtao_radius * 0.25,
+                        sigma_n: 8.0,
+                    };
+                    let blur_v = rmesh_postprocess::AoBlurUniforms {
+                        dir_x: 0,
+                        dir_y: 1,
+                        sigma_z: self.gtao_radius * 0.25,
+                        sigma_n: 8.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ao_blur_pipeline.uniforms_h,
+                        0,
+                        bytemuck::bytes_of(&blur_h),
+                    );
+                    gpu.queue.write_buffer(
+                        &gpu.ao_blur_pipeline.uniforms_v,
+                        0,
+                        bytemuck::bytes_of(&blur_v),
+                    );
+                    // H: ao_temporal_view → ao_blur_temp_view
+                    rmesh_postprocess::record_ao_blur_pass(
+                        &mut encoder,
+                        &gpu.ao_blur_pipeline,
+                        &gpu.ao_blur_bg_h,
+                        &gpu.targets.ao_blur_temp_view,
+                    );
+                    // V: ao_blur_temp_view → ao_current (deferred reads this).
+                    // Next frame, ao_current rotates to be ao_history — no copy.
+                    rmesh_postprocess::record_ao_blur_pass(
+                        &mut encoder,
+                        &gpu.ao_blur_pipeline,
+                        &gpu.ao_blur_bg_v,
+                        gpu.targets.ao_current(p),
+                    );
                 } // end if self.ao_enabled
 
                 if self.ssgi_enabled {
-                // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
-                // The ssgi_radius bounds ray length in world units; the
-                // bilateral's sigma_z follows (depth-stop scales with the AO
-                // sampling radius for consistency).
-                gpu.frame_counter = gpu.frame_counter.wrapping_add(1);
-                let ssgi_uniforms = rmesh_postprocess::SsgiUniforms {
-                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
-                    proj: proj_mat.to_cols_array_2d(),
-                    view: view_mat.to_cols_array_2d(),
-                    inv_view: view_mat.inverse().to_cols_array_2d(),
-                    width: w,
-                    height: h,
-                    near: self.camera.near_z,
-                    far: self.camera.far_z,
-                    max_mip: gpu.hiz_texture.mip_count - 1,
-                    frame: gpu.frame_counter,
-                    radius_world: self.ssgi_radius,
-                    thickness: self.ssgi_radius * 0.5,
-                    sky_color: self.sky_color,
-                    _pad0: 0.0,
-                    ground_color: self.ground_color,
-                    _pad1: 0.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ssgi_pipeline.uniforms_buf,
-                    0,
-                    bytemuck::bytes_of(&ssgi_uniforms),
-                );
-                rmesh_postprocess::record_ssgi_pass(
-                    &mut encoder,
-                    &gpu.ssgi_pipeline,
-                    &gpu.ssgi_bg[pu],
-                    gpu.targets.ssgi_current(p),
-                );
+                    // SSGI: ray-march Hi-Z, sample lit_history at hits, denoise.
+                    // The ssgi_radius bounds ray length in world units; the
+                    // bilateral's sigma_z follows (depth-stop scales with the AO
+                    // sampling radius for consistency).
+                    gpu.frame_counter = gpu.frame_counter.wrapping_add(1);
+                    let ssgi_uniforms = rmesh_postprocess::SsgiUniforms {
+                        inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                        proj: proj_mat.to_cols_array_2d(),
+                        view: view_mat.to_cols_array_2d(),
+                        inv_view: view_mat.inverse().to_cols_array_2d(),
+                        width: w,
+                        height: h,
+                        near: self.camera.near_z,
+                        far: self.camera.far_z,
+                        max_mip: gpu.hiz_texture.mip_count - 1,
+                        frame: gpu.frame_counter,
+                        radius_world: self.ssgi_radius,
+                        thickness: self.ssgi_radius * 0.5,
+                        sky_color: self.sky_color,
+                        _pad0: 0.0,
+                        ground_color: self.ground_color,
+                        _pad1: 0.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ssgi_pipeline.uniforms_buf,
+                        0,
+                        bytemuck::bytes_of(&ssgi_uniforms),
+                    );
+                    rmesh_postprocess::record_ssgi_pass(
+                        &mut encoder,
+                        &gpu.ssgi_pipeline,
+                        &gpu.ssgi_bg[pu],
+                        gpu.targets.ssgi_current(p),
+                    );
 
-                // SSGI temporal: ssgi_current + ssgi_history → ssgi_temporal_view
-                let ssgi_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
-                    inv_vp: cur_inv_vp.to_cols_array_2d(),
-                    prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w,
-                    height: h,
-                    near: self.camera.near_z,
-                    far: self.camera.far_z,
-                    max_mip: gpu.hiz_texture.mip_count - 1,
-                    alpha: self.ssgi_temporal_alpha,
-                    _pad0: 0.0,
-                    _pad1: 0.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ssgi_temporal_pipeline.uniforms_buf,
-                    0,
-                    bytemuck::bytes_of(&ssgi_temporal_uniforms),
-                );
-                rmesh_postprocess::record_temporal_pass(
-                    &mut encoder,
-                    &gpu.ssgi_temporal_pipeline,
-                    &gpu.ssgi_temporal_bg[pu],
-                    &gpu.targets.ssgi_temporal_view,
-                );
+                    // SSGI temporal: ssgi_current + ssgi_history → ssgi_temporal_view
+                    let ssgi_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
+                        inv_vp: cur_inv_vp.to_cols_array_2d(),
+                        prev_vp: prev_vp_mat.to_cols_array_2d(),
+                        width: w,
+                        height: h,
+                        near: self.camera.near_z,
+                        far: self.camera.far_z,
+                        max_mip: gpu.hiz_texture.mip_count - 1,
+                        alpha: self.ssgi_temporal_alpha,
+                        _pad0: 0.0,
+                        _pad1: 0.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ssgi_temporal_pipeline.uniforms_buf,
+                        0,
+                        bytemuck::bytes_of(&ssgi_temporal_uniforms),
+                    );
+                    rmesh_postprocess::record_temporal_pass(
+                        &mut encoder,
+                        &gpu.ssgi_temporal_pipeline,
+                        &gpu.ssgi_temporal_bg[pu],
+                        &gpu.targets.ssgi_temporal_view,
+                    );
 
-                let ssgi_blur_h = rmesh_postprocess::SsgiBlurUniforms {
-                    dir_x: 1,
-                    dir_y: 0,
-                    sigma_z: self.ssgi_radius * 0.5,
-                    sigma_n: 8.0,
-                };
-                let ssgi_blur_v = rmesh_postprocess::SsgiBlurUniforms {
-                    dir_x: 0,
-                    dir_y: 1,
-                    sigma_z: self.ssgi_radius * 0.5,
-                    sigma_n: 8.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ssgi_blur_pipeline.uniforms_h,
-                    0,
-                    bytemuck::bytes_of(&ssgi_blur_h),
-                );
-                gpu.queue.write_buffer(
-                    &gpu.ssgi_blur_pipeline.uniforms_v,
-                    0,
-                    bytemuck::bytes_of(&ssgi_blur_v),
-                );
-                // H: ssgi_temporal_view → ssgi_blur_temp_view
-                rmesh_postprocess::record_ssgi_blur_pass(
-                    &mut encoder,
-                    &gpu.ssgi_blur_pipeline,
-                    &gpu.ssgi_blur_bg_h,
-                    &gpu.targets.ssgi_blur_temp_view,
-                );
-                // V: ssgi_blur_temp_view → ssgi_current (deferred reads this).
-                // Next frame, ssgi_current rotates to be ssgi_history — no copy.
-                rmesh_postprocess::record_ssgi_blur_pass(
-                    &mut encoder,
-                    &gpu.ssgi_blur_pipeline,
-                    &gpu.ssgi_blur_bg_v,
-                    gpu.targets.ssgi_current(p),
-                );
+                    let ssgi_blur_h = rmesh_postprocess::SsgiBlurUniforms {
+                        dir_x: 1,
+                        dir_y: 0,
+                        sigma_z: self.ssgi_radius * 0.5,
+                        sigma_n: 8.0,
+                    };
+                    let ssgi_blur_v = rmesh_postprocess::SsgiBlurUniforms {
+                        dir_x: 0,
+                        dir_y: 1,
+                        sigma_z: self.ssgi_radius * 0.5,
+                        sigma_n: 8.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ssgi_blur_pipeline.uniforms_h,
+                        0,
+                        bytemuck::bytes_of(&ssgi_blur_h),
+                    );
+                    gpu.queue.write_buffer(
+                        &gpu.ssgi_blur_pipeline.uniforms_v,
+                        0,
+                        bytemuck::bytes_of(&ssgi_blur_v),
+                    );
+                    // H: ssgi_temporal_view → ssgi_blur_temp_view
+                    rmesh_postprocess::record_ssgi_blur_pass(
+                        &mut encoder,
+                        &gpu.ssgi_blur_pipeline,
+                        &gpu.ssgi_blur_bg_h,
+                        &gpu.targets.ssgi_blur_temp_view,
+                    );
+                    // V: ssgi_blur_temp_view → ssgi_current (deferred reads this).
+                    // Next frame, ssgi_current rotates to be ssgi_history — no copy.
+                    rmesh_postprocess::record_ssgi_blur_pass(
+                        &mut encoder,
+                        &gpu.ssgi_blur_pipeline,
+                        &gpu.ssgi_blur_bg_v,
+                        gpu.targets.ssgi_current(p),
+                    );
                 } // end if self.ssgi_enabled
 
                 // -------- SSR (specular reflections) --------

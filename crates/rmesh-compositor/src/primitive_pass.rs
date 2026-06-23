@@ -5,8 +5,9 @@ use crate::material::MaterialRegistry;
 use bytemuck::{Pod, Zeroable};
 use rmesh_interact::Primitive;
 
-const PRIMITIVE_WGSL: &str = include_str!("wgsl/primitive.wgsl");
-const PRIMITIVE_MRT_WGSL: &str = include_str!("wgsl/primitive_mrt.wgsl");
+static PRIMITIVE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/primitive.wgsl");
+static PRIMITIVE_MRT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/primitive_mrt.wgsl");
 
 /// Uniform data for one primitive draw call, padded to 256 bytes for dynamic offsets.
 #[repr(C)]
@@ -106,11 +107,11 @@ impl PrimitivePipeline {
     pub fn new(device: &wgpu::Device, material_bgl: &wgpu::BindGroupLayout) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("primitive.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PRIMITIVE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PRIMITIVE_WGSL.as_str().into()),
         });
         let shader_mrt = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("primitive_mrt.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PRIMITIVE_MRT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(PRIMITIVE_MRT_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

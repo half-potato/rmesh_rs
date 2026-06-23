@@ -3,7 +3,7 @@
 
 use bytemuck::{Pod, Zeroable};
 
-const COMPOSITE_WGSL: &str = include_str!("wgsl/composite.wgsl");
+static COMPOSITE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/composite.wgsl");
 
 /// Uniforms for the compositor (near/far plane distances).
 #[repr(C)]
@@ -56,7 +56,7 @@ impl CompositorPipeline {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("composite.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(COMPOSITE_WGSL.as_str().into()),
         });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {

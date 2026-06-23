@@ -163,13 +163,23 @@ impl VertexSelectInteraction {
             }
 
             // LMB down: pick → (if selection non-empty) begin grab.
-            (State::Hovering, InteractEvent::MouseDown { button: MouseButton::Left }) => {
+            (
+                State::Hovering,
+                InteractEvent::MouseDown {
+                    button: MouseButton::Left,
+                },
+            ) => {
                 self.mouse_start = self.mouse_pos;
                 VertexSelectResult::Pick
             }
 
             // LMB up while grabbing → confirm. Otherwise no-op.
-            (State::Grabbing, InteractEvent::MouseUp { button: MouseButton::Left }) => {
+            (
+                State::Grabbing,
+                InteractEvent::MouseUp {
+                    button: MouseButton::Left,
+                },
+            ) => {
                 self.state = State::Hovering;
                 VertexSelectResult::ConfirmGrab
             }
@@ -227,7 +237,9 @@ mod tests {
         vs.set_mouse_pos([100.0, 100.0]);
 
         // LMB down → Pick
-        let r = vs.process_event(&InteractEvent::MouseDown { button: MouseButton::Left });
+        let r = vs.process_event(&InteractEvent::MouseDown {
+            button: MouseButton::Left,
+        });
         assert!(matches!(r, VertexSelectResult::Pick));
         assert_eq!(vs.mouse_start(), [100.0, 100.0]);
 
@@ -242,7 +254,9 @@ mod tests {
         assert_eq!(vs.mouse_pos(), [110.0, 105.0]);
 
         // LMB up → ConfirmGrab, drops back to hovering
-        let r = vs.process_event(&InteractEvent::MouseUp { button: MouseButton::Left });
+        let r = vs.process_event(&InteractEvent::MouseUp {
+            button: MouseButton::Left,
+        });
         assert!(matches!(r, VertexSelectResult::ConfirmGrab));
         assert!(!vs.is_grabbing());
         assert!(vs.is_enabled());
@@ -253,7 +267,9 @@ mod tests {
         let mut vs = VertexSelectInteraction::new();
         vs.set_enabled(true);
         vs.set_selected(vec![7]);
-        vs.process_event(&InteractEvent::MouseDown { button: MouseButton::Left });
+        vs.process_event(&InteractEvent::MouseDown {
+            button: MouseButton::Left,
+        });
         vs.begin_grab();
         let r = vs.process_event(&InteractEvent::KeyDown(InteractKey::Escape));
         assert!(matches!(r, VertexSelectResult::CancelGrab));

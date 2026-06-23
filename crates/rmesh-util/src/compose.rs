@@ -15,9 +15,9 @@ use naga_oil::compose::{
     ComposableModuleDescriptor, Composer, NagaModuleDescriptor, ShaderLanguage, ShaderType,
 };
 
-const MATH_WGSL: &str = include_str!("wgsl/math.wgsl");
-const SH_WGSL: &str = include_str!("wgsl/sh.wgsl");
-const INTERSECT_WGSL: &str = include_str!("wgsl/intersect.wgsl");
+static MATH_WGSL: crate::HotShader = crate::hot_shader!("wgsl/math.wgsl");
+static SH_WGSL: crate::HotShader = crate::hot_shader!("wgsl/sh.wgsl");
+static INTERSECT_WGSL: crate::HotShader = crate::hot_shader!("wgsl/intersect.wgsl");
 
 /// Create a Composer pre-loaded with all shared rmesh WGSL modules.
 ///
@@ -31,9 +31,9 @@ pub fn create_composer() -> Result<Composer, String> {
     let mut composer = Composer::default();
 
     let modules = [
-        ("rmesh::math", MATH_WGSL),
-        ("rmesh::sh", SH_WGSL),
-        ("rmesh::intersect", INTERSECT_WGSL),
+        ("rmesh::math", &*MATH_WGSL),
+        ("rmesh::sh", &*SH_WGSL),
+        ("rmesh::intersect", &*INTERSECT_WGSL),
     ];
 
     for (name, source) in modules {

@@ -10,3 +10,15 @@ bytemuck = { workspace = true }
 glam = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
+
+[dev-dependencies]
+rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+rmesh-dsm = { path = "../rmesh-dsm" }
+rmesh-render = { path = "../rmesh-render" }
+rmesh-compositor = { path = "../rmesh-compositor" }
+rmesh-interact = { path = "../rmesh-interact" }
+rmesh-sort = { path = "../rmesh-sort" }
+rmesh-data = { path = "../rmesh-data" }
+image = { workspace = true }
+half = { workspace = true }
+pollster = { workspace = true }

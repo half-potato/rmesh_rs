@@ -49,8 +49,14 @@ pub fn color_constraints(
         // Find the smallest color used by neither endpoint.
         let mut color = 0u32;
         loop {
-            let used1 = vertex_colors[v1].get(color as usize).copied().unwrap_or(false);
-            let used2 = vertex_colors[v2].get(color as usize).copied().unwrap_or(false);
+            let used1 = vertex_colors[v1]
+                .get(color as usize)
+                .copied()
+                .unwrap_or(false);
+            let used2 = vertex_colors[v2]
+                .get(color as usize)
+                .copied()
+                .unwrap_or(false);
             if !used1 && !used2 {
                 break;
             }
@@ -132,10 +138,7 @@ mod tests {
     fn within_a_color_endpoints_are_disjoint() {
         // Tet 0-1-2-3 has 6 edges; greedy coloring should produce 3 colors
         // (each color = a perfect matching of the K4).
-        let edges = [
-            dc(0, 1), dc(0, 2), dc(0, 3),
-            dc(1, 2), dc(1, 3), dc(2, 3),
-        ];
+        let edges = [dc(0, 1), dc(0, 2), dc(0, 3), dc(1, 2), dc(1, 3), dc(2, 3)];
         let c = color_constraints(4, &edges);
         for ci in 0..c.num_colors() {
             let start = c.color_offsets[ci] as usize;

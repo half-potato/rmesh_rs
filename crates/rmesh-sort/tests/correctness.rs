@@ -84,14 +84,8 @@ fn run_sort(
     queue.write_buffer(state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    let result_in_b = record_radix_sort(
-        &mut encoder,
-        device,
-        &pipelines,
-        &state,
-        &keys_a,
-        &values_a,
-    );
+    let result_in_b =
+        record_radix_sort(&mut encoder, device, &pipelines, &state, &keys_a, &values_a);
 
     // Copy the destination buffers to readback staging.
     let readback = |label: &str| {

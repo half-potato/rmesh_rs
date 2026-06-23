@@ -2281,11 +2281,7 @@ async fn gpu_compute_interval_render_scene_async(
             mapped_at_creation: false,
         });
         Some(rmesh_render::create_hw_compute_bind_group(
-            &device,
-            &pipelines,
-            &buffers,
-            &material,
-            &dummy_sh,
+            &device, &pipelines, &buffers, &material, &dummy_sh,
         ))
     } else {
         None
