@@ -65,7 +65,7 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
 
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, _fwd, _t, _c, _r) = rmesh_render::setup_forward(
+    let (buffers, material, fwd_pipelines, _t, _c, _r) = rmesh_render::setup_forward(
         &device,
         &queue,
         scene,
@@ -84,7 +84,12 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
 
     let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
     let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
-    let dsm_project_pipeline = rmesh_dsm::DsmProjectPipeline::new(&device);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let prim_geometry = rmesh_compositor::PrimitiveGeometry::new(&device);
     let atlas = rmesh_dsm::DsmAtlas::new(&device, RES, &[0]);
 
@@ -104,7 +109,7 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
         &queue,
         &dsm_pipeline,
         &dsm_prim_pipeline,
-        &dsm_project_pipeline,
+        &fwd_pipelines,
         &prim_geometry,
         &[],
         &ci_pipelines,
@@ -112,6 +117,7 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
         &sort_state,
         &buffers,
         &material,
+        &dummy_sh,
         &lights,
         1,
         scene.tet_count,

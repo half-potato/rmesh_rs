@@ -25,7 +25,6 @@ use rmesh_compositor::PrimitiveGeometry;
 use rmesh_data::SceneData;
 use rmesh_dsm::{
     build_light_vp, generate_dsm_for_lights, DsmAtlas, DsmPipeline, DsmPrimitivePipeline,
-    DsmProjectPipeline,
 };
 use rmesh_render::{ComputeIntervalPipelines, GpuLight};
 use rmesh_sort::{RadixSortPipelines, RadixSortState, SortBackend};
@@ -213,7 +212,7 @@ fn probe_vs_cpu() {
     // --- Forward + interval + sort pipelines (mirrors what the viewer does) ---
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, _fwd_pipelines, _targets, _compute_bg, _render_bg) =
+    let (buffers, material, fwd_pipelines, _targets, _compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device,
             &queue,
@@ -232,7 +231,12 @@ fn probe_vs_cpu() {
 
     let dsm_pipeline = DsmPipeline::new(&device, color_format);
     let dsm_prim_pipeline = DsmPrimitivePipeline::new(&device);
-    let dsm_project_pipeline = DsmProjectPipeline::new(&device);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let prim_geometry = PrimitiveGeometry::new(&device);
 
     let lights = vec![make_light()];
@@ -249,7 +253,7 @@ fn probe_vs_cpu() {
         &queue,
         &dsm_pipeline,
         &dsm_prim_pipeline,
-        &dsm_project_pipeline,
+        &fwd_pipelines,
         &prim_geometry,
         &[],
         &ci_pipelines,
@@ -257,6 +261,7 @@ fn probe_vs_cpu() {
         &sort_state,
         &buffers,
         &material,
+        &dummy_sh,
         &lights,
         1,
         scene.tet_count,

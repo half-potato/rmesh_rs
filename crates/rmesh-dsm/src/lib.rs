@@ -41,7 +41,8 @@ use glam::{Mat3, Mat4, Vec3};
 use rmesh_compositor::{PrimitiveGeometry, PrimitiveVertex};
 use rmesh_interact::Primitive;
 use rmesh_render::{
-    dispatch_2d, ComputeIntervalPipelines, GpuLight, MaterialBuffers, SceneBuffers, Uniforms,
+    dispatch_2d, ComputeIntervalPipelines, ForwardPipelines, GpuLight, MaterialBuffers,
+    SceneBuffers, Uniforms,
 };
 
 static INTERVAL_VERTEX_WGSL: rmesh_util::HotShader =
@@ -51,8 +52,6 @@ static DSM_MOMENT_FRAGMENT_WGSL: rmesh_util::HotShader =
 static DSM_PRIMITIVE_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/dsm_primitive.wgsl");
 static DSM_RESOLVE_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/dsm_resolve.wgsl");
-static DSM_PROJECT_COMPUTE_WGSL: rmesh_util::HotShader =
-    rmesh_util::hot_shader!("wgsl/dsm_project_compute.wgsl");
 
 /// DSM moments texture format. Stores `(E[α·z], E[α·z²], 0, α)` per texel.
 pub const DSM_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
@@ -62,81 +61,6 @@ fn buf_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
-    }
-}
-
-/// Compute pipeline that builds the per-light Radiance-Meshes power sort
-/// (circumsphere power w.r.t. the light origin). One dispatch per light is
-/// enough for all six cubemap faces — see `RADIANCE_MESHES.md`.
-pub struct DsmProjectPipeline {
-    pub compute_pipeline: wgpu::ComputePipeline,
-    pub bind_group_layout: wgpu::BindGroupLayout,
-}
-
-impl DsmProjectPipeline {
-    pub fn new(device: &wgpu::Device) -> Self {
-        // 7 bindings: 0=uniforms (uniform), 1=vertices, 2=indices, 3=circumdata,
-        //             4=sort_keys, 5=sort_values, 6=indirect_args.
-        let mut entries = Vec::with_capacity(7);
-        entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        });
-        for (i, read_only) in [
-            (1, true),
-            (2, true),
-            (3, true),
-            (4, false),
-            (5, false),
-            (6, false),
-        ] {
-            entries.push(wgpu::BindGroupLayoutEntry {
-                binding: i,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Storage { read_only },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            });
-        }
-
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("dsm_project_bgl"),
-            entries: &entries,
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("dsm_project_pl"),
-            bind_group_layouts: &[&bind_group_layout],
-            immediate_size: 0,
-        });
-
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("dsm_project_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(DSM_PROJECT_COMPUTE_WGSL.as_str().into()),
-        });
-
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("dsm_project_pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        Self {
-            compute_pipeline,
-            bind_group_layout,
-        }
     }
 }
 
@@ -1114,17 +1038,19 @@ pub fn build_light_vp(light: &GpuLight, face_index: usize, near: f32, far: f32) 
 
 /// Generate deep shadow maps for all active lights.
 ///
-/// For each point/spot light, the Radiance-Meshes power sort (`P(T) =
-/// ‖C(T) − light_pos‖² − r(T)²`) depends only on the light origin, so one
-/// project+sort+indirect-convert produces a back-to-front order valid for
-/// every cubemap face simultaneously. See `RADIANCE_MESHES.md` for the
-/// proof reference (Karasick 1997) and the radical-axis intuition.
+/// Each cubemap face is sorted independently from the light's perspective:
+/// projecting the tets through that face's view-projection yields depth keys
+/// whose back-to-front order is correct for compositing the α-weighted
+/// termination-depth moments. (A single per-light radial sort is *not* a valid
+/// per-face depth order off-axis, so each face gets its own project + sort.)
 ///
-/// Per light:
-///   1. DSM project compute (power-of-point keys, no cull, no SH eval)
-///   2. Radix sort
-///   3. Indirect convert
-///   4. Per face: write face VP + interval gen + DSM render + copy to cubemap
+/// Per light, per face (×6):
+///   1. Project compute — reuse the forward `project_compute_hw` pipeline to
+///      project from the face VP and emit depth sort keys (frustum-culled)
+///   2. Radix sort by depth from the light
+///   3. Indirect convert — build dispatch/draw args from the visible count
+///   4. Interval gen + DSM render into staging, then copy to the cubemap face
+#[allow(clippy::too_many_arguments)]
 pub fn generate_dsm_for_lights(
     atlas: &DsmAtlas,
     encoder: &mut wgpu::CommandEncoder,
@@ -1132,7 +1058,7 @@ pub fn generate_dsm_for_lights(
     queue: &wgpu::Queue,
     dsm_pipeline: &DsmPipeline,
     dsm_prim_pipeline: &DsmPrimitivePipeline,
-    dsm_project_pipeline: &DsmProjectPipeline,
+    fwd_pipelines: &ForwardPipelines,
     prim_geometry: &PrimitiveGeometry,
     primitives: &[Primitive],
     ci_pipelines: &ComputeIntervalPipelines,
@@ -1140,6 +1066,7 @@ pub fn generate_dsm_for_lights(
     sort_state: &rmesh_sort::RadixSortState,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
+    sh_coeffs_buf: &wgpu::Buffer,
     lights: &[GpuLight],
     num_lights: u32,
     tet_count: u32,
@@ -1157,104 +1084,21 @@ pub fn generate_dsm_for_lights(
         let face_count = 6usize;
         let pos = Vec3::from(light.position);
 
-        // --- One project + sort + indirect convert per light ---
-        // The DSM project shader only reads `cam_pos_pad` from uniforms; the
-        // VP/intrinsics passed here are placeholders that get overwritten by
-        // each face's `face_uniforms` below before interval gen runs.
-        let mut result_in_b = false;
-        if render_tets {
-            let (placeholder_vp, placeholder_c2w) = build_light_vp(light, 0, near, far);
-            let light_uniforms = rmesh_render::make_uniforms(
-                placeholder_vp,
-                placeholder_c2w,
-                intrinsics,
-                pos,
-                res as f32,
-                res as f32,
-                tet_count,
-                0,
-                4,
-                0.0,
-                0,
-                near,
-                far,
-            );
-
-            // Flush prior GPU work so the queue writes below take effect
-            // before this light's project pass.
-            let old_encoder = std::mem::replace(
-                encoder,
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dsm_light_sort"),
-                }),
-            );
-            queue.submit(std::iter::once(old_encoder.finish()));
-            queue.write_buffer(
-                &atlas.scratch_uniforms,
-                0,
-                bytemuck::bytes_of(&light_uniforms),
-            );
-            queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
-            queue.write_buffer(
-                &buffers.interval_args_buf,
-                0,
-                bytemuck::cast_slice(&[0u32; 8]),
-            );
-            // indirect_args.instance_count is written to `tet_count` by the
-            // DSM project shader's thread 0 — no host-side reset needed.
-
-            let project_bg = create_dsm_project_bg(
-                device,
-                dsm_project_pipeline,
-                buffers,
-                &atlas.scratch_uniforms,
-            );
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("dsm_project_compute"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&dsm_project_pipeline.compute_pipeline);
-                cpass.set_bind_group(0, &project_bg, &[]);
-                let total_workgroups = n_pow2.div_ceil(64u32);
-                let (dx, dy) = dispatch_2d(total_workgroups);
-                cpass.dispatch_workgroups(dx, dy, 1);
-            }
-
-            result_in_b = rmesh_sort::record_radix_sort(
-                encoder,
-                device,
-                sort_pipelines,
-                sort_state,
-                &buffers.sort_keys,
-                &buffers.sort_values,
-            );
-
-            let convert_bg = create_dsm_indirect_convert_bg(device, ci_pipelines, buffers);
-            {
-                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("dsm_indirect_convert"),
-                    timestamp_writes: None,
-                });
-                cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
-                cpass.set_bind_group(0, &convert_bg, &[]);
-                cpass.dispatch_workgroups(1, 1, 1);
-            }
-        }
-
-        // --- Per face: write face VP, interval gen + DSM render + copy ---
-        for fi in 0..1 {
+        // --- Per face: project + sort + convert + interval gen + render + copy ---
+        for fi in 0..face_count {
             let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
             let face_uniforms = rmesh_render::make_uniforms(
                 face_vp, face_c2w, intrinsics, pos, res as f32, res as f32, tet_count, 0, 4, 0.0,
                 0, near, far,
             );
 
-            // Flush so the face_uniforms write takes effect before interval gen.
+            // Flush prior GPU work so the face_uniforms write takes effect
+            // before this face's project pass (and so the previous face's
+            // commands have consumed the shared buffers we reset below).
             let old_encoder = std::mem::replace(
                 encoder,
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("dsm_face"),
+                    label: Some("dsm_face_sort"),
                 }),
             );
             queue.submit(std::iter::once(old_encoder.finish()));
@@ -1263,6 +1107,82 @@ pub fn generate_dsm_for_lights(
                 0,
                 bytemuck::bytes_of(&face_uniforms),
             );
+
+            let mut result_in_b = false;
+            if render_tets {
+                // Reset draw/dispatch state: `project_compute_hw` frustum-culls
+                // and counts visible tets via atomicAdd on
+                // `indirect_args.instance_count`, so it must start at 0.
+                queue.write_buffer(
+                    &buffers.indirect_args,
+                    0,
+                    bytemuck::cast_slice(&[12u32, 0u32, 0u32, 0u32]),
+                );
+                queue.write_buffer(
+                    &buffers.interval_args_buf,
+                    0,
+                    bytemuck::cast_slice(&[0u32; 8]),
+                );
+                queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
+
+                // Project tets from this face's VP → depth sort keys, reusing
+                // the forward HW project compute (its color/SH outputs are
+                // unused here but the bind group layout requires them).
+                let compute_bg = create_dsm_hw_compute_bg(
+                    device,
+                    fwd_pipelines,
+                    buffers,
+                    material,
+                    sh_coeffs_buf,
+                    &atlas.scratch_uniforms,
+                );
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("dsm_project_hw"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+                    cpass.set_bind_group(0, &compute_bg, &[]);
+                    let total_workgroups = n_pow2.div_ceil(64u32);
+                    let (dx, dy) = dispatch_2d(total_workgroups);
+                    cpass.dispatch_workgroups(dx, dy, 1);
+                }
+
+                result_in_b = rmesh_sort::record_radix_sort(
+                    encoder,
+                    device,
+                    sort_pipelines,
+                    sort_state,
+                    &buffers.sort_keys,
+                    &buffers.sort_values,
+                );
+
+                let convert_bg = create_dsm_indirect_convert_bg(device, ci_pipelines, buffers);
+                {
+                    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("dsm_indirect_convert"),
+                        timestamp_writes: None,
+                    });
+                    cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
+                    cpass.set_bind_group(0, &convert_bg, &[]);
+                    cpass.dispatch_workgroups(1, 1, 1);
+                }
+
+                // Submit the sort work, then re-write face uniforms so the
+                // render pass below sees the correct per-face VP.
+                let sort_encoder = std::mem::replace(
+                    encoder,
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("dsm_face_render"),
+                    }),
+                );
+                queue.submit(std::iter::once(sort_encoder.finish()));
+                queue.write_buffer(
+                    &atlas.scratch_uniforms,
+                    0,
+                    bytemuck::bytes_of(&face_uniforms),
+                );
+            }
 
             record_dsm_primitive_pass(
                 encoder,
@@ -1350,19 +1270,22 @@ pub fn generate_dsm_for_lights(
     }
 }
 
-/// Create the DSM project compute bind group: layout matches
-/// `dsm_project_compute.wgsl`:
-///   0=uniforms (uniform), 1=vertices, 2=indices, 3=circumdata,
-///   4=sort_keys, 5=sort_values, 6=indirect_args.
-fn create_dsm_project_bg(
+/// Create the forward HW projection compute bind group with scratch uniforms.
+///
+/// Mirrors `rmesh_render::create_hw_compute_bind_group` but binds the DSM
+/// per-face `scratch_uniforms` at binding 0 instead of `buffers.uniforms`.
+/// Layout matches `project_compute_hw.wgsl` bindings 0–10.
+fn create_dsm_hw_compute_bg(
     device: &wgpu::Device,
-    pipeline: &DsmProjectPipeline,
+    fwd_pipelines: &ForwardPipelines,
     buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sh_coeffs_buf: &wgpu::Buffer,
     scratch_uniforms: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("dsm_project_bg"),
-        layout: &pipeline.bind_group_layout,
+        label: Some("dsm_hw_compute_bg"),
+        layout: &fwd_pipelines.hw_compute_bind_group_layout,
         entries: &[
             buf_entry(0, scratch_uniforms),
             buf_entry(1, &buffers.vertices),
@@ -1371,6 +1294,10 @@ fn create_dsm_project_bg(
             buf_entry(4, &buffers.sort_keys),
             buf_entry(5, &buffers.sort_values),
             buf_entry(6, &buffers.indirect_args),
+            buf_entry(7, &material.colors),
+            buf_entry(8, &material.base_colors),
+            buf_entry(9, &material.color_grads),
+            buf_entry(10, sh_coeffs_buf),
         ],
     })
 }

@@ -975,7 +975,6 @@ impl App {
         // DSM debug view (2-moment deep shadow map from camera perspective)
         let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
         let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
-        let dsm_project_pipeline = rmesh_dsm::DsmProjectPipeline::new(&device);
         let dsm_resolve_pipeline = rmesh_dsm::DsmResolvePipeline::new(&device, color_format);
         let (
             dsm_moments_texture,
@@ -1230,7 +1229,6 @@ impl App {
             has_pbr_data: has_pbr,
             dsm_pipeline,
             dsm_prim_pipeline,
-            dsm_project_pipeline,
             dsm_resolve_pipeline,
             dsm_moments_texture,
             dsm_moments_view,

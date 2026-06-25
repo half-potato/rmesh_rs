@@ -163,7 +163,7 @@ fn build_dsm_nf(
     let color_format = wgpu::TextureFormat::Rgba16Float;
 
     let base_colors = vec![0.6f32; scene.tet_count as usize * 3];
-    let (buffers, material, _fwd, _targets, _cbg, _rbg) = rmesh_render::setup_forward(
+    let (buffers, material, fwd_pipelines, _targets, _cbg, _rbg) = rmesh_render::setup_forward(
         device,
         queue,
         scene,
@@ -184,7 +184,12 @@ fn build_dsm_nf(
 
     let dsm_pipeline = rmesh_dsm::DsmPipeline::new(device, color_format);
     let dsm_prim = rmesh_dsm::DsmPrimitivePipeline::new(device);
-    let dsm_proj = rmesh_dsm::DsmProjectPipeline::new(device);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let prim_geo = rmesh_compositor::PrimitiveGeometry::new(device);
     let atlas = rmesh_dsm::DsmAtlas::new(device, res, &[light.light_type]);
     let lights_arr = [light];
@@ -197,7 +202,7 @@ fn build_dsm_nf(
         queue,
         &dsm_pipeline,
         &dsm_prim,
-        &dsm_proj,
+        &fwd_pipelines,
         &prim_geo,
         prim_occluders,
         &ci,
@@ -205,6 +210,7 @@ fn build_dsm_nf(
         &sort_state,
         &buffers,
         &material,
+        &dummy_sh,
         &lights_arr,
         1,
         scene.tet_count,
@@ -616,7 +622,12 @@ fn render_full_nf(
     let atlas = if dsm_on {
         let dsm_pipeline = rmesh_dsm::DsmPipeline::new(device, color_format);
         let dsm_prim = rmesh_dsm::DsmPrimitivePipeline::new(device);
-        let dsm_proj = rmesh_dsm::DsmProjectPipeline::new(device);
+        let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("dummy_sh_coeffs"),
+            size: 4,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         let prim_geo = rmesh_compositor::PrimitiveGeometry::new(device);
         let atlas = rmesh_dsm::DsmAtlas::new(device, 512, &[light.light_type]);
         let mut e = device.create_command_encoder(&Default::default());
@@ -627,7 +638,7 @@ fn render_full_nf(
             queue,
             &dsm_pipeline,
             &dsm_prim,
-            &dsm_proj,
+            &fwd,
             &prim_geo,
             prim_occluders,
             &ci,
@@ -635,6 +646,7 @@ fn render_full_nf(
             &sort_state,
             &buffers,
             &material,
+            &dummy_sh,
             &lights_arr,
             1,
             scene.tet_count,

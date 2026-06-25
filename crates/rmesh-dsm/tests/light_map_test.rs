@@ -27,7 +27,6 @@ use rmesh_compositor::PrimitiveGeometry;
 use rmesh_data::SceneData;
 use rmesh_dsm::{
     build_light_vp, generate_dsm_for_lights, DsmAtlas, DsmPipeline, DsmPrimitivePipeline,
-    DsmProjectPipeline,
 };
 use rmesh_interact::{Primitive, PrimitiveKind};
 use rmesh_render::GpuLight;
@@ -223,7 +222,7 @@ fn generate(
     let queue = &gpu.queue;
 
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
-    let (buffers, material, _fwd_pipelines, _targets, _cbg, _rbg) = rmesh_render::setup_forward(
+    let (buffers, material, fwd_pipelines, _targets, _cbg, _rbg) = rmesh_render::setup_forward(
         device,
         queue,
         scene,
@@ -245,7 +244,12 @@ fn generate(
 
     let dsm_pipeline = DsmPipeline::new(device, wgpu::TextureFormat::Rgba16Float);
     let dsm_prim_pipeline = DsmPrimitivePipeline::new(device);
-    let dsm_project_pipeline = DsmProjectPipeline::new(device);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let prim_geometry = PrimitiveGeometry::new(device);
 
     let atlas = DsmAtlas::new(device, RES, &[light.light_type]);
@@ -261,7 +265,7 @@ fn generate(
         queue,
         &dsm_pipeline,
         &dsm_prim_pipeline,
-        &dsm_project_pipeline,
+        &fwd_pipelines,
         &prim_geometry,
         primitives,
         &ci_pipelines,
@@ -269,6 +273,7 @@ fn generate(
         &sort_state,
         &buffers,
         &material,
+        &dummy_sh,
         &lights,
         lights.len() as u32,
         scene.tet_count,

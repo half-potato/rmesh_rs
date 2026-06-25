@@ -250,7 +250,6 @@ pub struct GpuState {
     // DSM debug view (2-moment deep shadow map from camera perspective)
     pub dsm_pipeline: rmesh_dsm::DsmPipeline,
     pub dsm_prim_pipeline: rmesh_dsm::DsmPrimitivePipeline,
-    pub dsm_project_pipeline: rmesh_dsm::DsmProjectPipeline,
     pub dsm_resolve_pipeline: rmesh_dsm::DsmResolvePipeline,
     pub dsm_moments_texture: wgpu::Texture,
     pub dsm_moments_view: wgpu::TextureView,

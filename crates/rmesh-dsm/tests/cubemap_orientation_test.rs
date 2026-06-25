@@ -171,7 +171,7 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
     let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
 
-    let (buffers, material, _fwd_pipelines, _targets, _compute_bg, _render_bg) =
+    let (buffers, material, fwd_pipelines, _targets, _compute_bg, _render_bg) =
         rmesh_render::setup_forward(
             &device,
             &queue,
@@ -193,7 +193,12 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
 
     let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
     let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
-    let dsm_project_pipeline = rmesh_dsm::DsmProjectPipeline::new(&device);
+    let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("dummy_sh_coeffs"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let prim_geometry = rmesh_compositor::PrimitiveGeometry::new(&device);
     let atlas = rmesh_dsm::DsmAtlas::new(&device, RES, &[0]); // one point light
 
@@ -214,7 +219,7 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
         &queue,
         &dsm_pipeline,
         &dsm_prim_pipeline,
-        &dsm_project_pipeline,
+        &fwd_pipelines,
         &prim_geometry,
         &[], // no opaque primitives
         &ci_pipelines,
@@ -222,6 +227,7 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
         &sort_state,
         &buffers,
         &material,
+        &dummy_sh,
         &lights,
         1,
         scene.tet_count,
