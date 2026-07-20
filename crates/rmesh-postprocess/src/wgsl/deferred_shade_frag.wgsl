@@ -31,6 +31,12 @@ struct DeferredUniforms {
     exposure: f32,
     ao_strength: f32,
     ssgi_strength: f32,
+    // vec3f auto-aligns to 16: _pad0 fills 124..128, sky_color@128, ground@144.
+    // Hemispherical environment radiance (AO-occluded ambient). `ambient` above
+    // is now vestigial — env intensity is folded into these on the CPU.
+    _pad0: f32,
+    sky_color: vec3f,
+    ground_color: vec3f,
 }
 
 struct Light {
@@ -434,28 +440,32 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let ao_factor = mix(1.0, ao_combined, uniforms.ao_strength);
     let env_F = env_brdf_approx(F0, r_clamped, NoV);
 
-    let ambient_diffuse = (1-env_F) * (1.0 - metallic) * albedo;// * ssgi_indirect * uniforms.ssgi_strength;
+    // ---- Indirect diffuse: self-occluded bounce + AO-occluded environment ----
+    // SSGI's hemisphere gather already accounts for visibility (rays that hit
+    // geometry return the occluder's radiance), so the bounce is NOT multiplied
+    // by AO — doing so would double-count occlusion. The environment term
+    // (hemispherical sky/ground) is the ambient light AO's job is to occlude.
+    // This unifies the SSGI on/off paths: with SSGI off, ssgi_indirect is masked
+    // to 0 by ssgi_strength and only the AO-occluded environment remains.
+    let kd_factor = (1.0 - env_F) * (1.0 - metallic);
+    let bounce = ssgi_indirect * uniforms.ssgi_strength;          // self-occluded
+    let env_diffuse = mix(uniforms.ground_color, uniforms.sky_color, N.y * 0.5 + 0.5);
+    let ambient_diffuse = kd_factor * albedo * (bounce + env_diffuse * ao_factor);
 
-    // Indirect specular radiance: smooth surfaces use the SSR ray (sharp,
-    // along reflect(V, N)); rough surfaces fall back to SSGI's hemisphere
-    // average. Smoothness² mix is the standard PBR specular envelope.
-    //
-    // NoV fade kills the SSR contribution at silhouettes, where reflect(V,N)
-    // skims along the surface (screen-space ray collapses, march false-hits
-    // the silhouette pixel itself). SSGI takes over there — same fallback as
-    // the off-screen / no-hit case inside ssr_compute.wgsl.
+    // ---- Indirect specular: SSR ray blended toward the environment by roughness ----
+    // Smooth surfaces use the sharp SSR reflection; rough surfaces fall back to the
+    // hemispherical environment along the reflection direction. (Was ssgi_indirect,
+    // which no longer carries the environment now that SSGI is bounce-only.)
     let smoothness = 1.0 - r_clamped;
     let smoothness_sq = smoothness * smoothness;
-    let indirect_spec_radiance = mix(ssgi_indirect, ssr_radiance, smoothness_sq);
+    let refl = reflect(-V, N);
+    let env_specular = mix(uniforms.ground_color, uniforms.sky_color, refl.y * 0.5 + 0.5);
+    let indirect_spec_radiance = mix(env_specular, ssr_radiance, smoothness_sq);
+    // Lazarov env-BRDF fit (env_F) accounts for roughness in the Fresnel factor,
+    // so a rough and a smooth surface don't get identical specular intensity.
+    let ambient_specular = env_F * indirect_spec_radiance;
 
-    // Lazarov env-BRDF fit: replaces F_view for the ambient/IBL specular so
-    // the Fresnel factor accounts for roughness (lobe broadening + bias),
-    // not just NoV. Without this, a r=1 surface and a r=0.05 surface would
-    // get identical specular intensity.
-    //
-    let ambient_specular = env_F * indirect_spec_radiance * uniforms.ssgi_strength;
-
-    let ambient_term = uniforms.ambient * ambient_diffuse * ao_factor;
+    let ambient_term = ambient_diffuse + ambient_specular;
 
     var lit = total_diffuse + total_specular + ambient_term;
     var final_color = aces_narkowicz(lit * uniforms.exposure);
@@ -463,7 +473,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     // Snapshot the true lit value for the lit_history feedback — this is what
     // SSGI samples next frame. Must be taken BEFORE any debug-mode override
     // below; otherwise the SSGI feedback chain gets poisoned with debug viz.
-    let lit_history_out = vec4f(max(final_color, vec3f(0.0)), alpha);
+    let lit_history_out = vec4f(max(lit, vec3f(0.0)), alpha);
 
     // Debug mode overrides — bypass tonemap for visualizations
     let dm = uniforms.debug_mode;

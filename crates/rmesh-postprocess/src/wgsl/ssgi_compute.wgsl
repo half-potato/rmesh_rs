@@ -150,9 +150,10 @@ fn march_ray(p_origin_view: vec3f, d_view: vec3f, t_max: f32, jitter: f32) -> Ra
         let t = (f32(s) - 1.0 + jitter) / f32(MAX_STEPS - 1u);
         let uv_t = mix(uv0, uv1, t);
         if (uv_t.x < 0.0 || uv_t.x > 1.0 || uv_t.y < 0.0 || uv_t.y > 1.0) {
-            // Off-screen → fall back to hemi.
-            let world_dir = (u.inv_view * vec4f(d_view, 0.0)).xyz;
-            r.color = hemi_fallback(normalize(world_dir));
+            // Off-screen → no on-screen bounce. The environment is added
+            // separately (AO-occluded) in the deferred pass; SSGI is bounce-only,
+            // so a missed ray contributes 0.
+            r.color = vec3f(0.0);
             return r;
         }
         let z_ray = 1.0 / mix(inv_z0, inv_z1, t);
@@ -190,9 +191,9 @@ fn march_ray(p_origin_view: vec3f, d_view: vec3f, t_max: f32, jitter: f32) -> Ra
         prev_t = t;
     }
 
-    // Reached max steps without a hit → fall back to hemi.
-    let world_dir = (u.inv_view * vec4f(d_view, 0.0)).xyz;
-    r.color = hemi_fallback(normalize(world_dir));
+    // Reached max steps without a hit → no on-screen bounce (environment is
+    // added separately, AO-occluded, in the deferred pass).
+    r.color = vec3f(0.0);
     return r;
 }
 

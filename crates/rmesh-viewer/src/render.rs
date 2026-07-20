@@ -1718,6 +1718,23 @@ impl App {
                 } else {
                     0.0
                 };
+                // Ambient enters the GI/reflection environment (hemispherical
+                // sky/ground) rather than a flat unoccluded add, so it's occluded
+                // by AO (diffuse) and by geometry (SSGI bounce). A uniform grey
+                // lift on the user's sky/ground tint; with black defaults it's the
+                // sole environment source. Shared by the deferred, SSGI and SSR
+                // uniforms below.
+                let amb = self.ambient;
+                let env_sky = [
+                    self.sky_color[0] + amb,
+                    self.sky_color[1] + amb,
+                    self.sky_color[2] + amb,
+                ];
+                let env_ground = [
+                    self.ground_color[0] + amb,
+                    self.ground_color[1] + amb,
+                    self.ground_color[2] + amb,
+                ];
                 let deferred_uniforms = rmesh_postprocess::DeferredUniforms {
                     inv_vp: vp.inverse().to_cols_array_2d(),
                     cam_pos: pos,
@@ -1732,7 +1749,11 @@ impl App {
                     exposure: self.exposure,
                     ao_strength: effective_ao_strength,
                     ssgi_strength: effective_ssgi_strength,
-                    _pad: [0.0; 2],
+                    _pad0: [0.0; 2],
+                    sky_color: env_sky,
+                    _pad1: 0.0,
+                    ground_color: env_ground,
+                    _pad2: 0.0,
                 };
                 gpu.queue.write_buffer(
                     &deferred.uniforms_buf,
@@ -1886,9 +1907,9 @@ impl App {
                         frame: gpu.frame_counter,
                         radius_world: self.ssgi_radius,
                         thickness: self.ssgi_radius * 0.5,
-                        sky_color: self.sky_color,
+                        sky_color: env_sky,
                         _pad0: 0.0,
-                        ground_color: self.ground_color,
+                        ground_color: env_ground,
                         _pad1: 0.0,
                     };
                     gpu.queue.write_buffer(
@@ -1984,9 +2005,9 @@ impl App {
                     frame: gpu.frame_counter,
                     radius_world: self.ssgi_radius,
                     thickness: self.ssgi_radius * 0.5,
-                    sky_color: self.sky_color,
+                    sky_color: env_sky,
                     _pad0: 0.0,
-                    ground_color: self.ground_color,
+                    ground_color: env_ground,
                     _pad1: 0.0,
                 };
                 gpu.queue.write_buffer(

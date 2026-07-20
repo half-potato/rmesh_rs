@@ -50,8 +50,23 @@ pub struct DeferredUniforms {
     pub exposure: f32,
     pub ao_strength: f32,
     pub ssgi_strength: f32,
-    pub _pad: [f32; 2],
+    // std140: vec3 aligns to 16 bytes. ssgi_strength ends at offset 120, so
+    // WGSL places `sky_color: vec3f` at 128 (next 16-boundary) — the Rust side
+    // therefore needs 8 bytes of padding here, not 4, to keep offsets identical.
+    // Layout: _pad0 120..128, sky_color 128..140, _pad1 140..144,
+    // ground_color 144..156, _pad2 156..160. Total struct size = 160 bytes.
+    // sky/ground carry the hemispherical environment radiance (the AO-occluded
+    // ambient); the viewer folds `ambient` into them as env_sky/env_ground.
+    pub _pad0: [f32; 2],
+    pub sky_color: [f32; 3],
+    pub _pad1: f32,
+    pub ground_color: [f32; 3],
+    pub _pad2: f32,
 }
+
+// Hand-packed to match the WGSL std140 uniform layout byte-for-byte (sky_color
+// at offset 128, ground_color at 144). If this fails, a field/pad drifted.
+const _: () = assert!(core::mem::size_of::<DeferredUniforms>() == 160);
 
 /// Uniforms for the GTAO ambient-occlusion pass. Matches WGSL `GtaoUniforms`.
 #[repr(C)]

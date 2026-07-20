@@ -720,7 +720,11 @@ fn render_full_nf(
         exposure: 1.0,
         ao_strength: 1.0,
         ssgi_strength: 0.0,
-        _pad: [0.0; 2],
+        _pad0: [0.0; 2],
+        sky_color: [0.0; 3],
+        _pad1: 0.0,
+        ground_color: [0.0; 3],
+        _pad2: 0.0,
     };
     queue.write_buffer(&deferred.uniforms_buf, 0, bytemuck::bytes_of(&u));
     let mut lights = [GpuLight::default(); rmesh_render::MAX_LIGHTS];

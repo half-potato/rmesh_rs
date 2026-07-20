@@ -219,11 +219,13 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
 
     let res = march_ray(p_o, dir_v, u.radius_world, step_jit);
 
-    // Miss fallback: SSGI's hemi-averaged radiance at this pixel. Vastly
-    // smoother than a 2-color sky/ground gradient and brings miss pixels
-    // into the same radiance range as hits, killing the binary "hit-bright /
-    // miss-dim" patches that plague single-ray SSR.
-    let fallback = textureLoad(ssgi_tex, vec2i(coords), 0).rgb;
+    // Miss fallback: hemispherical environment along the world-space reflection
+    // direction. SSGI is now bounce-only (its miss returns 0) and no longer
+    // carries the environment, so SSR samples sky/ground directly for off-screen
+    // / no-occluder rays — otherwise reflective surfaces facing open space would
+    // reflect black.
+    let refl_world = normalize((u.inv_view * vec4f(dir_v, 0.0)).xyz);
+    let fallback = mix(u.ground_color, u.sky_color, refl_world.y * 0.5 + 0.5);
     let final_color = mix(fallback, res.color, res.hit);
     return vec4f(final_color, 1.0);
 }
