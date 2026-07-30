@@ -52,6 +52,10 @@ pub struct SceneBuffers {
     pub interval_args_buf: wgpu::Buffer,
     /// Per-vertex normals [N × 3] f32 (optional, for interval tiled xyzd output)
     pub vertex_normals: wgpu::Buffer,
+    /// Occlusion-cull mask: ACTIVE region's per-tet visibility, bit-packed
+    /// [ceil(M/32)] u32 (bit t set = tet t visible). Initialized all-ones
+    /// (no-cull); the viewer rewrites it per region. Gated in project_compute.
+    pub tet_visibility: wgpu::Buffer,
 }
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
@@ -229,6 +233,16 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        // Occlusion-cull mask, bit-packed [ceil(M/32)] u32. Default all-ones so
+        // every tet is visible (no-cull) until the viewer writes a region mask —
+        // byte-identical output to the pre-cull pipeline.
+        let vis_words = ((scene.tet_count as usize + 31) / 32).max(1);
+        let tet_visibility = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tet_visibility"),
+            contents: bytemuck::cast_slice(&vec![0xFFFF_FFFFu32; vis_words]),
+            usage: storage_copy,
+        });
+
         Self {
             vertices,
             indices,
@@ -247,6 +261,7 @@ impl SceneBuffers {
             interval_fan_index_buf,
             interval_args_buf,
             vertex_normals,
+            tet_visibility,
         }
     }
 }

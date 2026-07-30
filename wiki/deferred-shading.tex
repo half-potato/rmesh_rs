@@ -1,0 +1,172 @@
+\chapter{Deferred Shading}\label{ch:deferred-shading}
+
+\section{Overview}
+
+When PBR data is present, the viewer shades in two phases: the volume and
+primitive renderers write a \emph{G-buffer} (multiple render targets), and a
+fullscreen pass (\code{deferred_shade_frag.wgsl},
+\code{DeferredShadePipeline} in \code{crates/rmesh-postprocess/src/lib.rs})
+combines it with analytic lights, deep-shadow-map transmittance, ambient
+occlusion, and screen-space GI/reflections, then tone-maps. Everything is
+linear \code{Rgba16Float} end to end; sRGB encoding happens only in the
+final \code{blit.wgsl} copy to the swapchain.
+
+\section{G-buffer layout}
+
+Both producers --- the volume interval renderer
+(\code{interval_fragment.wgsl}, see Chapter~\ref{ch:interval-renderer}) and the
+opaque primitive pass (\code{primitive_mrt.wgsl} in
+\code{rmesh-compositor}) --- write the \emph{same} four color attachments,
+plus the hardware depth buffer. All volume channels are premultiplied by
+$\alpha$ so hardware blending composites them; primitives write $\alpha = 1$.
+
+\begin{longtable}{@{}llll@{}}
+\toprule
+Slot & Binding & Format & Contents \\
+\midrule
+albedo & 1 & Rgba16Float & $\text{albedo} \cdot \alpha,\ \alpha$ \\
+aux0 (PBR) & 2 & Rgba16Float & $r\alpha,\ f_0\alpha,\ m\alpha,\ \alpha$ \\
+normals & 3 & Rgba8Unorm & $(\tfrac{n}{2}{+}\tfrac12)\alpha,\ \alpha$ \\
+depth & 4 & Rgba16Float & $\alpha E[z],\ \text{occl}\cdot\alpha,\ \alpha E[z^2],\ \alpha$ \\
+hw depth & 6 & Depth32Float & hardware $z$ \\
+\bottomrule
+\end{longtable}
+
+Conventions worth knowing:
+\begin{itemize}
+\item \textbf{Metallic sits in \code{aux0.b}}, dielectric $f_0$ in
+  \code{aux0.g} (glTF metallic-roughness order); primitives write 0 there,
+  and the deferred pass falls back to $f_0 = 0.04$.
+\item \textbf{Normals} are the only non-float16 target: bias-encoded
+  \code{Rgba8Unorm}. Volume normals are the interpolated \emph{scalar-field
+  gradient} (density gradient), not a surface normal; primitives compute a
+  TBN-mapped mesh normal. The deferred pass un-premultiplies, un-biases, and
+  \emph{negates} --- converting COLMAP (Y-down, Z-forward) source
+  conventions to wgpu (Y-up, Z-back).
+\item \textbf{Depth appears three ways} in the system: hardware
+  \code{Depth32Float}, the volume's premultiplied expected-termination depth
+  (with $E[z^2]$ for variance), and the shadow maps' normalized $[0,1]$
+  moment depth. They must not be conflated.
+\end{itemize}
+
+\section{World-position reconstruction}
+
+The fullscreen pass (a single vertex-index triangle, \code{draw(0..3)})
+reconstructs the shaded point per pixel by taking the \emph{closer} of the
+volume's expected termination depth (slot 3, normalized by its own $\alpha$)
+and the linearized hardware depth, converting back to NDC and multiplying by
+the inverse view-projection.
+
+\section{Lighting model}
+
+Lights are a read-only storage buffer of up to 16 \code{GpuLight} records
+(\code{rmesh-util/src/shared.rs}): position, type (0 point, 1 spot, 2
+directional), color, intensity, pre-normalized direction, and inner/outer
+cone cosines. The viewer collects them each frame from point-light and
+spot-light primitives and from active \emph{flare projectiles} (the flare
+gun's glTF model carries an offset light).
+
+Shading is a metallic-roughness GGX BRDF:
+\begin{itemize}
+\item Fresnel: Schlick, $F = F_0 + (1-F_0)(1-\cos\theta)^5$, with
+  $F_0 = (1-m)\,f_0 + m\,\text{albedo}$.
+\item Distribution: GGX/Trowbridge-Reitz with $a = r^2$
+  (roughness clamped to $[0.08, 1]$),
+  $D = \dfrac{a^2}{\pi\big((n \cdot h)^2 (a^2 - 1) + 1\big)^2}$.
+\item Visibility: height-correlated Smith GGX.
+\item Diffuse: $k_d = (1 - F_{\text{view}})(1 - m)$ times albedo, no
+  $1/\pi$ (matching the parent project's parametric relighting branch).
+\end{itemize}
+
+Per light: attenuation is $1/d^2$ for point/spot (smooth cone falloff
+between the cone cosines for spots) and $1$ for directional; the
+contribution is scaled by $T \cdot \text{atten}$ where $T$ is the deep
+shadow map transmittance (Chapter~\ref{ch:shadow-rendering}). Two optimizations
+land per pixel: an early \code{continue} when $n \cdot l \le 0$ skips the
+BRDF \emph{and} the cubemap shadow sample for back-facing lights, and
+$k_d \cdot \text{albedo}$ is folded once per pixel.
+
+\section{Ambient, occlusion, and screen-space effects}
+
+The indirect term combines:
+\begin{itemize}
+\item \textbf{GTAO} (\code{gtao.wgsl}, R8Unorm + temporal accumulation and
+  bilateral blur), multiplied with the primitive occlusion channel and
+  blended by an \code{ao_strength} uniform;
+\item \textbf{ambient specular} via the Lazarov/Karis analytic
+  environment-BRDF fit (\code{env_brdf_approx}) --- no BRDF LUT texture;
+\item \textbf{SSGI} (\code{ssgi_compute.wgsl}) --- hemisphere rays marched
+  against a Hi-Z min-pyramid (\code{hiz_linearize.wgsl} /
+  \code{hiz_downsample.wgsl}, R32Float, fusing hardware and volume depth),
+  sampling the \emph{previous frame's linear, pre-tonemap lit output} for
+  one bounce. Misses (off-screen or step-budget exhausted) return
+  \textbf{black}: SSGI is a pure on-screen bounce term, and the
+  environment contribution lives in the composite instead;
+\item \textbf{SSR} (\code{ssr_compute.wgsl}) --- a mirror ray for smooth
+  surfaces; the indirect specular blends SSR toward the hemispherical
+  \emph{environment} color by smoothness$^2$, and an SSR miss falls back
+  to the environment sampled along the world reflection direction.
+\end{itemize}
+
+The composite treats visibility asymmetrically, on purpose: the SSGI
+bounce already carries screen-space visibility in its rays, so it is
+\emph{not} multiplied by AO (that would double-count occlusion); the
+environment hemisphere term \emph{is} AO-occluded. Per pixel:
+\begin{align*}
+\text{env\_diffuse} &= \operatorname{mix}(\text{ground},\ \text{sky},\
+  \tfrac{n_y+1}{2}) \\
+\text{ambient\_diffuse} &= (1{-}F_{\text{env}})(1{-}m)\,\text{albedo}\,
+  \big(\text{ssgi\_strength}\cdot\text{ssgi} +
+  \text{env\_diffuse}\cdot\text{ao\_factor}\big) \\
+\text{ambient\_specular} &= F_{\text{env}}\cdot
+  \operatorname{mix}(\text{env\_specular},\ \text{ssr},\
+  \text{smoothness}^2)
+\end{align*}
+and both terms are added to \code{lit}. The \code{ambient} slider is
+vestigial as a shading input: the CPU folds it into
+\code{sky\_color}/\code{ground\_color} as a uniform grey lift before
+upload (\code{render.rs}), so the environment hemisphere is the single
+source of non-bounce ambient light.
+
+Pass order per frame: Hi-Z $\to$ GTAO (+temporal, blur) $\to$ SSGI
+(+temporal, blur) $\to$ SSR (+temporal) $\to$ deferred shade $\to$ blit.
+
+\section{Outputs, tone mapping, debug modes}
+
+The pass writes \textbf{two} targets: \code{display} (what the user sees,
+subject to debug overrides) and \code{lit} (the \emph{linear, pre-tonemap,
+pre-exposure} shaded color, clamped at zero and rotated into a history
+texture that feeds next frame's SSGI --- debug modes never pollute the
+feedback loop, and the bounce integrates HDR radiance rather than
+tone-compressed values). Tone mapping is the ACES Narkowicz fit applied to
+$\text{lit} \times \text{exposure}$ inline in the shader for
+\code{display}; gamma is deferred to \code{blit.wgsl}'s exact piecewise
+sRGB curve.
+
+Nineteen debug modes (\code{DBG_*}) can override \code{display}: albedo
+(raw/true), normals, roughness, packed PBR, depth, specular-only,
+diffuse-only, average shadow transmittance, cubemap-face color, plaster
+(albedo replaced by white), alpha, primitives-only, DSM moments, AO, SSGI,
+lit history, SSR, and depth standard deviation
+$\sigma = \sqrt{E[z^2] - E[z]^2}$ from the moment channels.
+
+\section{The non-deferred path: the compositor}
+
+When deferred shading is off, volumes and primitives render to separate
+color targets and \code{rmesh-compositor}'s \code{composite.wgsl} merges
+them per pixel: recover the volume's view depth by un-premultiplying its
+expected-depth channel, recover the primitive depth from the hardware
+buffer, then either pass the volume through (no primitive), output the
+primitive opaquely (primitive in front), or composite the premultiplied
+volume \emph{over} the primitive:
+$c = c_{\text{tet}} + (1 - \alpha_{\text{tet}})\, c_{\text{prim}}$.
+This is a single-layer depth resolve --- correct because the volume was
+already composited in sorted order upstream and primitives are opaque.
+
+The opaque primitives themselves (cube, sphere, plane, cylinder, custom glTF
+meshes) are drawn by \code{PrimitivePipeline}
+(\code{primitive_pass.rs}) with full glTF metallic-roughness materials
+(base-color, metal-rough, normal, and occlusion textures via a
+\code{MaterialRegistry}), in either single-target mode or 4-target MRT mode
+matching the G-buffer above.
+

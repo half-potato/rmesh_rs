@@ -1,0 +1,130 @@
+\chapter{Mesh-Style Renderers (Legacy Pathways)}\label{ch:mesh-style-renderers}
+
+\section{Overview}
+
+Before the interval shader, rmeshvk rendered tets the classical way: draw
+geometry that covers the tet's screen footprint and let the \emph{fragment}
+shader intersect the pixel ray with the tet's four planes to find the
+entry/exit segment. Four such renderers remain in the tree, selectable in the
+viewer via \code{RenderMode}: \code{Regular}, \code{Quad},
+\code{MeshShader}, and \code{RayTrace}. They are no longer the default and
+are not used by training or the Python forward path, but they are valuable as
+cross-checks (the test suite compares renderers against a CPU reference) and
+as diagnostics. All of them share the projection + radix-sort front end and
+the closed-form volume integral described in the overview article.
+
+Dispatch (\code{crates/rmesh-viewer/src/render.rs}):
+\begin{lstlisting}
+match render_mode {
+  IntervalShader => interval path (see interval-renderer.pdf),
+  MeshShader if supported => record_sorted_mesh_forward_pass,
+  RayTrace => locate + project + raytrace compute + copy to texture,
+  _ /* Regular | Quad */ => record_sorted_forward_pass(use_quad),
+}
+\end{lstlisting}
+
+\section{Regular: 12 triangles per tet (\code{ForwardPipelines})}
+
+\code{forward_vertex.wgsl} + \code{forward_fragment.wgsl},
+\code{record_sorted_forward_pass}. Each visible tet is drawn as an instance
+of 12 vertices (4 faces $\times$ 3), with \code{instance_index} indexing the
+sorted visible list.
+
+\paragraph{Vertex.} A constant \code{FACE_VERTEX_MAP} picks the face and
+corner. The shader computes per-face \emph{inward} normals, the ray--plane
+numerators $n \cdot (v_a - o_{\text{cam}})$, and denominators
+$n \cdot \text{ray}$, where the ray direction is deliberately left
+\emph{unnormalized} as $p_{\text{world}} - o_{\text{cam}}$ so that
+perspective-correct interpolation reproduces the exact per-pixel vector.
+Back-facing triangles (numerator $\le 0$) are collapsed to zero area ---
+only front faces of each tet are rasterized, and each pixel inside the
+silhouette is shaded once per front face it covers.
+
+\paragraph{Fragment.} Normalizes the interpolated ray, classifies the four
+planes into entering/exiting, and takes
+$t_{\min} = \max(t_{\text{enter}})$, $t_{\max} = \min(t_{\text{exit}})$,
+$d = \max(t_{\max} - t_{\min}, 0)$; then runs the shared
+\code{compute_integral} with the exit color first (webrm convention). MRT
+outputs: premultiplied color, an aux target
+$(t_{\min}, t_{\max}, \tau, d)$, entry normal, and premultiplied depth. Note
+this aux layout differs from the deferred-shading G-buffer --- this path
+predates it.
+
+\section{Quad: billboard per tet}
+
+Same record function with \code{use_quad = true}. A compute prepass
+(one thread per visible tet, \code{forward_prepass_compute.wgsl}) does the
+per-tet work once instead of 12 times per vertex:
+
+\begin{itemize}
+\item computes inward face normals and plane numerators;
+\item projects the 4 vertices, sorts them by angle around the centroid with a
+  5-comparison sorting network to get the convex hull in CCW order;
+\item writes a flat 160-byte record per tet: world positions in triangle-strip
+  order $[0,1,3,2]$, the four $(\text{normal}, \text{numerator})$ pairs, and
+  $(\text{base color}, \text{density})$, $(\nabla c, 0)$.
+\end{itemize}
+
+\code{forward_vertex_quad.wgsl} then emits a 4-vertex triangle strip per tet
+from the precomputed buffer, and \code{forward_fragment_quad.wgsl} performs
+the same 4-plane classification as the Regular fragment shader. It adds a
+fallback for behind-camera tets: if the interpolated ray degenerates
+(sentinel $\approx 0$), the ray is reconstructed from the pixel coordinates
+and camera intrinsics. The quad covers the whole silhouette with one
+primitive, trading vertex-shader work for slightly looser coverage.
+
+\section{Mesh-shader forward (\code{MeshForwardPipelines})}
+
+\code{forward_mesh.wgsl} (\code{enable wgpu_mesh_shader}) generates the
+per-tet geometry directly in a mesh shader: \code{@workgroup_size(32)} = 8
+tets $\times$ 4 threads; thread $k$ of a tet owns vertex $k$ \emph{and} face
+$k$. Vertex positions and face normals are exchanged between the 4 threads
+with \code{subgroupShuffle} --- groups of 4 never straddle a subgroup
+boundary for any subgroup size that is a multiple of 4. Each workgroup emits
+32 vertices / 32 primitives; front-facing faces become real triangles,
+back-facing ones degenerate. The fragment shader is the unmodified
+\code{forward_fragment.wgsl}. Dispatched via \code{indirect_convert.wgsl}
+(\code{TETS_PER_GROUP=8}) and \code{draw_mesh_tasks_indirect}. Requires
+\code{Features::EXPERIMENTAL_MESH_SHADER}.
+
+\section{Ray-trace compute (\code{rmesh-raytrace})}
+
+\code{RenderMode::RayTrace} is a software ray tracer used as the viewer's
+diagnostic mode --- it needs \emph{no sorting} at all, at the price of
+$O(\text{depth complexity})$ work per ray.
+
+Flow per frame: the CPU walks the mesh to keep track of which tet contains
+the camera (\code{find_containing_tet_walk}); \code{project_compute} runs
+only for its SH color evaluation; then \code{raytrace_compute.wgsl}
+(\code{@workgroup_size(8,8)}) runs one thread per pixel:
+
+\begin{enumerate}
+\item Derive the ray from intrinsics (or from ray buffers when
+  \code{ray_mode == 1}).
+\item Find the entry tet: if the camera is inside the mesh, start from
+  \code{start_tet}; otherwise trace a BVH over the \emph{boundary faces}
+  (32-deep stack, M\"oller--Trumbore tests; leaves pack
+  \code{tet_id << 2 | face}).
+\item \textbf{Adjacency walk}: intersect the ray with the current tet's four
+  inward planes (entry $=$ max $t$ over entering faces, exit $=$ min $t$
+  over exiting faces), accumulate
+  $c \mathrel{+}= c_{\text{premul}} \cdot T_j$ with
+  $T_j = e^{\log T}$, plus normal, depth, and entropy moments; step through
+  the exit face via \code{tet_neighbors[cur*4 + exit_face]}.
+\item Stop on leaving the mesh, on
+  $\log T \le -5.54$ (transmittance below $1/255$), or after 512 steps.
+\end{enumerate}
+
+The result is written to a storage buffer ($\alpha = 1 - T_{\text{final}}$
+plus an aux image with normal, depth, and entropy), then copied to an
+\code{Rgba32Float} texture for blitting. \code{locate_compute.wgsl} is a GPU
+point-location helper. Because the walk visits tets in exact ray order, this
+renderer is the ground truth the rasterizing paths are compared against.
+
+\section{Retained but unwired}
+
+\code{project_compute_16bit.wgsl} (half-precision sort keys, used by
+\code{SortMode::Gpu16}) and \code{shadow_ray_gen.wgsl} (a pre-DSM shadow
+experiment) are kept in the tree; the latter is superseded by the deep
+shadow maps described in Chapter~\ref{ch:shadow-rendering}.
+

@@ -134,7 +134,8 @@ impl ForwardPipelines {
         // `hw_compute_bg = Some(...)` to `record_sorted_forward_pass`, which
         // uses `hw_compute_pipeline` (10 storage total via uniform-buffer trick)
         // instead of `compute_pipeline`.
-        let compute_bg0_entries = storage_entries(8, wgpu::ShaderStages::COMPUTE, &[true; 8]);
+        // +1 read-only binding (8) for the occlusion-cull mask (tet_visibility).
+        let compute_bg0_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &[true; 9]);
         let compute_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg0_layout"),
@@ -1742,6 +1743,7 @@ pub fn create_compute_bind_group(
             buf_entry(5, &buffers.circumdata),
             buf_entry(6, &material.base_colors),
             buf_entry(7, sh_coeffs_buf),
+            buf_entry(8, &buffers.tet_visibility),
         ],
     });
     let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {

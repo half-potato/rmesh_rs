@@ -77,6 +77,7 @@ fn clone_scene(scene: &SceneData) -> SceneData {
         start_pose: scene.start_pose,
         vertex_count: scene.vertex_count,
         tet_count: scene.tet_count,
+        visibility: scene.visibility.clone(),
     }
 }
 

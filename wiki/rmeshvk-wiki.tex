@@ -1,0 +1,53 @@
+% rmeshvk-wiki.tex — master document; each chapter lives in its own .tex file.
+% Build with: tectonic rmeshvk-wiki.tex   (or ./build.sh)
+\documentclass[11pt]{report}
+\usepackage[a4paper,margin=2.4cm]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{parskip}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=blue!45!black,urlcolor=blue!45!black]{hyperref}
+
+\definecolor{codebg}{gray}{0.96}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  aboveskip=6pt,
+  belowskip=6pt,
+}
+
+% Inline code that tolerates underscores (robust so it survives the TOC).
+\DeclareRobustCommand{\code}[1]{\texttt{\detokenize{#1}}}
+
+% Long \code tokens can't hyphenate; give paragraphs slack instead.
+\emergencystretch=3em
+
+\title{\Huge rmeshvk\\[8pt]
+  \Large A Differentiable Tetrahedral Volume Renderer\\[4pt]
+  \large Technical Wiki}
+\author{}
+\date{\today}
+
+\begin{document}
+\maketitle
+\tableofcontents
+
+\input{overview}
+\input{interval-renderer}
+\input{mesh-style-renderers}
+\input{tile-renderer}
+\input{deferred-shading}
+\input{shadow-rendering}
+\input{gpu-sorting}
+\input{training-and-python}
+
+\end{document}

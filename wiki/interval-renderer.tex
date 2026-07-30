@@ -1,0 +1,208 @@
+\chapter{The Interval Renderer (Main Pathway)}\label{ch:interval-renderer}
+
+\section{Overview}
+
+The interval shader is the production renderer used by the interactive viewer
+(default \code{RenderMode::IntervalShader}) and by forward-only inference.
+Its central trick: instead of asking the fragment shader to figure out where
+a ray enters and exits a tetrahedron (which requires per-fragment plane
+intersections, as the legacy renderers do), a compute pass \emph{decomposes
+each tet's screen projection into non-overlapping triangles} whose vertices
+carry the front and back NDC depths of the tet along that pixel's ray. The
+hardware rasterizer then interpolates the depth interval per pixel, and each
+covered pixel is shaded exactly once per tet with the correct entry/exit
+segment. Overdraw is resolved by ordinary premultiplied-alpha blending over
+back-to-front sorted tets --- no fragment sorting, no fixed-function tricks.
+
+Code lives in \code{crates/rmesh-render} (\code{src/lib.rs} and
+\code{src/wgsl/}). Two pipeline structs drive the path:
+
+\begin{itemize}
+\item \code{ComputeIntervalPipelines} --- compute generation followed by a
+  vertex/fragment draw. \textbf{Universal}: works on Metal, Vulkan, DX12 and
+  WebGPU. This is the production path.
+\item \code{IntervalPipelines} --- a single mesh-shader dispatch
+  (\code{interval_mesh.wgsl}) replacing the generation + vertex stages.
+  Requires \code{Features::EXPERIMENTAL_MESH_SHADER}; currently untested for
+  lack of hardware.
+\end{itemize}
+
+\section{Stage 1 --- Projection, culling, SH color}
+
+\code{project_compute.wgsl} (or the lean \code{project_compute_hw.wgsl} when
+tile counts are not needed) runs one thread per tet
+(\code{@workgroup_size(64)}, 2D-dispatched above 65\,535 workgroups):
+
+\begin{enumerate}
+\item Project the 4 vertices to NDC. If any \code{clip.w <= 0} the tet
+  straddles the camera plane; it is kept and near-clipping is deferred to the
+  rasterizer. Otherwise reject if the NDC AABB is fully outside
+  $[-1,1]^3$ or the screen extent is under one pixel${}^2$.
+\item Cull by maximum optical depth: skip if
+  $\rho \cdot \max_{\text{edge}} < 0.01$.
+\item Compute the depth sort key from the circumsphere power
+  (see Chapter~\ref{ch:gpu-sorting}), bit-inverted so ascending order is
+  back-to-front. Culled threads write \code{0xFFFFFFFF}, sorting to the end.
+\item An \code{atomicAdd} on the instance count in \code{indirect_args}
+  compacts the visible tets into \code{compact_tet_ids}.
+\item Evaluate SH color (degree 0--3, f16 coefficients unpacked with
+  \code{unpack2x16float}) in the direction
+  $\widehat{\text{centroid} - \text{cam}}$, add the $+0.5$ DC bias and a
+  gradient offset, then \code{softplus}; write to \code{colors[tet_id]}.
+  Without SH data (training), base colors are copied through.
+\end{enumerate}
+
+\code{project_compute_hw.wgsl} additionally binds \code{Uniforms} as a
+\emph{uniform} buffer (dropping one storage binding for WebGPU's cap) and
+skips the tile-touch counting loop, which dominates the cost of the full
+variant. \code{project_compute_16bit.wgsl} quantizes depth to 16 bits for the
+faster \code{SortMode::Gpu16} (4 radix passes instead of 8).
+
+\section{Stage 2 --- Radix sort}
+
+\code{rmesh-sort} sorts \code{(sort_keys, sort_values)} by depth. The DRS
+subgroup backend is used when \code{Features::SUBGROUP} is available,
+otherwise the Basic 5-pass backend; on backends without either (Chrome
+WebGPU) or with \code{SortMode::Cpu}, a CPU sorter does frustum culling and
+power sorting and its output is uploaded with a \code{StagingBelt} between
+the projection and generation submits. Details in Chapter~\ref{ch:gpu-sorting}.
+\code{record_radix_sort} returns \code{result_in_b}, which selects the A/B
+bind group downstream (the sort ping-pongs buffers).
+
+\section{Stage 3 --- Indirect convert}
+
+\code{interval_indirect_convert.wgsl} runs a single thread that reads the
+visible count and fills an 8$\times$u32 buffer \code{interval_args_buf}:
+words $[0..2]$ are compute dispatch args
+$(\lceil n/64 \rceil, 1, 1)$ for the generation pass, words $[3..7]$ are
+\code{draw_indexed_indirect} args $(12n, 1, 0, 0, 0)$ --- twelve indices per
+tet. No CPU readback of the count is ever needed.
+
+\section{Stage 4 --- Interval decomposition (\code{interval_compute.wgsl})}
+
+One thread per sorted visible tet. The screen projection of a tetrahedron has
+exactly two silhouette topologies, and both are handled with a small,
+fixed-size output:
+
+\paragraph{Case 1 --- one vertex projects inside the opposite face.}
+\code{classify_silhouette} tests each vertex against the opposite face's
+screen triangle with signed 2D cross products. The silhouette is that face's
+triangle; the interior vertex splits it into a 3-triangle fan around the
+\emph{center} point. At the center, the ray passes through both the face
+(depth $z_{\text{face}}$, barycentric-interpolated) and the interior vertex
+(depth $z_{\text{center}}$); $z_{\text{front}} = \min$,
+$z_{\text{back}} = \max$. Emits 4 vertices, 3 triangles.
+
+\paragraph{Case 2 --- no interior vertex.} Two opposite edges cross in
+screen space. \code{find_crossing_edges} tests the three opposite-edge pairs
+$(01,23), (02,13), (03,12)$ with a 2D line--line intersection requiring both
+parameters in $(0,1)$. The silhouette is a quad of the 4 vertices, split into
+a 4-triangle fan around the crossing point; the two crossing edges provide
+the front and back depths there. Emits 5 vertices, 4 triangles.
+
+Per-vertex color offsets $\nabla c \cdot (v - o_{\text{cam}})$ are carried
+separately for the front and back surfaces, and the scalar-field gradient
+(used later as a normal) is carried for both. Degenerate tets (behind camera,
+depth range $< 10^{-7}$, density $< 10^{-6}$) write zeroed vertices.
+
+\paragraph{Fixed-slot output.} Every tet owns exactly 5 vertex slots
+(4 \code{vec4} each, 320 bytes/tet) in \code{interval_vertex_buf} at base
+$5\,\code{tid}$, plus two \code{vec4} of flat data
+(\code{base_color}, \code{density}, \code{tet_id}) in
+\code{interval_tet_data_buf}:
+\begin{lstlisting}
+slot + 0 : (ndc_x, ndc_y, z_front, z_back)
+slot + 1 : (color_off_front, color_off_back, 0, 0)
+slot + 2 : (gradient_front.xyz, 0)
+slot + 3 : (gradient_back.xyz, 0)
+\end{lstlisting}
+Because the layout is fixed, no atomic compaction is needed: a \emph{static
+fan index buffer} (\code{interval_fan_index_buf}) built once at load indexes
+the slots directly --- per tet $i$ with $b = 5i$, the triangles
+\[
+(b,\,b{+}1,\,b{+}4),\quad (b{+}1,\,b{+}2,\,b{+}4),\quad
+(b{+}2,\,b{+}3,\,b{+}4),\quad (b{+}3,\,b,\,b{+}4).
+\] Case-1 tets duplicate slot~0 into slot~3, making
+the fourth fan triangle degenerate.
+
+\section{Stage 5 --- Vertex shader (\code{interval_vertex.wgsl})}
+
+The pipeline binds \emph{no} vertex buffers; the vertex shader derives
+\code{tet = vertex_index / 5} and reads the slots from storage. It forwards
+NDC position, the depth pair, the color-offset pair, flat density /
+base-color / tet-id, and the interpolated field gradient.
+
+\section{Stage 6 --- Fragment shader (\code{interval_fragment.wgsl})}
+
+Per pixel:
+\begin{enumerate}
+\item Linearize the interpolated NDC depths:
+  $z = \dfrac{n f}{f - z_{\text{ndc}}(f - n)}$.
+\item Reconstruct the ray scale from the intrinsics,
+  $s = \lVert(\frac{x-c_x}{f_x}, \frac{y-c_y}{f_y}, 1)\rVert$, giving the
+  chord length $d = |z_b - z_f|\, s$.
+\item Entry/exit colors $c_{f/b} = \max(c_{\text{base}} + \text{off}_{f/b}, 0)$.
+\item Apply the closed-form volume integral (see the overview article):
+  $\tau = \rho d$, $\alpha = 1 - e^{-\tau}$,
+  $c_{\text{premul}} = w_0 c_b + w_1 c_f$.
+\end{enumerate}
+
+Two entry points share the shading core: \code{main_color_only} writes just
+the color target (lean forward path), and \code{main} writes the full MRT
+G-buffer for deferred shading (all channels premultiplied by $\alpha$ for
+hardware blending):
+
+\begin{longtable}{@{}lll@{}}
+\toprule
+Location & Format & Contents \\
+\midrule
+0 & Rgba16Float & $\text{albedo}\cdot\alpha,\ \alpha$ \\
+1 & Rgba16Float & $\text{roughness}\cdot\alpha,\ f_{0}\cdot\alpha,\ \text{metallic}\cdot\alpha,\ \alpha$ \\
+2 & Rgba8Unorm & bias-encoded field-gradient normal $\cdot\,\alpha$ \\
+3 & Rgba16Float & $\alpha E[z],\ 0,\ \alpha E[z^2],\ \alpha$ (expected termination depth) \\
+\bottomrule
+\end{longtable}
+
+$E[z^2]$ is exact for the exponential termination distribution within the
+segment, with a Taylor correction
+$\tau/6 - \tau^2/12 + \tau^3/40$ to avoid cancellation. The blend state is
+premultiplied over ($\text{src}\cdot 1 + \text{dst}\cdot(1-\alpha_\text{src})$),
+depth test \code{LessEqual} against the primitive depth with depth writes
+disabled, and no face culling (the triangles are screen-aligned).
+
+\section{The mesh-shader variant}
+
+\code{interval_mesh.wgsl} fuses stages 4--5 into one mesh-shader dispatch:
+\code{@workgroup_size(16)}, one thread per tet, 16 tets per workgroup. Each
+thread performs the same silhouette classification, then a serial 16-element
+workgroup prefix sum compacts variable per-tet output (4~verts/3~prims or
+5~verts/4~prims) into the workgroup's mesh output arrays
+(\code{MAX_VERTS=240}, \code{MAX_PRIMS=192}). A hard-won implementation note
+from the source: divergent threads must \emph{never} early-return in a mesh
+shader (it hangs); output is guarded with \code{if my_vert_count > 0u}
+instead. Dispatch args come from \code{indirect_convert.wgsl} with
+\code{TETS_PER_GROUP=16} and \code{draw_mesh_tasks_indirect}.
+
+\section{Record functions and orchestration}
+
+In \code{crates/rmesh-render/src/lib.rs}:
+\begin{itemize}
+\item \code{record_sorted_compute_interval_forward_pass}\\
+  --- the GPU-sort
+  path: reset args $\to$ project $\to$ radix sort $\to$ indirect convert
+  $\to$ generation compute (\code{dispatch_workgroups_indirect}) $\to$
+  MRT/color render pass (\code{draw_indexed_indirect} at byte offset 12).
+\item \code{record_compute_interval_project} /
+  \code{record_compute_interval_after_sort} --- the split used by the CPU
+  sort path, with a \code{StagingBelt} write of sorted indices and the
+  visible count in between.
+\item \code{record_sorted_interval_forward_pass} --- the mesh-shader
+  variant.
+\end{itemize}
+
+The viewer (\code{crates/rmesh-viewer/src/render.rs}) selects the pass by
+\code{RenderMode} and \code{SortMode}; all volume passes use
+\code{LoadOp::Load} to composite over the earlier opaque-primitive pass.
+The same generation + moment-render machinery is reused from each light's
+perspective to build deep shadow maps (Chapter~\ref{ch:shadow-rendering}).
+

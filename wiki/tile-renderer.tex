@@ -1,0 +1,180 @@
+\chapter{The Tile Renderer (Trainable Pathway)}\label{ch:tile-renderer}
+
+\section{Overview}
+
+\code{rmesh-trainable} implements the differentiable forward and backward
+passes used by \code{rmesh-train} and the Python bindings. Both directions
+are \emph{pure compute} --- no fixed-function rasterizer --- so the forward
+intermediates (per-tet interval geometry, per-pixel transmittance state) are
+exactly the quantities the backward kernel needs to replay. The screen is
+divided into tiles (size 12 in training); a sorted list of
+(tile, tet) pairs assigns each tile the tets that touch it in depth order
+(built by \code{rmesh-tile} + the radix sort, see Chapter~\ref{ch:gpu-sorting}),
+and one workgroup processes each tile.
+
+Two forward implementations exist:
+\begin{itemize}
+\item \textbf{Interval tiled} (\code{interval_generate.wgsl} +
+  \code{interval_tiled_rasterize.wgsl}) --- the current path, mirroring the
+  interactive interval renderer's geometry.
+\item \textbf{Software rasterizer baseline} (\code{rasterize_compute.wgsl})
+  --- the pre-interval kernel that does ray--tet plane intersection
+  in-shader; still used by \code{rmesh-train}'s loop and kept as a baseline.
+\end{itemize}
+
+\section{Forward stage 1 --- interval generation}
+
+\code{interval_generate.wgsl} (\code{IntervalGeneratePipeline}) runs one
+thread per visible tet, indexed through \code{compact_tet_ids}. It performs
+the same silhouette decomposition as the interactive renderer
+(Chapter~\ref{ch:interval-renderer}): Case 1 (interior vertex $\to$ 3-triangle
+fan) or Case 2 (crossing edges $\to$ 4-triangle fan), writing 5 fixed vertex
+slots per tet. Differences from the interactive variant:
+
+\begin{itemize}
+\item vertices are written in \emph{pixel} coordinates rather than NDC
+  ($x_{\text{px}} = (x_{\text{ndc}}+1)\frac{W}{2}$,
+  $y_{\text{px}} = (1-y_{\text{ndc}})\frac{H}{2}$), ready for tile scanline
+  tests;
+\item per-vertex records carry
+  $(x, y, z^{\text{ndc}}_{\text{front}}, z^{\text{ndc}}_{\text{back}})$,
+  the front/back color offsets, and front/back per-vertex normals;
+\item \code{interval_meta[vis_idx]} packs the silhouette vertex count in the
+  low 4 bits and the tet id above
+  (\code{num_sil | (tet_id << 4)});
+\item per-tet flat data \code{interval_tet_data[vis_idx]} $=
+  (\text{base color}, \rho)$ with
+  $\text{base color} = c + \nabla c \cdot (o_{\text{cam}} - v_0)$.
+\end{itemize}
+
+Behind-camera, out-of-frustum, and sub-pixel tets write degenerate slots and
+\code{interval_meta = 0}.
+
+\section{Forward stage 2 --- tiled rasterization}
+
+\code{interval_tiled_rasterize.wgsl}
+(\code{IntervalTiledRasterizePipeline}): one workgroup of 32 threads (one
+warp) per tile, dispatched \code{(num_tiles, 1, 1)}. Workgroup shared memory
+holds per-pixel state for up to $16\times16$ pixels: accumulated
+premultiplied color with \emph{log-space transmittance} in \code{.w},
+a normal+depth accumulator, and a 5-float Mip-NeRF-360 distortion-loss
+state.
+
+The tile's tets are traversed \textbf{front to back} by walking its
+\code{tile_ranges} entry from the near end. Per tet:
+
+\begin{enumerate}
+\item Load the 5 silhouette vertices; lanes each own one pixel row and
+  compute the scanline span $[x_l, x_r]$ of the silhouette polygon on that
+  row, trimming pixels already saturated
+  ($\log T < -13.8$, i.e.\ $T < 10^{-6}$); lane 0 builds a prefix sum of row
+  widths.
+\item All 32 lanes stride over the covered pixels. For each pixel: find the
+  containing fan triangle, compute barycentrics, interpolate
+  $z^{\text{ndc}}_{f}, z^{\text{ndc}}_{b}$ and the color offsets.
+\item Linearize depths, apply the ray scale, and evaluate the shared volume
+  integral: $\tau = \rho d$, $\varphi$, $w_0$, $w_1$,
+  $c_{\text{premul}} = w_0 c_b + w_1 c_f$ (colors ReLU-clamped).
+\item Composite front-to-back in log space:
+  $T_j = e^{\log T}$; if $T_j \ge 10^{-6}$:
+  $\text{color} \mathrel{+}= c_{\text{premul}} T_j$;
+  $\log T \mathrel{-}= \tau$. Normal/depth and distortion accumulators are
+  updated with the same $T_j$, and optional per-tet auxiliary channels
+  accumulate $T_j\,\alpha\,\text{aux}[tet]$.
+\end{enumerate}
+
+Final per-pixel writes: \code{rendered_image} RGBA with
+$\alpha = 1 - T_{\text{final}}$, a 4-channel \code{xyzd_image}
+(normal + expected depth), the 5-channel distortion state, and aux channels.
+
+The baseline \code{rasterize_compute.wgsl}
+(\code{RasterizeComputePipeline}) has the same tile/warp/scanline structure
+but intersects the pixel ray with the tet's four faces in-shader (slab
+method over the shared \code{FACES} winding table) instead of reading
+pre-decomposed intervals.
+
+\section{Backward stage 1 --- per-tile reverse traversal}
+
+\code{backward_interval_tiled.wgsl} (\code{BackwardIntervalTiledPipeline}),
+one warp per tile, two bind groups (WebGPU 8-buffer limit): read-only inputs
+(loss gradients \code{dl_d_image}, \code{dl_d_xyzd},
+\code{dl_d_distortion}, \code{dl_d_aux}, the forward outputs, and the
+interval buffers) and atomic accumulators
+(\code{d_interval_verts}, \code{d_interval_tet_data}, \code{d_aux_data}).
+
+The tile is traversed \textbf{back to front} --- the reverse of the forward
+order --- and the forward per-pixel state is reconstructed by \emph{undo}
+rather than storage: initialize from the final rendered pixel
+($\log T = \log(1-\alpha)$), and per tet recompute the forward quantities,
+then peel its contribution off:
+\[
+  \log T_{\text{prev}} = \min(\log T + \tau,\, 0), \qquad
+  \text{color}_{\text{prev}} = \text{color} - c_{\text{premul}}\,
+  T_{\text{prev}} .
+\]
+The chain rule then flows $dL/d(\text{image})$ into
+$d\,c_{\text{premul}}$, $d\tau$ (via
+$d w_0/d\tau = \varphi' + e^{-\tau}$, $d w_1/d\tau = -\varphi'$),
+$d\rho$, $d d$, and $d z^{\text{ndc}}_{f/b}$ (through the depth
+linearization Jacobian
+$\partial z_{\text{view}} / \partial z_{\text{ndc}} =
+n f (f-n) / (f - z_{\text{ndc}} (f-n))^2$), respecting every forward clamp
+(optical-depth clamp, ReLU on colors, NDC range). Contributions from the
+expected-depth and distortion outputs are handled the same way (distortion
+undoes its moment accumulators). Pixel gradients are scattered to the three
+fan-triangle vertices by barycentric weight.
+
+\paragraph{Accumulation strategy.} Each lane keeps private accumulators;
+a butterfly \code{subgroupShuffleXor} reduction sums the 32 lanes and
+\emph{only lane 0} flushes with \code{atomicAdd} --- one atomic add per
+channel per tet per tile instead of per pixel. Per-vertex gradient records
+hold 10 floats
+($dz_f, dz_b, d\text{off}_f, d\text{off}_b, d n_f, d n_b$); per-tet records
+hold $(d\,\text{base color}, d\rho)$.
+
+\section{Backward stage 2 --- chain back to parameters}
+
+\code{interval_chain_back.wgsl} (\code{IntervalChainBackPipeline}), one
+thread per visible tet, maps screen-space gradients back to mesh parameters.
+It reconstructs the same Case-1/Case-2 topology and applies:
+
+\begin{itemize}
+\item \textbf{density}: pass-through into \code{d_densities[tet]};
+\item \textbf{base color}: into \code{d_base_colors[tet]}; since
+  $\text{base} = c + \nabla c \cdot (o_{\text{cam}} - v_0)$, also
+  $d\nabla c \mathrel{+}= (o_{\text{cam}} - v_0)\, \Sigma d_{\text{bc}}$ and
+  $d v_0 \mathrel{-}= \nabla c\, \Sigma d_{\text{bc}}$;
+\item \textbf{NDC depth $\to$ vertices}:
+  $\partial z_{\text{ndc}} / \partial v_{\text{world}} =
+  (\text{VP}_{z\,\text{row}} - z_{\text{ndc}}\,\text{VP}_{w\,\text{row}}) /
+  w_{\text{clip}}$, scattered by the barycentric / edge-mix weights of the
+  case;
+\item \textbf{color offsets $\to$ gradient and vertices}: from
+  $\text{off} = \nabla c \cdot (v - o_{\text{cam}})$;
+\item \textbf{normals}: silhouette and center vertex normal gradients
+  scattered into \code{d_vertex_normals}.
+\end{itemize}
+
+All writes are \code{atomicAdd} --- per-vertex buffers are indexed by global
+vertex id, so vertices shared between tets accumulate correctly.
+
+\paragraph{Parameters receiving gradients:} vertex positions, per-tet
+densities, per-tet base colors (the SH DC term --- the trainable path runs
+with \code{sh_degree = 0}), per-tet color gradients, per-vertex normals, and
+optional per-tet aux channels.
+
+\section{Symbolic derivation and validation}
+
+\code{scripts/derive_backward.py} derives every piece of this math in SymPy
+and validates it with finite differences: the segment integral and its
+derivatives, the log-space compositing undo, ray--plane intersection
+Jacobians in compact cross-product form
+($\partial n / \partial v_a = [v_b - v_c]_\times$, etc.), the color chain
+with ReLU guards, and a full single-tet/single-pixel end-to-end chain.
+GPU-side finite-difference gradient checks live in
+\code{crates/rmesh-render/tests/gradient_test.rs} and
+\code{crates/rmesh-trainable/tests/kernel_tests.rs}.
+
+How this pathway is driven per training step --- tile-pair generation,
+sorting, loss, and Adam --- is covered in Chapter~\ref{ch:training-and-python}.
+

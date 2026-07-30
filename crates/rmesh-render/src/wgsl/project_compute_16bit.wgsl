@@ -44,6 +44,8 @@ struct DrawIndirectArgs {
 @group(0) @binding(5) var<storage, read> circumdata: array<f32>;
 @group(0) @binding(6) var<storage, read> base_colors_buf: array<f32>;
 @group(0) @binding(7) var<storage, read> sh_coeffs: array<u32>;
+// Occlusion-cull mask: bit t set => tet t visible from the active region.
+@group(0) @binding(8) var<storage, read> tet_visibility: array<u32>;
 
 @group(1) @binding(0) var<storage, read_write> colors: array<f32>;
 @group(1) @binding(1) var<storage, read_write> sort_keys: array<u32>;
@@ -101,6 +103,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
             sort_keys[tet_id] = 0xFFFFu;
             sort_values[tet_id] = tet_id;
         }
+        return;
+    }
+
+    // --- Occlusion cull: skip tets not visible from the active region ---
+    // (all-ones mask => no-op). Runs before frustum/optical-depth culls so the
+    // visible-instance count isolates the PVS-only reduction. 0xFFFFu sentinel
+    // matches the 16-bit sort-key convention used above.
+    if ((tet_visibility[tet_id >> 5u] & (1u << (tet_id & 31u))) == 0u) {
+        sort_keys[tet_id] = 0xFFFFu;
+        sort_values[tet_id] = tet_id;
         return;
     }
 

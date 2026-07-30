@@ -317,6 +317,7 @@ impl RMeshRenderer {
             start_pose: [0.0; 7],
             vertex_count,
             tet_count,
+            visibility: None,
         };
 
         // Initialize wgpu

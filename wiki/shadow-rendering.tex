@@ -1,0 +1,126 @@
+\chapter{Shadow Rendering: Moment-Based Deep Shadow Maps}\label{ch:shadow-rendering}
+
+\section{Why deep shadow maps}
+
+A translucent tetrahedral volume cannot use a classic depth-test shadow map:
+a light ray is not blocked at a single depth, it is \emph{attenuated
+continuously}. What a receiver needs is the transmittance function $T(z)$
+along the light ray. \code{rmesh-dsm} stores a compact statistical summary
+of the absorption along each light ray --- two $\alpha$-weighted depth
+moments --- in a per-light cubemap, and reconstructs a conservative $T(z)$
+bound at shading time. The design is documented in \code{MSM.md}; an earlier
+4-moment trigonometric variant (Peters--Klein style) was removed in favor of
+this cheaper 2-moment scheme.
+
+\section{Representation}
+
+One \code{Rgba16Float} cubemap per light (max 16 lights), each texel:
+\[
+  \big(\, E[\alpha z],\; E[\alpha z^2],\; 0,\; \alpha_{\text{total}} \,\big),
+\]
+where $z$ is view-space depth normalized to $[0,1]$ over the light's
+$[\text{near}, \text{far}]$ range and
+$\alpha_{\text{total}} = 1 - T_{\text{total}}$ is the total absorption along
+the ray. At $256^3$ this costs 3\,MiB per light (versus 9\,MiB for the
+removed 4-moment variant).
+
+\section{Generating the moments}
+
+\code{generate_dsm_for_lights} (\code{crates/rmesh-dsm/src/lib.rs}) runs
+per light, \emph{per cubemap face} ($\times 6$):
+
+\begin{enumerate}
+\item \textbf{Build the face view-projection} (\code{build_light_vp}):
+  point lights get a $90^\circ$ perspective per face (using face
+  direction/up pairs matched to WebGPU cube conventions, plus a clip-space
+  Y flip); spot lights a perspective with FOV $= 2\arccos(\cos_{\text{outer}})$;
+  directional lights an orthographic box.
+\item \textbf{Opaque blocker pre-pass} (\code{DsmPrimitivePipeline},
+  \code{dsm_primitive.wgsl}): primitives write $(z, z^2, 0, 1)$ ---
+  a full-$\alpha$ absorber concentrated at their depth --- with depth
+  writes on, so tets behind opaque geometry are culled by the depth test.
+\item \textbf{Project + sort}: the forward \code{project_compute_hw}
+  pipeline projects all tets through the face VP and emits depth keys, then
+  the radix sort orders them back-to-front \emph{for that face}.
+  Each face gets its own project + sort because a single per-light radial
+  sort is \emph{not} a valid per-face compositing order off-axis --- this
+  correctness fix (commit \code{9207ea3}) costs $6\times$ the sort work per
+  light but eliminates wrong shadows.
+\item \textbf{Interval generation + moment render}
+  (\code{DsmPipeline}): the interval renderer's geometry pass runs from the
+  light's viewpoint, and \code{dsm_moment_fragment.wgsl} converts each
+  tet's depth interval into moment contributions, blended back-to-front
+  with premultiplied alpha
+  ($\text{src}\cdot 1 + \text{dst}\cdot(1-\alpha_{\text{src}})$) into a
+  shared 2D staging texture, which is then copied into the cube face layer.
+\end{enumerate}
+
+\paragraph{Moment fragment math.} For a tet crossing the light ray over
+$[z_a, z_b]$ with optical depth $\tau$: $\alpha = 1 - e^{-\tau}$, and using
+the same termination-distribution weights as the color integral
+($\varphi = (1-e^{-\tau})/\tau$, $w_0 = \varphi - e^{-\tau}$,
+$w_1 = 1 - \varphi$):
+\[
+  \text{out} = \big( w_0 z_b + w_1 z_a,\;\; w_0 z_b^2 + w_1 z_a^2,\;\; 0,\;\;
+  \alpha \big) \;=\; \big( \alpha E[z],\; \alpha E[z^2],\; 0,\; \alpha \big).
+\]
+
+Regeneration is triggered when lights move or appear (e.g.\ a flying flare
+projectile), or on demand from the UI.
+
+\section{Atlas and metadata}
+
+\code{DsmAtlas} owns the per-light cubemaps, the staging textures, and a
+storage buffer of \code{ShadowLightMeta}: per light, the six per-face
+view-projection \emph{W rows only} (enough to compute the receiver's
+light-space depth; storing full matrices cost $4\times$ the bytes and forced
+materializing all six for dynamic indexing), plus near/far and the light
+type.
+
+\section{Sampling at shading time}
+
+The deferred pass (Chapter~\ref{ch:deferred-shading}) calls
+\code{evaluate_transmittance(world_pos, light)} per light:
+
+\begin{enumerate}
+\item Select the cube face from the major axis of
+  $d = p_{\text{world}} - p_{\text{light}}$ and sample the moments with a
+  filtering cube sampler.
+\item Receiver depth: $w_{\text{clip}} = \text{VP}_{w\,\text{row}} \cdot
+  (p_{\text{world}}, 1)$, normalized
+  $z = \frac{w_{\text{clip}} - n}{f - n} - \text{bias}$.
+\item Un-premultiply: $\mu = \frac{E[\alpha z]}{\alpha}$,
+  $\overline{z^2} = \frac{E[\alpha z^2]}{\alpha}$.
+\item If $z \le \mu$, the receiver is in front of the mean absorber:
+  $T = 1$. Otherwise apply the \textbf{Cantelli (one-sided Chebyshev)
+  bound} --- the same inequality behind Variance Shadow Maps:
+  \[
+    \sigma^2 = \max\!\big(\overline{z^2} - \mu^2,\;
+    \sigma^2_{\min}\big), \qquad
+    T(z) \;\le\; p_{\max} = \frac{\sigma^2}{\sigma^2 + (z - \mu)^2}.
+  \]
+\item Reduce light bleeding by remapping
+  $\text{linstep}(0.15, 1, p_{\max})$, and floor the result at
+  $1 - \alpha_{\text{total}}$ (light that provably gets through).
+\end{enumerate}
+
+Constants: depth bias $1.5 \times 10^{-3}$, minimum variance
+$4 \times 10^{-4}$, bleed-reduction threshold $0.15$. The bound is exact
+only for a two-spike absorber; for smoother distributions it
+\emph{over}-shadows, which errs on the visually safe side.
+
+\section{Debugging and validation}
+
+\code{DsmResolvePipeline} (\code{dsm_resolve.wgsl}) reconstructs $T(z)$ from
+a moment texture at a UI-chosen query depth --- it must use identical
+constants to the deferred shader --- and
+\code{record_dsm_resolve_cubemap_cross} lays the six faces out as a
+$3\times2$ cross for inspection. The deferred pass also has dedicated debug
+modes for average transmittance, cube-face selection, and raw DSM moments.
+A CPU-reference comparison lives in
+\code{crates/rmesh-dsm/tests/probe_vs_cpu_test.rs}.
+
+References: Donnelly \& Lauritzen, \emph{Variance Shadow Maps} (2006);
+Peters \& Klein, \emph{Moment Shadow Mapping} (2015); Lokovic \& Veach,
+\emph{Deep Shadow Maps} (2000).
+

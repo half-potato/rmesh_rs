@@ -40,13 +40,15 @@ rmesh-tile          ← Tile infrastructure (fill, ranges, scan, RTS prefix scan
 rmesh-data          ← .rmesh file loading, PCA decompression, circumsphere computation
     ↓
 rmesh-render        ← Interactive rendering: interval shader (main) + legacy mesh-style/HW raster paths
+rmesh-raytrace      ← Software ray tracer (BVH entry + adjacency walk), viewer diagnostic mode
     ↓
 rmesh-trainable     ← Trainable pipeline: tile shader (compute-based tiled forward + backward + gradient accumulation)
 rmesh-error         ← Per-tet error statistics accumulation
     ↓
 rmesh-train         ← Training loop (forward + loss + backward + Adam, all GPU)
-rmesh-dsm           ← Deep shadow maps (power moments, per-light cubemap atlas)
+rmesh-dsm           ← Deep shadow maps (2-moment α-weighted, per-light cubemap atlas)
 rmesh-compositor    ← Opaque primitive rendering (cube, sphere, plane, cylinder) + depth compositing
+rmesh-postprocess   ← Deferred shading + screen-space effects (GTAO, SSGI, SSR, Hi-Z), blit
 rmesh-pbd           ← GPU XPBD distance-constraint solver for interactive vertex grabs
 rmesh-anim          ← Animation clock, keyframe evaluation, glTF scene loader
 rmesh-interact      ← Input handling & transform interactions (translate, rotate, scale, vertex select)
@@ -73,7 +75,7 @@ The interval shading path is the active rendering approach for the viewer and fo
 2. **Radix sort** — GPU radix sort of tets by depth (`rmesh-sort`, 5-pass: count → reduce → scan → scan_add → scatter). Falls back to CPU `radsort` + sphere-frustum cull on backends without subgroups (Chrome WebGPU).
 3. **Interval compute** — Generates screen-space triangles per tet and writes vertex + per-tet data to fixed-slot buffers (`interval_compute.wgsl`)
 4. **Interval vertex/fragment** — Hardware rasterizes the interval geometry with MRT output: color, depth, normals (`interval_vertex.wgsl`, `interval_fragment.wgsl`)
-5. **Deferred shading** — Fullscreen pass combining the MRT G-buffer with PBR lighting and DSM shadows (`deferred_shade_frag.wgsl`)
+5. **Deferred shading** — Fullscreen pass combining the MRT G-buffer with PBR lighting and DSM shadows (`deferred_shade_frag.wgsl` in `rmesh-postprocess`)
 
 The two pipeline structs that drive this path:
 - `ComputeIntervalPipelines` — compute → vertex/fragment draw. **Universal** — works on every backend (Metal/Vulkan/DX12/WebGPU).
@@ -81,11 +83,11 @@ The two pipeline structs that drive this path:
 
 #### Deep Shadow Maps (rmesh-dsm)
 
-Shadows use power moments stored in a per-light cubemap atlas:
-- `DsmPipeline` renders interval geometry from each light's perspective
-- Fragment shader accumulates power moments (m_0..m_4 = α·z^k) into 3 Rgba16Float MRT targets
-- `DsmResolvePipeline` reconstructs transmittance T(z) via Hamburger 2-atom moment reconstruction
-- The deferred shading pass samples the DSM atlas for shadow evaluation
+Shadows use α-weighted depth moments stored in a per-light cubemap atlas (see `MSM.md`; the older 4-moment trigonometric variant was removed):
+- Each texel of a light's Rgba16Float cubemap stores `(E[α·z], E[α·z²], 0, α)` with z normalized to [0,1] over the light's near/far range
+- Per light, **per cubemap face** (×6): opaque-primitive depth pre-pass → project + radix sort through that face's VP (a single per-light radial sort is not a valid per-face order off-axis) → interval gen → `DsmPipeline` blends moments back-to-front (`dsm_moment_fragment.wgsl`)
+- The deferred shading pass reconstructs transmittance T(z) with a Cantelli / one-sided-Chebyshev bound (VSM-style): `p_max = σ²/(σ² + (z−μ)²)`, with light-bleed reduction and a `1−α` floor
+- `DsmResolvePipeline` is a debug pass reconstructing T(z) at a query depth (must keep its constants in sync with the deferred shader)
 
 #### Compositing (rmesh-compositor)
 
@@ -98,7 +100,7 @@ The original vertex/fragment and mesh-shader forward path predates interval shad
 - **Hardware rasterization** (`forward_vertex.wgsl`, `forward_fragment.wgsl`, `ForwardPipelines`) — the original 12-tri-per-tet draw with sorted indices.
 - **Quad billboard** (`forward_vertex_quad.wgsl`, `forward_fragment_quad.wgsl`, `forward_prepass_compute.wgsl`) — 4 verts/tet via triangle strip, reads a precomputed per-tet buffer.
 - **Mesh-shader forward** (`forward_mesh.wgsl`, `MeshForwardPipelines`) — non-interval mesh-shader path.
-- **Ray-tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`) — software ray-tet intersection used for the viewer's diagnostic mode.
+- **Ray-tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`, in the `rmesh-raytrace` crate) — software ray-tet intersection used for the viewer's diagnostic mode.
 
 Also retained but not wired into the active viewer modes: `project_compute_16bit.wgsl` (half-precision projection) and `shadow_ray_gen.wgsl` (pre-DSM shadow approach).
 

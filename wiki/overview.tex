@@ -1,0 +1,187 @@
+\chapter{rmeshvk Architecture Overview}\label{ch:overview}
+
+\section{What is rmeshvk?}
+
+\textbf{rmeshvk} is a wgpu-based differentiable tetrahedral volume renderer
+for \emph{Radiance Meshes}: Delaunay tetrahedral meshes carrying per-tet
+density, base color, linear color gradients, and spherical-harmonics (SH)
+appearance. It is the Rust/WebGPU port of the rendering and training backend
+of the parent \code{delaunay_rasterization} project, replacing its Slang/CUDA
+pipeline. Everything --- forward rendering, backward (gradient) passes, loss,
+and the Adam optimizer --- runs on the GPU through WGSL compute and render
+pipelines, and a PyO3 module exposes the renderer to Python/PyTorch.
+
+\section{The core idea: sorting by circumsphere power}
+
+Rendering a translucent tetrahedral volume requires compositing tets in depth
+order. For a \emph{Delaunay} tetrahedralization, the back-to-front order from
+a fixed origin $o$ is given by a per-tet scalar, the \emph{power} of the
+origin with respect to the tet's circumsphere:
+\[
+  P(T) \;=\; \lVert C(T) - o \rVert^2 \;-\; r(T)^2 ,
+\]
+where $C$ and $r$ are the circumsphere center and radius
+(see \code{RADIANCE_MESHES.md}; the proof is due to Karasick et al.\ 1997).
+Crucially the order depends only on the ray \emph{origin}, not the view
+direction, so one radix sort serves any projection sharing that origin
+(pinhole, fisheye, cubemap faces, off-axis). In the shaders the key is
+computed in a cancellation-stable form and bit-inverted so that an ascending
+radix sort yields back-to-front order:
+
+\begin{lstlisting}
+let depth_raw = dot(cam - v0, cam + v0 - 2.0 * center);
+sort_keys[tet_id] = ~bitcast<u32>(clamp(depth_raw, -1e20, 1e20));
+\end{lstlisting}
+
+Per-view frustum culling is decoupled from sorting and happens downstream in
+the projection / interval-generation shaders. See
+\emph{GPU Sorting} (Chapter~\ref{ch:gpu-sorting}) for the sort implementations.
+
+\section{The volume rendering integral}
+
+All renderers share one analytic segment integral. A ray crosses a tet over a
+chord of length $d$; with density $\rho$, the optical depth is
+$\tau = \rho\, d$ (clamped to $[0, 88]$). Color varies linearly along the
+ray, so the exact integral has closed form:
+\[
+  \alpha = 1 - e^{-\tau}, \qquad
+  \varphi(\tau) = \frac{1 - e^{-\tau}}{\tau}, \qquad
+  w_0 = \varphi - e^{-\tau}, \qquad
+  w_1 = 1 - \varphi,
+\]
+\[
+  c_{\text{premul}} \;=\; w_0\, c_{\text{back}} + w_1\, c_{\text{front}} ,
+\]
+where $c_{\text{front}}, c_{\text{back}}$ are the colors at the entry and
+exit points ($c(p) = c_{\text{base}} + \nabla c \cdot (p - o_{\text{cam}})$,
+clamped non-negative). $\varphi$ uses a 4-term Taylor expansion for
+$\tau < 0.02$ to avoid catastrophic cancellation
+(\code{crates/rmesh-util/src/wgsl/math.wgsl}). Compositing uses
+premultiplied alpha; the expected termination depth
+$w_0 z_{\text{back}} + w_1 z_{\text{front}}$ feeds deferred shading and
+shadow moments. The math is derived and finite-difference-validated by
+\code{scripts/derive_backward.py} (SymPy).
+
+\section{Workspace crates}
+
+\begin{longtable}{@{}l>{\raggedright\arraybackslash}p{10.6cm}@{}}
+\toprule
+Crate & Role \\
+\midrule
+\code{rmesh-util} & Shared CPU/GPU \code{#[repr(C)]} structs; WGSL utility modules (math, intersect, SH) \\
+\code{rmesh-sort} & GPU radix sort (Basic 5-pass, DRS subgroup) + CPU fallback sorter \\
+\code{rmesh-tile} & Tile--tet pair generation, RTS prefix scan, tile ranges (training path) \\
+\code{rmesh-data} & \code{.rmesh} loading, PCA SH decompression, circumsphere computation, GPU buffers \\
+\code{rmesh-render} & Interval renderer (main) + legacy mesh-style renderers \\
+\code{rmesh-raytrace} & Compute ray tracer with BVH entry + adjacency walk \\
+\code{rmesh-trainable} & Differentiable tiled forward + backward (interval and baseline rasterizer) \\
+\code{rmesh-error} & Per-tet error statistics for densification \\
+\code{rmesh-train} & GPU-only training loop: loss, backward, Adam \\
+\code{rmesh-dsm} & Deep shadow maps (2-moment, per-light cubemap atlas) \\
+\code{rmesh-compositor} & Opaque primitive rendering (glTF materials) + depth compositing \\
+\code{rmesh-postprocess} & Deferred shading, GTAO, SSGI, SSR, Hi-Z, blit \\
+\code{rmesh-pbd} & GPU XPBD distance-constraint solver for vertex grabs \\
+\code{rmesh-anim} & Animation clock, keyframes, glTF scene loader \\
+\code{rmesh-interact} & Input handling, transform manipulators, vertex picking \\
+\code{rmesh-viewer} & Interactive winit/wgpu viewer (orbit camera, egui UI) \\
+\code{rmesh-viewer-web} & WebAssembly viewer (WebGPU limits, CPU sort) \\
+\code{rmesh-python} & PyO3/maturin bindings (\code{RMeshRenderer}) for PyTorch \\
+\bottomrule
+\end{longtable}
+
+\section{The three rendering pathways}
+
+\begin{longtable}{@{}lll@{}}
+\toprule
+Pathway & Crate & Purpose \\
+\midrule
+Interval shader & \code{rmesh-render} & \textbf{Main} --- viewer and forward inference \\
+Mesh-style shaders & \code{rmesh-render} & \textbf{Legacy} --- reference paths, viewer toggles \\
+Tile shader & \code{rmesh-trainable} & \textbf{Trainable} --- differentiable forward + backward \\
+\bottomrule
+\end{longtable}
+
+\begin{itemize}
+\item \emph{Interval shader} (Chapter~\ref{ch:interval-renderer}) decomposes each
+  tet into non-overlapping screen-space triangles carrying interpolated
+  front/back depths, so the hardware rasterizer resolves overdraw with plain
+  premultiplied blending --- no per-fragment sorting.
+\item \emph{Mesh-style shaders} (Chapter~\ref{ch:mesh-style-renderers}) are the
+  original 12-triangle, quad-billboard, mesh-shader, and ray-trace paths,
+  kept for reference and diagnostics.
+\item \emph{Tile shader} (Chapter~\ref{ch:tile-renderer}) is pure compute in both
+  directions: a tiled front-to-back forward pass whose intermediates are
+  exactly what the reverse-order backward pass needs.
+\end{itemize}
+
+On top of the volume renderers sit \emph{deferred shading}
+(Chapter~\ref{ch:deferred-shading}) --- a G-buffer + fullscreen PBR pass with
+GTAO/SSGI/SSR --- and \emph{deep shadow maps}
+(Chapter~\ref{ch:shadow-rendering}). Training and the PyTorch bridge are covered
+in Chapter~\ref{ch:training-and-python}.
+
+\section{Key design patterns}
+
+\begin{itemize}
+\item \textbf{Shared types} --- \code{crates/rmesh-util/src/shared.rs}
+  defines \code{#[repr(C)]} + \code{bytemuck::Pod} structs matching WGSL
+  std430 layouts byte-for-byte (\code{Uniforms} is 192 bytes and is bound as
+  a \emph{storage} buffer in most passes to avoid std140 padding). All
+  CPU$\leftrightarrow$GPU data flows through these.
+\item \textbf{Shaders as \code{include_str!}} --- WGSL is embedded at compile
+  time; \code{naga_oil} \code{#import} provides shared modules
+  (\code{rmesh::math}, \code{rmesh::intersect}, \code{rmesh::sh}).
+\item \textbf{WebGPU limits} --- bind groups are split in two to respect the
+  8--10 storage-buffer caps; the web viewer falls back to CPU sorting because
+  WebGPU (wgpu 28) exposes no subgroup features.
+\item \textbf{Indirect everything} --- projection compacts visible tets with
+  an atomic counter; tiny ``indirect convert'' kernels turn that count into
+  dispatch and draw arguments, so no CPU readback is needed per frame.
+\item \textbf{GPU-only training} --- \code{rmesh-train} records forward +
+  loss + backward + Adam into a single command encoder per view; the only
+  readback is the scalar loss.
+\end{itemize}
+
+\section{Viewer frame graph}
+
+Per frame, \code{rmesh-viewer/src/render.rs} records:
+\begin{enumerate}
+\item egui UI build; optional PBD solver step (vertex grabs).
+\item Opaque primitive pass (glTF materials) --- writes depth, and the full
+  G-buffer when deferred shading is on.
+\item Volume forward pass by \code{RenderMode}: \code{IntervalShader}
+  (default), \code{Regular}, \code{Quad}, \code{MeshShader}, or
+  \code{RayTrace}; all load (not clear) the primitive targets so the volume
+  composites over the opaques.
+\item Optional DSM regeneration (per light, per cubemap face) when lights
+  moved or a recompute is forced.
+\item Screen-space stack: Hi-Z pyramid $\to$ GTAO $\to$ SSGI $\to$ SSR (each
+  with temporal accumulation) $\to$ deferred shade $\to$ sRGB blit to the
+  swapchain.
+\end{enumerate}
+
+\section{The \code{.rmesh} data format}
+
+Gzip-compressed binary (\code{crates/rmesh-data}):
+header \code{[vertex_count, tet_count, sh_degree, k_components]} (u32);
+start pose ($8\times$ f32); vertices $[N\times3]$ f32; indices $[M\times4]$
+u32; densities $[M]$ u8, log-encoded and decoded as
+$\exp((v-100)/20)$; SH coefficients PCA-compressed (mean + basis + weights in
+f16) and decompressed on load as
+$\text{sh}[t][f] = \text{mean}[f] + \sum_k w[t][k]\, B[k][f]$;
+color gradients $[M\times3]$ f16. Circumspheres are computed on load in
+double precision with degenerate-tet fallbacks
+(\code{compute_circumspheres_parallel}).
+
+\section{Chapter guide}
+
+\begin{itemize}
+\item Chapter~\ref{ch:interval-renderer} --- the main interval-shader renderer
+\item Chapter~\ref{ch:mesh-style-renderers} --- legacy renderers (Regular, Quad, MeshShader, RayTrace)
+\item Chapter~\ref{ch:tile-renderer} --- the trainable tiled renderer and backward pass
+\item Chapter~\ref{ch:deferred-shading} --- G-buffer, PBR lighting, screen-space effects
+\item Chapter~\ref{ch:shadow-rendering} --- moment-based deep shadow maps
+\item Chapter~\ref{ch:gpu-sorting} --- power sort theory and the radix sort backends
+\item Chapter~\ref{ch:training-and-python} --- training loop and PyTorch integration
+\end{itemize}
+

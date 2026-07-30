@@ -1,0 +1,120 @@
+\chapter{GPU Sorting}\label{ch:gpu-sorting}
+
+\section{Why sorting is the linchpin}
+
+Every rasterizing pathway composites translucent tets with premultiplied
+alpha, which is only correct in depth order. rmeshvk's tets come from a
+Delaunay tetrahedralization, and \code{RADIANCE_MESHES.md} records the
+property everything rests on: the back-to-front order from an origin $o$ is
+the descending order of the \emph{circumsphere power}
+\[
+  P(T) = \lVert C(T) - o \rVert^2 - r(T)^2 ,
+\]
+independent of view direction (Karasick et al.\ 1997; cf.\ Edelsbrunner
+1989, Max 1990). One sort per origin therefore serves any projection from
+that origin --- the six faces of a shadow cubemap being the notable
+\emph{non}-example, since each face pass still needs its own
+\emph{culling}, and compositing correctness per face requires sorting with
+that face's projection (see Chapter~\ref{ch:shadow-rendering}).
+
+\paragraph{Key construction.} Expanding $P$ around a tet vertex $v_0$ gives
+the cancellation-stable form used in \code{project_compute.wgsl}:
+\[
+  \text{depth} = (o - v_0) \cdot (o + v_0 - 2C) ,
+\]
+clamped to $\pm 10^{20}$, bitcast to \code{u32}, and bit-inverted so an
+\emph{ascending} radix sort yields \emph{back-to-front}. Culled slots get
+\code{0xFFFFFFFF} and sort to the end; the value array carries tet ids.
+Degenerate (near-planar) tets get $r^2 = 10^{20}$ at load time, sorting them
+last. A 16-bit linear quantization of the key
+(\code{project_compute_16bit.wgsl}, \code{SortMode::Gpu16}) halves the radix
+passes when precision allows.
+
+\section{Backend selection}
+
+\code{rmesh-sort} picks a backend at startup:
+\begin{itemize}
+\item \textbf{DRS} when \code{Features::SUBGROUP} is available (native
+  Vulkan/Metal/DX12);
+\item \textbf{Basic} otherwise (portable, workgroup atomics only);
+\item \textbf{CPU} for \code{SortMode::Cpu} and the web viewer, where wgpu
+  28's WebGPU backend exposes no subgroups and the Basic sort is visibly
+  out of order at multi-million tet counts.
+\end{itemize}
+\code{record_radix_sort} returns \code{result_in_b}: the sort ping-pongs
+between A/B buffer pairs, and an odd pass count leaves the result in B, so
+downstream passes carry two prebuilt bind groups and pick by this flag.
+
+\section{Basic backend: 5-pass, 4-bit radix}
+
+\code{crates/rmesh-sort/src/basic.rs}, with one shader per pass
+(\code{radix_sort_count.wgsl} through \code{radix_sort_scatter.wgsl});
+256-thread workgroups, 4 elements/thread (blocks of 1024), 16 bins. Per 4-bit digit
+(8 passes for 32-bit keys):
+\begin{enumerate}
+\item \textbf{count} --- per-block digit histograms via workgroup atomics;
+\item \textbf{reduce} --- tree-reduce each bin's block counts into a spine;
+\item \textbf{scan} --- single-workgroup exclusive prefix sum of the spine;
+\item \textbf{scan\_add} --- add the scanned spine back into the per-block
+  counts, yielding global bin offsets;
+\item \textbf{scatter} --- a stable in-block 2-bit-at-a-time local sort,
+  then scatter keys and values to their global positions.
+\end{enumerate}
+A \code{KEY_STRIDE} substitution reuses the same shaders for 32-bit tet keys
+and 64-bit tile keys.
+
+\section{DRS backend: 3-kernel, 8-bit radix}
+
+\code{crates/rmesh-sort/src/drs.rs} ports b0nes164's
+\emph{DeviceRadixSort} (shaders \code{drs_upsweep.wgsl},
+\code{drs_scan.wgsl}, \code{drs_downsweep.wgsl}): radix 256, 15
+keys/thread, 3840-element partitions, 4 passes for 32 bits.
+Upsweep builds per-block and global digit histograms; a 256-workgroup scan
+(one per digit) prefixes the spine; the downsweep ranks keys cooperatively
+with subgroup operations and scatters. The per-pass key count is copied from
+a GPU counter, so the visible-tet count never touches the CPU.
+
+\section{CPU fallback}
+
+\code{crates/rmesh-sort/src/cpu.rs} (\code{CpuSorter}) performs
+Gribb--Hartmann sphere-vs-frustum culling (wgpu's $[0,1]$ NDC makes the near
+plane row $r_2$, not $r_3 + r_2$), computes the same power key with the
+bit-inversion trick, packs \code{(key << 32) | tet_id} into \code{u64}, and
+uses \code{sort_unstable} (pdqsort --- in place, avoiding a
+$\sim$38\,MB radix scratch). The viewer uploads the resulting compact index
+list and visible count with a \code{StagingBelt} between the projection and
+interval-generation submits.
+
+\section{Tile-pair sorting for the trainable path}
+
+Training needs each screen tile's tets in depth order, which is a sort of
+\emph{(tile, tet)} pairs under a 64-bit key (tile id in the high half, depth
+in the low half). \code{rmesh-tile} builds the pairs without CPU readback
+(\code{record_scan_tile_pipeline}):
+
+\begin{enumerate}
+\item \textbf{tile\_fill} --- fill the key/value arrays with the
+  \code{0xFFFFFFFF} sentinel;
+\item \code{project_compute} counts, per visible tet, the tiles its
+  silhouette touches (conservative scanline test) into
+  \code{tiles_touched};
+\item \textbf{prepare\_dispatch} --- one thread converts the visible count
+  into dispatch arguments for the following passes;
+\item \textbf{RTS prefix scan} (\code{rts.wgsl}, a port of b0nes164's
+  reduce-then-scan, subgroup-based, 256 threads $\times$ vec4$\times$4
+  elements) turns the per-tet tile counts into write offsets --- no atomics;
+\item \textbf{tile\_gen\_scan} --- each tet re-runs the scanline fill and
+  emits one (key, tet id) pair per covered tile; the last tet writes the
+  total pair count;
+\item \textbf{radix sort} the pairs (\code{KEY_STRIDE=2}; the bit count
+  adapts to the number of tile bits);
+\item \textbf{tile\_ranges} --- one thread per pair detects tile boundaries
+  in the sorted array and writes \code{tile_ranges[tile] = [start, end)}.
+\end{enumerate}
+
+The tiled rasterizer and backward kernels then walk \code{tile_ranges}
+front-to-back and back-to-front respectively (Chapter~\ref{ch:tile-renderer}).
+The forward interval renderer sets \code{tile_size_u = 0} to skip the
+tile-touch counting entirely --- it is the dominant cost of the full
+projection kernel and only training needs it.
+

@@ -1,0 +1,129 @@
+\chapter{Training Loop and Python Integration}\label{ch:training-and-python}
+
+\section{Overview}
+
+Two consumers drive the trainable pathway (Chapter~\ref{ch:tile-renderer}):
+the native Rust training loop in \code{rmesh-train}, and the PyTorch bridge
+in \code{rmesh-python}. Both share the same principle: record forward,
+loss, backward, and the optimizer into as few command encoders as possible
+and keep data on the GPU --- the native loop's only per-step readback is the
+scalar loss.
+
+\section{The native loop (\code{rmesh-train})}
+
+\code{train()} builds every pipeline, buffer, and bind group once (including
+A/B variants for the radix-sort ping-pong), then per view records a
+\emph{single} command encoder:
+
+\begin{enumerate}
+\item clear gradient, loss, tile-range, and image buffers;
+\item \code{project_compute} --- SH/color evaluation, culling, per-tet tile
+  counts, compact visible ids;
+\item tile-pair generation and 64-bit radix sort, then tile ranges
+  (Chapter~\ref{ch:gpu-sorting});
+\item forward rasterization --- the native loop uses the
+  software-rasterizer baseline (tile size 12,
+  \code{RasterizeComputePipeline}); the interval variant is exercised
+  through the Python bindings;
+\item loss pass; backward pass; three Adam dispatches (one per parameter
+  group).
+\end{enumerate}
+
+One \code{queue.submit} per view; the only \code{write_buffer}s are the
+camera uniforms and per-group Adam uniforms. Cameras come from
+\code{TrainingView} with the pinhole convention (x right, y down, z
+forward) and intrinsics derived from the FOV.
+
+\subsection{Loss (\code{loss_compute.wgsl})}
+
+A $16\times16$ workgroup per pixel block compares the premultiplied rendered
+RGB against ground truth. \code{loss_type = 0} gives L1
+($\partial L/\partial c = \text{sign}(c - g)/n$), otherwise L2
+($2(c - g)/n$); the result is written per pixel to \code{dl_d_image}
+(alpha gradient zero). SSIM has plumbing (a \code{lambda_ssim} uniform and
+\code{ssim_err} buffers consumed by \code{rmesh-error}) but is \emph{not}
+computed by this shader --- only L1/L2 are.
+
+\subsection{Adam (\code{adam_compute.wgsl})}
+
+One dispatch per parameter group so each group gets its own learning rate:
+vertices ($10^{-4}$), densities ($10^{-2}$), color gradients ($10^{-3}$);
+$\beta_1 = 0.9$, $\beta_2 = 0.999$, $\epsilon = 10^{-8}$. The kernel is a
+standard Adam step with NaN-guarded gradients and bias correction via
+$\beta^t = e^{t \ln \beta}$, using the safe-math helpers throughout. Moment
+buffers ($m, v$) live per group in \code{AdamState} /
+\code{MaterialAdamState}.
+
+\subsection{Per-tet error statistics (\code{rmesh-error})}
+
+\code{error_tiled_compute.wgsl} re-traverses tiles exactly like the forward
+rasterizer but accumulates per-tet statistics with atomics, weighted by
+$T \cdot \tau$: total weight, weighted L1 and L1$^2$, weighted SSIM error,
+weighted entry/exit points and centroid, a hit count, and a max-visibility
+score. These drive densification decisions (which tets to split or prune).
+
+\section{Python bindings (\code{rmesh-python})}
+
+\code{maturin develop} builds the \code{_native} module; the
+\code{rmesh_wgpu} package wraps it.
+
+\subsection{\code{RMeshRenderer}}
+
+A single \code{#[pyclass]} owns the entire wgpu state. Key methods:
+
+\begin{itemize}
+\item constructor: \code{(vertices, indices, base_colors,}
+  \code{densities, color_grads, circumdata, width, height, aux_dim=0)};
+\item forward variants: \code{forward} (hardware-raster path),
+  \code{forward_tiled} (software rasterizer),
+  \code{forward_interval_tiled} (interval path --- returns a dict with
+  image, xyzd, distortion, and aux arrays), \code{forward_raytrace},
+  \code{forward_error};
+\item backward variants: \code{backward} and
+  \code{backward_interval_tiled}, the latter taking \code{dl_d_image} and
+  optional \code{dl_d_xyzd} / \code{dl_d_distortion} / \code{dl_d_aux}
+  --- each returns a dict of flat
+  \code{f32} gradient arrays (\code{d_vertices}, \code{d_densities},
+  \code{d_base_colors}, \code{d_color_grads}, \code{d_vertex_normals},
+  optionally \code{d_aux_data});
+\item \code{train_step(...) -> f32} --- the all-GPU step (forward + loss +
+  backward + Adam) with only the scalar loss read back;
+\item \code{update_params} / \code{get_params} and setters for vertex
+  normals, aux data, and \code{min_t}.
+\end{itemize}
+
+\code{backward_interval_tiled} internally re-runs tile generation and
+sorting for the given view, then the two backward stages (per-tile
+reverse traversal, then the per-tet chain back to parameters) before reading
+back the gradient buffers.
+
+\subsection{\code{autograd.py} and the tensor boundary}
+
+\code{RMeshForward(torch.autograd.Function)}:
+\begin{itemize}
+\item \textbf{forward}: syncs the current PyTorch parameters into the GPU
+  buffers via \code{update_params}, calls the chosen forward, and wraps the
+  returned image back into a torch tensor on the caller's device;
+\item \textbf{backward}: moves \code{grad_output} to CPU numpy, calls the
+  matching native backward, and wraps each gradient array as a torch tensor
+  aligned with the forward argument tuple.
+\end{itemize}
+
+The boundary is \emph{explicit host copies} in both directions
+(\code{.detach().cpu().numpy()} up, \code{read_buffer_f32} $\to$ numpy
+$\to$ \code{torch.from_numpy} down); there is no zero-copy
+CUDA$\leftrightarrow$wgpu interop. \code{RMeshModule(nn.Module)} exposes
+\code{vertices}, \code{base_colors}, \code{densities}, and
+\code{color_grads} as \code{nn.Parameter}s so a standard
+\code{torch.optim.Adam(model.parameters())} loop trains the mesh --- the
+alternative to the fully-native \code{train_step}.
+
+\section{Validation}
+
+Finite-difference gradient checks live in
+\code{crates/rmesh-render/tests/gradient_test.rs} and
+\code{crates/rmesh-trainable/tests/kernel_tests.rs}; the analytic math they
+check is derived symbolically in \code{scripts/derive_backward.py}
+(see Chapter~\ref{ch:tile-renderer}). Renderer-vs-CPU-reference image comparisons
+live in \code{crates/rmesh-render/tests/}.
+

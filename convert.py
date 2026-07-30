@@ -436,6 +436,35 @@ def read_null_terminated_string(fid):
         char_list.append(char)
     return b''.join(char_list).decode("utf-8")
 
+def process_visibility_to_rmesh(ply_file_path, vis_dir, starting_cam, out_deg):
+    """Process PLY + precomputed visibility (.npy from bake_visibility.py) into an
+    .rmesh with tet_visibility / region_centroids / region_radii tagged sections."""
+    buffer, tet_mask = _process_ply_to_rmesh_buffer(ply_file_path, starting_cam, out_deg)
+    _align4(buffer)
+    buffer.write(np.array([TAGGED_MAGIC], dtype=np.uint32).tobytes())
+
+    vis_dir = Path(vis_dir)
+    vis = np.load(vis_dir / "tet_visibility.npy")            # [K, M_full] u8
+    centroids = np.load(vis_dir / "region_centroids.npy")    # [K, 3] f32
+    radii = np.load(vis_dir / "region_radii.npy")            # [K] f32
+
+    if vis.shape[1] != tet_mask.shape[0]:
+        raise ValueError(
+            f"visibility M={vis.shape[1]} != PLY tet count {tet_mask.shape[0]}; "
+            "bake_visibility must run on the same model this PLY was exported from")
+    vis_kept = vis[:, ~tet_mask]                             # [K, M_kept]
+    print(f"  visibility: {vis.shape[0]} regions, {vis_kept.shape[1]} kept tets "
+          f"(dropped {int(tet_mask.sum())})")
+
+    num_sections = 3
+    buffer.write(np.array([num_sections], dtype=np.uint32).tobytes())
+    write_tagged_section(buffer, "tet_visibility", vis_kept, 2)     # u8
+    write_tagged_section(buffer, "region_centroids", centroids, 1)  # f32
+    write_tagged_section(buffer, "region_radii", radii, 1)          # f32
+
+    return gzip.compress(buffer.getvalue(), compresslevel=9)
+
+
 def read_extrinsics_binary(path_to_model_file, transform_matrix):
     """
     Reads the images.bin file, converts to GL coordinates, applies transform,
@@ -505,6 +534,12 @@ def main():
         "--pbr", action="store_true",
         help="Enable PBR export (expects PBR checkpoint files in the input directory)"
     )
+    parser.add_argument(
+        "--visibility", default=None,
+        help="Path to a directory with tet_visibility.npy / region_centroids.npy / "
+             "region_radii.npy (from bake_visibility.py). Bakes occlusion-PVS "
+             "sections for viewer-side occlusion culling."
+    )
     args = parser.parse_args()
     for input_file in args.input_files:
         input_path = Path(input_file)
@@ -529,6 +564,11 @@ def main():
             print(f"  PBR export from {ckpt_dir}")
             rmesh_data = process_pbr_to_rmesh(
                 str(ply_file), str(ckpt_dir), extrinsics[0], 0
+            )
+        elif args.visibility:
+            print(f"  Visibility (occlusion PVS) export from {args.visibility}")
+            rmesh_data = process_visibility_to_rmesh(
+                str(ply_file), args.visibility, extrinsics[0], args.degree
             )
         else:
             rmesh_data = process_ply_to_rmesh(str(ply_file), extrinsics[0], args.degree)
