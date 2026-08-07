@@ -244,6 +244,24 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         ndc_z[vi] = clip[vi].z * inv_w;
     }
 
+    // Screen-space extent of the projected tet, in pixels. The interval
+    // silhouette geometry is only worth generating when the tet covers at
+    // least ~1 pixel; below that the hardware rasterizer samples it at most
+    // once (and often misses it entirely), so we instead emit a single
+    // coverage-weighted splat (see the sub-pixel branch below). `coverage`
+    // (area capped at 1) attenuates the splat's contribution so a tet
+    // covering, say, 0.3 px adds 0.3× its alpha.
+    var ndc_min = ndc_xy[0];
+    var ndc_max = ndc_xy[0];
+    for (var vi = 1u; vi < 4u; vi++) {
+        ndc_min = min(ndc_min, ndc_xy[vi]);
+        ndc_max = max(ndc_max, ndc_xy[vi]);
+    }
+    let ext_px = (ndc_max - ndc_min)
+        * vec2<f32>(uniforms.screen_width, uniforms.screen_height) * 0.5;
+    let area_px = ext_px.x * ext_px.y;
+    let coverage = min(area_px, 1.0);
+
     // Material data
     let tet_density = densities[tet_id];
     let color = load_color(tet_id);
@@ -259,15 +277,56 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     vn[2] = load_vnormal(i2);
     vn[3] = load_vnormal(i3);
 
-    // Write per-tet flat data: slot 0 = (base_color.rgb, density), slot 1 = (tet_id, 0, 0, 0)
+    // Write per-tet flat data: slot 0 = (base_color.rgb, density),
+    // slot 1 = (tet_id, coverage, 0, 0)
     out_tet_data[tid * 2u] = vec4<f32>(base_color, tet_density);
-    out_tet_data[tid * 2u + 1u] = vec4<f32>(bitcast<f32>(tet_id), 0.0, 0.0, 0.0);
+    out_tet_data[tid * 2u + 1u] = vec4<f32>(bitcast<f32>(tet_id), coverage, 0.0, 0.0);
 
     // Skip degenerate tets
     let z_range = max(max(ndc_z[0], ndc_z[1]), max(ndc_z[2], ndc_z[3]))
                 - min(min(ndc_z[0], ndc_z[1]), min(ndc_z[2], ndc_z[3]));
     if z_range < 1e-7 || tet_density < 1e-6 {
         for (var i = 0u; i < 5u; i++) { write_degenerate_vertex(v_base + i); }
+        return;
+    }
+
+    // Sub-pixel tets: skip the interval silhouette geometry and emit a single
+    // 1-pixel splat snapped to the nearest pixel center (so it reliably covers
+    // exactly one pixel instead of flickering in and out between samples). The
+    // fragment shader weights it by `coverage` (= area, capped at 1).
+    if area_px < 1.0 {
+        let scr = vec2<f32>(uniforms.screen_width, uniforms.screen_height);
+        let cen = 0.25 * (ndc_xy[0] + ndc_xy[1] + ndc_xy[2] + ndc_xy[3]);
+        let px = (cen * 0.5 + 0.5) * scr;          // NDC -> pixel coords
+        let px_c = floor(px) + 0.5;                // nearest pixel center
+        let cen_snap = (px_c / scr) * 2.0 - 1.0;   // pixel center -> NDC
+        // Half of one pixel in NDC (full quad = ±1/W, ±1/H around the center).
+        let hx = 1.0 / uniforms.screen_width;
+        let hy = 1.0 / uniforms.screen_height;
+
+        // Depth interval = tet's NDC z-extent (thickness along the centroid ray).
+        let zf = min(min(ndc_z[0], ndc_z[1]), min(ndc_z[2], ndc_z[3]));
+        let zb = max(max(ndc_z[0], ndc_z[1]), max(ndc_z[2], ndc_z[3]));
+
+        // Flat color offset + gradient sampled at the tet centroid.
+        let cen_world = 0.25 * (v_world[0] + v_world[1] + v_world[2] + v_world[3]);
+        let cen_off = dot(grad, cen_world - cam_pos);
+        let gn = 0.25 * (vn[0] + vn[1] + vn[2] + vn[3]);
+
+        // 4 corners + center, matching the fan (0,1,4)(1,2,4)(2,3,4)(3,0,4).
+        // Ordered clockwise in NDC so that after the viewport Y-flip the
+        // triangles are CCW (front-facing) and survive the pipeline's Back cull
+        // (front_face = Ccw). Wrong winding would cull the whole coplanar splat.
+        let corners = array<vec2<f32>, 4>(
+            cen_snap + vec2<f32>(-hx, -hy),
+            cen_snap + vec2<f32>(-hx,  hy),
+            cen_snap + vec2<f32>( hx,  hy),
+            cen_snap + vec2<f32>( hx, -hy),
+        );
+        for (var i = 0u; i < 4u; i++) {
+            write_vertex(v_base + i, corners[i], zf, zb, cen_off, cen_off, gn);
+        }
+        write_vertex(v_base + 4u, cen_snap, zf, zb, cen_off, cen_off, gn);
         return;
     }
 

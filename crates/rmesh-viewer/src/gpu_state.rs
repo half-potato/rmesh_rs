@@ -84,6 +84,19 @@ pub struct CpuTimings {
 
 pub const TS_QUERY_COUNT: u32 = 8;
 
+/// Number of timestamp slots the frame actually writes: 0..6 (project, sort,
+/// gen/prepass, render). Slots 6..8 belong to the standalone SH-eval compute
+/// pass (`rmesh_util::sh_eval`), which the viewer never records — the interval
+/// path evaluates SH inline in `project_compute.wgsl`.
+///
+/// Only ever resolve slots that were written this frame. `resolve_query_set`
+/// over a never-written query is undefined behavior on Vulkan and **wedges the
+/// NVIDIA Linux driver**: the submission never completes, so nothing is ever
+/// presented and the window shows a black or frozen image while input keeps
+/// working. If the SH-eval pass is ever recorded again, raise this to
+/// `TS_QUERY_COUNT` only on the frames that actually dispatch it.
+pub const TS_WRITTEN_COUNT: u32 = 6;
+
 /// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
 /// Pack SH coefficients as f16 pairs into u32 words.
 ///

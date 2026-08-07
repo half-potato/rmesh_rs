@@ -119,6 +119,59 @@ impl ShCoeffs {
 /// Magic bytes for tagged extension sections: "RMTX" as u32 LE.
 const TAGGED_MAGIC: u32 = 0x524D5458;
 
+/// Scan forward from `from` for the start of the tagged extension block.
+///
+/// The block's position used to be inferred by summing the sizes of the legacy
+/// blocks that precede it (SH, color_grads). A PBR export may omit either of
+/// those, and then the computed offset lands in the middle of the tagged data —
+/// the magic check fails and the PBR + visibility sections are dropped
+/// *silently*, so the model loads as non-PBR with no diagnostic. Locating the
+/// block by scanning instead makes the parse independent of which legacy blocks
+/// a given file happens to carry.
+///
+/// Candidates are validated (plausible section count, well-formed first header)
+/// so a chance 4-byte match inside legacy float data can't be mistaken for the
+/// real block.
+fn find_tagged_magic(data: &[u8], from: usize) -> Option<usize> {
+    let mut p = (from + 3) & !3;
+    while p + 8 <= data.len() {
+        if u32::from_le_bytes(data[p..p + 4].try_into().ok()?) == TAGGED_MAGIC
+            && validate_tagged_header(data, p)
+        {
+            return Some(p);
+        }
+        p += 4;
+    }
+    None
+}
+
+/// Cheap plausibility check for a candidate tagged block at `p`.
+fn validate_tagged_header(data: &[u8], p: usize) -> bool {
+    let Ok(bytes) = data[p + 4..p + 8].try_into() else {
+        return false;
+    };
+    let num_sections = u32::from_le_bytes(bytes);
+    if num_sections == 0 || num_sections > 64 {
+        return false;
+    }
+    // First section header: 16-byte tag, dtype, shape_rank.
+    let h = p + 8;
+    if h + 24 > data.len() {
+        return false;
+    }
+    let tag = &data[h..h + 16];
+    if !tag
+        .iter()
+        .all(|&b| b == 0 || (b.is_ascii_graphic() && b != b'"'))
+        || tag[0] == 0
+    {
+        return false;
+    }
+    let dtype = u32::from_le_bytes(data[h + 16..h + 20].try_into().unwrap());
+    let shape_rank = u32::from_le_bytes(data[h + 20..h + 24].try_into().unwrap());
+    dtype < 16 && shape_rank >= 1 && shape_rank <= 4
+}
+
 /// PBR material data loaded from tagged .rmesh extension sections.
 #[derive(Clone, Debug)]
 pub struct PbrData {
@@ -319,10 +372,50 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         effective_k
     );
 
+    // Locate the tagged extension block before consuming anything else. Where it
+    // sits tells us which legacy blocks this file actually contains — a PBR
+    // export may omit the SH block, the color_grads block, or both, and reading
+    // them unconditionally would consume tagged data and desync the parse.
+    let scan_start = offset;
+    let sh_bytes =
+        (total_dims + effective_k * total_dims + tet_count as usize * effective_k) * 2;
+    let sh_end = (scan_start + sh_bytes + 3) & !3;
+    let color_grads_count = tet_count as usize * 3;
+    let color_grads_bytes = color_grads_count * 2;
+    let cg_end = (sh_end + color_grads_bytes + 3) & !3;
+
+    let tagged_at = find_tagged_magic(data, scan_start);
+    // A block that starts before a legacy section would end means that section
+    // is absent from the file.
+    let has_sh = tagged_at.is_none_or(|p| p >= sh_end);
+    let has_color_grads = tagged_at.is_none_or(|p| p >= cg_end);
+    if let Some(p) = tagged_at {
+        if !has_sh || !has_color_grads {
+            log::info!(
+                "Tagged sections at offset {} — this file omits legacy blocks (SH: {}, color_grads: {}). \
+                 Substituting zeros for the missing ones.",
+                p,
+                if has_sh { "present" } else { "ABSENT" },
+                if has_color_grads { "present" } else { "ABSENT" },
+            );
+        }
+    }
+
     // SH Mean + Basis are small, Weights + Grads are large → parallel f16 conversion
-    let mean = slice_f16_to_f32(data, &mut offset, total_dims);
-    let basis = slice_f16_to_f32(data, &mut offset, effective_k * total_dims);
-    let weights = slice_f16_to_f32(data, &mut offset, tet_count as usize * effective_k);
+    let (mean, basis, weights) = if has_sh {
+        let mean = slice_f16_to_f32(data, &mut offset, total_dims);
+        let basis = slice_f16_to_f32(data, &mut offset, effective_k * total_dims);
+        let weights = slice_f16_to_f32(data, &mut offset, tet_count as usize * effective_k);
+        (mean, basis, weights)
+    } else {
+        // No SH block: leave base colors at zero. For a PBR file this is
+        // harmless — the renderer takes albedo from the tagged sections.
+        (
+            vec![0.0f32; total_dims],
+            vec![0.0f32; effective_k * total_dims],
+            vec![0.0f32; tet_count as usize * effective_k],
+        )
+    };
     log::debug!(
         "Parse offsets: after SH weights = {} / {} bytes ({:.1} MB remaining)",
         offset,
@@ -331,16 +424,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     );
 
     offset = (offset + 3) & !3;
-    let color_grads_count = tet_count as usize * 3;
-    let color_grads_bytes = color_grads_count * 2;
-    // Check if tagged PBR sections start here (before color_grads)
-    let has_tagged_here = offset + 4 <= data.len()
-        && u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) == TAGGED_MAGIC;
-    let color_grads = if has_tagged_here {
-        log::info!(
-            "Tagged sections found at offset {} (before color_grads). Using zeros for color_grads.",
-            offset
-        );
+    let color_grads = if !has_color_grads {
         vec![0.0f32; color_grads_count]
     } else if offset + color_grads_bytes <= data.len() {
         slice_f16_to_f32(data, &mut offset, color_grads_count)
@@ -393,9 +477,33 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 
     // --- Parse tagged extension sections (if present) ---
+    // Resync to the scanned position: the legacy blocks above may have consumed
+    // a different number of bytes than this file actually stores.
+    if let Some(p) = tagged_at {
+        if p != ((offset + 3) & !3) {
+            log::warn!(
+                "Tagged sections start at offset {} but legacy parsing ended at {} \
+                 (delta {}). Resyncing — legacy block sizes in this file don't match the header.",
+                p,
+                (offset + 3) & !3,
+                p as i64 - (((offset + 3) & !3) as i64),
+            );
+        }
+        offset = p;
+    }
     let (pbr_data, visibility) = parse_tagged_extensions(data, &mut offset);
     if pbr_data.is_some() {
         log::info!("Found PBR tagged extension sections");
+    } else if data.len().saturating_sub(offset) > 64 {
+        // Never drop PBR silently: a model that has tagged data but fails to
+        // parse it renders as a plain non-PBR mesh, which is easy to mistake for
+        // a shading bug rather than a load failure.
+        log::warn!(
+            "No PBR tagged sections parsed, but {} bytes remain unconsumed at offset {}. \
+             If this model is supposed to be PBR, its section block was not found.",
+            data.len() - offset,
+            offset,
+        );
     }
     if let Some(v) = &visibility {
         log::info!(

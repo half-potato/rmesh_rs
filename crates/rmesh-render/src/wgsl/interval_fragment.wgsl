@@ -50,6 +50,7 @@ struct FragmentInput {
     @location(3) @interpolate(flat) base_color: vec3<f32>,
     @location(4) @interpolate(flat) tet_id: u32,
     @location(5) field_gradient: vec3<f32>,          // interpolated raw gradient, normalize in pixel
+    @location(6) @interpolate(flat) coverage: f32,   // sub-pixel area weight (1.0 for >=1px tets)
 };
 
 struct FragmentOutput {
@@ -150,7 +151,9 @@ fn shade_common(frag_coord: vec4<f32>, in: FragmentInput) -> ShadeCommon {
 @fragment
 fn main_color_only(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput)
     -> @location(0) vec4<f32> {
-    return shade_common(frag_coord, in).color;
+    // `coverage` scales the whole premultiplied contribution (rgb and a), so a
+    // sub-pixel tet composites as if it only covered `coverage` of the pixel.
+    return shade_common(frag_coord, in).color * in.coverage;
 }
 
 @fragment
@@ -218,6 +221,17 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
 
     out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
+
+    // Sub-pixel coverage weight. Every MRT slot is premultiplied by alpha and
+    // carries alpha in .a, so scaling each slot by `coverage` attenuates the
+    // fragment's entire contribution (color, material, normal, depth moments)
+    // as if it covered only `coverage` of the pixel. For >=1px tets coverage
+    // is 1.0 and these are no-ops.
+    let cov = in.coverage;
+    out.color *= cov;
+    out.aux0 *= cov;
+    out.normals *= cov;
+    out.expected_depth *= cov;
 
     return out;
 }

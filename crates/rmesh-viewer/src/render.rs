@@ -53,6 +53,43 @@ impl App {
 
         // Occlusion-cull mask: pick region for the (now-current) camera, upload on change.
         self.update_cull_mask();
+
+        // One-shot diagnostic: overdraw / visibility breakdown for this exact view.
+        if self.measure_subpixel {
+            self.measure_subpixel = false;
+            let drawn = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
+            log::info!(
+                "[overdraw probe] baked PVS: cull_enabled={} region={} baked_visible={} of {} ({:.1}%) | \
+                 GPU actually drew (visible_instance_count) = {} last frame",
+                self.cull_enabled,
+                self.active_region,
+                self.active_baked_count,
+                self.scene_data.tet_count,
+                100.0 * self.active_baked_count as f32 / self.scene_data.tet_count.max(1) as f32,
+                drawn,
+            );
+            // The region-21 PVS mask (u8 per tet), if a region is active, so the
+            // probe can measure overdraw over only the PVS-visible set.
+            let m = self.scene_data.tet_count as usize;
+            let vis_row: Option<&[u8]> = if self.active_region >= 0 {
+                self.scene_data.visibility.as_ref().and_then(|v| {
+                    let r = self.active_region as usize;
+                    v.masks.get(r * m..r * m + m)
+                })
+            } else {
+                None
+            };
+            measure_subpixel_fraction(
+                &vp,
+                w,
+                h,
+                &self.scene_data.vertices,
+                &self.scene_data.indices,
+                &self.scene_data.densities,
+                m,
+                vis_row,
+            );
+        }
         // Snapshot the previous frame's view-projection BEFORE any state
         // update — the temporal pass needs it to reproject the history sample.
         let prev_vp_snapshot = self.prev_view_proj;
@@ -110,13 +147,9 @@ impl App {
                     (ts[4].wrapping_sub(ts[1])) as f64 * p
                 };
                 let render = (ts[5].wrapping_sub(ts[4])) as f64 * p;
-                // SH eval queries (slots 6..8) are only written when sh_degree > 0;
-                // see comment near resolve_query_set.
-                let sh = if gpu.sh_degree > 0 && ts.len() >= 8 {
-                    (ts[7].wrapping_sub(ts[6])) as f64 * p
-                } else {
-                    0.0
-                };
+                // Slots 6..8 (SH eval) are never resolved — see TS_WRITTEN_COUNT.
+                // Reading them here would report uninitialized buffer contents.
+                let sh = 0.0;
                 let total = sh + project + sort + prepass + render;
 
                 gpu.gpu_times_ms = GpuTimings {
@@ -162,6 +195,37 @@ impl App {
                 gpu.surface_config.desired_maximum_frame_latency
             );
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
+        }
+
+        // One-shot GPU timing probe: block (with a hard cap so it can't hang)
+        // until the GPU is idle before acquiring, so the swapchain can't jam and
+        // the frame completes. Times the wait so we see the real per-frame
+        // wall-clock even when it's far past the 2s acquire timeout. Two frames:
+        // the first completes a clean frame, the second reads back its drawn
+        // count + per-stage timers.
+        if self.timing_probe_frames > 0 {
+            let t_drain = std::time::Instant::now();
+            gpu.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(std::time::Duration::from_secs(120)),
+                })
+                .ok();
+            let drain_ms = t_drain.elapsed().as_secs_f64() * 1000.0;
+            self.timing_probe_frames -= 1;
+            let t = gpu.gpu_times_ms.clone();
+            log::info!(
+                "[timing probe] frame wall-clock {:.0}ms | GPU drew {} tets | timers: total {:.1}ms = \
+                 SH {:.1} + Proj {:.1} + Sort {:.1} + Gen(prepass) {:.1} + Render {:.1}",
+                drain_ms,
+                gpu.visible_instance_count,
+                t.total_ms,
+                t.sh_eval_ms,
+                t.project_ms,
+                t.sort_ms,
+                t.prepass_ms,
+                t.render_ms,
+            );
         }
 
         let t_before_acquire = std::time::Instant::now();
@@ -2218,11 +2282,12 @@ impl App {
         let ts_buf_free =
             !gpu.ts_readback_mapped[cur_rb].load(std::sync::atomic::Ordering::Acquire);
         if ts_buf_free {
-            // Only resolve slots that are actually written this frame. Slots 6..8 are
-            // SH-eval timestamps and are NOT written when sh_degree == 0 (no SH compute
-            // pass runs). Resolving never-written queries is undefined behavior on Vulkan
-            // and wedges the NVIDIA Linux driver.
-            let written_count: u32 = if gpu.sh_degree > 0 { TS_QUERY_COUNT } else { 6 };
+            // Only resolve slots that are actually written this frame — see
+            // TS_WRITTEN_COUNT. This used to be gated on `sh_degree > 0`, but the
+            // SH-eval pass that would write slots 6..8 is never recorded by the
+            // viewer at any degree, so every SH scene resolved two never-written
+            // queries and wedged the driver.
+            let written_count: u32 = TS_WRITTEN_COUNT;
             encoder.resolve_query_set(&gpu.ts_query_set, 0..written_count, &gpu.ts_resolve_buf, 0);
             encoder.copy_buffer_to_buffer(
                 &gpu.ts_resolve_buf,
@@ -2325,4 +2390,212 @@ impl App {
             self.load_file(&path);
         }
     }
+}
+
+/// One-shot CPU replica of the interval shader's screen-area test, for the
+/// current view. Projects every tet exactly as `interval_compute.wgsl` does
+/// (clip = vp·world, ndc = clip.xy/w, area = ndc-bbox × screen/2) and logs the
+/// distribution of projected pixel areas — so we can see what fraction of tets
+/// are sub-pixel and thus candidates for the point-splat fast path.
+fn measure_subpixel_fraction(
+    vp: &glam::Mat4,
+    w: u32,
+    h: u32,
+    vertices: &[f32],
+    indices: &[u32],
+    densities: &[f32],
+    tet_count: usize,
+    vis_mask: Option<&[u8]>,
+) {
+    let sx = w as f32 * 0.5;
+    let sy = h as f32 * 0.5;
+
+    let screen_area = (w as f32) * (h as f32);
+    let mut behind = 0usize; // any vertex at/behind camera (w <= 0)
+    let mut in_front = 0usize; // fully in front, area measured
+    let mut on_screen = 0usize; // in-front AND ndc bbox overlaps the frustum
+    let mut capped_fill = 0.0f64; // Σ min(area, screen) over on-screen tets = overdraw proxy
+    // Same, but restricted to PVS-visible tets (region mask bit set).
+    let mut on_screen_pvs = 0usize;
+    let mut capped_fill_pvs = 0.0f64;
+    // Opacity of PVS-visible on-screen tets: alpha = 1-exp(-density * mean_edge).
+    let mut alpha_sum = 0.0f64;
+    // alpha buckets: [<0.01, 0.01-0.05, 0.05-0.2, 0.2-0.5, >=0.5]
+    let mut alpha_buckets = [0usize; 5];
+    // Pixel-area histogram buckets:
+    // [<1, 1-16, 16-64, 64-256, 256-1k, 1k-10k, 10k-screen, >=screen]
+    let mut buckets = [0usize; 8];
+    let mut huge = 0usize; // area >= full screen (near-plane blowup / very close)
+    let mut max_area = 0.0f32;
+    let mut area_sum = 0.0f64;
+
+    for t in 0..tet_count {
+        let base = t * 4;
+        let mut any_behind = false;
+        let mut mn = glam::Vec2::splat(f32::INFINITY);
+        let mut mx = glam::Vec2::splat(f32::NEG_INFINITY);
+        let mut wp = [glam::Vec3::ZERO; 4];
+        for k in 0..4 {
+            let vi = indices[base + k] as usize;
+            let world = glam::Vec3::new(vertices[vi * 3], vertices[vi * 3 + 1], vertices[vi * 3 + 2]);
+            wp[k] = world;
+            let clip = *vp * world.extend(1.0);
+            if clip.w <= 1e-6 {
+                any_behind = true;
+                break;
+            }
+            let ndc = glam::Vec2::new(clip.x / clip.w, clip.y / clip.w);
+            mn = mn.min(ndc);
+            mx = mx.max(ndc);
+        }
+        if any_behind {
+            behind += 1;
+            continue;
+        }
+        in_front += 1;
+
+        // Frustum test: does the tet's NDC bbox overlap the [-1,1] screen rect?
+        let onscreen = mx.x >= -1.0 && mn.x <= 1.0 && mx.y >= -1.0 && mn.y <= 1.0;
+        if !onscreen {
+            continue; // in front of the camera but entirely off to the side
+        }
+        on_screen += 1;
+
+        let ext = (mx - mn) * glam::Vec2::new(sx, sy);
+        let area = (ext.x * ext.y).max(0.0);
+        area_sum += area as f64;
+        let capped = area.min(screen_area) as f64;
+        capped_fill += capped;
+        // PVS-visible subset (mask absent => treat all as visible).
+        if vis_mask.map_or(true, |mk| mk[t] != 0) {
+            on_screen_pvs += 1;
+            capped_fill_pvs += capped;
+            // Approx per-tet opacity: alpha = 1 - exp(-density * mean_edge_len).
+            let mean_edge = (wp[0].distance(wp[1])
+                + wp[0].distance(wp[2])
+                + wp[0].distance(wp[3])
+                + wp[1].distance(wp[2])
+                + wp[1].distance(wp[3])
+                + wp[2].distance(wp[3]))
+                / 6.0;
+            let alpha = 1.0 - (-densities[t] * mean_edge).exp();
+            alpha_sum += alpha as f64;
+            let ab = if alpha < 0.01 {
+                0
+            } else if alpha < 0.05 {
+                1
+            } else if alpha < 0.2 {
+                2
+            } else if alpha < 0.5 {
+                3
+            } else {
+                4
+            };
+            alpha_buckets[ab] += 1;
+        }
+        max_area = max_area.max(area);
+        if area >= screen_area {
+            huge += 1;
+        }
+        let b = if area < 1.0 {
+            0
+        } else if area < 16.0 {
+            1
+        } else if area < 64.0 {
+            2
+        } else if area < 256.0 {
+            3
+        } else if area < 1024.0 {
+            4
+        } else if area < 10240.0 {
+            5
+        } else if area < screen_area {
+            6
+        } else {
+            7
+        };
+        buckets[b] += 1;
+    }
+
+    let sub_px = buckets[0]; // area < 1px
+    let pct = |n: usize| {
+        if on_screen == 0 {
+            0.0
+        } else {
+            100.0 * n as f32 / on_screen as f32
+        }
+    };
+    // Average tets covering each pixel = Σ min(area, screen) / screen. This is
+    // the depth-complexity / overdraw factor — the thing that makes fill-bound
+    // frames slow.
+    let overdraw = capped_fill / screen_area as f64;
+    let overdraw_pvs = capped_fill_pvs / screen_area as f64;
+    log::info!(
+        "[overdraw probe] {}x{} (screen={:.0}px) | tets={} behind_cam={} in_front={} on_screen={} | \
+         OVERDRAW={:.0}x tets/pixel | sub-pixel(<1px)={} ({:.1}%) | full-screen+={} ({:.2}%) | max_area={:.0}px",
+        w,
+        h,
+        screen_area,
+        tet_count,
+        behind,
+        in_front,
+        on_screen,
+        overdraw,
+        sub_px,
+        pct(sub_px),
+        huge,
+        pct(huge),
+        max_area,
+    );
+    log::info!(
+        "[overdraw probe] PVS-visible on-screen tets={} (of {} on-screen) | OVERDRAW(PVS-only)={:.0}x tets/pixel \
+         => applying the region mask would cut overdraw {:.1}x",
+        on_screen_pvs,
+        on_screen,
+        overdraw_pvs,
+        if overdraw_pvs > 0.0 { overdraw / overdraw_pvs } else { 0.0 },
+    );
+    // Opacity: does a pixel saturate early (few opaque tets) or need all of them?
+    let mean_alpha = if on_screen_pvs > 0 {
+        alpha_sum / on_screen_pvs as f64
+    } else {
+        0.0
+    };
+    // Tets to reach T<0.01 assuming mean alpha: N = ln(0.01)/ln(1-mean_alpha).
+    let sat_depth = if mean_alpha > 1e-4 && mean_alpha < 1.0 {
+        (0.01f64.ln() / (1.0 - mean_alpha).ln()).ceil()
+    } else {
+        f64::INFINITY
+    };
+    let apct = |n: usize| {
+        if on_screen_pvs == 0 {
+            0.0
+        } else {
+            100.0 * n as f32 / on_screen_pvs as f32
+        }
+    };
+    log::info!(
+        "[overdraw probe] per-tet opacity (PVS-visible): mean_alpha={:.3} => pixel saturates after ~{:.0} tets \
+         (vs {} stacked). alpha buckets: <0.01={:.0}%  0.01-0.05={:.0}%  0.05-0.2={:.0}%  0.2-0.5={:.0}%  >=0.5={:.0}%",
+        mean_alpha,
+        sat_depth,
+        on_screen_pvs,
+        apct(alpha_buckets[0]),
+        apct(alpha_buckets[1]),
+        apct(alpha_buckets[2]),
+        apct(alpha_buckets[3]),
+        apct(alpha_buckets[4]),
+    );
+    log::info!(
+        "[overdraw probe] area histogram: <1px={} ({:.1}%)  1-16={} ({:.1}%)  16-64={} ({:.1}%)  \
+         64-256={} ({:.1}%)  256-1k={} ({:.1}%)  1k-10k={} ({:.1}%)  10k-screen={} ({:.1}%)  >=screen={} ({:.2}%)",
+        buckets[0], pct(buckets[0]),
+        buckets[1], pct(buckets[1]),
+        buckets[2], pct(buckets[2]),
+        buckets[3], pct(buckets[3]),
+        buckets[4], pct(buckets[4]),
+        buckets[5], pct(buckets[5]),
+        buckets[6], pct(buckets[6]),
+        buckets[7], pct(buckets[7]),
+    );
 }

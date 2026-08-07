@@ -40,6 +40,7 @@ struct IntervalVertexOutput {
     @location(3) @interpolate(flat) base_color: vec3<f32>,
     @location(4) @interpolate(flat) tet_id: u32,
     @location(5) field_gradient: vec3<f32>,  // interpolated per-pixel, normalize in fragment
+    @location(6) @interpolate(flat) coverage: f32,  // sub-pixel area weight (1.0 for >=1px tets)
 };
 
 @vertex
@@ -67,5 +68,6 @@ fn main(@builtin(vertex_index) vid: u32) -> IntervalVertexOutput {
     out.density = td.w;
     out.base_color = td.xyz;
     out.tet_id = bitcast<u32>(td1.x);
+    out.coverage = td1.y;
     return out;
 }

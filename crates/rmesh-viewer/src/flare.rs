@@ -156,7 +156,7 @@ impl CollisionMesh {
         }
 
         log::info!(
-            "Collision mesh: {} boundary triangles from {} dense tets (threshold={:.3})",
+            "Collision mesh: {} boundary triangles from {} distinct dense-tet faces (threshold={:.3})",
             triangles.len(),
             face_map.len(),
             threshold,

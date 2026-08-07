@@ -217,6 +217,11 @@ struct App {
     active_mask_dirty: bool,
     active_mask_scratch: Vec<u32>,
     active_baked_count: u32,
+    // One-shot sub-pixel tet measurement (press 'M' to re-run for the current view).
+    measure_subpixel: bool,
+    // One-shot GPU timing probe: press 'T' to drain the swapchain for a few
+    // frames so one completes, then log drawn-tet-count + per-stage GPU ms.
+    timing_probe_frames: u32,
 }
 
 impl App {
@@ -306,11 +311,17 @@ impl App {
             rt_start_tet_hint: -1,
             rt_locate_ms: 0.0,
             flare_system: FlareSystem::default(),
-            cull_enabled: false,
+            cull_enabled: true,
             active_region: -2,
             active_mask_dirty: true,
             active_mask_scratch: vec![0xFFFF_FFFFu32; vis_words],
             active_baked_count: 0,
+            // Both probes are opt-in via their keybinds ('M' / 'T'). Auto-running
+            // them at startup made every launch stall: the timing probe blocks on
+            // `device.poll(Wait)` for up to 120s on each of its frames, and the
+            // sub-pixel probe is an O(tet_count) CPU sweep on the first frame.
+            measure_subpixel: false,
+            timing_probe_frames: 0,
         }
     }
 
@@ -2640,6 +2651,18 @@ impl ApplicationHandler for App {
                     } else {
                         log::info!("Occlusion cull: no visibility data baked in this .rmesh");
                     }
+                }
+
+                // 'M' re-runs the sub-pixel tet probe for the current view.
+                if code == KeyCode::KeyM && key_event.state == ElementState::Pressed {
+                    self.measure_subpixel = true;
+                }
+
+                // 'T' runs the one-shot GPU timing probe (drains a few frames so
+                // one completes, then logs drawn count + per-stage GPU ms).
+                if code == KeyCode::KeyT && key_event.state == ElementState::Pressed {
+                    self.timing_probe_frames = 2;
+                    log::info!("[timing probe] capturing 2 frames — may take up to ~1-2 min if a frame is very slow...");
                 }
 
                 // Try interaction system first
