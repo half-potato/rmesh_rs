@@ -718,8 +718,16 @@ async fn gpu_raytrace_scene_async(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
+    // No density shell in these tests: bind the far-plane stub so the shell
+    // z-cull finds no occluder (it is flag-gated off too).
+    let (_shell_hiz_stub, shell_hiz_stub_view) = rmesh_render::dummy_shell_hiz(&device, &queue);
     let compute_bg = rmesh_render::create_compute_bind_group(
-        &device, &pipelines, &buffers, &material, &dummy_sh,
+        &device,
+        &pipelines,
+        &buffers,
+        &material,
+        &dummy_sh,
+        &shell_hiz_stub_view,
     );
 
     // Build ray trace data
@@ -2280,8 +2288,15 @@ async fn gpu_compute_interval_render_scene_async(
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
+        let (_shell_hiz_stub, shell_hiz_stub_view) =
+            rmesh_render::dummy_shell_hiz(&device, &queue);
         Some(rmesh_render::create_hw_compute_bind_group(
-            &device, &pipelines, &buffers, &material, &dummy_sh,
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &dummy_sh,
+            &shell_hiz_stub_view,
         ))
     } else {
         None

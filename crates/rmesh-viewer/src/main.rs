@@ -49,6 +49,7 @@ use rmesh_render::{
 
 mod flare;
 mod gpu_state;
+mod shell;
 mod render;
 use flare::FlareSystem;
 use gpu_state::*;
@@ -209,6 +210,7 @@ struct App {
     rt_locate_ms: f32,
     // Flare gun
     flare_system: FlareSystem,
+    shell_system: shell::ShellSystem,
     // Occlusion culling ('C' toggles). active_region -1 = no-cull (all visible);
     // -2 forces a first rebuild. active_mask_scratch is the bit-packed
     // [ceil(M/32)] u32 mask uploaded to SceneBuffers.tet_visibility on change.
@@ -222,6 +224,45 @@ struct App {
     // One-shot GPU timing probe: press 'T' to drain the swapchain for a few
     // frames so one completes, then log drawn-tet-count + per-stage GPU ms.
     timing_probe_frames: u32,
+}
+
+/// Build the density-shell bind group.
+///
+/// `aux_data` is optional — scenes without PBR channels get a 4-byte stub, which
+/// `shell.wgsl` detects with the same `arrayLength(&aux_data) > 1u` check
+/// `interval_fragment.wgsl` uses. The stub is kept alive by the bind group's own
+/// reference, so it does not need storing.
+fn build_shell_bind_group(
+    device: &wgpu::Device,
+    pipeline: &rmesh_render::ShellPipeline,
+    shell: &rmesh_render::ShellBuffers,
+    buffers: &SceneBuffers,
+    material: &MaterialBuffers,
+    sh_coeffs_buf: &wgpu::Buffer,
+    aux_data_buf: Option<&wgpu::Buffer>,
+) -> wgpu::BindGroup {
+    let stub;
+    let aux = match aux_data_buf {
+        Some(buf) => buf,
+        None => {
+            stub = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("shell_aux_stub"),
+                size: 4,
+                usage: wgpu::BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            &stub
+        }
+    };
+    rmesh_render::create_shell_bind_group(
+        device,
+        pipeline,
+        shell,
+        buffers,
+        material,
+        sh_coeffs_buf,
+        aux,
+    )
 }
 
 impl App {
@@ -311,6 +352,7 @@ impl App {
             rt_start_tet_hint: -1,
             rt_locate_ms: 0.0,
             flare_system: FlareSystem::default(),
+            shell_system: shell::ShellSystem::default(),
             cull_enabled: true,
             active_region: -2,
             active_mask_dirty: true,
@@ -629,10 +671,51 @@ impl App {
 
         // Fluid simulation: lazily initialized when first enabled (saves ~500MB GPU memory)
 
-        let compute_bg =
-            create_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
-        let hw_compute_bg =
-            create_hw_compute_bind_group(&device, &pipelines, &buffers, &material, &sh_coeffs_buf);
+        // Primitive depth target and the density-shell Hi-Z are built here rather
+        // than with the rest of the primitive setup below: the projection bind
+        // groups sample the pyramid, so it has to exist first.
+        let primitive_targets =
+            PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
+        let shell_pipeline = rmesh_render::ShellPipeline::new(
+            &device,
+            color_format,
+            wgpu::TextureFormat::Depth32Float,
+        );
+        let shell_buffers = rmesh_render::ShellBuffers::new(&device);
+        let shell_bg = build_shell_bind_group(
+            &device,
+            &shell_pipeline,
+            &shell_buffers,
+            &buffers,
+            &material,
+            &sh_coeffs_buf,
+            aux_data_buf.as_ref(),
+        );
+        let shell_hiz_pipelines = rmesh_render::ShellHiZPipelines::new(&device);
+        let shell_hiz = rmesh_render::ShellHiZ::new(
+            &device,
+            &shell_hiz_pipelines,
+            &primitive_targets.depth_view,
+            size.width.max(1),
+            size.height.max(1),
+        );
+
+        let compute_bg = create_compute_bind_group(
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &sh_coeffs_buf,
+            &shell_hiz.full_view,
+        );
+        let hw_compute_bg = create_hw_compute_bind_group(
+            &device,
+            &pipelines,
+            &buffers,
+            &material,
+            &sh_coeffs_buf,
+            &shell_hiz.full_view,
+        );
         let render_bg = create_render_bind_group(&device, &pipelines, &buffers, &material);
         let render_bg_b = create_render_bind_group_with_sort_values(
             &device,
@@ -750,8 +833,6 @@ impl App {
         let mut material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
         let primitive_pipeline =
             PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
-        let primitive_targets =
-            PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
 
         // Instance count readback buffer
         let instance_count_readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1278,6 +1359,12 @@ impl App {
             material_registry,
             primitive_pipeline,
             primitive_targets,
+            shell_pipeline,
+            shell_buffers,
+            shell_bg,
+            shell_hiz_pipelines,
+            shell_hiz,
+            dsm_shell_hiz: None,
             egui_renderer,
             egui_state,
             instance_count_readback,
@@ -1407,6 +1494,8 @@ impl App {
         // Cache the flare collision mesh up front for the new scene (drops the
         // stale mesh from the previous scene and avoids a first-flare hitch).
         self.flare_system.rebuild_collision_mesh(&self.scene_data);
+        // Shell face ids index the previous scene's tet array — drop them.
+        self.shell_system.reset();
         self.deferred_enabled = self.pbr_data.is_some();
         self.loaded_path = Some(path.to_path_buf());
 
@@ -1456,12 +1545,26 @@ impl App {
             gpu.sort_state_16bit.upload_configs(&gpu.queue);
 
             // Recreate bind groups
+            // New scene: drop the old shell (its face ids index the previous
+            // tet array) and rebind against the new buffers.
+            gpu.shell_buffers = rmesh_render::ShellBuffers::new(&gpu.device);
+            gpu.shell_bg = build_shell_bind_group(
+                &gpu.device,
+                &gpu.shell_pipeline,
+                &gpu.shell_buffers,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
+                gpu.aux_data_buf.as_ref(),
+            );
+
             gpu.compute_bg = create_compute_bind_group(
                 &gpu.device,
                 &gpu.pipelines,
                 &gpu.buffers,
                 &gpu.material_buffers,
                 &gpu.sh_coeffs_buf,
+                &gpu.shell_hiz.full_view,
             );
             gpu.hw_compute_bg = create_hw_compute_bind_group(
                 &gpu.device,
@@ -1469,6 +1572,7 @@ impl App {
                 &gpu.buffers,
                 &gpu.material_buffers,
                 &gpu.sh_coeffs_buf,
+                &gpu.shell_hiz.full_view,
             );
             gpu.render_bg = create_render_bind_group(
                 &gpu.device,
@@ -1772,6 +1876,34 @@ impl App {
             // Recreate primitive depth target
             gpu.primitive_targets =
                 PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
+
+            // Recreate the density-shell Hi-Z, and with it every bind group that
+            // holds its view. The projection bind groups sample the pyramid, and
+            // they are NOT otherwise rebuilt on resize — miss this and the cull
+            // silently reads a stale, wrongly-sized texture.
+            gpu.shell_hiz = rmesh_render::ShellHiZ::new(
+                &gpu.device,
+                &gpu.shell_hiz_pipelines,
+                &gpu.primitive_targets.depth_view,
+                new_size.width,
+                new_size.height,
+            );
+            gpu.compute_bg = create_compute_bind_group(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
+                &gpu.shell_hiz.full_view,
+            );
+            gpu.hw_compute_bg = create_hw_compute_bind_group(
+                &gpu.device,
+                &gpu.pipelines,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
+                &gpu.shell_hiz.full_view,
+            );
 
             // Recreate Hi-Z (texture + per-mip bind groups) since size changed.
             gpu.hiz_texture =

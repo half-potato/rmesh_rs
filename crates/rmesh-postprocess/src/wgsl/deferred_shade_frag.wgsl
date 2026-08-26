@@ -320,14 +320,16 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let inv_da = 1.0 / max(depth_alpha, 1e-6);
     let z_expected = depth_raw.r * inv_da;
 
-    // HEAD's primitive_mrt writes per-pixel occlusion into depth_tex.g.
-    // Volumes don't have a baked-occlusion concept (GTAO provides it), so we
-    // gate on hw_depth: primitives use their channel value, volumes pass
-    // through with 1.0. Using `if` instead of `select` so the un-premultiply
-    // mul is skipped on volume pixels (select would evaluate both arms).
-    let is_prim = hw_depth < 0.999;
+    // Baked occlusion lives in depth_tex.g. Both producers now write it
+    // premultiplied — primitive_mrt writes its occlusion-map sample, and
+    // interval_fragment writes 1.0 (volumes have no baked occlusion; GTAO
+    // provides it) — so the blended channel is already the α-weighted average
+    // across everything that covered this pixel and needs no hw_depth gate.
+    // The gate was only there because volumes used to write 0.0, which would
+    // black out any opaque surface seen through a volume. Falls back to 1.0
+    // where slot 3 has no coverage at all.
     var prim_occlusion = 1.0;
-    if (is_prim) {
+    if (depth_alpha >= 0.01) {
         prim_occlusion = depth_raw.g * inv_da;
     }
 

@@ -270,7 +270,16 @@ impl App {
             sh_degree: gpu.sh_degree,
             near_plane: self.camera.near_z,
             far_plane: self.camera.far_z,
-            _pad1: [0; 2],
+            shell_cull_bias: self.shell_system.cull_bias,
+            // One frame behind the UI, like every other setting written here
+            // (the egui frame runs after this upload). Harmless: with the shell
+            // off the pyramid still holds valid opaque-primitive depth, so the
+            // cull stays conservative either way.
+            shell_cull_flags: u32::from(
+                self.shell_system.enabled
+                    && self.shell_system.cull_enabled
+                    && self.shell_system.has_shell(),
+            ),
         };
 
         gpu.queue
@@ -324,6 +333,15 @@ impl App {
         let mut density_threshold = self.flare_system.density_threshold;
         let mut force_dsm_recompute = self.flare_system.force_dsm_recompute;
         let mut show_collision_mesh = self.flare_system.show_collision_mesh;
+        let mut shell_enabled = self.shell_system.enabled;
+        let mut shell_cull_enabled = self.shell_system.cull_enabled;
+        let mut shell_threshold = self.shell_system.density_threshold;
+        let mut shell_cull_bias = self.shell_system.cull_bias;
+        let mut shell_show_only = self.shell_system.show_only;
+        let shell_face_count = self.shell_system.face_count();
+        let shell_rebuilding = self.shell_system.rebuild_pending();
+        // Set by the threshold slider on release (see the Density Shell block).
+        let mut shell_rebuild = false;
         let flare_count = self.flare_system.flare_count();
         let collision_tri_count = self.flare_system.collision_triangle_count();
         let primitives_ref = &self.primitives;
@@ -417,6 +435,33 @@ impl App {
                         ui.add(egui::Slider::new(&mut density_threshold, 0.0..=1.0).text("Collision Density"));
                         ui.checkbox(&mut force_dsm_recompute, "Dynamic DSM (every frame)");
                         ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
+                        ui.separator();
+                        ui.label("Density Shell");
+                        ui.checkbox(&mut shell_enabled, "Enable Shell");
+                        ui.add_enabled_ui(shell_enabled, |ui| {
+                            // Log scale: densities are exp((u8 - 100) / 20), so
+                            // the useful range spans several decades and a linear
+                            // slider is unusable at the low end.
+                            let slider = egui::Slider::new(&mut shell_threshold, 0.001..=100.0)
+                                .logarithmic(true)
+                                .text("Density Threshold");
+                            // Rebuild on release, not on drag — extraction is a
+                            // multi-second hash over every dense tet's faces.
+                            if ui.add(slider).drag_stopped() {
+                                shell_rebuild = true;
+                            }
+                            ui.checkbox(&mut shell_cull_enabled, "Z-Cull Behind Shell");
+                            ui.add(
+                                egui::Slider::new(&mut shell_cull_bias, 0.0..=0.01)
+                                    .text("Cull Bias"),
+                            );
+                            ui.checkbox(&mut shell_show_only, "Show Shell Only");
+                            if shell_rebuilding {
+                                ui.label("rebuilding...");
+                            } else {
+                                ui.label(format!("{} faces", shell_face_count));
+                            }
+                        });
                     });
                     ui.menu_button("Deferred Shading", |ui| {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
@@ -766,6 +811,38 @@ impl App {
         self.flare_system.density_threshold = density_threshold;
         self.flare_system.force_dsm_recompute = force_dsm_recompute;
         self.flare_system.show_collision_mesh = show_collision_mesh;
+
+        let shell_was_enabled = self.shell_system.enabled;
+        self.shell_system.enabled = shell_enabled;
+        self.shell_system.cull_enabled = shell_cull_enabled;
+        self.shell_system.density_threshold = shell_threshold;
+        self.shell_system.cull_bias = shell_cull_bias;
+        self.shell_system.show_only = shell_show_only;
+        if shell_rebuild || (shell_enabled && !shell_was_enabled) {
+            self.shell_system.mark_dirty();
+        }
+
+        // Density shell: kick off a background extraction if the threshold moved,
+        // and install one if it has finished. The previous shell keeps drawing
+        // in the meantime, so dragging the slider never stalls the frame.
+        self.shell_system.maybe_start_rebuild(&self.scene_data);
+        if self
+            .shell_system
+            .poll(&gpu.device, &gpu.queue, &mut gpu.shell_buffers)
+        {
+            // The face buffer was reallocated, so the old bind group points at a
+            // dead buffer.
+            let bg = crate::build_shell_bind_group(
+                &gpu.device,
+                &gpu.shell_pipeline,
+                &gpu.shell_buffers,
+                &gpu.buffers,
+                &gpu.material_buffers,
+                &gpu.sh_coeffs_buf,
+                gpu.aux_data_buf.as_ref(),
+            );
+            gpu.shell_bg = bg;
+        }
 
         // Install any async-rebuilt collision mesh kicked off by the PBD
         // ConfirmGrab path.
@@ -1255,13 +1332,16 @@ impl App {
             }
         }
 
-        // 2. Sorted forward pass: compute → radix sort → render
-        //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         let mrt_enabled = self.deferred_enabled && gpu.has_pbr_data;
-        let skip_volume =
-            !self.show_scene || (self.deferred_enabled && self.deferred_debug_mode == 13);
+        let skip_volume = !self.show_scene
+            || self.shell_system.show_only
+            || (self.deferred_enabled && self.deferred_debug_mode == 13);
+
+        // When the volume pass is skipped it never overwrites the MRT targets,
+        // so last frame's contents would ghost through. Clear them here —
+        // *before* the shell draws, not after, or "Show Shell Only" erases the
+        // very thing it is meant to show.
         if skip_volume && mrt_enabled {
-            // Clear MRT targets when volume is skipped to avoid ghosting
             let clear_ops = wgpu::Operations {
                 load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                 store: wgpu::StoreOp::Store,
@@ -1298,6 +1378,37 @@ impl App {
                 ..Default::default()
             });
         }
+
+        // 1b. Density shell: the boundary surface of the dense region, drawn as
+        //     opaque geometry into the same color + depth targets the primitives
+        //     just wrote. Two jobs at once — its color becomes the volume's
+        //     backstop (residual transmittance reveals the model instead of the
+        //     background), and its depth becomes the bound everything past it is
+        //     culled against.
+        if self.shell_system.enabled && gpu.shell_buffers.face_count > 0 {
+            gpu.shell_buffers
+                .write_view(&gpu.queue, vp.to_cols_array_2d(), self.camera.position.into());
+            rmesh_render::record_shell_pass(
+                &mut encoder,
+                &gpu.shell_pipeline,
+                &gpu.shell_bg,
+                &gpu.shell_buffers,
+                &gpu.targets.color_view,
+                &gpu.targets.aux0_view,
+                &gpu.targets.normals_view,
+                &gpu.targets.depth_view,
+                &gpu.primitive_targets.depth_view,
+            );
+        }
+
+        // Max-reduce pyramid over whatever now occupies the depth buffer (shell
+        // + opaque primitives). Built unconditionally so the cull sees opaque
+        // primitives even with the shell off, and built HERE — before the
+        // projection dispatch — so the bound is this frame's, not last frame's.
+        rmesh_render::record_shell_hiz(&mut encoder, &gpu.shell_hiz_pipelines, &gpu.shell_hiz);
+
+        // 2. Sorted forward pass: compute → radix sort → render
+        //    Color uses LoadOp::Load (preserves primitive colors), depth test culls behind primitives
         if !skip_volume {
             match self.render_mode {
                 RenderMode::IntervalShader => {
@@ -1672,8 +1783,17 @@ impl App {
                         if need_realloc {
                             let light_types: Vec<u32> =
                                 scene_lights.iter().map(|l| l.light_type).collect();
-                            gpu.dsm_atlas =
-                                Some(rmesh_dsm::DsmAtlas::new(&gpu.device, 1024, &light_types));
+                            let atlas = rmesh_dsm::DsmAtlas::new(&gpu.device, 1024, &light_types);
+                            // The shell pyramid is bound to the atlas's staging
+                            // depth view, so it dies with the old atlas.
+                            gpu.dsm_shell_hiz = Some(rmesh_render::ShellHiZ::new(
+                                &gpu.device,
+                                &gpu.shell_hiz_pipelines,
+                                &atlas.staging_depth_view,
+                                atlas.resolution,
+                                atlas.resolution,
+                            ));
+                            gpu.dsm_atlas = Some(atlas);
                         }
 
                         // Scene AABB in world space, computed once over all
@@ -1750,6 +1870,20 @@ impl App {
                                 dsm_near,
                                 dsm_far,
                                 self.show_scene,
+                                match (self.shell_system.enabled, gpu.dsm_shell_hiz.as_ref()) {
+                                    (true, Some(hiz)) if gpu.shell_buffers.face_count > 0 => {
+                                        Some(rmesh_dsm::DsmShell {
+                                            pipeline: &gpu.shell_pipeline,
+                                            bind_group: &gpu.shell_bg,
+                                            buffers: &gpu.shell_buffers,
+                                            hiz_pipelines: &gpu.shell_hiz_pipelines,
+                                            hiz,
+                                            cull_enabled: self.shell_system.cull_enabled,
+                                            cull_bias: self.shell_system.cull_bias,
+                                        })
+                                    }
+                                    _ => None,
+                                },
                             );
                             atlas.populate_metadata(&gpu.queue, scene_lights, dsm_near, dsm_far);
 

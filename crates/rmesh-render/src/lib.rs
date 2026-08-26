@@ -38,6 +38,15 @@ pub use rmesh_tile::{
     ScanPipelines, TileBuffers, TilePipelines,
 };
 
+pub mod shell;
+pub mod shell_hiz;
+
+pub use shell::{
+    create_shell_bind_group, record_shell_dsm_pass, record_shell_pass, ShellBuffers,
+    ShellPipeline, ShellView,
+};
+pub use shell_hiz::{dummy_shell_hiz, record_shell_hiz, ShellHiZ, ShellHiZPipelines};
+
 // WGSL shader sources, embedded from crate-local files.
 static PROJECT_COMPUTE_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/project_compute.wgsl");
@@ -114,6 +123,23 @@ pub struct ForwardPipelines {
     pub prepass_bg_layout: wgpu::BindGroupLayout,
 }
 
+/// Bind-group-layout entry for the density-shell max-depth pyramid sampled by
+/// `project_compute*`. Textures do not count toward
+/// `maxStorageBuffersPerShaderStage`, so this slots in without displacing a
+/// storage buffer on either the 10-cap web path or the native one.
+fn shell_hiz_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
 /// Helper: create N storage buffer layout entries for the given visibility.
 impl ForwardPipelines {
     /// Create all three pipelines from WGSL shader sources.
@@ -135,7 +161,8 @@ impl ForwardPipelines {
         // uses `hw_compute_pipeline` (10 storage total via uniform-buffer trick)
         // instead of `compute_pipeline`.
         // +1 read-only binding (8) for the occlusion-cull mask (tet_visibility).
-        let compute_bg0_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &[true; 9]);
+        let mut compute_bg0_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &[true; 9]);
+        compute_bg0_entries.push(shell_hiz_layout_entry(9));
         let compute_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg0_layout"),
@@ -215,6 +242,7 @@ impl ForwardPipelines {
                 count: None,
             });
         }
+        hw_compute_entries.push(shell_hiz_layout_entry(11));
         let hw_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw_compute_bind_group_layout"),
@@ -1730,6 +1758,7 @@ pub fn create_compute_bind_group(
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
+    shell_hiz_view: &wgpu::TextureView,
 ) -> ForwardComputeBindGroups {
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_bind_group_0"),
@@ -1744,6 +1773,7 @@ pub fn create_compute_bind_group(
             buf_entry(6, &material.base_colors),
             buf_entry(7, sh_coeffs_buf),
             buf_entry(8, &buffers.tet_visibility),
+            rmesh_util::gpu_helpers::tex_entry(9, shell_hiz_view),
         ],
     });
     let bg1 = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1773,6 +1803,7 @@ pub fn create_hw_compute_bind_group(
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
+    shell_hiz_view: &wgpu::TextureView,
 ) -> ForwardHwComputeBindGroups {
     let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("hw_compute_bind_group"),
@@ -1789,6 +1820,7 @@ pub fn create_hw_compute_bind_group(
             buf_entry(8, &material.base_colors),
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
+            rmesh_util::gpu_helpers::tex_entry(11, shell_hiz_view),
         ],
     });
     ForwardHwComputeBindGroups { bg }
@@ -3276,7 +3308,15 @@ pub fn setup_forward(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    let compute_bg = create_compute_bind_group(device, &pipelines, &buffers, &material, &dummy_sh);
+    let (_dummy_hiz, dummy_hiz_view) = shell_hiz::dummy_shell_hiz(device, queue);
+    let compute_bg = create_compute_bind_group(
+        device,
+        &pipelines,
+        &buffers,
+        &material,
+        &dummy_sh,
+        &dummy_hiz_view,
+    );
     let render_bg = create_render_bind_group(device, &pipelines, &buffers, &material);
 
     (buffers, material, pipelines, targets, compute_bg, render_bg)
@@ -3318,7 +3358,8 @@ pub fn make_uniforms(
         sh_degree,
         near_plane,
         far_plane,
-        _pad1: [0; 2],
+        shell_cull_bias: 0.0,
+        shell_cull_flags: 0,
     }
 }
 

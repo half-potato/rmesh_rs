@@ -42,7 +42,7 @@ pub struct SceneBuffers {
     pub mesh_indirect_args: wgpu::Buffer,
     /// Precomputed per-tet data for quad renderer [M × 8] vec4<f32> (128 bytes/tet)
     pub precomputed: wgpu::Buffer,
-    /// Compute-interval vertex buffer [M × 5 × 3] vec4<f32> (240 bytes/tet)
+    /// Compute-interval vertex buffer [M × 5 × 4] vec4<f32> (320 bytes/tet)
     pub interval_vertex_buf: wgpu::Buffer,
     /// Compute-interval per-tet flat data [M] vec4<f32> (16 bytes/tet)
     pub interval_tet_data_buf: wgpu::Buffer,
@@ -169,7 +169,7 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
-        // Compute-interval vertex buffer: 5 verts × 3 vec4s × 16 bytes = 240 bytes/tet
+        // Compute-interval vertex buffer: 5 verts × 4 vec4s × 16 bytes = 320 bytes/tet
         let interval_vertex_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("interval_vertex_buf"),
             size: m * 5 * 4 * 16, // 5 verts × 4 vec4 × 16 bytes (pos+z, offsets, n_front, n_back)

@@ -2129,6 +2129,7 @@ fn known_tet_scene() -> SceneData {
         start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         vertex_count: 4,
         tet_count: 1,
+        visibility: None,
     }
 }
 

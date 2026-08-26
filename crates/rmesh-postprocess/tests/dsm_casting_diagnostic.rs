@@ -217,6 +217,7 @@ fn build_dsm_nf(
         near,
         far,
         render_tets,
+        None, // no density shell in this test
     );
     queue.submit(std::iter::once(e.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
@@ -653,6 +654,7 @@ fn render_full_nf(
             near,
             far,
             true,
+            None, // no density shell in this test
         );
         queue.submit(std::iter::once(e.finish()));
         let _ = device.poll(wgpu::PollType::wait_indefinitely());

@@ -395,12 +395,17 @@ impl RMeshRenderer {
             mapped_at_creation: false,
         });
         // Forward bind groups
+        // Forward-only inference draws no density shell; the far-plane stub
+        // satisfies the binding and can never cull.
+        let (_shell_hiz_stub, shell_hiz_stub_view) =
+            rmesh_render::dummy_shell_hiz(&device, &queue);
         let compute_bg = create_compute_bind_group(
             &device,
             &fwd_pipelines,
             &scene_buffers,
             &material_buffers,
             &dummy_sh,
+            &shell_hiz_stub_view,
         );
         let render_bg =
             create_render_bind_group(&device, &fwd_pipelines, &scene_buffers, &material_buffers);

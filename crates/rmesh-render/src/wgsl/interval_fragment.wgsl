@@ -7,7 +7,7 @@
 //   location(0): albedo.rgb * a, a
 //   location(1): roughness * a, f0_dielectric * a, metallic * a, a
 //   location(2): field_gradient.xyz * a, a  — raw, normalized only in deferred
-//   location(3): expected_depth * a, 0, expected_z2 * a, a
+//   location(3): expected_depth * a, occlusion(=1) * a, expected_z2 * a, a
 //
 // Channel order in slot 1 matches the glTF primitive_mrt convention so the
 // deferred shader can read metallic from .b uniformly across volumes and
@@ -33,7 +33,8 @@ struct Uniforms {
     sh_degree: u32,
     near_plane: f32,
     far_plane: f32,
-    _pad1: vec2<u32>,
+    shell_cull_bias: f32,
+    shell_cull_flags: u32,
 };
 
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
@@ -198,9 +199,15 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let n_biased = n_unit * 0.5 + 0.5;
     out.normals = vec4f(n_biased * alpha, alpha);
 
-    // Slot 3: expected termination depth + E[z²] (for std). .g is unused
-    // (formerly retro * alpha; left at 0). .b holds the second-moment
-    // contribution, composited via the same premul-alpha blend as .r.
+    // Slot 3: expected termination depth + E[z²] (for std). .g carries the
+    // baked-occlusion channel that primitive_mrt also writes; volumes have no
+    // baked occlusion (GTAO provides it) so they contribute 1.0, premultiplied
+    // to `alpha`. That makes the blended .g a proper α-weighted average of
+    // volume-occlusion and whatever opaque surface sits behind — necessary now
+    // that the density shell puts an opaque surface behind most volume pixels.
+    // Writing 0.0 here instead would drag the composite toward black wherever a
+    // volume covers an opaque surface. .b holds the second-moment contribution,
+    // composited via the same premul-alpha blend as .r.
     //
     // Exact within-segment α·E[z²] for the exponential termination distribution
     // on [z_f, z_b] (PDF f(z) = σ_eff · exp(−σ_eff(z−z_f))):
@@ -220,7 +227,7 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
     let L = z_b - z_f;
     let depth2_premul = w0 * z_b * z_b + w1 * z_f * z_f - L * L * correction;
 
-    out.expected_depth = vec4f(depth_premul, 0.0, depth2_premul, alpha);
+    out.expected_depth = vec4f(depth_premul, alpha, depth2_premul, alpha);
 
     // Sub-pixel coverage weight. Every MRT slot is premultiplied by alpha and
     // carries alpha in .a, so scaling each slot by `coverage` attenuates the

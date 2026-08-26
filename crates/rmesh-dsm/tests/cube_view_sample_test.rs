@@ -124,6 +124,7 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
         NEAR,
         FAR,
         true,
+        None, // no density shell in this test
     );
     queue.submit(std::iter::once(encoder.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());

@@ -191,6 +191,21 @@ pub struct GpuState {
     pub material_registry: MaterialRegistry,
     pub primitive_pipeline: PrimitivePipeline,
     pub primitive_targets: PrimitiveTargets,
+    // Density shell: boundary surface of the density-thresholded region. Drawn
+    // between the primitive pass and the volume pass, where it acts as both the
+    // volume's opaque color backstop and the z-cull bound.
+    pub shell_pipeline: rmesh_render::ShellPipeline,
+    pub shell_buffers: rmesh_render::ShellBuffers,
+    pub shell_bg: wgpu::BindGroup,
+    /// Max-reduce pyramid over the shell/primitive depth. Sampled by
+    /// `project_compute*`, so `compute_bg` / `hw_compute_bg` reference it and
+    /// must be rebuilt whenever this is recreated (i.e. on resize).
+    pub shell_hiz_pipelines: rmesh_render::ShellHiZPipelines,
+    pub shell_hiz: rmesh_render::ShellHiZ,
+    /// Shell pyramid at DSM face resolution, built against the atlas's shared
+    /// staging depth view so one instance serves every light and face.
+    /// Rebuilt whenever the atlas is (re)allocated.
+    pub dsm_shell_hiz: Option<rmesh_render::ShellHiZ>,
     // egui
     pub egui_renderer: egui_wgpu::Renderer,
     pub egui_state: egui_winit::State,

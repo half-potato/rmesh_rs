@@ -233,7 +233,8 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
         scene.tet_count,
         NEAR,
         FAR,
-        true, // render tets
+        true, // render tets,
+        None, // no density shell in this test
     );
     queue.submit(std::iter::once(encoder.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());

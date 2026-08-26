@@ -369,7 +369,8 @@ impl WebViewer {
             sh_degree: scene.sh_degree,
             near_plane: 0.01,
             far_plane: 1000.0,
-            _pad1: [0; 2],
+            shell_cull_bias: 0.0,
+            shell_cull_flags: 0,
         };
 
         self.queue
@@ -836,12 +837,17 @@ impl WebViewer {
         );
         sort_state.upload_configs(&self.queue);
 
+        // The web viewer has no shell pass yet; bind the far-plane stub so the
+        // layout is satisfied and the cull stays inert.
+        let (_shell_hiz_stub, shell_hiz_stub_view) =
+            rmesh_render::dummy_shell_hiz(&self.device, &self.queue);
         let compute_bg = create_compute_bind_group(
             &self.device,
             &self.pipelines,
             &buffers,
             &material,
             &sh_coeffs_buf,
+            &shell_hiz_stub_view,
         );
         let hw_compute_bg = create_hw_compute_bind_group(
             &self.device,
@@ -849,6 +855,7 @@ impl WebViewer {
             &buffers,
             &material,
             &sh_coeffs_buf,
+            &shell_hiz_stub_view,
         );
         // Interval shading bind groups. Only gen_bg_a is needed because the
         // web viewer skips GPU radix sort and writes pre-sorted indices into

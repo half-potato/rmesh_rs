@@ -44,8 +44,12 @@ pub struct Uniforms {
     pub near_plane: f32,
     /// Far clip plane distance (positive, view-space Z).
     pub far_plane: f32,
-    /// Padding to maintain 192-byte struct size.
-    pub _pad1: [u32; 2],
+    /// NDC depth slack added to the shell z-cull bound in `project_compute*`.
+    /// Positive values cull less (safer); 0 culls exactly at the shell exit.
+    pub shell_cull_bias: f32,
+    /// Bit 0: shell z-cull enabled. Remaining bits reserved (keeps the struct
+    /// at 192 bytes without reintroducing a pad field).
+    pub shell_cull_flags: u32,
 }
 
 impl Uniforms {

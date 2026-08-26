@@ -436,9 +436,18 @@ pub fn train(
         usage: wgpu::BufferUsages::STORAGE,
         mapped_at_creation: false,
     });
-    // Forward compute bind group
-    let compute_bg =
-        create_compute_bind_group(device, &fwd_pipelines, &buffers, &material, &dummy_sh);
+    // Forward compute bind group. Training never draws a density shell, so bind
+    // the far-plane stub — the cull is flag-gated off anyway, and the stub reads
+    // 1.0 so it could not cull even if the flag were set.
+    let (_shell_hiz_stub, shell_hiz_stub_view) = rmesh_render::dummy_shell_hiz(device, queue);
+    let compute_bg = create_compute_bind_group(
+        device,
+        &fwd_pipelines,
+        &buffers,
+        &material,
+        &dummy_sh,
+        &shell_hiz_stub_view,
+    );
 
     // Tiled forward pipeline
     let rasterize =
@@ -684,7 +693,8 @@ pub fn train(
                 sh_degree: 0,
                 near_plane: 0.01,
                 far_plane: 1000.0,
-                _pad1: [0; 2],
+                shell_cull_bias: 0.0,
+                shell_cull_flags: 0,
             };
 
             // Upload uniforms

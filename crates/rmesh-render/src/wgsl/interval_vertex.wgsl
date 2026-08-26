@@ -2,7 +2,9 @@
 //
 // Uses draw_indexed_indirect with a static fan index buffer.
 // vertex_index = tet*5 + local_vert (from index buffer).
-// Reads 3 vec4s per vertex from storage + 2 vec4s per tet flat data.
+// Reads 4 vec4s per vertex from storage + 2 vec4s per tet flat data.
+// (The 4th is unused by this path but the 64-byte stride is deliberate: 48
+// bytes measured slower, this pass being bandwidth-bound.)
 // Output struct matches interval_fragment.wgsl's FragmentInput exactly.
 
 struct Uniforms {
@@ -25,7 +27,8 @@ struct Uniforms {
     sh_degree: u32,
     near_plane: f32,
     far_plane: f32,
-    _pad1: vec2<u32>,
+    shell_cull_bias: f32,
+    shell_cull_flags: u32,
 };
 
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;

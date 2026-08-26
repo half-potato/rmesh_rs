@@ -898,7 +898,9 @@ impl DsmAtlas {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // TEXTURE_BINDING so the density shell's max-Hi-Z can read this face's
+            // depth back and cull tets out of the per-face sort.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let staging_depth_view = staging_depth.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1051,6 +1053,30 @@ pub fn build_light_vp(light: &GpuLight, face_index: usize, near: f32, far: f32) 
 ///   3. Indirect convert — build dispatch/draw args from the visible count
 ///   4. Interval gen + DSM render into staging, then copy to the cubemap face
 #[allow(clippy::too_many_arguments)]
+/// Density-shell inputs for DSM generation.
+///
+/// The shell earns its keep twice per cube face: its depth rejects tet intervals
+/// behind it (via the DSM render pipeline's existing `LessEqual` test) *and*
+/// removes those tets from the per-face radix sort, which each face pays in
+/// full. Its alpha=1 moment stands in for the occlusion those culled tets used
+/// to provide, so the shadow does not get lighter as a result.
+pub struct DsmShell<'a> {
+    pub pipeline: &'a rmesh_render::ShellPipeline,
+    pub bind_group: &'a wgpu::BindGroup,
+    pub buffers: &'a rmesh_render::ShellBuffers,
+    pub hiz_pipelines: &'a rmesh_render::ShellHiZPipelines,
+    /// Built against `atlas.staging_depth_view`, so one instance serves every
+    /// face and every light — it is rebuilt in place per face.
+    pub hiz: &'a rmesh_render::ShellHiZ,
+    /// Whether to also drop tets out of the per-face projection + sort. Split
+    /// from drawing the shell at all: the shell is a shadow caster either way,
+    /// and being able to turn just the cull off makes it A/B-testable.
+    pub cull_enabled: bool,
+    /// NDC slack on the per-tet cull test; mirrors the main view's setting.
+    pub cull_bias: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_dsm_for_lights(
     atlas: &DsmAtlas,
     encoder: &mut wgpu::CommandEncoder,
@@ -1073,8 +1099,21 @@ pub fn generate_dsm_for_lights(
     near: f32,
     far: f32,
     render_tets: bool,
+    shell: Option<DsmShell<'_>>,
 ) {
     let res = atlas.resolution;
+    // Without a shell there is still a Hi-Z binding to satisfy. The stub reads
+    // the far plane, so it can never cull.
+    let stub_hiz = if shell.is_none() {
+        Some(rmesh_render::dummy_shell_hiz(device, queue))
+    } else {
+        None
+    };
+    let shell_hiz_view = match (&shell, &stub_hiz) {
+        (Some(sh), _) => &sh.hiz.full_view,
+        (None, Some((_, view))) => view,
+        (None, None) => unreachable!("stub is created whenever shell is None"),
+    };
     let n_pow2 = tet_count.next_power_of_two();
     let half = res as f32 / 2.0;
     let intrinsics = [half, half, half, half];
@@ -1087,10 +1126,16 @@ pub fn generate_dsm_for_lights(
         // --- Per face: project + sort + convert + interval gen + render + copy ---
         for fi in 0..face_count {
             let (face_vp, face_c2w) = build_light_vp(light, fi, near, far);
-            let face_uniforms = rmesh_render::make_uniforms(
+            let mut face_uniforms = rmesh_render::make_uniforms(
                 face_vp, face_c2w, intrinsics, pos, res as f32, res as f32, tet_count, 0, 4, 0.0,
                 0, near, far,
             );
+            // make_uniforms defaults the shell cull off; switch it on per face
+            // when a shell is actually being drawn into this face's depth.
+            if let Some(ref sh) = shell {
+                face_uniforms.shell_cull_flags = u32::from(sh.cull_enabled);
+                face_uniforms.shell_cull_bias = sh.cull_bias;
+            }
 
             // Flush prior GPU work so the face_uniforms write takes effect
             // before this face's project pass (and so the previous face's
@@ -1107,6 +1152,39 @@ pub fn generate_dsm_for_lights(
                 0,
                 bytemuck::bytes_of(&face_uniforms),
             );
+
+            // Opaque occluders first: this clears the face's depth and moment
+            // targets, so it has to precede the shell (which depth-tests into
+            // the same buffer) and the projection cull (which reads the pyramid
+            // built from it).
+            record_dsm_primitive_pass(
+                encoder,
+                queue,
+                dsm_prim_pipeline,
+                prim_geometry,
+                &atlas.staging_moments_view,
+                &atlas.staging_depth_view,
+                primitives,
+                &face_vp,
+                near,
+                far,
+                res,
+                res,
+            );
+
+            if let Some(ref sh) = shell {
+                sh.buffers
+                    .write_view_with_planes(queue, face_vp.to_cols_array_2d(), pos.into(), near, far);
+                rmesh_render::record_shell_dsm_pass(
+                    encoder,
+                    sh.pipeline,
+                    sh.bind_group,
+                    sh.buffers,
+                    &atlas.staging_moments_view,
+                    &atlas.staging_depth_view,
+                );
+                rmesh_render::record_shell_hiz(encoder, sh.hiz_pipelines, sh.hiz);
+            }
 
             let mut result_in_b = false;
             if render_tets {
@@ -1135,6 +1213,7 @@ pub fn generate_dsm_for_lights(
                     material,
                     sh_coeffs_buf,
                     &atlas.scratch_uniforms,
+                    shell_hiz_view,
                 );
                 {
                     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -1183,21 +1262,6 @@ pub fn generate_dsm_for_lights(
                     bytemuck::bytes_of(&face_uniforms),
                 );
             }
-
-            record_dsm_primitive_pass(
-                encoder,
-                queue,
-                dsm_prim_pipeline,
-                prim_geometry,
-                &atlas.staging_moments_view,
-                &atlas.staging_depth_view,
-                primitives,
-                &face_vp,
-                near,
-                far,
-                res,
-                res,
-            );
 
             if render_tets {
                 let sort_vals = if result_in_b {
@@ -1282,6 +1346,7 @@ fn create_dsm_hw_compute_bg(
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
     scratch_uniforms: &wgpu::Buffer,
+    shell_hiz_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("dsm_hw_compute_bg"),
@@ -1298,6 +1363,7 @@ fn create_dsm_hw_compute_bg(
             buf_entry(8, &material.base_colors),
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
+            rmesh_util::gpu_helpers::tex_entry(11, shell_hiz_view),
         ],
     })
 }

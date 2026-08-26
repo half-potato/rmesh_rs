@@ -29,7 +29,8 @@ struct Uniforms {
     sh_degree: u32,
     near_plane: f32,
     far_plane: f32,
-    _pad1: vec2<u32>,
+    shell_cull_bias: f32,
+    shell_cull_flags: u32,
 };
 
 struct TileUniforms {

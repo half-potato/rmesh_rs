@@ -19,7 +19,10 @@ struct Uniforms {
     ray_mode: u32,
     min_t: f32,
     sh_degree: u32,
-    _pad2: vec4<u32>,
+    near_plane: f32,
+    far_plane: f32,
+    shell_cull_bias: f32,
+    shell_cull_flags: u32,
 };
 
 struct DrawIndirectArgs {
@@ -43,6 +46,9 @@ struct DrawIndirectArgs {
 @group(0) @binding(8) var<storage, read> base_colors: array<f32>;
 @group(0) @binding(9) var<storage, read> color_grads: array<f32>;
 @group(0) @binding(10) var<storage, read> sh_coeffs: array<u32>;
+// Density-shell max-depth pyramid (NDC z). Textures do not count toward
+// the per-stage storage-buffer cap, so this fits without displacing a buffer.
+@group(0) @binding(11) var shell_hiz: texture_2d<f32>;
 
 // --- SH constants ---
 const C0: f32 = 0.28209479177387814;
@@ -80,6 +86,47 @@ fn project_to_ndc(pos: vec3<f32>, vp: mat4x4<f32>) -> vec4<f32> {
 fn load_vertex(idx: u32) -> vec3<f32> {
     let i = idx * 3u;
     return vec3<f32>(vertices[i], vertices[i + 1u], vertices[i + 2u]);
+}
+
+// Conservative occlusion test against the density shell's max-depth pyramid.
+//
+// Culls only when the tet's NEAREST point in NDC z lies behind the FARTHEST
+// occluder anywhere in its screen footprint. Untouched texels hold the cleared
+// 1.0, so any footprint that grazes background maxes to 1.0 and culls nothing.
+//
+// Sampling the mip where the whole AABB fits in 2x2 texels keeps this at four
+// loads no matter how large the tet is on screen.
+//
+// This runs before the sort key is written and before the visible-instance
+// atomic, so a culled tet costs nothing in the radix sort, the interval gen or
+// the draw — which is the point. A fragment-level depth test would only save
+// the last of the three.
+fn shell_occluded(min_x: f32, max_x: f32, min_y: f32, max_y: f32, near_z: f32) -> bool {
+    if ((uniforms.shell_cull_flags & 1u) == 0u) {
+        return false;
+    }
+
+    let dim0 = vec2<f32>(textureDimensions(shell_hiz, 0));
+    // NDC -> framebuffer texels. y flips: NDC +1 is the top row.
+    let u0 = clamp((min_x * 0.5 + 0.5) * dim0.x, 0.0, dim0.x - 1.0);
+    let u1 = clamp((max_x * 0.5 + 0.5) * dim0.x, 0.0, dim0.x - 1.0);
+    let v0 = clamp((0.5 - max_y * 0.5) * dim0.y, 0.0, dim0.y - 1.0);
+    let v1 = clamp((0.5 - min_y * 0.5) * dim0.y, 0.0, dim0.y - 1.0);
+
+    // 2^level >= span guarantees the AABB touches at most 2x2 texels at `level`.
+    let span = max(max(u1 - u0, v1 - v0), 1.0);
+    let level = min(u32(ceil(log2(span))), textureNumLevels(shell_hiz) - 1u);
+
+    let mmax = textureDimensions(shell_hiz, level) - vec2<u32>(1u, 1u);
+    let t0 = min(vec2<u32>(u32(u0) >> level, u32(v0) >> level), mmax);
+    let t1 = min(vec2<u32>(u32(u1) >> level, u32(v1) >> level), mmax);
+
+    var bound = textureLoad(shell_hiz, t0, level).r;
+    bound = max(bound, textureLoad(shell_hiz, vec2<u32>(t1.x, t0.y), level).r);
+    bound = max(bound, textureLoad(shell_hiz, vec2<u32>(t0.x, t1.y), level).r);
+    bound = max(bound, textureLoad(shell_hiz, t1, level).r);
+
+    return near_z > bound + uniforms.shell_cull_bias;
 }
 
 @compute @workgroup_size(64)
@@ -131,6 +178,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         let ext_x = (max_x - min_x) * uniforms.screen_width;
         let ext_y = (max_y - min_y) * uniforms.screen_height;
         if (ext_x * ext_y < 1.0) {
+            visible = false;
+        }
+
+        // Shell z-cull. Inside the !any_behind branch on purpose: a tet with a
+        // vertex behind the camera has meaningless NDC, and the path above
+        // deliberately keeps those visible without frustum culling.
+        if (visible && shell_occluded(min_x, max_x, min_y, max_y, min_z)) {
             visible = false;
         }
     }

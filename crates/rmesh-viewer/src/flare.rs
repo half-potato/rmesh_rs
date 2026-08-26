@@ -62,6 +62,60 @@ impl BvhNode {
     }
 }
 
+/// Unpack a `(tet_id << 2) | face_idx` face id into its two components.
+#[inline]
+pub fn unpack_face(packed: u32) -> (usize, usize) {
+    ((packed >> 2) as usize, (packed & 3) as usize)
+}
+
+/// Boundary faces of the density-thresholded region, packed as
+/// `(tet_id << 2) | face_idx` — the same convention
+/// [`rmesh_raytrace::build_boundary_bvh`] uses.
+///
+/// A face is on the boundary when exactly one tet passing `threshold` claims
+/// it, so faces shared by two dense tets (interior) drop out while faces on the
+/// domain boundary are kept. The result is therefore a closed surface, which is
+/// what makes its back faces a usable "ray exits the solid here" bound.
+pub fn extract_boundary_faces(
+    idxs: &[u32],
+    densities: &[f32],
+    tet_count: usize,
+    threshold: f32,
+) -> Vec<u32> {
+    // Key = sorted (i, j, k) → the packed face ids sharing that key.
+    let mut face_map: HashMap<[u32; 3], Vec<u32>> = HashMap::new();
+
+    for t in 0..tet_count {
+        if densities[t] < threshold {
+            continue;
+        }
+        let ti = [
+            idxs[t * 4],
+            idxs[t * 4 + 1],
+            idxs[t * 4 + 2],
+            idxs[t * 4 + 3],
+        ];
+        for (fi, face) in TET_FACES.iter().enumerate() {
+            let mut key = [ti[face[0]], ti[face[1]], ti[face[2]]];
+            key.sort_unstable();
+            face_map
+                .entry(key)
+                .or_default()
+                .push(((t as u32) << 2) | fi as u32);
+        }
+    }
+
+    let mut faces: Vec<u32> = face_map
+        .values()
+        .filter(|entries| entries.len() == 1)
+        .map(|entries| entries[0])
+        .collect();
+    // HashMap iteration order varies run to run; sort so the uploaded buffer is
+    // reproducible (and so tests over it are stable).
+    faces.sort_unstable();
+    faces
+}
+
 pub struct CollisionMesh {
     /// Boundary triangles: [v0, v1, v2] per triangle.
     triangles: Vec<[Vec3; 3]>,
@@ -94,36 +148,13 @@ impl CollisionMesh {
         tet_count: usize,
         threshold: f32,
     ) -> Self {
-        // Collect faces from dense tets. Key = sorted (i, j, k).
-        // Value = (tet_index, face_index, count).
-        let mut face_map: HashMap<[u32; 3], Vec<(usize, usize)>> = HashMap::new();
+        let boundary = extract_boundary_faces(idxs, densities, tet_count, threshold);
 
-        for t in 0..tet_count {
-            if densities[t] < threshold {
-                continue;
-            }
-            let ti = [
-                idxs[t * 4],
-                idxs[t * 4 + 1],
-                idxs[t * 4 + 2],
-                idxs[t * 4 + 3],
-            ];
-            for (fi, face) in TET_FACES.iter().enumerate() {
-                let mut key = [ti[face[0]], ti[face[1]], ti[face[2]]];
-                key.sort_unstable();
-                face_map.entry(key).or_default().push((t, fi));
-            }
-        }
+        let mut triangles = Vec::with_capacity(boundary.len());
+        let mut normals = Vec::with_capacity(boundary.len());
 
-        // Boundary faces appear exactly once (not shared by two dense tets).
-        let mut triangles = Vec::new();
-        let mut normals = Vec::new();
-
-        for entries in face_map.values() {
-            if entries.len() != 1 {
-                continue; // interior face (shared by two dense tets)
-            }
-            let (t, fi) = entries[0];
+        for &packed in &boundary {
+            let (t, fi) = unpack_face(packed);
             let ti = [
                 idxs[t * 4],
                 idxs[t * 4 + 1],
@@ -156,9 +187,9 @@ impl CollisionMesh {
         }
 
         log::info!(
-            "Collision mesh: {} boundary triangles from {} distinct dense-tet faces (threshold={:.3})",
+            "Collision mesh: {} boundary triangles from {} dense-tet boundary faces (threshold={:.3})",
             triangles.len(),
-            face_map.len(),
+            boundary.len(),
             threshold,
         );
 
@@ -824,6 +855,69 @@ fn dir_to_rotation(dir: Vec3) -> Quat {
 mod tests {
     use super::*;
 
+    /// Two tets sharing the face (v0, v1, v2). Vertices are shared by index so
+    /// the shared face really is one face, not two coincident ones.
+    fn two_tets_sharing_a_face(densities: [f32; 2]) -> (Vec<u32>, Vec<f32>) {
+        // Verts 0,1,2 form the shared face; 3 and 4 are the apexes either side.
+        let indices = vec![0, 1, 2, 3, 0, 1, 2, 4];
+        (indices, densities.to_vec())
+    }
+
+    #[test]
+    fn boundary_faces_drop_the_shared_face() {
+        let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
+        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5);
+
+        // 8 faces total, minus the one interior face counted from both sides.
+        assert_eq!(faces.len(), 6, "expected a closed 6-face surface: {faces:?}");
+
+        // Every face must belong to one of the two tets, and no (tet, face)
+        // pair may repeat.
+        let mut seen = std::collections::HashSet::new();
+        for &packed in &faces {
+            let (tet, face) = unpack_face(packed);
+            assert!(tet < 2, "face id {packed} names tet {tet}");
+            assert!(face < 4, "face id {packed} names face {face}");
+            assert!(seen.insert(packed), "duplicate face id {packed}");
+        }
+    }
+
+    #[test]
+    fn threshold_excludes_sparse_tets() {
+        let (indices, densities) = two_tets_sharing_a_face([1.0, 0.1]);
+
+        // Above the second tet's density: only the first tet is solid, so its
+        // formerly-interior face becomes boundary and all 4 of its faces show.
+        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        assert_eq!(faces.len(), 4);
+        for &packed in &faces {
+            assert_eq!(unpack_face(packed).0, 0, "sparse tet leaked into the shell");
+        }
+
+        // Below both: back to the shared 6-face surface.
+        assert_eq!(
+            extract_boundary_faces(&indices, &densities, 2, 0.05).len(),
+            6
+        );
+
+        // Above both: nothing is solid, so there is no shell at all. This is the
+        // case the render path must survive — it draws zero faces rather than an
+        // empty depth bound that would cull the whole scene.
+        assert!(extract_boundary_faces(&indices, &densities, 2, 10.0).is_empty());
+    }
+
+    #[test]
+    fn boundary_faces_are_deterministic() {
+        // The extractor walks a HashMap, whose order varies per process. The GPU
+        // buffer must not, or a rebuild at an unchanged threshold would reshuffle
+        // the draw for no reason.
+        let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
+        let a = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        let b = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        assert_eq!(a, b);
+        assert!(a.windows(2).all(|w| w[0] < w[1]), "not sorted: {a:?}");
+    }
+
     /// Build a minimal SceneData with the given tets.
     fn make_scene(tets: &[([Vec3; 4], f32)]) -> rmesh_data::SceneData {
         let mut vertices = Vec::new();
@@ -854,6 +948,7 @@ mod tests {
             start_pose: [0.0; 7],
             vertex_count,
             tet_count,
+            visibility: None,
         }
     }
 
@@ -966,6 +1061,7 @@ mod tests {
             start_pose: [0.0; 7],
             vertex_count: 5,
             tet_count: 2,
+            visibility: None,
         };
 
         let mesh = CollisionMesh::build(&scene, 0.1);

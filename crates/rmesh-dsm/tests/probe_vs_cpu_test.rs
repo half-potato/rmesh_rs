@@ -268,6 +268,7 @@ fn probe_vs_cpu() {
         NEAR,
         FAR,
         true,
+        None, // no density shell in this test
     );
     queue.submit(std::iter::once(encoder.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());

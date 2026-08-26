@@ -280,6 +280,7 @@ fn generate(
         NEAR,
         FAR,
         render_tets,
+        None, // no density shell in this test
     );
     // Flush the final face's work (generate leaves it un-submitted) into the cubemaps.
     queue.submit(std::iter::once(encoder.finish()));
