@@ -5,7 +5,6 @@
 
 use glam::{Quat, Vec3};
 use rmesh_interact::{Primitive, PrimitiveKind};
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -76,44 +75,96 @@ pub fn unpack_face(packed: u32) -> (usize, usize) {
 /// it, so faces shared by two dense tets (interior) drop out while faces on the
 /// domain boundary are kept. The result is therefore a closed surface, which is
 /// what makes its back faces a usable "ray exits the solid here" bound.
+/// Boundary faces of the dense set, given a prebuilt tet adjacency.
+///
+/// The adjacency (`neighbors[tet * 4 + face]` = the tet across that face, or -1)
+/// depends only on the tetrahedralization, so it survives every threshold and
+/// erosion change and is worth building once and keeping. With it in hand both
+/// erosion and extraction become linear scans over `dense`, which is what makes
+/// the threshold slider usable — the hashing variant below is seconds per move
+/// on a multi-million-tet scene.
+///
+/// Face `f` of a dense tet is on the boundary exactly when the tet across it is
+/// absent or not dense. Output is ascending in packed id by construction, so it
+/// needs no sort to be reproducible.
+pub fn extract_boundary_faces_adj(
+    neighbors: &[i32],
+    densities: &[f32],
+    tet_count: usize,
+    threshold: f32,
+    erosion_steps: u32,
+) -> Vec<u32> {
+    let mut dense: Vec<bool> = (0..tet_count).map(|t| densities[t] >= threshold).collect();
+    let initial_dense = dense.iter().filter(|&&d| d).count();
+
+    // A tet owns a boundary face exactly when it is in the outer layer, so
+    // peeling every tet that owns one is one erosion step. Collect first, then
+    // apply — peeling in place would erode the whole set in a single sweep.
+    let mut peel: Vec<u32> = Vec::new();
+    for _ in 0..erosion_steps {
+        peel.clear();
+        for t in 0..tet_count {
+            if !dense[t] {
+                continue;
+            }
+            let on_boundary = neighbors[t * 4..t * 4 + 4]
+                .iter()
+                .any(|&n| n < 0 || !dense[n as usize]);
+            if on_boundary {
+                peel.push(t as u32);
+            }
+        }
+        if peel.is_empty() {
+            break;
+        }
+        for &t in &peel {
+            dense[t as usize] = false;
+        }
+    }
+
+    let mut faces = Vec::new();
+    for t in 0..tet_count {
+        if !dense[t] {
+            continue;
+        }
+        for f in 0..4usize {
+            let n = neighbors[t * 4 + f];
+            if n < 0 || !dense[n as usize] {
+                faces.push(((t as u32) << 2) | f as u32);
+            }
+        }
+    }
+
+    // The two fractions say whether the threshold found a solid at all: a set
+    // that survives erosion roughly intact is a blob worth surfacing, while one
+    // that collapses was a scatter of thin sheets that never had an interior.
+    let surviving = dense.iter().filter(|&&d| d).count();
+    log::info!(
+        "[shell] dense {}/{} ({:.2}%) -> after erosion {} ({:.2}%), {} boundary faces",
+        initial_dense,
+        tet_count,
+        100.0 * initial_dense as f64 / tet_count.max(1) as f64,
+        surviving,
+        100.0 * surviving as f64 / tet_count.max(1) as f64,
+        faces.len(),
+    );
+
+    faces
+}
+
 pub fn extract_boundary_faces(
     idxs: &[u32],
     densities: &[f32],
     tet_count: usize,
     threshold: f32,
+    erosion_steps: u32,
 ) -> Vec<u32> {
-    // Key = sorted (i, j, k) → the packed face ids sharing that key.
-    let mut face_map: HashMap<[u32; 3], Vec<u32>> = HashMap::new();
-
-    for t in 0..tet_count {
-        if densities[t] < threshold {
-            continue;
-        }
-        let ti = [
-            idxs[t * 4],
-            idxs[t * 4 + 1],
-            idxs[t * 4 + 2],
-            idxs[t * 4 + 3],
-        ];
-        for (fi, face) in TET_FACES.iter().enumerate() {
-            let mut key = [ti[face[0]], ti[face[1]], ti[face[2]]];
-            key.sort_unstable();
-            face_map
-                .entry(key)
-                .or_default()
-                .push(((t as u32) << 2) | fi as u32);
-        }
-    }
-
-    let mut faces: Vec<u32> = face_map
-        .values()
-        .filter(|entries| entries.len() == 1)
-        .map(|entries| entries[0])
-        .collect();
-    // HashMap iteration order varies run to run; sort so the uploaded buffer is
-    // reproducible (and so tests over it are stable).
-    faces.sort_unstable();
-    faces
+    // Builds the adjacency and throws it away. Fine for a one-shot caller such
+    // as the collision mesh; anything that re-extracts as a setting moves should
+    // hold the adjacency and call `extract_boundary_faces_adj` directly, which
+    // is what `ShellSystem` does.
+    let neighbors = rmesh_raytrace::compute_tet_neighbors(idxs, tet_count);
+    extract_boundary_faces_adj(&neighbors, densities, tet_count, threshold, erosion_steps)
 }
 
 pub struct CollisionMesh {
@@ -148,7 +199,7 @@ impl CollisionMesh {
         tet_count: usize,
         threshold: f32,
     ) -> Self {
-        let boundary = extract_boundary_faces(idxs, densities, tet_count, threshold);
+        let boundary = extract_boundary_faces(idxs, densities, tet_count, threshold, 0);
 
         let mut triangles = Vec::with_capacity(boundary.len());
         let mut normals = Vec::with_capacity(boundary.len());
@@ -866,7 +917,7 @@ mod tests {
     #[test]
     fn boundary_faces_drop_the_shared_face() {
         let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
-        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5, 0);
 
         // 8 faces total, minus the one interior face counted from both sides.
         assert_eq!(faces.len(), 6, "expected a closed 6-face surface: {faces:?}");
@@ -888,7 +939,7 @@ mod tests {
 
         // Above the second tet's density: only the first tet is solid, so its
         // formerly-interior face becomes boundary and all 4 of its faces show.
-        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        let faces = extract_boundary_faces(&indices, &densities, 2, 0.5, 0);
         assert_eq!(faces.len(), 4);
         for &packed in &faces {
             assert_eq!(unpack_face(packed).0, 0, "sparse tet leaked into the shell");
@@ -896,24 +947,42 @@ mod tests {
 
         // Below both: back to the shared 6-face surface.
         assert_eq!(
-            extract_boundary_faces(&indices, &densities, 2, 0.05).len(),
+            extract_boundary_faces(&indices, &densities, 2, 0.05, 0).len(),
             6
         );
 
         // Above both: nothing is solid, so there is no shell at all. This is the
         // case the render path must survive — it draws zero faces rather than an
         // empty depth bound that would cull the whole scene.
-        assert!(extract_boundary_faces(&indices, &densities, 2, 10.0).is_empty());
+        assert!(extract_boundary_faces(&indices, &densities, 2, 10.0, 0).is_empty());
+    }
+
+    #[test]
+    fn erosion_deletes_structures_thinner_than_it() {
+        // Both tets sit on the surface — a two-tet slab has no interior — so one
+        // erosion step consumes the whole thing. This is the case the erosion
+        // knob exists for: a structure this thin is nearly transparent in the
+        // volume, so an opaque shell over it both looks wrong and wrongly
+        // occludes whatever is behind it.
+        let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
+        assert_eq!(extract_boundary_faces(&indices, &densities, 2, 0.5, 0).len(), 6);
+        assert!(
+            extract_boundary_faces(&indices, &densities, 2, 0.5, 1).is_empty(),
+            "one erosion step should peel a two-tet slab away entirely"
+        );
+        // Eroding past empty must terminate, not spin or panic.
+        assert!(extract_boundary_faces(&indices, &densities, 2, 0.5, 9).is_empty());
     }
 
     #[test]
     fn boundary_faces_are_deterministic() {
-        // The extractor walks a HashMap, whose order varies per process. The GPU
-        // buffer must not, or a rebuild at an unchanged threshold would reshuffle
-        // the draw for no reason.
+        // The extractor now emits in ascending packed-id order by construction,
+        // so this holds without a sort. Still worth pinning: a rebuild at an
+        // unchanged threshold must not reshuffle the draw, and the adjacency it
+        // walks is built by bucketing, which is order-sensitive to get right.
         let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
-        let a = extract_boundary_faces(&indices, &densities, 2, 0.5);
-        let b = extract_boundary_faces(&indices, &densities, 2, 0.5);
+        let a = extract_boundary_faces(&indices, &densities, 2, 0.5, 0);
+        let b = extract_boundary_faces(&indices, &densities, 2, 0.5, 0);
         assert_eq!(a, b);
         assert!(a.windows(2).all(|w| w[0] < w[1]), "not sorted: {a:?}");
     }

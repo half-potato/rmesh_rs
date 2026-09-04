@@ -104,7 +104,13 @@ pub struct PrimitivePipeline {
 }
 
 impl PrimitivePipeline {
-    pub fn new(device: &wgpu::Device, material_bgl: &wgpu::BindGroupLayout) -> Self {
+    /// `formats` must match the `RenderTargets` these primitives composite
+    /// into — primitives and volumes render into the same G-buffer.
+    pub fn new(
+        device: &wgpu::Device,
+        material_bgl: &wgpu::BindGroupLayout,
+        formats: rmesh_util::shared::GBufferFormats,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("primitive.wgsl"),
             source: wgpu::ShaderSource::Wgsl(PRIMITIVE_WGSL.as_str().into()),
@@ -138,6 +144,10 @@ impl PrimitivePipeline {
             immediate_size: 0,
         });
 
+        // The compositor's OWN HDR colour target (`PrimitiveTargets::color_texture`),
+        // used by the non-MRT `prim_pipeline` below. This is deliberately NOT one of
+        // the G-buffer attachments — it used to share a local with them, so narrowing
+        // the G-buffer would have silently narrowed this unrelated HDR texture too.
         let color_format = wgpu::TextureFormat::Rgba16Float;
 
         let vertex_state = wgpu::VertexBufferLayout {
@@ -209,18 +219,17 @@ impl PrimitivePipeline {
             cache: None,
         });
 
-        // MRT pipeline (4 color targets matching interval pipeline)
-        let opaque_target = Some(wgpu::ColorTargetState {
-            format: color_format,
-            blend: None,
-            write_mask: wgpu::ColorWrites::ALL,
-        });
-        // Normals: Rgba8Unorm bias-encoded (matches normals_texture).
-        let normals_target = Some(wgpu::ColorTargetState {
-            format: wgpu::TextureFormat::Rgba8Unorm,
-            blend: None,
-            write_mask: wgpu::ColorWrites::ALL,
-        });
+        // MRT pipeline — the four targets must match the volume path's
+        // G-buffer attachment-for-attachment, so they come from the same
+        // `formats` set rather than a shared local. Slots 0, 1 and 3 used to
+        // share one `opaque_target`, which silently coupled them.
+        let mrt_target = |format: wgpu::TextureFormat| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        };
         let pipeline_mrt = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("prim_pipeline_mrt"),
             layout: Some(&pipeline_layout),
@@ -234,10 +243,10 @@ impl PrimitivePipeline {
                 module: &shader_mrt,
                 entry_point: Some("fs_main"),
                 targets: &[
-                    opaque_target.clone(), // location(0): albedo
-                    opaque_target.clone(), // location(1): roughness, 0, metallic
-                    normals_target,        // location(2): normals
-                    opaque_target,         // location(3): depth, occlusion, 0
+                    mrt_target(formats.color),   // location(0): albedo
+                    mrt_target(formats.aux0),    // location(1): roughness, 0, metallic
+                    mrt_target(formats.normals), // location(2): normals
+                    mrt_target(formats.depth),   // location(3): depth, occlusion, 0
                 ],
                 compilation_options: Default::default(),
             }),

@@ -233,7 +233,7 @@ fn generate(
     );
 
     let ci_pipelines =
-        rmesh_render::ComputeIntervalPipelines::new(device, wgpu::TextureFormat::Rgba16Float);
+        rmesh_render::ComputeIntervalPipelines::new(device, rmesh_render::GBufferFormats::default());
 
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =

@@ -404,11 +404,11 @@ pub fn train(
     views: &[TrainingView],
     config: &TrainConfig,
 ) -> Result<()> {
-    let color_format = wgpu::TextureFormat::Rgba16Float;
+    let gbuffer_formats = rmesh_util::shared::GBufferFormats::default();
     let tile_size = 12u32;
 
     // Create pipelines
-    let fwd_pipelines = ForwardPipelines::new(device, color_format);
+    let fwd_pipelines = ForwardPipelines::new(device, gbuffer_formats);
     let bwd_tiled_pipelines = BackwardTiledPipelines::new(device);
     let loss_pipeline = LossPipeline::new(device);
     let adam_pipeline = AdamPipeline::new(device);

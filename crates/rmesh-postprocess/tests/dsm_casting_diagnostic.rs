@@ -174,7 +174,7 @@ fn build_dsm_nf(
     );
     queue.write_buffer(&buffers.vertex_normals, 0, bytemuck::cast_slice(vnormals));
 
-    let ci = rmesh_render::ComputeIntervalPipelines::new(device, color_format);
+    let ci = rmesh_render::ComputeIntervalPipelines::new(device, rmesh_render::GBufferFormats::default());
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =
         rmesh_sort::RadixSortPipelines::new(device, 1, rmesh_sort::SortBackend::Drs);
@@ -503,7 +503,7 @@ fn render_full_nf(
         rmesh_render::setup_forward(device, queue, scene, &base_colors, &scene.color_grads, W, H);
     queue.write_buffer(&buffers.vertex_normals, 0, bytemuck::cast_slice(vnormals));
 
-    let ci = rmesh_render::ComputeIntervalPipelines::new(device, color_format);
+    let ci = rmesh_render::ComputeIntervalPipelines::new(device, rmesh_render::GBufferFormats::default());
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =
         rmesh_sort::RadixSortPipelines::new(device, 1, rmesh_sort::SortBackend::Drs);
@@ -615,6 +615,7 @@ fn render_full_nf(
         None,
         false,
         true,
+        None,
     );
     queue.submit(std::iter::once(enc.finish()));
     let _ = device.poll(wgpu::PollType::wait_indefinitely());

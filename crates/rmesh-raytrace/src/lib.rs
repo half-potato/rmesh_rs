@@ -11,7 +11,6 @@
 
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use std::collections::HashMap;
 use wgpu::util::DeviceExt;
 
 use rmesh_data::{MaterialBuffers, SceneBuffers};
@@ -29,33 +28,116 @@ static LOCATE_COMPUTE_WGSL: rmesh_util::HotShader =
 // ---------------------------------------------------------------------------
 
 /// Tet neighbor adjacency: `neighbors[tet_id * 4 + face_idx]` = neighbor tet or -1.
+///
+/// Bucketed by each face's smallest vertex index rather than hashed. A face's
+/// two claimants share a sorted vertex triple and therefore share a smallest
+/// vertex, so both always land in the same bucket and matching is local. That
+/// replaces ~4M hash operations with two linear scans plus a sort of ~24
+/// elements per vertex, which matters: this runs on multi-million-tet scenes
+/// and the density shell rebuilds on top of it.
+///
+/// Assumes each face is claimed by at most two tets, which holds for any
+/// tetrahedralization of a 3-manifold. Extra claimants beyond the first pair
+/// are simply left unmatched (reported as boundary).
 pub fn compute_tet_neighbors(indices: &[u32], tet_count: usize) -> Vec<i32> {
-    use rmesh_util::shared::TET_FACE_INDICES;
+    let n_faces = tet_count * 4;
+    let mut neighbors = vec![-1i32; n_faces];
+    if tet_count == 0 {
+        return neighbors;
+    }
 
-    let mut neighbors = vec![-1i32; tet_count * 4];
-    let mut face_map: HashMap<[u32; 3], (usize, usize)> = HashMap::with_capacity(tet_count * 4);
+    let idx = &indices[..n_faces];
+    let n_verts = idx.iter().copied().max().unwrap_or(0) as usize + 1;
 
-    for tet_id in 0..tet_count {
-        for face_idx in 0..4usize {
-            let fi_base = face_idx * 3;
-            let vi0 = indices[tet_id * 4 + TET_FACE_INDICES[fi_base] as usize];
-            let vi1 = indices[tet_id * 4 + TET_FACE_INDICES[fi_base + 1] as usize];
-            let vi2 = indices[tet_id * 4 + TET_FACE_INDICES[fi_base + 2] as usize];
+    // Histogram faces by smallest vertex, then prefix-sum into CSR offsets.
+    let mut offsets = vec![0u32; n_verts + 1];
+    for t in 0..tet_count {
+        for f in 0..4usize {
+            offsets[face_key(idx, t, f)[0] as usize + 1] += 1;
+        }
+    }
+    for v in 0..n_verts {
+        offsets[v + 1] += offsets[v];
+    }
 
-            let mut key = [vi0, vi1, vi2];
-            key.sort();
-
-            if let Some(&(other_tet, other_face)) = face_map.get(&key) {
-                neighbors[tet_id * 4 + face_idx] = other_tet as i32;
-                neighbors[other_tet * 4 + other_face] = tet_id as i32;
-                face_map.remove(&key);
-            } else {
-                face_map.insert(key, (tet_id, face_idx));
-            }
+    // Scatter packed `(tet << 2) | face` ids into their buckets.
+    let mut cursor = offsets[..n_verts].to_vec();
+    let mut slots = vec![0u32; n_faces];
+    for t in 0..tet_count {
+        for f in 0..4usize {
+            let a = face_key(idx, t, f)[0] as usize;
+            slots[cursor[a] as usize] = ((t as u32) << 2) | f as u32;
+            cursor[a] += 1;
         }
     }
 
+    // Match within each bucket. Buckets hold the faces incident to one vertex —
+    // a few dozen — so the sort is on a slice that stays in L1.
+    let mut buf: Vec<([u32; 3], u32)> = Vec::with_capacity(64);
+    let mut non_manifold = 0usize;
+    for v in 0..n_verts {
+        let (s, e) = (offsets[v] as usize, offsets[v + 1] as usize);
+        if e - s < 2 {
+            continue;
+        }
+        buf.clear();
+        buf.extend(slots[s..e].iter().map(|&packed| {
+            (
+                face_key(idx, (packed >> 2) as usize, (packed & 3) as usize),
+                packed,
+            )
+        }));
+        buf.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+
+        let mut i = 0;
+        while i < buf.len() {
+            let mut j = i + 1;
+            while j < buf.len() && buf[j].0 == buf[i].0 {
+                j += 1;
+            }
+            if j - i == 2 {
+                let (p0, p1) = (buf[i].1, buf[i + 1].1);
+                neighbors[(p0 >> 2) as usize * 4 + (p0 & 3) as usize] = (p1 >> 2) as i32;
+                neighbors[(p1 >> 2) as usize * 4 + (p1 & 3) as usize] = (p0 >> 2) as i32;
+            } else if j - i > 2 {
+                non_manifold += j - i;
+            }
+            i = j;
+        }
+    }
+
+    if non_manifold > 0 {
+        log::warn!(
+            "compute_tet_neighbors: {non_manifold} of {n_faces} faces have 3+ claimants; \
+             left unmatched (reported as boundary)"
+        );
+    }
+
     neighbors
+}
+
+/// Sorted vertex triple of face `f` of tet `t` — the identity a face is matched
+/// on. Sorted by a 3-element network; `[u32; 3]::sort` is measurably slower at
+/// the ~50M calls this sees.
+#[inline]
+fn face_key(indices: &[u32], t: usize, f: usize) -> [u32; 3] {
+    use rmesh_util::shared::TET_FACE_INDICES;
+    let b = f * 3;
+    let mut k = [
+        indices[t * 4 + TET_FACE_INDICES[b] as usize],
+        indices[t * 4 + TET_FACE_INDICES[b + 1] as usize],
+        indices[t * 4 + TET_FACE_INDICES[b + 2] as usize],
+    ];
+    if k[0] > k[1] {
+        k.swap(0, 1);
+    }
+    if k[1] > k[2] {
+        k.swap(1, 2);
+    }
+    if k[0] > k[1] {
+        k.swap(0, 1);
+    }
+    k
 }
 
 // ---------------------------------------------------------------------------

@@ -133,11 +133,9 @@ fn shell_occluded(min_x: f32, max_x: f32, min_y: f32, max_y: f32, near_z: f32) -
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
 
+    // Sort array is compacted — see the note in project_compute.wgsl. A culled
+    // tet writes nothing; `num_keys` is the resulting instance count.
     if (tet_id >= uniforms.tet_count) {
-        if (tet_id < arrayLength(&sort_keys)) {
-            sort_keys[tet_id] = 0xFFFFFFFFu;
-            sort_values[tet_id] = tet_id;
-        }
         return;
     }
 
@@ -190,8 +188,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     if (!visible) {
-        sort_keys[tet_id] = 0xFFFFFFFFu;
-        sort_values[tet_id] = tet_id;
         return;
     }
 
@@ -207,10 +203,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let depth_raw = dot(cam - v0, cam + v0 - 2.0 * center);
     let depth = clamp(depth_raw, -1e20, 1e20);
     let depth_bits = bitcast<u32>(depth);
-    sort_keys[tet_id] = ~depth_bits;
-    sort_values[tet_id] = tet_id;
 
-    atomicAdd(&indirect_args.instance_count, 1u);
+    let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
+    sort_keys[vis_idx] = ~depth_bits;
+    sort_values[vis_idx] = tet_id;
 
     // --- 4. Color evaluation (only for visible tets) ---
     // sh_degree >= 0 all need SH eval (degree 0 = DC only). Else branch is training-only.

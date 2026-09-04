@@ -141,23 +141,16 @@ fn shell_occluded(min_x: f32, max_x: f32, min_y: f32, max_y: f32, near_z: f32) -
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
-    // Padding threads (beyond tet_count): initialize sort buffers.
-    // Use 0xFFFF (16-bit max) so DRS with sorting_bits=16 sorts these to end.
+    // Sort array is compacted — see the note in project_compute.wgsl. A culled
+    // tet writes nothing; `num_keys` is the resulting instance count.
     if (tet_id >= uniforms.tet_count) {
-        if (tet_id < arrayLength(&sort_keys)) {
-            sort_keys[tet_id] = 0xFFFFu;
-            sort_values[tet_id] = tet_id;
-        }
         return;
     }
 
     // --- Occlusion cull: skip tets not visible from the active region ---
     // (all-ones mask => no-op). Runs before frustum/optical-depth culls so the
-    // visible-instance count isolates the PVS-only reduction. 0xFFFFu sentinel
-    // matches the 16-bit sort-key convention used above.
+    // visible-instance count isolates the PVS-only reduction.
     if ((tet_visibility[tet_id >> 5u] & (1u << (tet_id & 31u))) == 0u) {
-        sort_keys[tet_id] = 0xFFFFu;
-        sort_values[tet_id] = tet_id;
         return;
     }
 
@@ -209,8 +202,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     if (!visible) {
-        sort_keys[tet_id] = 0xFFFFu;
-        sort_values[tet_id] = tet_id;
         return;
     }
 
@@ -226,8 +217,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         );
         let max_od = densities[tet_id] * sqrt(max_edge_sq);
         if (max_od < 0.01) {
-            sort_keys[tet_id] = 0xFFFFu;
-            sort_values[tet_id] = tet_id;
             return;
         }
     }
@@ -247,11 +236,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let dist = sqrt(max(depth_raw, 0.0));
     let t = clamp(dist / uniforms.far_plane, 0.0, 1.0);
     let key16 = u32(t * 65535.0);
-    sort_keys[tet_id] = 65535u - key16; // Invert for back-to-front
-    sort_values[tet_id] = tet_id;
 
-    // Atomic increment instance count, get compact vis_idx
+    // Claim a slot; everything below is indexed by it. See project_compute.wgsl.
     let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
+
+    sort_keys[vis_idx] = 65535u - key16; // Invert for back-to-front
+    sort_values[vis_idx] = tet_id;
 
     // Write compact tet id list for tiled path
     compact_tet_ids[vis_idx] = tet_id;

@@ -9,6 +9,7 @@ bytemuck = { workspace = true }
 naga_oil = "0.21"
 naga = { version = "28", features = ["wgsl-in", "wgsl-out"] }
 wgpu = { workspace = true }
+half = { workspace = true }
 
 # Optional deps for test-util feature
 pollster = { workspace = true, optional = true }

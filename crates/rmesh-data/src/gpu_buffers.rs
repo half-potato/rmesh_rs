@@ -106,14 +106,18 @@ impl SceneBuffers {
         let sort_keys = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_keys"),
             size: n_pow2 * 4,
-            usage: wgpu::BufferUsages::STORAGE,
+            // COPY_SRC so the sort's output can be read back and checked; the
+            // compacted layout is otherwise invisible to tests.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let sort_values = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sort_values"),
             size: n_pow2 * 4,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 

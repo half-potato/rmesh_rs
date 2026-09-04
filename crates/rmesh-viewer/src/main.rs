@@ -54,6 +54,16 @@ mod render;
 use flare::FlareSystem;
 use gpu_state::*;
 
+/// Read a 0/1 environment override for a boolean toggle, falling back to
+/// `default` when unset or unparseable.
+fn env_flag(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("0") | Some("false") => false,
+        Some("1") | Some("true") => true,
+        _ => default,
+    }
+}
+
 /// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
 /// Hard-fail when the loaded PbrData is missing the parametric BRDF channels
 /// (metallic / f0_dielectric / albedo / roughness). This is what we'd see
@@ -211,6 +221,8 @@ struct App {
     // Flare gun
     flare_system: FlareSystem,
     shell_system: shell::ShellSystem,
+    /// `RMESH_SHOT` frame capture, for judging a change on the image.
+    screenshot: Option<shell::Screenshot>,
     // Occlusion culling ('C' toggles). active_region -1 = no-cull (all visible);
     // -2 forces a first rebuild. active_mask_scratch is the bit-packed
     // [ceil(M/32)] u32 mask uploaded to SceneBuffers.tet_visibility on change.
@@ -221,6 +233,10 @@ struct App {
     active_baked_count: u32,
     // One-shot sub-pixel tet measurement (press 'M' to re-run for the current view).
     measure_subpixel: bool,
+    /// One-shot: spawn RMESH_LIGHTS point lights on the first rendered frame.
+    /// Deferred until then because the orbit camera (which positions them) is
+    /// only meaningful once a scene is loaded.
+    profile_lights_pending: u32,
     // One-shot GPU timing probe: press 'T' to drain the swapchain for a few
     // frames so one completes, then log drawn-tet-count + per-stage GPU ms.
     timing_probe_frames: u32,
@@ -327,16 +343,18 @@ impl App {
             next_primitive_id: 1,
             anim_clock: AnimationClock::new(),
             animated_scene: None,
-            deferred_enabled: pbr.is_some(),
+            // RMESH_DEFERRED/RMESH_AO/RMESH_SSGI (0|1) pin the effect toggles at
+            // startup so the profiler can sweep configurations non-interactively.
+            deferred_enabled: env_flag("RMESH_DEFERRED", pbr.is_some()),
             deferred_debug_mode: 0,
             ambient: 0.3,
             sky_color: [0.0, 0.0, 0.0],
             ground_color: [0.0, 0.0, 0.0],
             exposure: 1.0,
-            ao_enabled: true,
+            ao_enabled: env_flag("RMESH_AO", true),
             ao_strength: 1.0,
             gtao_radius: 0.5,
-            ssgi_enabled: true,
+            ssgi_enabled: env_flag("RMESH_SSGI", true),
             ssgi_strength: 1.0,
             ssgi_radius: 1.5,
             ssgi_temporal_alpha: 0.2,
@@ -352,7 +370,8 @@ impl App {
             rt_start_tet_hint: -1,
             rt_locate_ms: 0.0,
             flare_system: FlareSystem::default(),
-            shell_system: shell::ShellSystem::default(),
+            shell_system: shell::ShellSystem::from_env(),
+            screenshot: shell::Screenshot::from_env(),
             cull_enabled: true,
             active_region: -2,
             active_mask_dirty: true,
@@ -362,7 +381,13 @@ impl App {
             // them at startup made every launch stall: the timing probe blocks on
             // `device.poll(Wait)` for up to 120s on each of its frames, and the
             // sub-pixel probe is an O(tet_count) CPU sweep on the first frame.
-            measure_subpixel: false,
+            // RMESH_OVERDRAW_PROBE=1 fires the 'M' sub-pixel/overdraw probe on the
+            // first frame, so it can be captured without a keypress.
+            measure_subpixel: env_flag("RMESH_OVERDRAW_PROBE", false),
+            profile_lights_pending: std::env::var("RMESH_LIGHTS")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0),
             timing_probe_frames: 0,
         }
     }
@@ -488,6 +513,23 @@ impl App {
                 if mesh_shader_supported {
                     required_features |= wgpu::Features::EXPERIMENTAL_MESH_SHADER;
                 }
+                // Encoder-level timestamps let the postprocess profiler bracket
+                // each fullscreen pass without threading timestamp_writes
+                // through every record_* helper. Optional — the profiler
+                // degrades to "unavailable" when the backend lacks it.
+                let encoder_ts =
+                    adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+                if encoder_ts {
+                    required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+                }
+                log::info!("Encoder timestamp support: {}", encoder_ts);
+                // Fragment-invocation counter for the interval raster pass.
+                let pipe_stats =
+                    adapter_features.contains(wgpu::Features::PIPELINE_STATISTICS_QUERY);
+                if pipe_stats {
+                    required_features |= wgpu::Features::PIPELINE_STATISTICS_QUERY;
+                }
+                log::info!("Pipeline statistics support: {}", pipe_stats);
 
                 let mut limits = wgpu::Limits::default();
                 limits.max_storage_buffers_per_shader_stage = 20;
@@ -552,7 +594,10 @@ impl App {
             .unwrap_or(surface_caps.formats[0]);
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // COPY_SRC so `RMESH_SHOT` can read the presented frame back. Free
+            // on every backend we target; keeps the capture honest by grabbing
+            // exactly what was shown rather than an off-screen re-render.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width.max(1),
             height: size.height.max(1),
@@ -563,25 +608,41 @@ impl App {
         };
         surface.configure(&device, &surface_config);
 
+        // `color_format` now covers only the non-G-buffer targets that happen to
+        // be Rgba16Float: the DSM moment atlas, the deferred output and the
+        // debug textures. The four G-buffer attachments are named separately by
+        // `gbuffer_formats` so narrowing one cannot leak into DSM.
         let color_format = wgpu::TextureFormat::Rgba16Float;
+        // RMESH_GBUF="color=rgba8srgb,aux0=rgba16f" overrides the attachment
+        // formats for a perf sweep without a rebuild.
+        let gbuffer_formats = rmesh_util::shared::GBufferFormats::from_env();
+        log::info!(
+            "G-buffer: color={:?} aux0={:?} normals={:?} depth={:?} ({} B/px, {} ROP slots)",
+            gbuffer_formats.color,
+            gbuffer_formats.aux0,
+            gbuffer_formats.normals,
+            gbuffer_formats.depth,
+            gbuffer_formats.bytes_per_pixel(),
+            gbuffer_formats.rop_slots(),
+        );
 
         log::info!("Compiling shader pipelines...");
         let t0 = std::time::Instant::now();
-        let pipelines = ForwardPipelines::new(&device, color_format);
+        let pipelines = ForwardPipelines::new(&device, gbuffer_formats);
         let blit_pipeline = BlitPipeline::new(&device, surface_format);
         let mesh_pipelines = if mesh_shader_supported {
             log::info!("Compiling mesh shader pipelines...");
-            Some(MeshForwardPipelines::new(&device, color_format))
+            Some(MeshForwardPipelines::new(&device, gbuffer_formats))
         } else {
             None
         };
         let interval_pipelines = if mesh_shader_supported {
             log::info!("Compiling interval shading pipelines...");
-            Some(IntervalPipelines::new(&device, color_format))
+            Some(IntervalPipelines::new(&device, gbuffer_formats))
         } else {
             None
         };
-        let compute_interval_pipelines = ComputeIntervalPipelines::new(&device, color_format);
+        let compute_interval_pipelines = ComputeIntervalPipelines::new(&device, gbuffer_formats);
         log::info!("Pipelines compiled: {:.2}s", t0.elapsed().as_secs_f64());
 
         log::info!(
@@ -647,7 +708,12 @@ impl App {
 
         log::info!("Buffers uploaded: {:.2}s", t0.elapsed().as_secs_f64());
 
-        let targets = RenderTargets::new(&device, size.width.max(1), size.height.max(1));
+        let targets = RenderTargets::new_with_formats(
+            &device,
+            size.width.max(1),
+            size.height.max(1),
+            gbuffer_formats,
+        );
 
         // Radix sort state — use DRS (subgroup-based) when available, else Basic
         let sort_backend = if subgroup_supported {
@@ -678,7 +744,8 @@ impl App {
             PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
         let shell_pipeline = rmesh_render::ShellPipeline::new(
             &device,
-            color_format,
+            gbuffer_formats,
+            color_format, // DSM moment target — deliberately independent of the G-buffer
             wgpu::TextureFormat::Depth32Float,
         );
         let shell_buffers = rmesh_render::ShellBuffers::new(&device);
@@ -832,7 +899,11 @@ impl App {
         let mut primitive_geometry = PrimitiveGeometry::new(&device);
         let mut material_registry = rmesh_compositor::MaterialRegistry::new(&device, &queue);
         let primitive_pipeline =
-            PrimitivePipeline::new(&device, &material_registry.bind_group_layout);
+            PrimitivePipeline::new(
+                &device,
+                &material_registry.bind_group_layout,
+                gbuffer_formats,
+            );
 
         // Instance count readback buffer
         let instance_count_readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -871,6 +942,71 @@ impl App {
             std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
         let ts_readback_mapped: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
             std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        // --- Postprocess-chain profiler ---
+        // A second query set, written with encoder-level write_timestamp()
+        // calls that bracket each fullscreen pass in the deferred/GTAO/SSGI/SSR
+        // chain. Slot count is dynamic per frame (passes are gated by toggles),
+        // so `pp_ts_used` records how many were actually written and only that
+        // prefix is ever resolved — see TS_WRITTEN_COUNT's warning.
+        let pp_ts_enabled = device
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+        let pp_query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("pp_profiler"),
+            ty: wgpu::QueryType::Timestamp,
+            count: PP_TS_COUNT,
+        });
+        let pp_resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pp_ts_resolve"),
+            size: (PP_TS_COUNT as u64) * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let pp_readback = std::array::from_fn(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("pp_ts_readback"),
+                size: (PP_TS_COUNT as u64) * 8,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        let pp_readback_ready: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
+            std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+        let pp_readback_mapped: [std::sync::Arc<std::sync::atomic::AtomicBool>; 2] =
+            std::array::from_fn(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+
+        // --- Fragment-invocation counter for the interval raster pass ---
+        // Turns the raster pass's per-fragment cost from an estimate into a
+        // measurement: fragments/frame is the denominator of the whole roofline.
+        // Optional; the adapter may not expose pipeline statistics.
+        let frag_stats_enabled = device
+            .features()
+            .contains(wgpu::Features::PIPELINE_STATISTICS_QUERY);
+        let frag_query_set = frag_stats_enabled.then(|| {
+            device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("frag_invocations"),
+                ty: wgpu::QueryType::PipelineStatistics(
+                    wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+                ),
+                count: 1,
+            })
+        });
+        // One statistic, 8 bytes.
+        let frag_resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frag_stats_resolve"),
+            size: 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let frag_readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("frag_stats_readback"),
+            size: 8,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let frag_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let frag_mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // egui setup
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -1374,6 +1510,22 @@ impl App {
             ts_readback,
             ts_readback_ready,
             ts_readback_mapped,
+            pp_ts_enabled,
+            pp_query_set,
+            pp_resolve_buf,
+            pp_readback,
+            pp_readback_ready,
+            pp_readback_mapped,
+            pp_labels_pending: [Vec::new(), Vec::new()],
+            pp_times_ms: Vec::new(),
+            frag_query_set,
+            frag_resolve_buf,
+            frag_readback,
+            frag_ready,
+            frag_mapped,
+            frag_invocations: 0,
+            pp_lights: 0,
+            pp_dsm: false,
             ts_frame: 0,
             ts_period_ns,
             gpu_times_ms: GpuTimings::default(),
@@ -1496,7 +1648,8 @@ impl App {
         self.flare_system.rebuild_collision_mesh(&self.scene_data);
         // Shell face ids index the previous scene's tet array — drop them.
         self.shell_system.reset();
-        self.deferred_enabled = self.pbr_data.is_some();
+        self.deferred_enabled = env_flag("RMESH_DEFERRED", self.pbr_data.is_some());
+
         self.loaded_path = Some(path.to_path_buf());
 
         // Reset camera
@@ -1868,7 +2021,12 @@ impl App {
             gpu.surface_config.width = new_size.width;
             gpu.surface_config.height = new_size.height;
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
-            gpu.targets = RenderTargets::new(&gpu.device, new_size.width, new_size.height);
+            gpu.targets = RenderTargets::new_with_formats(
+                &gpu.device,
+                new_size.width,
+                new_size.height,
+                gpu.targets.formats,
+            );
             // Recreate blit bind group since color_view changed
             gpu.blit_bg =
                 create_blit_bind_group(&gpu.device, &gpu.blit_pipeline, &gpu.targets.color_view);
@@ -2712,7 +2870,23 @@ impl ApplicationHandler for App {
             });
         let attrs = Window::default_attributes()
             .with_title(title)
-            .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+            .with_inner_size(
+                // RMESH_WIN=WxH overrides the default window size, so the
+                // postprocess profiler can be swept across resolutions.
+                std::env::var("RMESH_WIN")
+                    .ok()
+                    .and_then(|v| {
+                        let (w, h) = v.split_once('x')?;
+                        Some(winit::dpi::PhysicalSize::new(
+                            w.trim().parse::<u32>().ok()?,
+                            h.trim().parse::<u32>().ok()?,
+                        ))
+                    })
+                    .map_or(
+                        winit::dpi::Size::Logical(winit::dpi::LogicalSize::new(1280.0, 720.0)),
+                        winit::dpi::Size::Physical,
+                    ),
+            );
         let window = Arc::new(event_loop.create_window(attrs).unwrap());
         self.init_gpu(window.clone());
         self.window = Some(window);

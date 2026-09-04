@@ -42,7 +42,7 @@ pub mod shell;
 pub mod shell_hiz;
 
 pub use shell::{
-    create_shell_bind_group, record_shell_dsm_pass, record_shell_pass, ShellBuffers,
+    create_shell_bind_group, record_shell_dsm_pass, record_shell_pass, ShellBuffers, ShellFace,
     ShellPipeline, ShellView,
 };
 pub use shell_hiz::{dummy_shell_hiz, record_shell_hiz, ShellHiZ, ShellHiZPipelines};
@@ -144,9 +144,10 @@ fn shell_hiz_layout_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
 impl ForwardPipelines {
     /// Create all three pipelines from WGSL shader sources.
     ///
-    /// `color_format`: texture format for all color attachments (Rgba16Float).
+    /// `formats`: per-attachment G-buffer formats; must match the
+    /// `RenderTargets` these pipelines render into.
     /// Total bytes per sample must not exceed 32 bytes (4 * 8 = 32 for Rgba16Float).
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
         // ----- Compute pipeline (split into 2 bind groups, 14 storage total) -----
         // Split along read-only / read-write boundary for code organization:
         //   group 0 (8 read-only): uniforms, vertices, indices, densities,
@@ -343,13 +344,13 @@ impl ForwardPipelines {
                 targets: &[
                     // Color attachment 0: premultiplied alpha blend
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Color attachment 1 (aux): premultiplied alpha blend
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.aux0,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -357,13 +358,13 @@ impl ForwardPipelines {
                     // Rgba8Unorm matches normals_texture (halved bandwidth vs
                     // Rgba16Float; bias-encoded as (n*0.5+0.5)*alpha).
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: formats.normals,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // Color attachment 3 (depth): premultiplied alpha blend
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.depth,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -466,25 +467,25 @@ impl ForwardPipelines {
                 targets: &[
                     // location(0) color
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(1) aux0
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.aux0,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(2) normals — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: formats.normals,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(3) depth
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.depth,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -498,7 +499,7 @@ impl ForwardPipelines {
         // ----- Color-only pipeline variants (no MRT — single color target) -----
         let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
             Some(wgpu::ColorTargetState {
-                format: color_format,
+                format: formats.color,
                 blend: Some(premul_blend),
                 write_mask: wgpu::ColorWrites::ALL,
             }),
@@ -616,7 +617,7 @@ pub struct MeshForwardPipelines {
 
 impl MeshForwardPipelines {
     /// Create mesh shader pipelines. Requires `Features::EXPERIMENTAL_MESH_SHADER`.
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
         // ----- Mesh render pipeline (8 read-only storage bindings) -----
         // Bindings 0-6: same as vertex shader render bind group
         // Binding 7: indirect_args (read visible_count)
@@ -687,25 +688,25 @@ impl MeshForwardPipelines {
                 targets: &[
                     // location(0) color
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(1) aux0
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.aux0,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(2) normals — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: formats.normals,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(3) depth
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.depth,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -765,7 +766,7 @@ impl MeshForwardPipelines {
 
         let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
             Some(wgpu::ColorTargetState {
-                format: color_format,
+                format: formats.color,
                 blend: Some(premul_blend),
                 write_mask: wgpu::ColorWrites::ALL,
             }),
@@ -838,7 +839,7 @@ pub struct IntervalPipelines {
 
 impl IntervalPipelines {
     /// Create interval shading pipelines. Requires `Features::EXPERIMENTAL_MESH_SHADER`.
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
         // ----- Mesh render pipeline (8 read-only storage bindings) -----
         // Same bindings as MeshForwardPipelines: uniforms, vertices, indices, colors,
         // densities, color_grads, sorted_indices, indirect_args
@@ -913,7 +914,7 @@ impl IntervalPipelines {
                 targets: &[
                     // Single color attachment: premultiplied alpha blend
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -1005,7 +1006,7 @@ pub struct ComputeIntervalPipelines {
 }
 
 impl ComputeIntervalPipelines {
-    pub fn new(device: &wgpu::Device, color_format: wgpu::TextureFormat) -> Self {
+    pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
         // ----- Gen compute pipeline (11 bindings) -----
         // Binding 0 (uniforms) is bound as a UNIFORM buffer so the COMPUTE-stage
         // storage-buffer count is 10, fitting WebGPU's per-stage cap.
@@ -1134,25 +1135,25 @@ impl ComputeIntervalPipelines {
                 targets: &[
                     // location(0): color (plaster RGBA)
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(1): aux0 (roughness, env_feat[0..2])
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.aux0,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(2): normals (normal.xyz, env_feat[3]) — Rgba8Unorm bias-encoded.
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: formats.normals,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     // location(3): depth_albedo (depth, albedo.rgb)
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.depth,
                         blend: Some(premul_blend),
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -1212,7 +1213,7 @@ impl ComputeIntervalPipelines {
 
         let color_only_targets: &[Option<wgpu::ColorTargetState>] = &[
             Some(wgpu::ColorTargetState {
-                format: color_format,
+                format: formats.color,
                 blend: Some(premul_blend),
                 write_mask: wgpu::ColorWrites::ALL,
             }),
@@ -1277,15 +1278,23 @@ impl ComputeIntervalPipelines {
 // Render Targets
 // ---------------------------------------------------------------------------
 
+pub use rmesh_util::shared::GBufferFormats;
+
 /// The render target textures for MRT output.
 pub struct RenderTargets {
-    /// Main color output texture (e.g. Rgba16Float)
+    /// Formats the four G-buffer attachments were actually created with.
+    /// Producers' `FragmentState.targets` arrays must match these, and
+    /// readback paths must size and decode against them rather than assuming
+    /// 8 bytes/pixel of f16 (which is how the already-narrowed normals target
+    /// went unnoticed for so long).
+    pub formats: rmesh_util::shared::GBufferFormats,
+    /// Slot 0 — albedo.rgb * a, a. `.a` is the deferred shader's alpha gate.
     pub color_texture: wgpu::Texture,
-    /// Auxiliary output texture (Rgba16Float)
+    /// Slot 1 — roughness * a, f0_dielectric * a, metallic * a, a.
     pub aux0_texture: wgpu::Texture,
-    /// Normals output texture (Rgba16Float, premultiplied alpha blend)
+    /// Slot 2 — (n * 0.5 + 0.5) * a, a, bias-encoded, premultiplied blend.
     pub normals_texture: wgpu::Texture,
-    /// Depth output texture (Rgba16Float, premultiplied alpha blend)
+    /// Slot 3 — E[z] * a, occlusion * a, E[z^2] * a, a, premultiplied blend.
     pub depth_texture: wgpu::Texture,
     /// AO output texture (R8Unorm) — written by GTAO pass, read by deferred.
     pub ao_texture: wgpu::Texture,
@@ -1386,9 +1395,26 @@ impl RenderTargets {
         &self.lit_views[((parity ^ 1) & 1) as usize]
     }
 
-    /// Create render target textures at the given resolution.
+    /// Create render target textures at the given resolution, with the
+    /// default G-buffer formats.
     pub fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let color_format = wgpu::TextureFormat::Rgba16Float;
+        Self::new_with_formats(
+            device,
+            width,
+            height,
+            rmesh_util::shared::GBufferFormats::default(),
+        )
+    }
+
+    /// Create render target textures with an explicit G-buffer format set.
+    /// The pipelines that render into these targets must be built with the
+    /// same `formats`, or wgpu will reject the render pass.
+    pub fn new_with_formats(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        formats: rmesh_util::shared::GBufferFormats,
+    ) -> Self {
 
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("color_target"),
@@ -1400,7 +1426,7 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: color_format,
+            format: formats.color,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1417,7 +1443,7 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: color_format,
+            format: formats.aux0,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1439,7 +1465,7 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: formats.normals,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1456,7 +1482,7 @@ impl RenderTargets {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: color_format,
+            format: formats.depth,
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                 | wgpu::TextureUsages::TEXTURE_BINDING
                 | wgpu::TextureUsages::COPY_SRC,
@@ -1564,6 +1590,7 @@ impl RenderTargets {
             depth_texture,
             ao_texture,
             ao_blur_temp_texture,
+            formats,
             ssgi_texture,
             ssgi_blur_temp_texture,
             ssgi_temporal_texture,
@@ -2439,11 +2466,11 @@ pub fn record_sorted_forward_pass(
     };
     queue.write_buffer(&buffers.indirect_args, 0, bytemuck::bytes_of(&reset_cmd));
 
-    // Write sort element count to radix sort's num_keys_buf.
-    // project_compute dispatches n_pow2 threads; padding threads write
-    // sort_keys = 0xFFFFFFFF which sorts to the end.
+    // Projection still dispatches over the power-of-two padding; threads past
+    // `tet_count` return without claiming a slot, so they cost nothing but a
+    // bounds check. `num_keys` for the sort comes from the instance count they
+    // accumulate, copied in below.
     let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
     // Use lean HW projection shader when available (no tile counting work)
@@ -2474,6 +2501,17 @@ pub fn record_sorted_forward_pass(
     }
 
     // ----- 3. Radix sort (back-to-front via ascending ~depth_bits) -----
+    // The projection compacts its output, so the number of keys is not known
+    // until it has run: take it from the instance count it just accumulated.
+    // Recorded between the two passes, so the sort sees this frame's value.
+    encoder.copy_buffer_to_buffer(
+        &buffers.indirect_args,
+        4, // DrawIndirectArgs.instance_count
+        sort_state.num_keys_buf(),
+        0,
+        4,
+    );
+
     let result_in_b = rmesh_sort::record_radix_sort(
         encoder,
         device,
@@ -2655,7 +2693,6 @@ pub fn record_sorted_mesh_forward_pass(
     );
 
     let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
     {
@@ -2685,6 +2722,17 @@ pub fn record_sorted_mesh_forward_pass(
     }
 
     // ----- 3. Radix sort -----
+    // The projection compacts its output, so the number of keys is not known
+    // until it has run: take it from the instance count it just accumulated.
+    // Recorded between the two passes, so the sort sees this frame's value.
+    encoder.copy_buffer_to_buffer(
+        &buffers.indirect_args,
+        4, // DrawIndirectArgs.instance_count
+        sort_state.num_keys_buf(),
+        0,
+        4,
+    );
+
     let result_in_b = rmesh_sort::record_radix_sort(
         encoder,
         device,
@@ -2845,7 +2893,6 @@ pub fn record_sorted_interval_forward_pass(
     );
 
     let n_pow2 = tet_count.next_power_of_two();
-    queue.write_buffer(sort_state.num_keys_buf(), 0, bytemuck::bytes_of(&n_pow2));
 
     // ----- 2. Compute pass -----
     {
@@ -2875,6 +2922,17 @@ pub fn record_sorted_interval_forward_pass(
     }
 
     // ----- 3. Radix sort -----
+    // The projection compacts its output, so the number of keys is not known
+    // until it has run: take it from the instance count it just accumulated.
+    // Recorded between the two passes, so the sort sees this frame's value.
+    encoder.copy_buffer_to_buffer(
+        &buffers.indirect_args,
+        4, // DrawIndirectArgs.instance_count
+        sort_state.num_keys_buf(),
+        0,
+        4,
+    );
+
     let result_in_b = rmesh_sort::record_radix_sort(
         encoder,
         device,
@@ -2999,17 +3057,15 @@ pub fn record_compute_interval_project(
     );
 
     // The DRS/basic radix sorts are counting sorts: they honor `num_keys` and
-    // early-out any thread-blocks past `ceil(num_keys / PART_SIZE)`. The old
-    // power-of-two padding (for a never-implemented bitonic path) just made the
-    // sort and projection chew through ~42% more elements. Size both to exactly
-    // `tet_count`. The sort buffers stay over-allocated at n_pow2, so the
-    // now-uninitialized [tet_count, n_pow2) tail is simply never read.
+    // early-out any thread-block past `ceil(num_keys / PART_SIZE)`. `num_keys`
+    // is no longer written here — the projection compacts its output, so the
+    // real count is the instance count it accumulates, and the caller copies
+    // that into `num_keys_buf` before recording the sort. That is what lets the
+    // shell z-cull shrink the sort rather than merely relabelling its input.
+    //
+    // The dispatch below still covers every tet: projection has to examine all
+    // of them to decide which survive.
     let sort_count = tet_count;
-    queue.write_buffer(
-        sort_state.num_keys_buf(),
-        0,
-        bytemuck::bytes_of(&sort_count),
-    );
 
     // ----- 2. Compute pass (projection + SH eval) -----
     let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -3039,6 +3095,18 @@ pub fn record_compute_interval_project(
     let dispatch_x = total_workgroups.min(max_per_dim);
     let dispatch_y = total_workgroups.div_ceil(max_per_dim);
     cpass.dispatch_workgroups(dispatch_x, dispatch_y, 1);
+    drop(cpass);
+
+    // Publish the key count for the sort. The projection compacts its output, so
+    // this is only known once it has run, and it belongs next to the pass that
+    // establishes it rather than at the sort call site.
+    encoder.copy_buffer_to_buffer(
+        &buffers.indirect_args,
+        4, // DrawIndirectArgs.instance_count
+        sort_state.num_keys_buf(),
+        0,
+        4,
+    );
 }
 
 /// Record steps 4–6 of the compute-interval pipeline: indirect-convert (turns
@@ -3061,6 +3129,10 @@ pub fn record_compute_interval_after_sort(
     depth_view: &wgpu::TextureView,
     profiler: Option<&wgpu::QuerySet>,
     mrt_enabled: bool,
+    // Optional pipeline-statistics query set for the interval render pass.
+    // Query 0 counts fragment-shader invocations, which is what makes the
+    // raster pass's ROP/bandwidth cost measurable rather than estimated.
+    stats: Option<&wgpu::QuerySet>,
 ) {
     record_compute_interval_after_sort_impl(
         encoder,
@@ -3073,6 +3145,7 @@ pub fn record_compute_interval_after_sort(
         depth_view,
         profiler,
         mrt_enabled,
+        stats,
     );
 }
 
@@ -3097,6 +3170,10 @@ pub fn record_sorted_compute_interval_forward_pass(
     profiler: Option<&wgpu::QuerySet>,
     use_16bit_sort: bool,
     mrt_enabled: bool,
+    // Optional pipeline-statistics query set for the interval render pass.
+    // Query 0 counts fragment-shader invocations, which is what makes the
+    // raster pass's ROP/bandwidth cost measurable rather than estimated.
+    stats: Option<&wgpu::QuerySet>,
 ) {
     // Steps 1 + 2: reset + project compute
     record_compute_interval_project(
@@ -3113,6 +3190,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     );
 
     // ----- 3. Radix sort -----
+    // `num_keys` was published by the projection above, which compacts.
     let result_in_b = rmesh_sort::record_radix_sort(
         encoder,
         device,
@@ -3135,6 +3213,7 @@ pub fn record_sorted_compute_interval_forward_pass(
         depth_view,
         profiler,
         mrt_enabled,
+        stats,
     );
 }
 
@@ -3151,6 +3230,10 @@ fn record_compute_interval_after_sort_impl(
     depth_view: &wgpu::TextureView,
     profiler: Option<&wgpu::QuerySet>,
     mrt_enabled: bool,
+    // Optional pipeline-statistics query set for the interval render pass.
+    // Query 0 counts fragment-shader invocations, which is what makes the
+    // raster pass's ROP/bandwidth cost measurable rather than estimated.
+    stats: Option<&wgpu::QuerySet>,
 ) {
     // ----- 4. Indirect convert → combined dispatch + draw args -----
     {
@@ -3247,6 +3330,9 @@ fn record_compute_interval_after_sort_impl(
             multiview_mask: None,
         });
 
+        if let Some(qs) = stats {
+            rpass.begin_pipeline_statistics_query(qs, 0);
+        }
         rpass.set_viewport(
             0.0,
             0.0,
@@ -3268,6 +3354,9 @@ fn record_compute_interval_after_sort_impl(
         );
         // draw-indexed-indirect args start at byte offset 12 (skip 3 dispatch u32s)
         rpass.draw_indexed_indirect(&buffers.interval_args_buf, 12);
+        if stats.is_some() {
+            rpass.end_pipeline_statistics_query();
+        }
     }
 }
 
@@ -3294,12 +3383,44 @@ pub fn setup_forward(
     ForwardComputeBindGroups,
     wgpu::BindGroup,
 ) {
-    let color_format = wgpu::TextureFormat::Rgba16Float;
+    setup_forward_with_formats(
+        device,
+        queue,
+        scene,
+        base_colors,
+        color_grads,
+        width,
+        height,
+        rmesh_util::shared::GBufferFormats::default(),
+    )
+}
 
+/// `setup_forward` with an explicit G-buffer format set. The pipelines and the
+/// targets are built from the same `formats`, which is the invariant wgpu
+/// enforces at render-pass time — keeping them in one call is what makes an
+/// A/B of two format sets in a single process safe.
+#[allow(clippy::too_many_arguments)]
+pub fn setup_forward_with_formats(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    scene: &SceneData,
+    base_colors: &[f32],
+    color_grads: &[f32],
+    width: u32,
+    height: u32,
+    formats: rmesh_util::shared::GBufferFormats,
+) -> (
+    SceneBuffers,
+    MaterialBuffers,
+    ForwardPipelines,
+    RenderTargets,
+    ForwardComputeBindGroups,
+    wgpu::BindGroup,
+) {
     let buffers = SceneBuffers::upload(device, queue, scene);
     let material = MaterialBuffers::upload(device, base_colors, color_grads, scene.tet_count);
-    let pipelines = ForwardPipelines::new(device, color_format);
-    let targets = RenderTargets::new(device, width, height);
+    let pipelines = ForwardPipelines::new(device, formats);
+    let targets = RenderTargets::new_with_formats(device, width, height, formats);
 
     // Dummy sh_coeffs buffer (sh_degree=0 path uses base_colors instead)
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {

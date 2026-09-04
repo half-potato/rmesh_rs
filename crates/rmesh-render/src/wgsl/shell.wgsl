@@ -1,12 +1,25 @@
 // Density shell: the boundary surface of the density-thresholded region,
 // rendered as opaque geometry.
 //
-// Only *back* faces are emitted — the point where a ray leaves the dense region
-// is a bound on how far light can travel, so the depth this pass writes is a
-// conservative "everything past here is occluded" plane. The interval pass
-// already depth-tests LessEqual against the same buffer, so writing it here is
-// all that is needed to kill occluded fragments; `shell_hiz` turns the same
-// depth into a per-tet cull that runs before the sort.
+// One face orientation is emitted, chosen by `view.params.w`:
+//
+//   EXIT (0) — back faces, where a ray *leaves* the dense region. This is a
+//     bound that is true whatever the region's actual opacity, so it never
+//     removes anything visible. It is also a weak one: it only occludes what
+//     lies behind the whole blob, so on a scene whose density is one connected
+//     mass it recovers very little.
+//
+//   ENTRY (1) — front faces, where a ray *enters*. Everything past that point
+//     is occluded only if the region really is opaque, which is precisely what
+//     the density threshold plus erosion are there to establish: erosion drops
+//     any structure thinner than `erosion_steps` tets and sinks the surface
+//     that many layers inside the true boundary, so the volume still renders
+//     its own outer shell and only the interior — the part that is genuinely
+//     saturated — is replaced.
+//
+// The interval pass already depth-tests LessEqual against the same buffer, so
+// writing it here is all that is needed to kill occluded fragments; `shell_hiz`
+// turns the same depth into a per-tet cull that runs before the sort.
 //
 // The color it writes is the second half of the idea: it sits *under* the
 // volume, so residual transmittance reveals the model's own surface color
@@ -59,8 +72,9 @@ struct ShellView {
     /// xyz = eye (camera or light) position. Back-facing is decided against
     /// this, in world space, so no NDC winding convention is involved.
     eye: vec4<f32>,
-    /// x = face count, y = near plane, z = far plane, w reserved.
-    /// near/far are only read by the DSM entry point.
+    /// x = face count, y = near plane, z = far plane, w = face orientation
+    /// (0 = exit/back, 1 = entry/front). near/far are only read by the DSM
+    /// entry point.
     params: vec4<f32>,
 };
 
@@ -253,11 +267,13 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
         outward = -outward;
     }
 
-    // Keep only faces the ray leaves through: outward pointing away from the
-    // eye. This is the exit of the dense region, which is the bound we want.
-    // Decided in world space, so it is independent of NDC winding and works
-    // unchanged when `eye` is a light position.
-    if (dot(outward, center - view.eye.xyz) <= 0.0) {
+    // Keep one orientation. `facing > 0` is a face the ray leaves through (the
+    // exit); `< 0` is one it enters through. Decided in world space, so it is
+    // independent of NDC winding and works unchanged when `eye` is a light
+    // position. Faces exactly edge-on contribute nothing either way.
+    let facing = dot(outward, center - view.eye.xyz);
+    let want_entry = view.params.w > 0.5;
+    if (select(facing <= 0.0, facing >= 0.0, want_entry)) {
         return degenerate();
     }
 
@@ -278,7 +294,14 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
     var out: VsOut;
     out.pos = clip;
-    out.sh_color = eval_sh_color(tet_id, dir, center, centroid);
+    // `fs_main` prefers the PBR aux albedo whenever it exists and only falls
+    // back to SH otherwise, so evaluating SH on a PBR scene is dead work — up
+    // to 48 f16 reads per vertex thrown away. Same test the fragment uses.
+    if (arrayLength(&aux_data) > 1u) {
+        out.sh_color = vec3<f32>(0.0);
+    } else {
+        out.sh_color = eval_sh_color(tet_id, dir, center, centroid);
+    }
     out.view_depth = clip.w;
     if (arrayLength(&vertex_normals) > 1u) {
         out.grad = load_normal(vn_idx);

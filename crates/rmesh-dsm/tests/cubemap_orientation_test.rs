@@ -182,7 +182,7 @@ fn gpu_all_faces_coverage(scene: &rmesh_data::SceneData) -> Option<[Vec<f32>; 6]
             RES,
         );
 
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
 
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =

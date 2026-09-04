@@ -62,7 +62,7 @@ fn test_project_compute_kernel() {
         &scene.color_grads,
         scene.tet_count,
     );
-    let pipelines = rmesh_render::ForwardPipelines::new(&device, wgpu::TextureFormat::Rgba16Float);
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, rmesh_render::GBufferFormats::default());
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
         size: 4,
@@ -161,7 +161,7 @@ fn test_project_compute_hw_kernel() {
         &scene.color_grads,
         scene.tet_count,
     );
-    let pipelines = rmesh_render::ForwardPipelines::new(&device, wgpu::TextureFormat::Rgba16Float);
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, rmesh_render::GBufferFormats::default());
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
         size: 4,
@@ -226,15 +226,32 @@ fn test_project_compute_hw_kernel() {
         "project_compute_hw: vertex_count={}, instance_count={}",
         args[0], args[1]
     );
-    let sort_vals: Vec<u32> = read_buffer(&device, &queue, &buffers.sort_values, 4);
-    eprintln!("project_compute_hw: sort_values[0..4]={:?}", sort_vals);
-    let sort_keys: Vec<u32> = read_buffer(&device, &queue, &buffers.sort_keys, 4);
-    eprintln!("project_compute_hw: sort_keys[0..4]={:?}", sort_keys);
-
     assert_eq!(
         args[1], scene.tet_count,
         "project_compute_hw should publish instance_count = tet_count ({}), got {}",
         scene.tet_count, args[1]
+    );
+
+    // The projection compacts: slots [0, instance_count) must hold each visible
+    // tet exactly once, with nothing written past that. Every tet is visible in
+    // this scene, so the surviving slots are a permutation of all tet ids.
+    let vis = args[1] as usize;
+    let sort_vals: Vec<u32> = read_buffer(&device, &queue, &buffers.sort_values, vis);
+    let mut seen = vec![false; scene.tet_count as usize];
+    for (slot, &tet) in sort_vals.iter().enumerate() {
+        assert!(
+            (tet as usize) < seen.len(),
+            "slot {slot} holds tet id {tet}, out of range for {} tets",
+            scene.tet_count
+        );
+        assert!(
+            !std::mem::replace(&mut seen[tet as usize], true),
+            "tet {tet} claimed more than one compacted slot"
+        );
+    }
+    assert!(
+        seen.iter().all(|&s| s),
+        "every tet is visible here, so all should appear in the compacted range"
     );
 }
 
@@ -336,8 +353,7 @@ fn test_interval_pipeline_creation() {
         }
     };
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
-    let _interval = rmesh_render::IntervalPipelines::new(&device, color_format);
+    let _interval = rmesh_render::IntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
     eprintln!("interval_mesh.wgsl + interval_fragment.wgsl compiled successfully");
 }
 
@@ -393,8 +409,7 @@ fn test_compute_interval_pipeline_creation() {
         }
     };
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
-    let _ci = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let _ci = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
     eprintln!("interval_compute.wgsl + interval_vertex.wgsl + interval_fragment.wgsl compiled successfully");
 }
 
@@ -556,7 +571,7 @@ fn project_visible_count_with_shell(
         &scene.color_grads,
         scene.tet_count,
     );
-    let pipelines = rmesh_render::ForwardPipelines::new(device, wgpu::TextureFormat::Rgba16Float);
+    let pipelines = rmesh_render::ForwardPipelines::new(device, rmesh_render::GBufferFormats::default());
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
         size: 4,
@@ -728,7 +743,8 @@ fn test_shell_pipeline_creation() {
     // Panics on a naga validation error, which is the point of the test.
     let _shell = rmesh_render::ShellPipeline::new(
         &device,
-        wgpu::TextureFormat::Rgba16Float,
+        rmesh_render::GBufferFormats::default(),
+        wgpu::TextureFormat::Rgba16Float, // DSM moment target
         wgpu::TextureFormat::Depth32Float,
     );
     let hiz_pipelines = rmesh_render::ShellHiZPipelines::new(&device);

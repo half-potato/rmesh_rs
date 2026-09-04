@@ -3584,6 +3584,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "half",
  "naga",
  "naga_oil",
  "pollster",
@@ -3605,6 +3606,7 @@ dependencies = [
  "env_logger",
  "glam",
  "half",
+ "image",
  "log",
  "pollster",
  "rayon",

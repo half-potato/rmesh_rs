@@ -223,7 +223,7 @@ fn probe_vs_cpu() {
             RES,
         );
 
-    let ci_pipelines = ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
     let sort_pipelines = RadixSortPipelines::new(&device, 1, SortBackend::Drs);
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_state = RadixSortState::new(&device, n_pow2, 32, 1, SortBackend::Drs);

@@ -141,20 +141,18 @@ fn shell_occluded(min_x: f32, max_x: f32, min_y: f32, max_y: f32, near_z: f32) -
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
-    // Padding threads (beyond tet_count): initialize sort buffers for bitonic sort.
+    // The sort array is compacted: a surviving tet claims the next slot with an
+    // atomic, and `num_keys` for the radix sort is the resulting instance count.
+    // So a culled tet writes nothing at all — there is no slot of its own to
+    // sentinel, and nothing downstream reads past `instance_count`. This is what
+    // makes culling shrink the sort instead of merely relabelling its input.
     if (tet_id >= uniforms.tet_count) {
-        if (tet_id < arrayLength(&sort_keys)) {
-            sort_keys[tet_id] = 0xFFFFFFFFu;
-            sort_values[tet_id] = tet_id;
-        }
         return;
     }
 
     // --- Occlusion cull: skip tets not visible from the active region ---
-    // (all-ones mask => no-op). 0xFFFFFFFFu sentinel matches this variant.
+    // (all-ones mask => no-op).
     if ((tet_visibility[tet_id >> 5u] & (1u << (tet_id & 31u))) == 0u) {
-        sort_keys[tet_id] = 0xFFFFFFFFu;
-        sort_values[tet_id] = tet_id;
         return;
     }
 
@@ -206,8 +204,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     }
 
     if (!visible) {
-        sort_keys[tet_id] = 0xFFFFFFFFu;
-        sort_values[tet_id] = tet_id;
         return;
     }
 
@@ -223,8 +219,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         );
         let max_od = densities[tet_id] * sqrt(max_edge_sq);
         if (max_od < 0.01) {
-            sort_keys[tet_id] = 0xFFFFFFFFu;
-            sort_values[tet_id] = tet_id;
             return;
         }
     }
@@ -242,11 +236,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     // Clamp to valid range — NaN/inf from degenerate circumspheres would corrupt sort
     let depth = clamp(depth_raw, -1e20, 1e20);
     let depth_bits = bitcast<u32>(depth);
-    sort_keys[tet_id] = ~depth_bits; // Invert for back-to-front sort
-    sort_values[tet_id] = tet_id;
 
-    // Atomic increment instance count, get compact vis_idx
+    // Claim a slot. Everything below is indexed by it, so the sort sees exactly
+    // the surviving tets and `interval_compute`'s `sorted_indices[tid]` for
+    // `tid < instance_count` keeps meaning what it did.
     let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
+
+    sort_keys[vis_idx] = ~depth_bits; // Invert for back-to-front sort
+    sort_values[vis_idx] = tet_id;
 
     // Write compact tet id list for tiled path
     compact_tet_ids[vis_idx] = tet_id;

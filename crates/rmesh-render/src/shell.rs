@@ -35,7 +35,8 @@ pub struct ShellView {
     /// xyz = eye (camera or light) position. Back-facing is decided against
     /// this in world space, so no NDC winding convention is involved.
     pub eye: [f32; 4],
-    /// x = face count, yzw reserved.
+    /// x = face count, y = near plane, z = far plane, w = face orientation
+    /// (0 = exit/back faces, 1 = entry/front faces).
     pub params: [f32; 4],
 }
 
@@ -46,12 +47,38 @@ pub const SHELL_VIEW_SIZE: u64 = std::mem::size_of::<ShellView>() as u64;
 /// The buffer is grown on demand and never shrunk — thresholds get dragged back
 /// and forth, and a realloc per drag step is worse than holding the high-water
 /// mark.
+/// Which side of the dense region the shell draws. See the header comment in
+/// `shell.wgsl` for why the choice is a correctness/speed trade rather than a
+/// preference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ShellFace {
+    /// Back faces: where a ray leaves the dense region. The volume in front of
+    /// the shell still renders in full, so the tets that actually accumulate the
+    /// image are never culled — the shell only backs them. The default.
+    #[default]
+    Exit,
+    /// Front faces: where a ray enters. Culls the region's own interior, which
+    /// means culling the tets whose accumulated radiance *is* the image and
+    /// replacing them with one flat surface.
+    ///
+    /// Measured, this is not a free win: at a fixed threshold and erosion it is
+    /// faster and worse (on `stump_conserv`, 67fps/29.5dB against exit's
+    /// 60fps/32.1dB), and once quality is matched the two sit on the same
+    /// speed/quality frontier. Erosion, not face orientation, is what makes the
+    /// shell safe. Kept because a genuinely opaque object gets there cheaper
+    /// this way; prefer `Exit` unless measurement says otherwise.
+    Entry,
+}
+
 pub struct ShellBuffers {
     pub faces: wgpu::Buffer,
     /// Faces actually live in `faces` (may be less than its capacity).
     pub face_count: u32,
     capacity: u32,
     pub view_buf: wgpu::Buffer,
+    /// Written into `params.w` by both view writers, so the camera pass and the
+    /// DSM cube faces cannot disagree about which surface the shell is.
+    pub face: ShellFace,
 }
 
 impl ShellBuffers {
@@ -74,6 +101,7 @@ impl ShellBuffers {
             face_count: 0,
             capacity: 1,
             view_buf,
+            face: ShellFace::default(),
         }
     }
 
@@ -121,7 +149,15 @@ impl ShellBuffers {
         let view = ShellView {
             vp,
             eye: [eye[0], eye[1], eye[2], 0.0],
-            params: [self.face_count as f32, near, far, 0.0],
+            params: [
+                self.face_count as f32,
+                near,
+                far,
+                match self.face {
+                    ShellFace::Exit => 0.0,
+                    ShellFace::Entry => 1.0,
+                },
+            ],
         };
         queue.write_buffer(&self.view_buf, 0, bytemuck::bytes_of(&view));
     }
@@ -141,9 +177,14 @@ pub struct ShellPipeline {
 }
 
 impl ShellPipeline {
+    /// `formats` drives the four G-buffer MRT attachments; `dsm_format` drives
+    /// the separate DSM moment target. These were a single `color_format`
+    /// parameter, which meant narrowing the G-buffer silently narrowed DSM
+    /// moments too — they are unrelated targets and must be named separately.
     pub fn new(
         device: &wgpu::Device,
-        color_format: wgpu::TextureFormat,
+        formats: rmesh_util::shared::GBufferFormats,
+        dsm_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -232,22 +273,22 @@ impl ShellPipeline {
                 targets: &[
                     // Opaque: replace, don't blend. The volume blends over this.
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.color,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.aux0,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        format: formats.normals,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                     Some(wgpu::ColorTargetState {
-                        format: color_format,
+                        format: formats.depth,
                         blend: None,
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
@@ -299,7 +340,7 @@ impl ShellPipeline {
                 module: &shader,
                 entry_point: Some("fs_dsm_moment"),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: color_format,
+                    format: dsm_format,
                     blend: Some(premul_blend),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],

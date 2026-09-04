@@ -351,10 +351,10 @@ impl RMeshRenderer {
         }))
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("Device error: {e}")))?;
 
-        let color_format = wgpu::TextureFormat::Rgba16Float;
 
         // Create pipelines
-        let fwd_pipelines = ForwardPipelines::new(&device, color_format);
+        let gbuffer_formats = rmesh_util::shared::GBufferFormats::default();
+        let fwd_pipelines = ForwardPipelines::new(&device, gbuffer_formats);
         let bwd_tiled_pipelines = BackwardTiledPipelines::new(&device);
         let loss_pipeline = LossPipeline::new(&device);
         let adam_pipeline = AdamPipeline::new(&device);
@@ -367,7 +367,7 @@ impl RMeshRenderer {
             MaterialBuffers::upload(&device, base_colors_slice, color_grads_slice, tet_count);
 
         // Render targets
-        let targets = RenderTargets::new(&device, width, height);
+        let targets = RenderTargets::new_with_formats(&device, width, height, gbuffer_formats);
 
         // Dummy depth texture (cleared to 1.0 = all-pass) for forward pass depth attachment
         let dummy_depth_texture = device.create_texture(&wgpu::TextureDescriptor {

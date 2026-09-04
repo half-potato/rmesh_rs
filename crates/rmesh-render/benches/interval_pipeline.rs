@@ -101,7 +101,6 @@ fn create_state() -> Option<State> {
 
     let (vp, c2w, intrinsics, eye) = setup_camera();
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, fwd_pipelines, targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
@@ -132,7 +131,7 @@ fn create_state() -> Option<State> {
     );
     queue.write_buffer(&buffers.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
 
     // 32-bit tet-level sort (1 payload). Buffers stay over-allocated at the
     // power-of-two size (mirroring SceneBuffers / the viewer); the DRS counting
@@ -254,6 +253,7 @@ fn record_frame(s: &State) {
         None,  // profiler
         false, // use_16bit_sort
         false, // mrt_enabled — color-only keeps the bench focused on forward
+        None,
     );
 
     s.queue.submit(std::iter::once(encoder.finish()));

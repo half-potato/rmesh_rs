@@ -74,7 +74,7 @@ fn sample_cube_view(scene: &rmesh_data::SceneData, dirs: &[Vec3]) -> Option<Vec<
         RES,
         RES,
     );
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
     let n_pow2 = scene.tet_count.next_power_of_two().max(1);
     let sort_pipelines =
         rmesh_sort::RadixSortPipelines::new(&device, 1, rmesh_sort::SortBackend::Drs);

@@ -579,7 +579,11 @@ async fn gpu_render_scene_async(
     );
 
     // Copy color texture to readback buffer
-    let bytes_per_pixel = 8u32; // Rgba16Float = 4 × f16 = 8 bytes
+    // Stride and decode both follow the target's ACTUAL format. Hardcoding
+    // 8-byte f16 here is what let the already-narrowed normals target read
+    // garbage unnoticed, and it breaks outright once color narrows.
+    let color_format = targets.formats.color;
+    let bytes_per_pixel = rmesh_util::shared::bytes_per_texel(color_format);
     let bytes_per_row = w * bytes_per_pixel;
     // wgpu requires bytes_per_row aligned to 256
     let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
@@ -631,14 +635,8 @@ async fn gpu_render_scene_async(
         let row_start = (row * aligned_bytes_per_row) as usize;
         for col in 0..w {
             let pixel_start = row_start + (col * bytes_per_pixel) as usize;
-            let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
-            let g =
-                half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
-            let b =
-                half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
-            let a =
-                half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
-            image[(row * w + col) as usize] = [r, g, b, a];
+            image[(row * w + col) as usize] =
+                rmesh_util::shared::decode_texel(color_format, &data[pixel_start..]);
         }
     }
 
@@ -702,7 +700,6 @@ async fn gpu_raytrace_scene_async(
         .ok()?;
 
     // Upload scene
-    let color_format = wgpu::TextureFormat::Rgba16Float;
     let buffers = rmesh_render::SceneBuffers::upload(&device, &queue, scene);
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let material = rmesh_render::MaterialBuffers::upload(
@@ -711,7 +708,7 @@ async fn gpu_raytrace_scene_async(
         &scene.color_grads,
         scene.tet_count,
     );
-    let pipelines = rmesh_render::ForwardPipelines::new(&device, color_format);
+    let pipelines = rmesh_render::ForwardPipelines::new(&device, rmesh_render::GBufferFormats::default());
     let dummy_sh = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("dummy_sh_coeffs"),
         size: 4,
@@ -1574,7 +1571,6 @@ async fn gpu_interval_render_scene_async(
         .await
         .ok()?;
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
@@ -1588,7 +1584,7 @@ async fn gpu_interval_render_scene_async(
         );
 
     // Interval shading pipelines
-    let interval_pipelines = rmesh_render::IntervalPipelines::new(&device, color_format);
+    let interval_pipelines = rmesh_render::IntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
 
     // Sort infrastructure (32-bit keys)
     let n_pow2 = scene.tet_count.next_power_of_two();
@@ -1704,7 +1700,11 @@ async fn gpu_interval_render_scene_async(
     );
 
     // Copy color texture to readback buffer
-    let bytes_per_pixel = 8u32; // Rgba16Float = 4 × f16 = 8 bytes
+    // Stride and decode both follow the target's ACTUAL format. Hardcoding
+    // 8-byte f16 here is what let the already-narrowed normals target read
+    // garbage unnoticed, and it breaks outright once color narrows.
+    let color_format = targets.formats.color;
+    let bytes_per_pixel = rmesh_util::shared::bytes_per_texel(color_format);
     let bytes_per_row = w * bytes_per_pixel;
     let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
 
@@ -1755,14 +1755,8 @@ async fn gpu_interval_render_scene_async(
         let row_start = (row * aligned_bytes_per_row) as usize;
         for col in 0..w {
             let pixel_start = row_start + (col * bytes_per_pixel) as usize;
-            let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
-            let g =
-                half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
-            let b =
-                half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
-            let a =
-                half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
-            image[(row * w + col) as usize] = [r, g, b, a];
+            image[(row * w + col) as usize] =
+                rmesh_util::shared::decode_texel(color_format, &data[pixel_start..]);
         }
     }
 
@@ -2232,7 +2226,6 @@ async fn gpu_compute_interval_render_scene_async(
         .await
         .ok()?;
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
     let zero_base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, _render_bg) =
         rmesh_render::setup_forward(
@@ -2246,7 +2239,7 @@ async fn gpu_compute_interval_render_scene_async(
         );
 
     // Compute-interval pipelines (no mesh shader needed)
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
 
     // Sort infrastructure
     let n_pow2 = scene.tet_count.next_power_of_two();
@@ -2388,10 +2381,12 @@ async fn gpu_compute_interval_render_scene_async(
         None,
         false,
         true,
+        None,
     );
 
     // Copy color texture to readback buffer
-    let bytes_per_pixel = 8u32;
+    let color_format = targets.formats.color;
+    let bytes_per_pixel = rmesh_util::shared::bytes_per_texel(color_format);
     let bytes_per_row = w * bytes_per_pixel;
     let aligned_bytes_per_row = (bytes_per_row + 255) & !255;
 
@@ -2442,14 +2437,8 @@ async fn gpu_compute_interval_render_scene_async(
         let row_start = (row * aligned_bytes_per_row) as usize;
         for col in 0..w {
             let pixel_start = row_start + (col * bytes_per_pixel) as usize;
-            let r = half::f16::from_le_bytes([data[pixel_start], data[pixel_start + 1]]).to_f32();
-            let g =
-                half::f16::from_le_bytes([data[pixel_start + 2], data[pixel_start + 3]]).to_f32();
-            let b =
-                half::f16::from_le_bytes([data[pixel_start + 4], data[pixel_start + 5]]).to_f32();
-            let a =
-                half::f16::from_le_bytes([data[pixel_start + 6], data[pixel_start + 7]]).to_f32();
-            image[(row * w + col) as usize] = [r, g, b, a];
+            image[(row * w + col) as usize] =
+                rmesh_util::shared::decode_texel(color_format, &data[pixel_start..]);
         }
     }
 
@@ -2674,7 +2663,6 @@ async fn gpu_ci_mrt_async(
         .await
         .ok()?;
 
-    let color_format = wgpu::TextureFormat::Rgba16Float;
     let base_colors = vec![0.5f32; scene.tet_count as usize * 3];
     let (buffers, material, pipelines, targets, compute_bg, _) = rmesh_render::setup_forward(
         &device,
@@ -2685,7 +2673,7 @@ async fn gpu_ci_mrt_async(
         w,
         h,
     );
-    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, color_format);
+    let ci_pipelines = rmesh_render::ComputeIntervalPipelines::new(&device, rmesh_render::GBufferFormats::default());
 
     let n_pow2 = scene.tet_count.next_power_of_two();
     let sort_pipelines =
@@ -2834,6 +2822,7 @@ async fn gpu_ci_mrt_async(
         None,
         false,
         true,
+        None,
     );
 
     let tex_list = [
@@ -2842,15 +2831,25 @@ async fn gpu_ci_mrt_async(
         &targets.normals_texture,
         &targets.depth_texture,
     ];
-    let bpp = 8u32;
-    let abpr = ((w * bpp) + 255) & !255;
-    let bsz = (abpr * h) as u64;
+    // Each attachment has its own format, so stride and decode are per-texture.
+    // A single hardcoded 8-byte f16 decode here silently produced NaN normals
+    // (that target has long been Rgba8Unorm) and garbage for every attachment
+    // once the G-buffer narrowed.
+    let layouts: Vec<(u32, u32)> = tex_list
+        .iter()
+        .map(|tex| {
+            let bpp = rmesh_util::shared::bytes_per_texel(tex.format());
+            (bpp, ((w * bpp) + 255) & !255)
+        })
+        .collect();
 
-    let rbs: Vec<wgpu::Buffer> = (0..4)
-        .map(|i| {
+    let rbs: Vec<wgpu::Buffer> = layouts
+        .iter()
+        .enumerate()
+        .map(|(i, &(_, abpr))| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("rb{i}")),
-                size: bsz,
+                size: (abpr * h) as u64,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -2858,6 +2857,7 @@ async fn gpu_ci_mrt_async(
         .collect();
 
     for (i, tex) in tex_list.iter().enumerate() {
+        let abpr = layouts[i].1;
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: tex,
@@ -2883,7 +2883,9 @@ async fn gpu_ci_mrt_async(
     queue.submit(std::iter::once(encoder.finish()));
 
     let mut imgs: Vec<Vec<[f32; 4]>> = Vec::new();
-    for rb in &rbs {
+    for (i, rb) in rbs.iter().enumerate() {
+        let (bpp, abpr) = layouts[i];
+        let format = tex_list[i].format();
         let slice = rb.slice(..);
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| {
@@ -2897,11 +2899,8 @@ async fn gpu_ci_mrt_async(
             let rs = (row * abpr) as usize;
             for col in 0..w {
                 let ps = rs + (col * bpp) as usize;
-                let r = half::f16::from_le_bytes([data[ps], data[ps + 1]]).to_f32();
-                let g = half::f16::from_le_bytes([data[ps + 2], data[ps + 3]]).to_f32();
-                let b = half::f16::from_le_bytes([data[ps + 4], data[ps + 5]]).to_f32();
-                let a = half::f16::from_le_bytes([data[ps + 6], data[ps + 7]]).to_f32();
-                img[(row * w + col) as usize] = [r, g, b, a];
+                img[(row * w + col) as usize] =
+                    rmesh_util::shared::decode_texel(format, &data[ps..ps + bpp as usize]);
             }
         }
         drop(data);

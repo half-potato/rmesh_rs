@@ -97,6 +97,13 @@ pub const TS_QUERY_COUNT: u32 = 8;
 /// `TS_QUERY_COUNT` only on the frames that actually dispatch it.
 pub const TS_WRITTEN_COUNT: u32 = 6;
 
+/// Slot capacity for the postprocess-chain profiler query set. The deferred
+/// chain records at most ~16 bracketed passes (hi-z linearize + N downsample
+/// mips + gtao + ao temporal + 2 ao blurs + ssgi + ssgi temporal + 2 ssgi
+/// blurs + ssr + ssr temporal + ssr copy + deferred shade), each needing 2
+/// slots. 64 leaves headroom for a deep Hi-Z pyramid at 4K.
+pub const PP_TS_COUNT: u32 = 64;
+
 /// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
 /// Pack SH coefficients as f16 pairs into u32 words.
 ///
@@ -220,6 +227,30 @@ pub struct GpuState {
     pub ts_readback_mapped: [Arc<AtomicBool>; 2],
     pub ts_frame: usize,
     pub ts_period_ns: f32,
+    // Postprocess-chain profiler (encoder-level timestamps, dynamic slot count)
+    pub pp_ts_enabled: bool,
+    pub pp_query_set: wgpu::QuerySet,
+    pub pp_resolve_buf: wgpu::Buffer,
+    pub pp_readback: [wgpu::Buffer; 2],
+    pub pp_readback_ready: [Arc<AtomicBool>; 2],
+    pub pp_readback_mapped: [Arc<AtomicBool>; 2],
+    /// `pp_labels` snapshotted per readback slot, so the async readback two
+    /// frames later can still name what it measured.
+    pub pp_labels_pending: [Vec<&'static str>; 2],
+    /// Last completed readback: (label, milliseconds), in encode order.
+    pub pp_times_ms: Vec<(&'static str, f32)>,
+    // Fragment-shader invocations in the interval raster pass (None when the
+    // adapter lacks PIPELINE_STATISTICS_QUERY).
+    pub frag_query_set: Option<wgpu::QuerySet>,
+    pub frag_resolve_buf: wgpu::Buffer,
+    pub frag_readback: wgpu::Buffer,
+    pub frag_ready: Arc<AtomicBool>,
+    pub frag_mapped: Arc<AtomicBool>,
+    /// Last completed readback of the fragment-invocation counter.
+    pub frag_invocations: u64,
+    /// Shading workload the last encoded deferred pass saw, for the profile log.
+    pub pp_lights: u32,
+    pub pp_dsm: bool,
     pub gpu_times_ms: GpuTimings,
     pub cpu_times_ms: CpuTimings,
     pub instance_count_ready: Arc<AtomicBool>,
