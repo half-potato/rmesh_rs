@@ -1600,6 +1600,7 @@ async fn gpu_interval_render_scene_async(
         &interval_pipelines,
         &buffers,
         &material,
+        None,
     );
     let interval_render_bg_b = rmesh_render::create_interval_render_bind_group_with_sort_values(
         &device,
@@ -1607,6 +1608,7 @@ async fn gpu_interval_render_scene_async(
         &buffers,
         &material,
         sort_state.values_b(),
+        None,
     );
     let indirect_convert_bg = rmesh_render::create_interval_indirect_convert_bind_group(
         &device,
@@ -1696,6 +1698,8 @@ async fn gpu_interval_render_scene_async(
         &queue,
         &depth_view,
         None,
+        None,
+        false,
         None,
     );
 

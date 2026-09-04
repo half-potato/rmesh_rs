@@ -49,6 +49,9 @@ struct DrawIndirectArgs {
 // Density-shell max-depth pyramid (NDC z). Textures do not count toward
 // the per-stage storage-buffer cap, so this fits without displacing a buffer.
 @group(0) @binding(11) var shell_hiz: texture_2d<f32>;
+// Per-tet keep mask (bit t set => draw tet t): the baked-PVS occlusion cull,
+// or a diagnostic keep set. All-ones when neither is active.
+@group(0) @binding(12) var<storage, read> tet_visibility: array<u32>;
 
 // --- SH constants ---
 const C0: f32 = 0.28209479177387814;
@@ -136,6 +139,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     // Sort array is compacted — see the note in project_compute.wgsl. A culled
     // tet writes nothing; `num_keys` is the resulting instance count.
     if (tet_id >= uniforms.tet_count) {
+        return;
+    }
+    if ((tet_visibility[tet_id >> 5u] & (1u << (tet_id & 31u))) == 0u) {
         return;
     }
 

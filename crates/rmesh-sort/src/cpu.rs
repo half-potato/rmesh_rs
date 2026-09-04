@@ -43,6 +43,9 @@ impl CpuSorter {
     ///   `compute_circumspheres_parallel` in rmesh-data)
     /// - `cam_pos`: camera world-space position (`uniforms.cam_pos_pad.xyz`)
     /// - `vp`: view-projection matrix (`uniforms.vp_col0..3` as columns)
+    /// - `keep_mask`: optional bit-packed per-tet keep mask (bit `t` set ⇒
+    ///   draw), the same `tet_visibility` buffer the GPU projection honours,
+    ///   so the occlusion PVS and importance culls apply on this path too
     ///
     /// Returns the number of visible tets. After return,
     /// `self.sorted_indices[..visible_count]` is the back-to-front list,
@@ -55,6 +58,7 @@ impl CpuSorter {
         circumdata: &[f32],
         cam_pos: Vec3,
         vp: Mat4,
+        keep_mask: Option<&[u32]>,
     ) -> usize {
         let tet_count = indices.len() / 4;
         self.packed.clear();
@@ -82,6 +86,11 @@ impl CpuSorter {
         }
 
         for tet in 0..tet_count {
+            if let Some(m) = keep_mask {
+                if m[tet >> 5] & (1u32 << (tet & 31)) == 0 {
+                    continue;
+                }
+            }
             let base = tet * 4;
             let center = Vec3::new(circumdata[base], circumdata[base + 1], circumdata[base + 2]);
             // circumdata[base + 3] is radius² (see rmesh-data

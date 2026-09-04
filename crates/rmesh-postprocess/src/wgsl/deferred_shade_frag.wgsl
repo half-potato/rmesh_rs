@@ -31,10 +31,11 @@ struct DeferredUniforms {
     exposure: f32,
     ao_strength: f32,
     ssgi_strength: f32,
-    // vec3f auto-aligns to 16: _pad0 fills 124..128, sky_color@128, ground@144.
+    // SSR blend weight (0 = SSR passes skipped, texture stale). Sits at
+    // offset 120; vec3f auto-aligns to 16 so sky_color@128, ground@144.
     // Hemispherical environment radiance (AO-occluded ambient). `ambient` above
     // is now vestigial — env intensity is folded into these on the CPU.
-    _pad0: f32,
+    ssr_strength: f32,
     sky_color: vec3f,
     ground_color: vec3f,
 }
@@ -462,7 +463,7 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> DeferredOut {
     let smoothness_sq = smoothness * smoothness;
     let refl = reflect(-V, N);
     let env_specular = mix(uniforms.ground_color, uniforms.sky_color, refl.y * 0.5 + 0.5);
-    let indirect_spec_radiance = mix(env_specular, ssr_radiance, smoothness_sq);
+    let indirect_spec_radiance = mix(env_specular, ssr_radiance, smoothness_sq * uniforms.ssr_strength);
     // Lazarov env-BRDF fit (env_F) accounts for roughness in the Fresnel factor,
     // so a rough and a smooth surface don't get identical specular intensity.
     let ambient_specular = env_F * indirect_spec_radiance;

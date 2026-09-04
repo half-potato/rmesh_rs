@@ -79,7 +79,7 @@ The interval shading path is the active rendering approach for the viewer and fo
 
 The two pipeline structs that drive this path:
 - `ComputeIntervalPipelines` — compute → vertex/fragment draw. **Universal** — works on every backend (Metal/Vulkan/DX12/WebGPU).
-- `IntervalPipelines` — single mesh-shader dispatch replacing steps 3–4 (`interval_mesh.wgsl` + `interval_fragment.wgsl`). Requires `Features::EXPERIMENTAL_MESH_SHADER`; currently untested due to lack of HW access.
+- `IntervalPipelines` — single mesh-shader dispatch replacing steps 3–4 (`interval_mesh.wgsl` + `interval_fragment.wgsl`). Requires `Features::EXPERIMENTAL_MESH_SHADER` (Vulkan/DX12; naga has no MSL mesh shaders). The viewer uses it automatically when the adapter supports it (`RMESH_MESH=0` forces the compute path). Same G-buffer output as the compute path, ~equal frame time — the raster pass dominates either way. Keep `interval_mesh.wgsl` in sync with `interval_compute.wgsl`.
 
 #### Deep Shadow Maps (rmesh-dsm)
 

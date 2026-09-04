@@ -30,6 +30,8 @@ pub struct SceneCache {
     pub neighbors: Vec<i32>,
     /// Alpha a single tet contributes to a ray crossing it, in [0, 1].
     pub alphas: Vec<f32>,
+    /// `density · longest_edge` per tet.
+    pub max_od: Vec<f32>,
 }
 
 pub struct ShellSystem {
@@ -58,6 +60,22 @@ pub struct ShellSystem {
     pub face: rmesh_render::ShellFace,
     /// Debug: draw the shell but skip the volume.
     pub show_only: bool,
+    /// Leave out every tet whose view-independent weight bound is under
+    /// `importance_threshold` (see `importance.rs`). Independent of the shell
+    /// itself; only shares its per-scene cache.
+    pub importance_enabled: bool,
+    /// Weight floor for the importance cull, in [0, 1].
+    pub importance_threshold: f32,
+    /// Bit-packed keep mask for the current importance settings, ANDed into
+    /// the visibility mask by `App::update_cull_mask`. `None` = keep all.
+    importance_mask: Option<Vec<u32>>,
+    /// (enabled, threshold) the mask was built for.
+    importance_key: (bool, f32),
+    /// Per-tet weight bound, computed off-thread once the cache exists — a
+    /// second stage rather than part of the cache so its ~4s never delays the
+    /// shell, which only needs the adjacency and opacities.
+    importance_scores: Option<Arc<Vec<f32>>>,
+    importance_pending: Option<mpsc::Receiver<Vec<f32>>>,
 
     faces: Vec<u32>,
     /// (threshold, erosion) the live `faces` were built at; the NaN threshold
@@ -104,6 +122,23 @@ impl Default for ShellSystem {
             erosion_steps: 2,
             face: rmesh_render::ShellFace::Exit,
             show_only: false,
+            // Measured operating point (see importance.rs). Scored on sRGB
+            // screenshots against the shell-on frame, 1080p:
+            //   0.01: stump 107->92/px 51->54 fps 46.2 dB/0.9986; room 74->47
+            //         48->56 fps 43.4/0.9914; bicycle 154->129 26->26 fps
+            //         46.1/0.9989.
+            //   0.02: stump 81/px 56 fps 42.1/0.9938; room 43/px 58 fps
+            //         42.8/0.9897 (SSIM just under); bicycle 112/px 44.0/0.9971.
+            //   0.03: stump 70/px 60 fps 39.4/0.9888; room 40/px 60 fps
+            //         41.7/0.9882 -- both miss the 0.99 SSIM bar.
+            // 0.01 is the largest value that clears 35 dB / 0.99 SSIM on all
+            // three; 0.02 is worth it where room-like SSIM tolerance allows.
+            importance_enabled: true,
+            importance_threshold: 0.01,
+            importance_mask: None,
+            importance_key: (false, f32::NAN),
+            importance_scores: None,
+            importance_pending: None,
             faces: Vec::new(),
             built_key: (f32::NAN, 0),
             dirty: false,
@@ -125,6 +160,8 @@ impl ShellSystem {
     /// * `RMESH_SHELL_BIAS=0.0`      — NDC slack on the cull test
     /// * `RMESH_SHELL_FACE=exit|entry` — which surface the shell is
     /// * `RMESH_SHELL_ONLY=1`        — draw the shell, skip the volume
+    /// * `RMESH_IMPORTANCE=0|1`      — view-independent importance cull
+    /// * `RMESH_IMPORTANCE_THRESHOLD=0.03` — its weight floor
     pub fn from_env() -> Self {
         let mut s = Self::default();
         let f = |n: &str| std::env::var(n).ok().and_then(|v| v.parse::<f32>().ok());
@@ -152,7 +189,75 @@ impl ShellSystem {
         if let Some(v) = std::env::var("RMESH_SHELL_ONLY").ok() {
             s.show_only = v != "0" && v != "false";
         }
+        if let Some(v) = std::env::var("RMESH_IMPORTANCE").ok() {
+            s.importance_enabled = v != "0" && v != "false";
+        }
+        if let Some(v) = f("RMESH_IMPORTANCE_THRESHOLD") {
+            s.importance_threshold = v;
+        }
         s
+    }
+
+    /// The importance keep mask, once the scene cache exists and the cull is on.
+    pub fn importance_mask(&self) -> Option<&[u32]> {
+        self.importance_mask.as_deref()
+    }
+
+    /// Rebuild the importance mask when its settings moved or the cache just
+    /// arrived. Returns `true` when the visibility mask must be re-uploaded.
+    pub fn refresh_importance(&mut self) -> bool {
+        // Second stage: start the bound once the cache exists, install it when
+        // it arrives.
+        if self.importance_scores.is_none() && self.importance_pending.is_none() {
+            if let Some(cache) = self.cache.clone() {
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let t = std::time::Instant::now();
+                    let n = cache.alphas.len();
+                    let wb = crate::importance::weight_bound(&cache.neighbors, &cache.alphas, &cache.max_od, n);
+                    log::info!("[importance] weight bound for {n} tets in {:.2}s", t.elapsed().as_secs_f64());
+                    let _ = tx.send(wb);
+                });
+                self.importance_pending = Some(rx);
+            }
+        }
+        if let Some(rx) = &self.importance_pending {
+            if let Ok(wb) = rx.try_recv() {
+                self.importance_scores = Some(Arc::new(wb));
+                self.importance_pending = None;
+                self.importance_key = (false, f32::NAN); // force a (re)build below
+            }
+        }
+
+        let key = (self.importance_enabled, self.importance_threshold);
+        if key == self.importance_key {
+            return false;
+        }
+        if !self.importance_enabled {
+            self.importance_key = key;
+            let had = self.importance_mask.take().is_some();
+            return had;
+        }
+        let (Some(cache), Some(scores)) = (self.cache.as_ref(), self.importance_scores.as_ref()) else {
+            return false; // keep drawing everything until the bound lands
+        };
+        let n = cache.alphas.len();
+        let t = std::time::Instant::now();
+        let (mask, kept, by_distance) =
+            crate::importance::build_mask(scores, &cache.max_od, self.importance_threshold, n);
+        log::info!(
+            "[importance] threshold {:.3}: keep {} of {} tets ({:.1}%); {} of the {} culled were removed by the distance term, the rest by opacity alone ({:.1} ms)",
+            self.importance_threshold,
+            kept,
+            n,
+            100.0 * kept as f32 / n.max(1) as f32,
+            by_distance,
+            n - kept,
+            t.elapsed().as_secs_f64() * 1000.0
+        );
+        self.importance_mask = Some(mask);
+        self.importance_key = key;
+        true
     }
 
     pub fn face_count(&self) -> usize {
@@ -174,6 +279,11 @@ impl ShellSystem {
         self.pending.is_some()
     }
 
+    /// The per-scene adjacency + opacity cache, once the first rebuild has built it.
+    pub fn scene_cache(&self) -> Option<Arc<SceneCache>> {
+        self.cache.clone()
+    }
+
     /// Call when the threshold slider is released, or the scene changes.
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
@@ -185,12 +295,19 @@ impl ShellSystem {
         self.built_key = (f32::NAN, 0);
         self.pending = None;
         self.cache = None;
+        self.importance_mask = None;
+        self.importance_key = (false, f32::NAN);
+        self.importance_scores = None;
+        self.importance_pending = None;
         self.dirty = self.enabled;
     }
 
     /// Kick off a background extraction if one is owed and none is running.
     pub fn maybe_start_rebuild(&mut self, scene_data: &rmesh_data::SceneData) {
-        if !self.enabled || scene_data.tet_count == 0 {
+        // The importance cull needs the same cache, so it can drive the
+        // first build even with the shell itself off (the faces it also
+        // extracts are cheap and simply not drawn).
+        if !(self.enabled || (self.importance_enabled && self.cache.is_none())) || scene_data.tet_count == 0 {
             return;
         }
         // `built_key.0` starts NaN, so this is also what triggers the very
@@ -224,15 +341,15 @@ impl ShellSystem {
                 Some(c) => (c, None),
                 None => {
                     let t = std::time::Instant::now();
-                    let c = Arc::new(SceneCache {
-                        neighbors: rmesh_raytrace::compute_tet_neighbors(&idxs, tet_count),
-                        alphas: tet_alphas(&verts, &idxs, &densities, tet_count),
-                    });
+                    let neighbors = rmesh_raytrace::compute_tet_neighbors(&idxs, tet_count);
+                    let alphas = tet_alphas(&verts, &idxs, &densities, tet_count);
+                    let max_od = crate::importance::tet_max_od(&verts, &idxs, &densities, tet_count);
                     log::info!(
                         "[shell] built adjacency + per-tet opacity for {} tets in {:.2}s",
                         tet_count,
                         t.elapsed().as_secs_f64()
                     );
+                    let c = Arc::new(SceneCache { neighbors, alphas, max_od });
                     (c.clone(), Some(c))
                 }
             };

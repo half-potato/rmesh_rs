@@ -51,8 +51,20 @@ impl App {
         let proj_mat = self.camera.projection_matrix(aspect);
         let vp = proj_mat * view_mat;
 
+        if let Some(p) = self.pending_quality.take() {
+            self.quality_knobs().apply(p);
+        }
+        let quality_now = self.quality_knobs().current();
+
         // Occlusion-cull mask: pick region for the (now-current) camera, upload on change.
+        if self.shell_system.refresh_importance() {
+            self.active_mask_dirty = true;
+        }
         self.update_cull_mask();
+
+        // Overdraw oracle + keep-mask sweep (RMESH_ORACLE): may override the
+        // visibility mask, shell state and overdraw probe for this frame.
+        self.oracle_pre_frame(view_mat, w, h);
 
         // RMESH_LIGHTS=N: one-shot spawn of N point lights ringing the scene, so
         // the deferred shader's per-light BRDF (and DSM) loop can be profiled.
@@ -407,6 +419,8 @@ impl App {
         let mut open_file = false;
         let mut vsync = self.vsync;
         let mut render_mode = self.render_mode;
+        let mut use_mesh_shader = self.use_mesh_shader;
+        let mesh_supported = self.mesh_shader_supported;
         let mesh_shader_supported = self.mesh_shader_supported;
         let mut show_primitives = self.show_primitives;
         let mut show_scene = self.show_scene;
@@ -431,6 +445,8 @@ impl App {
         let mut shell_erosion = self.shell_system.erosion_steps;
         let mut shell_show_only = self.shell_system.show_only;
         let mut shell_face = self.shell_system.face;
+        let mut importance_enabled = self.shell_system.importance_enabled;
+        let mut importance_threshold = self.shell_system.importance_threshold;
         let shell_face_count = self.shell_system.face_count();
         let shell_rebuilding = self.shell_system.rebuild_pending();
         // Set by the threshold slider on release (see the Density Shell block).
@@ -449,6 +465,8 @@ impl App {
         let mut ao_strength = self.ao_strength;
         let mut gtao_radius = self.gtao_radius;
         let mut ssgi_enabled = self.ssgi_enabled;
+        let mut ssr_enabled = self.ssr_enabled;
+        let mut quality_pick: Option<crate::QualityPreset> = None;
         let mut ssgi_strength = self.ssgi_strength;
         let mut ssgi_radius = self.ssgi_radius;
         let mut ssgi_temporal_alpha = self.ssgi_temporal_alpha;
@@ -521,6 +539,15 @@ impl App {
                         }
                         ui.radio_value(&mut render_mode, RenderMode::IntervalShader, "Interval Shader");
                         ui.radio_value(&mut render_mode, RenderMode::RayTrace, "Ray Trace");
+                        ui.add_enabled(
+                            mesh_supported,
+                            egui::Checkbox::new(&mut use_mesh_shader, "Interval via Mesh Shader"),
+                        )
+                        .on_hover_text(if mesh_supported {
+                            "Emit interval geometry from a mesh shader instead of a compute pass + vertex stage"
+                        } else {
+                            "This GPU/backend has no mesh shader support"
+                        });
                         ui.checkbox(&mut show_primitives, "Show Primitives");
                         ui.checkbox(&mut show_scene, "Show Scene");
                         ui.separator();
@@ -586,7 +613,36 @@ impl App {
                                 ui.label(format!("{} faces", shell_face_count));
                             }
                         });
+                        ui.separator();
+                        ui.checkbox(&mut importance_enabled, "Importance Cull")
+                            .on_hover_text("Drop tets whose weight on any ray from free space is bounded under the threshold");
+                        ui.add_enabled(
+                            importance_enabled,
+                            egui::Slider::new(&mut importance_threshold, 0.001..=0.3)
+                                .logarithmic(true)
+                                .text("Weight Floor"),
+                        );
                     });
+                    ui.menu_button(
+                        format!("Quality: {}", quality_now.map_or("Custom", |p| p.label())),
+                        |ui| {
+                            for p in crate::QualityPreset::ALL {
+                                if ui
+                                    .radio(quality_now == Some(p), p.label())
+                                    .on_hover_text(match p {
+                                        crate::QualityPreset::Lowest => "CPU sort, no AO/SSGI/SSR, importance cull 0.03",
+                                        crate::QualityPreset::Low => "GPU 16-bit sort, no AO/SSGI/SSR, importance cull 0.02",
+                                        crate::QualityPreset::Medium => "GPU 16-bit sort, SSGI only (no AO/SSR), importance cull 0.01",
+                                        crate::QualityPreset::High => "GPU 32-bit sort, all effects, shell + importance cull 0.01",
+                                        crate::QualityPreset::Reference => "All effects, no shell, no importance cull",
+                                    })
+                                    .clicked()
+                                {
+                                    quality_pick = Some(p);
+                                }
+                            }
+                        },
+                    );
                     ui.menu_button("Deferred Shading", |ui| {
                         ui.add_enabled(has_pbr, egui::Checkbox::new(&mut deferred_enabled, "Deferred Shading"));
                         if deferred_enabled && has_pbr {
@@ -596,6 +652,7 @@ impl App {
                             ui.add_enabled(ao_enabled, egui::Slider::new(&mut ao_strength, 0.0..=2.0).text("AO Strength"));
                             ui.add_enabled(ao_enabled, egui::Slider::new(&mut gtao_radius, 0.05..=2.0).logarithmic(true).text("AO Radius"));
                             ui.checkbox(&mut ssgi_enabled, "SSGI");
+                            ui.checkbox(&mut ssr_enabled, "SSR");
                             ui.add_enabled(ssgi_enabled, egui::Slider::new(&mut ssgi_strength, 0.0..=1.0).text("SSGI Strength"));
                             ui.add_enabled(ssgi_enabled, egui::Slider::new(&mut ssgi_radius, 0.1..=5.0).logarithmic(true).text("SSGI Radius"));
                             ui.add(egui::Slider::new(&mut ao_temporal_alpha, 0.0..=1.0).text("AO Temporal α"));
@@ -905,6 +962,7 @@ impl App {
             gpu.pending_reconfigure = true;
         }
         self.render_mode = render_mode;
+        self.use_mesh_shader = use_mesh_shader;
         self.show_primitives = show_primitives;
         if show_scene != self.show_scene {
             // Invalidate DSM cache when scene visibility changes
@@ -923,6 +981,7 @@ impl App {
         self.ao_strength = ao_strength;
         self.gtao_radius = gtao_radius;
         self.ssgi_enabled = ssgi_enabled;
+        self.ssr_enabled = ssr_enabled;
         self.ssgi_strength = ssgi_strength;
         self.ssgi_radius = ssgi_radius;
         self.ssgi_temporal_alpha = ssgi_temporal_alpha;
@@ -944,8 +1003,21 @@ impl App {
         self.shell_system.erosion_steps = shell_erosion;
         self.shell_system.show_only = shell_show_only;
         self.shell_system.face = shell_face;
+        self.shell_system.importance_enabled = importance_enabled;
+        self.shell_system.importance_threshold = importance_threshold;
         if shell_rebuild || (shell_enabled && !shell_was_enabled) {
             self.shell_system.mark_dirty();
+        }
+        // A preset pick wins over the individual widgets written back above.
+        if let Some(p) = quality_pick {
+            crate::QualityKnobs {
+                sort_mode: &mut self.sort_mode,
+                ao_enabled: &mut self.ao_enabled,
+                ssgi_enabled: &mut self.ssgi_enabled,
+                ssr_enabled: &mut self.ssr_enabled,
+                shell: &mut self.shell_system,
+            }
+            .apply(p);
         }
 
         // Density shell: kick off a background extraction if the threshold moved,
@@ -1589,6 +1661,7 @@ impl App {
                                 &self.scene_data.circumdata,
                                 self.camera.position,
                                 vp,
+                                Some(&self.active_mask_scratch),
                             );
                             rmesh_render::record_compute_interval_project(
                                 &mut encoder,
@@ -1632,6 +1705,36 @@ impl App {
                                 &gpu.compute_interval_render_bg,
                                 &gpu.compute_interval_convert_bg,
                                 &gpu.primitive_targets.depth_view,
+                                Some(&gpu.ts_query_set),
+                                mrt_enabled,
+                                gpu.frag_query_set.as_ref(),
+                            );
+                        }
+                        _ if self.use_mesh_shader
+                            && gpu.interval_pipelines.is_some()
+                            && gpu.interval_render_bg_a.is_some() =>
+                        {
+                            // Mesh-shader interval path: project → sort → mesh
+                            // dispatch, no interval buffers. 32-bit sort only;
+                            // the 16-bit sort's bind groups hold a different
+                            // values buffer that this path does not carry.
+                            rmesh_render::record_sorted_interval_forward_pass(
+                                &mut encoder,
+                                &gpu.device,
+                                &gpu.pipelines,
+                                gpu.interval_pipelines.as_ref().unwrap(),
+                                &gpu.sort_pipelines,
+                                &gpu.sort_state,
+                                &gpu.buffers,
+                                &gpu.targets,
+                                &gpu.compute_bg,
+                                gpu.interval_render_bg_a.as_ref().unwrap(),
+                                gpu.interval_render_bg_b.as_ref().unwrap(),
+                                gpu.interval_indirect_convert_bg.as_ref().unwrap(),
+                                gpu.tet_count,
+                                &gpu.queue,
+                                &gpu.primitive_targets.depth_view,
+                                Some(&gpu.hw_compute_bg),
                                 Some(&gpu.ts_query_set),
                                 mrt_enabled,
                                 gpu.frag_query_set.as_ref(),
@@ -1853,7 +1956,10 @@ impl App {
         //     so it measures the fragments that actually survived the shell
         //     z-cull and the depth test this frame — not a geometric estimate.
         if self.overdraw_view.is_some() && !skip_volume {
-            if self.render_mode == RenderMode::IntervalShader {
+            // The probe replays the compute path's interval buffers, which the
+            // mesh path never fills.
+            let mesh_active = self.use_mesh_shader && gpu.interval_pipelines.is_some();
+            if self.render_mode == RenderMode::IntervalShader && !mesh_active {
                 pp_time!("overdraw_probe", {
                     rmesh_render::record_overdraw_count(
                         &mut encoder,
@@ -2152,7 +2258,8 @@ impl App {
                     exposure: self.exposure,
                     ao_strength: effective_ao_strength,
                     ssgi_strength: effective_ssgi_strength,
-                    _pad0: [0.0; 2],
+                    // Slot 0 is the deferred shader's `ssr_strength`.
+                    _pad0: [if self.ssr_enabled { 1.0 } else { 0.0 }, 0.0],
                     sky_color: env_sky,
                     _pad1: 0.0,
                     ground_color: env_ground,
@@ -2409,100 +2516,104 @@ impl App {
                     });
                 } // end if self.ssgi_enabled
 
-                // -------- SSR (specular reflections) --------
-                // Single Hi-Z ray-march along reflect(view, N). Same matrices /
-                // dimensions as SSGI; per-pixel jitter on the start step is
-                // the only randomness (no Monte Carlo over a lobe).
-                let ssr_uniforms = rmesh_postprocess::SsrUniforms {
-                    inv_proj: proj_mat.inverse().to_cols_array_2d(),
-                    proj: proj_mat.to_cols_array_2d(),
-                    view: view_mat.to_cols_array_2d(),
-                    inv_view: view_mat.inverse().to_cols_array_2d(),
-                    width: w,
-                    height: h,
-                    near: self.camera.near_z,
-                    far: self.camera.far_z,
-                    max_mip: gpu.hiz_texture.mip_count - 1,
-                    frame: gpu.frame_counter,
-                    radius_world: self.ssgi_radius,
-                    thickness: self.ssgi_radius * 0.5,
-                    sky_color: env_sky,
-                    _pad0: 0.0,
-                    ground_color: env_ground,
-                    _pad1: 0.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ssr_pipeline.uniforms_buf,
-                    0,
-                    bytemuck::bytes_of(&ssr_uniforms),
-                );
-                pp_time!("ssr", {
-                    rmesh_postprocess::record_ssr_pass(
-                        &mut encoder,
-                        &gpu.ssr_pipeline,
-                        &gpu.ssr_bg[pu],
-                        gpu.targets.ssr_current(p),
+                // SSR is skipped entirely when off; the deferred shader then
+                // gets ssr_strength = 0 so the stale texture is never read.
+                if self.ssr_enabled {
+                    // -------- SSR (specular reflections) --------
+                    // Single Hi-Z ray-march along reflect(view, N). Same matrices /
+                    // dimensions as SSGI; per-pixel jitter on the start step is
+                    // the only randomness (no Monte Carlo over a lobe).
+                    let ssr_uniforms = rmesh_postprocess::SsrUniforms {
+                        inv_proj: proj_mat.inverse().to_cols_array_2d(),
+                        proj: proj_mat.to_cols_array_2d(),
+                        view: view_mat.to_cols_array_2d(),
+                        inv_view: view_mat.inverse().to_cols_array_2d(),
+                        width: w,
+                        height: h,
+                        near: self.camera.near_z,
+                        far: self.camera.far_z,
+                        max_mip: gpu.hiz_texture.mip_count - 1,
+                        frame: gpu.frame_counter,
+                        radius_world: self.ssgi_radius,
+                        thickness: self.ssgi_radius * 0.5,
+                        sky_color: env_sky,
+                        _pad0: 0.0,
+                        ground_color: env_ground,
+                        _pad1: 0.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ssr_pipeline.uniforms_buf,
+                        0,
+                        bytemuck::bytes_of(&ssr_uniforms),
                     );
-                });
+                    pp_time!("ssr", {
+                        rmesh_postprocess::record_ssr_pass(
+                            &mut encoder,
+                            &gpu.ssr_pipeline,
+                            &gpu.ssr_bg[pu],
+                            gpu.targets.ssr_current(p),
+                        );
+                    });
 
-                // SSR temporal: ssr_current + ssr_history → ssr_temporal_view
-                let ssr_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
-                    inv_vp: cur_inv_vp.to_cols_array_2d(),
-                    prev_vp: prev_vp_mat.to_cols_array_2d(),
-                    width: w,
-                    height: h,
-                    near: self.camera.near_z,
-                    far: self.camera.far_z,
-                    max_mip: gpu.hiz_texture.mip_count - 1,
-                    alpha: self.ssr_temporal_alpha,
-                    _pad0: 0.0,
-                    _pad1: 0.0,
-                };
-                gpu.queue.write_buffer(
-                    &gpu.ssr_temporal_pipeline.uniforms_buf,
-                    0,
-                    bytemuck::bytes_of(&ssr_temporal_uniforms),
-                );
-                pp_time!("ssr_temporal", {
-                    rmesh_postprocess::record_temporal_pass(
-                        &mut encoder,
-                        &gpu.ssr_temporal_pipeline,
-                        &gpu.ssr_temporal_bg[pu],
-                        &gpu.targets.ssr_temporal_view,
+                    // SSR temporal: ssr_current + ssr_history → ssr_temporal_view
+                    let ssr_temporal_uniforms = rmesh_postprocess::TemporalUniforms {
+                        inv_vp: cur_inv_vp.to_cols_array_2d(),
+                        prev_vp: prev_vp_mat.to_cols_array_2d(),
+                        width: w,
+                        height: h,
+                        near: self.camera.near_z,
+                        far: self.camera.far_z,
+                        max_mip: gpu.hiz_texture.mip_count - 1,
+                        alpha: self.ssr_temporal_alpha,
+                        _pad0: 0.0,
+                        _pad1: 0.0,
+                    };
+                    gpu.queue.write_buffer(
+                        &gpu.ssr_temporal_pipeline.uniforms_buf,
+                        0,
+                        bytemuck::bytes_of(&ssr_temporal_uniforms),
                     );
-                });
+                    pp_time!("ssr_temporal", {
+                        rmesh_postprocess::record_temporal_pass(
+                            &mut encoder,
+                            &gpu.ssr_temporal_pipeline,
+                            &gpu.ssr_temporal_bg[pu],
+                            &gpu.targets.ssr_temporal_view,
+                        );
+                    });
 
-                // Copy ssr_temporal_view → ssr_current(p) (final readable form
-                // for deferred). The destination texture depends on parity since
-                // both halves of the SSR ping-pong are alternately "current".
-                // This copy is the SSR cleanup that's still outstanding —
-                // killing it requires restructuring the temporal pass.
-                let ssr_dst_tex = if pu == 0 {
-                    &gpu.targets.ssr_texture
-                } else {
-                    &gpu.targets.ssr_history_texture
-                };
-                pp_time!("ssr_copy", {
-                    encoder.copy_texture_to_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &gpu.targets.ssr_temporal_texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::TexelCopyTextureInfo {
-                            texture: ssr_dst_tex,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        wgpu::Extent3d {
-                            width: w,
-                            height: h,
-                            depth_or_array_layers: 1,
-                        },
-                    );
-                });
+                    // Copy ssr_temporal_view → ssr_current(p) (final readable form
+                    // for deferred). The destination texture depends on parity since
+                    // both halves of the SSR ping-pong are alternately "current".
+                    // This copy is the SSR cleanup that's still outstanding —
+                    // killing it requires restructuring the temporal pass.
+                    let ssr_dst_tex = if pu == 0 {
+                        &gpu.targets.ssr_texture
+                    } else {
+                        &gpu.targets.ssr_history_texture
+                    };
+                    pp_time!("ssr_copy", {
+                        encoder.copy_texture_to_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &gpu.targets.ssr_temporal_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::TexelCopyTextureInfo {
+                                texture: ssr_dst_tex,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            wgpu::Extent3d {
+                                width: w,
+                                height: h,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                    });
+                } // end if self.ssr_enabled
 
                 // Record deferred shade pass — writes display to deferred_output
                 // (location 0) and the true lit value to lit_current (location 1).
@@ -2777,6 +2888,13 @@ impl App {
         for id in &full_output.textures_delta.free {
             gpu.egui_renderer.free_texture(id);
         }
+
+        crate::oracle::oracle_post_frame(
+            &mut self.oracle,
+            gpu,
+            &mut self.overdraw_view,
+            &mut self.active_mask_dirty,
+        );
 
         // Capture before present: the surface texture is still ours to copy.
         if let Some(shot) = &self.screenshot {

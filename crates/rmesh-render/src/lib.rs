@@ -249,6 +249,20 @@ impl ForwardPipelines {
             });
         }
         hw_compute_entries.push(shell_hiz_layout_entry(11));
+        // 12 = tet_visibility (occlusion / keep mask), same as project_compute's
+        // binding 8. This makes eleven storage buffers in the stage: fine on
+        // native (the viewer asks for 20) but past WebGPU's default cap of 8,
+        // so the web viewer must request the adapter's real limit.
+        hw_compute_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 12,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
         let hw_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw_compute_bind_group_layout"),
@@ -831,29 +845,59 @@ impl MeshForwardPipelines {
 // Interval Shading Pipelines (requires EXPERIMENTAL_MESH_SHADER)
 // ---------------------------------------------------------------------------
 
-/// Compiled pipelines for the interval shading forward pass.
+/// Compiled pipelines for the mesh-shader interval forward pass.
 ///
-/// Decomposes each tet into non-overlapping screen-space triangles with
-/// interpolated front/back NDC depths. Single color output (no MRT).
+/// `interval_mesh.wgsl` emits the same fan geometry `interval_compute.wgsl` +
+/// `interval_vertex.wgsl` produce, straight from a mesh workgroup, and shares
+/// `interval_fragment.wgsl` with the compute path — so it writes the same
+/// G-buffer (MRT) or colour-only output and needs no vertex buffer, no
+/// generate dispatch and no indexed draw.
 pub struct IntervalPipelines {
+    /// MRT variant (colour, aux0, normals, depth moments).
     pub mesh_render_pipeline: wgpu::RenderPipeline,
+    /// Colour-only variant (`main_color_only`).
+    pub mesh_render_pipeline_color_only: wgpu::RenderPipeline,
     pub mesh_render_bg_layout: wgpu::BindGroupLayout,
     pub indirect_convert_pipeline: wgpu::ComputePipeline,
     pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
 }
 
+/// Tets per mesh workgroup; must match `TETS_PER_GROUP` in `interval_mesh.wgsl`.
+pub const INTERVAL_MESH_TETS_PER_GROUP: u32 = 32;
+
 impl IntervalPipelines {
     /// Create interval shading pipelines. Requires `Features::EXPERIMENTAL_MESH_SHADER`.
     pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
-        // ----- Mesh render pipeline (8 read-only storage bindings) -----
-        // Same bindings as MeshForwardPipelines: uniforms, vertices, indices, colors,
-        // densities, color_grads, sorted_indices, indirect_args
-        let mesh_read_only = [true; 8];
-        let mesh_entries = storage_entries(
-            8,
-            wgpu::ShaderStages::MESH | wgpu::ShaderStages::FRAGMENT,
-            &mesh_read_only,
-        );
+        // One bind group serves both stages. Slots 0, 3, 4, 5 are what
+        // `interval_fragment.wgsl` declares (uniforms, aux_data, vertex_normals,
+        // tet_indices) and keep those types; the mesh stage adds its own.
+        //   0 uniforms        MESH|FRAGMENT
+        //   1 vertices        MESH
+        //   2 colors          MESH
+        //   3 aux_data        FRAGMENT
+        //   4 vertex_normals  MESH|FRAGMENT
+        //   5 indices         MESH|FRAGMENT
+        //   6 densities       MESH
+        //   7 color_grads     MESH
+        //   8 sorted_indices  MESH
+        //   9 indirect_args   MESH
+        let both = wgpu::ShaderStages::MESH | wgpu::ShaderStages::FRAGMENT;
+        let mesh = wgpu::ShaderStages::MESH;
+        let vis = [both, mesh, mesh, wgpu::ShaderStages::FRAGMENT, both, both, mesh, mesh, mesh, mesh];
+        let mesh_entries: Vec<wgpu::BindGroupLayoutEntry> = vis
+            .iter()
+            .enumerate()
+            .map(|(i, &visibility)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
         let mesh_render_bg_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("interval_mesh_render_bg_layout"),
@@ -873,7 +917,6 @@ impl IntervalPipelines {
             source: wgpu::ShaderSource::Wgsl(INTERVAL_FRAGMENT_WGSL.as_str().into()),
         });
 
-        // Premultiplied alpha blend for single color attachment
         let premul_blend = wgpu::BlendState {
             color: wgpu::BlendComponent {
                 src_factor: wgpu::BlendFactor::One,
@@ -886,52 +929,63 @@ impl IntervalPipelines {
                 operation: wgpu::BlendOperation::Add,
             },
         };
+        let target = |format: wgpu::TextureFormat| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(premul_blend),
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        };
+        let mrt_targets = [
+            target(formats.color),
+            target(formats.aux0),
+            target(formats.normals),
+            target(formats.depth),
+        ];
+        let color_only_targets = [target(formats.color)];
 
-        let mesh_render_pipeline = device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
-            label: Some("interval_mesh_render_pipeline"),
-            layout: Some(&mesh_pipeline_layout),
-            task: None,
-            mesh: wgpu::MeshState {
-                module: &mesh_shader,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None, // No face culling — interval triangles are screen-aligned
-                unclipped_depth: false,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
-                depth_compare: wgpu::CompareFunction::LessEqual,
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &fragment_shader,
-                entry_point: Some("main"),
-                targets: &[
-                    // Single color attachment: premultiplied alpha blend
-                    Some(wgpu::ColorTargetState {
-                        format: formats.color,
-                        blend: Some(premul_blend),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
-                compilation_options: Default::default(),
-            }),
-            multiview: None,
-            cache: None,
-        });
+        let make = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
+            device.create_mesh_pipeline(&wgpu::MeshPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&mesh_pipeline_layout),
+                task: None,
+                mesh: wgpu::MeshState {
+                    module: &mesh_shader,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None, // interval triangles are screen-aligned
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &fragment_shader,
+                    entry_point: Some(entry),
+                    targets,
+                    compilation_options: Default::default(),
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let mesh_render_pipeline = make("interval_mesh_render_pipeline", "main", &mrt_targets);
+        let mesh_render_pipeline_color_only =
+            make("interval_mesh_render_pipeline_color_only", "main_color_only", &color_only_targets);
 
         // ----- Indirect convert compute pipeline (2 bindings) -----
-        // Reuses indirect_convert.wgsl with TETS_PER_GROUP overridden to 16
         let indirect_convert_bg_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("interval_indirect_convert_bg_layout"),
@@ -968,7 +1022,6 @@ impl IntervalPipelines {
             label: Some("interval_indirect_convert.wgsl"),
             source: wgpu::ShaderSource::Wgsl(INDIRECT_CONVERT_WGSL.as_str().into()),
         });
-        // Override TETS_PER_GROUP to 16 for interval path
         let indirect_convert_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("interval_indirect_convert_pipeline"),
@@ -976,7 +1029,7 @@ impl IntervalPipelines {
                 module: &indirect_convert_shader,
                 entry_point: Some("main"),
                 compilation_options: wgpu::PipelineCompilationOptions {
-                    constants: &[("TETS_PER_GROUP", 16.0)],
+                    constants: &[("TETS_PER_GROUP", INTERVAL_MESH_TETS_PER_GROUP as f64)],
                     ..Default::default()
                 },
                 cache: None,
@@ -984,6 +1037,7 @@ impl IntervalPipelines {
 
         Self {
             mesh_render_pipeline,
+            mesh_render_pipeline_color_only,
             mesh_render_bg_layout,
             indirect_convert_pipeline,
             indirect_convert_bg_layout,
@@ -1884,7 +1938,7 @@ pub fn create_compute_bind_group(
 /// Binding order matches `project_compute_hw.wgsl`:
 ///   0=uniforms, 1=vertices, 2=indices, 3=circumdata,
 ///   4=sort_keys, 5=sort_values, 6=indirect_args, 7=colors,
-///   8=base_colors, 9=color_grads, 10=sh_coeffs
+///   8=base_colors, 9=color_grads, 10=sh_coeffs, 11=shell_hiz, 12=tet_visibility
 pub fn create_hw_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
@@ -1909,6 +1963,7 @@ pub fn create_hw_compute_bind_group(
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
             rmesh_util::gpu_helpers::tex_entry(11, shell_hiz_view),
+            buf_entry(12, &buffers.tet_visibility),
         ],
     });
     ForwardHwComputeBindGroups { bg }
@@ -2077,11 +2132,15 @@ pub fn create_indirect_convert_bind_group(
 /// Binding order matches `interval_mesh.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: colors,
 ///   4: densities, 5: color_grads, 6: sorted_indices, 7: indirect_args
+/// Mesh-interval render bind group. `aux_data` is the per-tet PBR material
+/// buffer, or `None` for a colour-only scene (a 4-byte dummy is bound, which
+/// the fragment shader detects through `arrayLength`).
 pub fn create_interval_render_bind_group(
     device: &wgpu::Device,
     interval_pipelines: &IntervalPipelines,
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
+    aux_data: Option<&wgpu::Buffer>,
 ) -> wgpu::BindGroup {
     create_interval_render_bind_group_with_sort_values(
         device,
@@ -2089,6 +2148,7 @@ pub fn create_interval_render_bind_group(
         buffers,
         material,
         &buffers.sort_values,
+        aux_data,
     )
 }
 
@@ -2099,19 +2159,29 @@ pub fn create_interval_render_bind_group_with_sort_values(
     buffers: &SceneBuffers,
     material: &MaterialBuffers,
     sort_values: &wgpu::Buffer,
+    aux_data: Option<&wgpu::Buffer>,
 ) -> wgpu::BindGroup {
+    let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("interval_mesh_aux_dummy"),
+        size: 4,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    // Slot order documented on `IntervalPipelines::new`.
     device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("interval_render_bind_group_sort_b"),
+        label: Some("interval_render_bind_group"),
         layout: &interval_pipelines.mesh_render_bg_layout,
         entries: &[
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
-            buf_entry(2, &buffers.indices),
-            buf_entry(3, &material.colors),
-            buf_entry(4, &buffers.densities),
-            buf_entry(5, &material.color_grads),
-            buf_entry(6, sort_values),
-            buf_entry(7, &buffers.indirect_args),
+            buf_entry(2, &material.colors),
+            buf_entry(3, aux_data.unwrap_or(&dummy)),
+            buf_entry(4, &buffers.vertex_normals),
+            buf_entry(5, &buffers.indices),
+            buf_entry(6, &buffers.densities),
+            buf_entry(7, &material.color_grads),
+            buf_entry(8, sort_values),
+            buf_entry(9, &buffers.indirect_args),
         ],
     })
 }
@@ -2938,6 +3008,8 @@ pub fn record_sorted_interval_forward_pass(
     depth_view: &wgpu::TextureView,
     hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
     profiler: Option<&wgpu::QuerySet>,
+    mrt_enabled: bool,
+    stats: Option<&wgpu::QuerySet>,
 ) {
     // ----- 1. Reset indirect args -----
     let reset_cmd = DrawIndirectCommand {
@@ -3018,27 +3090,45 @@ pub fn record_sorted_interval_forward_pass(
         cpass.dispatch_workgroups(1, 1, 1);
     }
 
-    // ----- 4. Interval shading render pass (single color output) -----
+    // ----- 4. Interval shading render pass (same attachments as the compute path) -----
     let render_bg = if result_in_b {
         interval_render_bg_b
     } else {
         interval_render_bg_a
     };
+    let load = wgpu::Operations {
+        load: wgpu::LoadOp::Load, // preserve the primitive pass output
+        store: wgpu::StoreOp::Store,
+    };
+    fn attach<'a>(
+        view: &'a wgpu::TextureView,
+        ops: wgpu::Operations<wgpu::Color>,
+    ) -> Option<wgpu::RenderPassColorAttachment<'a>> {
+        Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops,
+            depth_slice: None,
+        })
+    }
+    let mrt_attachments;
+    let color_only_attachments;
+    let color_attachments: &[Option<wgpu::RenderPassColorAttachment>] = if mrt_enabled {
+        mrt_attachments = [
+            attach(&targets.color_view, load),
+            attach(&targets.aux0_view, load),
+            attach(&targets.normals_view, load),
+            attach(&targets.depth_view, load),
+        ];
+        &mrt_attachments
+    } else {
+        color_only_attachments = [attach(&targets.color_view, load)];
+        &color_only_attachments
+    };
     {
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("interval_forward_render"),
-            color_attachments: &[
-                // Single color attachment: premultiplied alpha blend
-                Some(wgpu::RenderPassColorAttachment {
-                    view: &targets.color_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                }),
-            ],
+            color_attachments,
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: depth_view,
                 depth_ops: Some(wgpu::Operations {
@@ -3056,6 +3146,9 @@ pub fn record_sorted_interval_forward_pass(
             multiview_mask: None,
         });
 
+        if let Some(qs) = stats {
+            rpass.begin_pipeline_statistics_query(qs, 0);
+        }
         rpass.set_viewport(
             0.0,
             0.0,
@@ -3065,10 +3158,17 @@ pub fn record_sorted_interval_forward_pass(
             1.0,
         );
         rpass.set_scissor_rect(0, 0, targets.width, targets.height);
-        rpass.set_pipeline(&interval_pipelines.mesh_render_pipeline);
+        if mrt_enabled {
+            rpass.set_pipeline(&interval_pipelines.mesh_render_pipeline);
+        } else {
+            rpass.set_pipeline(&interval_pipelines.mesh_render_pipeline_color_only);
+        }
         rpass.set_bind_group(0, render_bg, &[]);
 
         rpass.draw_mesh_tasks_indirect(&buffers.mesh_indirect_args, 0);
+        if stats.is_some() {
+            rpass.end_pipeline_statistics_query();
+        }
     }
 }
 

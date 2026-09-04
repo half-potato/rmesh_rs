@@ -50,12 +50,133 @@ use rmesh_render::{
 mod flare;
 mod gpu_state;
 mod shell;
+mod importance;
+mod oracle;
 mod render;
 use flare::FlareSystem;
 use gpu_state::*;
 
 /// Read a 0/1 environment override for a boolean toggle, falling back to
 /// `default` when unset or unparseable.
+/// Quality presets: one menu pick that sets every speed/quality knob at once.
+/// Each preset is a full assignment of the knobs it lists, so picking one is
+/// reproducible regardless of what was fiddled with before; touching any of
+/// those knobs afterwards shows as "Custom".
+///
+/// Measured on stump_conserv at 1080p (sRGB PSNR against Reference):
+/// Reference 38 fps; High 44 fps, 37.1 dB / 0.996; Medium 49 fps, 36.8 dB /
+/// 0.995; Low 58 fps, 24.3 dB / 0.960 (SSGI off); Lowest 12 fps — the CPU sort
+/// of 6.5M tets is ~60 ms, so it is for backends without subgroups, not speed.
+/// Geometry is 16 of the ~23 ms at High; the whole screen-space chain is 5 ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QualityPreset {
+    /// CPU sort (no subgroups needed), no screen-space effects, aggressive
+    /// importance cull. The floor for weak or subgroup-less GPUs.
+    Lowest,
+    /// 16-bit GPU sort, no screen-space effects.
+    Low,
+    /// 16-bit GPU sort, SSGI kept, AO and SSR dropped. Measured on stump:
+    /// SSGI off costs 13 dB against the reference frame (it is most of the
+    /// indirect light), AO + SSR off together cost 0.3 dB — so this is the
+    /// cheap half of the chain to shed, not the obvious one.
+    Medium,
+    /// Everything on with the measured-safe culls (the default).
+    High,
+    /// Everything on, no shell, no importance cull: the ground truth.
+    Reference,
+}
+
+impl QualityPreset {
+    pub const ALL: [QualityPreset; 5] = [
+        QualityPreset::Lowest,
+        QualityPreset::Low,
+        QualityPreset::Medium,
+        QualityPreset::High,
+        QualityPreset::Reference,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            QualityPreset::Lowest => "Lowest",
+            QualityPreset::Low => "Low",
+            QualityPreset::Medium => "Medium",
+            QualityPreset::High => "High",
+            QualityPreset::Reference => "Reference",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|p| p.label().eq_ignore_ascii_case(name.trim()))
+    }
+
+    /// The knob values this preset stands for:
+    /// (sort, ao, ssgi, ssr, shell, importance, importance threshold).
+    fn knobs(self) -> (SortMode, bool, bool, bool, bool, bool, f32) {
+        match self {
+            QualityPreset::Lowest => (SortMode::Cpu, false, false, false, true, true, 0.03),
+            QualityPreset::Low => (SortMode::Gpu16, false, false, false, true, true, 0.02),
+            QualityPreset::Medium => (SortMode::Gpu16, false, true, false, true, true, 0.01),
+            QualityPreset::High => (SortMode::Gpu32, true, true, true, true, true, 0.01),
+            QualityPreset::Reference => (SortMode::Gpu32, true, true, true, false, false, 0.01),
+        }
+    }
+}
+
+/// The knobs a preset governs, borrowed individually so the render loop can
+/// use them while it holds `gpu` mutably.
+pub struct QualityKnobs<'a> {
+    pub sort_mode: &'a mut SortMode,
+    pub ao_enabled: &'a mut bool,
+    pub ssgi_enabled: &'a mut bool,
+    pub ssr_enabled: &'a mut bool,
+    pub shell: &'a mut shell::ShellSystem,
+}
+
+impl QualityKnobs<'_> {
+    /// Which preset the current knobs match exactly, if any.
+    pub fn current(&self) -> Option<QualityPreset> {
+        QualityPreset::ALL.into_iter().find(|p| {
+            let (sort, ao, ssgi, ssr, shell, imp, thr) = p.knobs();
+            *self.sort_mode == sort
+                && *self.ao_enabled == ao
+                && *self.ssgi_enabled == ssgi
+                && *self.ssr_enabled == ssr
+                && self.shell.enabled == shell
+                && self.shell.importance_enabled == imp
+                && (!imp || (self.shell.importance_threshold - thr).abs() < 1e-6)
+        })
+    }
+
+    pub fn apply(&mut self, preset: QualityPreset) {
+        let (sort, ao, ssgi, ssr, shell, imp, thr) = preset.knobs();
+        *self.sort_mode = sort;
+        *self.ao_enabled = ao;
+        *self.ssgi_enabled = ssgi;
+        *self.ssr_enabled = ssr;
+        if shell && !self.shell.enabled {
+            self.shell.mark_dirty();
+        }
+        self.shell.enabled = shell;
+        self.shell.importance_enabled = imp;
+        self.shell.importance_threshold = thr;
+        log::info!("[quality] preset {:?}", preset);
+    }
+}
+
+impl App {
+    fn quality_knobs(&mut self) -> QualityKnobs<'_> {
+        QualityKnobs {
+            sort_mode: &mut self.sort_mode,
+            ao_enabled: &mut self.ao_enabled,
+            ssgi_enabled: &mut self.ssgi_enabled,
+            ssr_enabled: &mut self.ssr_enabled,
+            shell: &mut self.shell_system,
+        }
+    }
+}
+
 fn env_flag(name: &str, default: bool) -> bool {
     match std::env::var(name).ok().as_deref() {
         Some("0") | Some("false") => false,
@@ -151,6 +272,10 @@ struct App {
     vsync: bool,
     render_mode: RenderMode,
     mesh_shader_supported: bool,
+    /// Drive the interval path with the mesh shader (`IntervalPipelines`)
+    /// instead of interval_compute + a vertex stage. Only meaningful when
+    /// `mesh_shader_supported`; on by default there.
+    use_mesh_shader: bool,
     // Rendering options
     show_primitives: bool,
     show_scene: bool,
@@ -198,6 +323,9 @@ struct App {
     ao_strength: f32,
     gtao_radius: f32,
     ssgi_enabled: bool,
+    /// Screen-space reflections; off skips the SSR + temporal + copy passes
+    /// and zeroes the deferred blend weight.
+    ssr_enabled: bool,
     ssgi_strength: f32,
     ssgi_radius: f32,
     /// History blend factor: 1.0 = no temporal accumulation, 0.0 = frozen.
@@ -228,6 +356,16 @@ struct App {
     overdraw_scale: f32,
     /// `RMESH_SHOT` frame capture, for judging a change on the image.
     screenshot: Option<shell::Screenshot>,
+    /// `RMESH_QUALITY=<preset>`: applied on the first frame, so it overrides
+    /// the individual env toggles.
+    pending_quality: Option<QualityPreset>,
+    /// Ignore mouse and keyboard entirely. Defaults to on for headless runs
+    /// (`RMESH_SHOT` / `RMESH_ORACLE`), whose windows pop up on a desktop
+    /// where a stray hover over the menu bar or a drag has already ruined a
+    /// measurement. `RMESH_NO_INPUT=0|1` overrides.
+    ignore_input: bool,
+    /// `RMESH_ORACLE=<dir>`: per-pixel overdraw oracle + keep-mask sweep.
+    oracle: Option<oracle::OracleRun>,
     // Occlusion culling ('C' toggles). active_region -1 = no-cull (all visible);
     // -2 forces a first rebuild. active_mask_scratch is the bit-packed
     // [ceil(M/32)] u32 mask uploaded to SceneBuffers.tet_visibility on change.
@@ -320,7 +458,7 @@ impl App {
             fps: 0.0,
             loaded_path: None,
             pending_load: None,
-            vsync: true,
+            vsync: env_flag("RMESH_VSYNC", true),
             // Default to IntervalShader when PBR data is loaded — only this
             // path runs interval_fragment.wgsl, which writes the metallic/F0
             // channels the deferred shader expects. Other modes write
@@ -332,9 +470,15 @@ impl App {
                 RenderMode::Regular
             },
             mesh_shader_supported: false,
+            use_mesh_shader: true,
             show_primitives: true,
             show_scene: true,
-            sort_mode: SortMode::Gpu32,
+            // RMESH_SORT=gpu32|gpu16|cpu pins the sort path for headless A/Bs.
+            sort_mode: match std::env::var("RMESH_SORT").ok().as_deref() {
+                Some("gpu16") => SortMode::Gpu16,
+                Some("cpu") => SortMode::Cpu,
+                _ => SortMode::Gpu32,
+            },
             interaction: TransformInteraction::new(),
             vertex_select: VertexSelectInteraction::new(),
             mesh_topology: None,
@@ -360,6 +504,7 @@ impl App {
             ao_strength: 1.0,
             gtao_radius: 0.5,
             ssgi_enabled: env_flag("RMESH_SSGI", true),
+            ssr_enabled: env_flag("RMESH_SSR", true),
             ssgi_strength: 1.0,
             ssgi_radius: 1.5,
             ssgi_temporal_alpha: 0.2,
@@ -387,6 +532,12 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256.0),
             screenshot: shell::Screenshot::from_env(),
+            pending_quality: std::env::var("RMESH_QUALITY").ok().and_then(|v| QualityPreset::from_name(&v)),
+            ignore_input: env_flag(
+                "RMESH_NO_INPUT",
+                std::env::var_os("RMESH_SHOT").is_some() || std::env::var_os("RMESH_ORACLE").is_some(),
+            ),
+            oracle: oracle::OracleConfig::from_env().map(oracle::OracleRun::new),
             cull_enabled: true,
             active_region: -2,
             active_mask_dirty: true,
@@ -461,6 +612,13 @@ impl App {
                 }
             }
         }
+        // View-independent importance cull: a tet under the weight bound is
+        // dropped whatever region the camera is in.
+        if let Some(imp) = self.shell_system.importance_mask() {
+            for (w, &m) in self.active_mask_scratch.iter_mut().zip(imp) {
+                *w &= m;
+            }
+        }
         self.active_baked_count = self
             .active_mask_scratch
             .iter()
@@ -513,10 +671,13 @@ impl App {
                 let adapter_features = adapter.features();
                 let _backend = info.backend;
                 let subgroup_supported = adapter_features.contains(wgpu::Features::SUBGROUP);
-                let mesh_shader_supported = false;
-                //subgroup_supported
-                // && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
-                // && backend != wgpu::Backend::Metal; // naga MSL backend doesn't implement mesh shaders
+                // naga's MSL backend does not implement mesh shaders, so
+                // Metal is excluded even when the adapter advertises them.
+                // RMESH_MESH=0 forces the compute interval path.
+                let mesh_shader_supported = subgroup_supported
+                    && adapter_features.contains(wgpu::Features::EXPERIMENTAL_MESH_SHADER)
+                    && _backend != wgpu::Backend::Metal
+                    && env_flag("RMESH_MESH", true);
                 log::info!("Subgroup support: {}", subgroup_supported);
                 log::info!("Mesh shader support: {}", mesh_shader_supported);
 
@@ -837,13 +998,20 @@ impl App {
         // Interval shading bind groups (if supported)
         let (interval_render_bg_a, interval_render_bg_b, interval_indirect_convert_bg) =
             if let Some(ref ip) = interval_pipelines {
-                let a = create_interval_render_bind_group(&device, ip, &buffers, &material);
+                let a = create_interval_render_bind_group(
+                    &device,
+                    ip,
+                    &buffers,
+                    &material,
+                    aux_data_buf.as_ref(),
+                );
                 let b = create_interval_render_bind_group_with_sort_values(
                     &device,
                     ip,
                     &buffers,
                     &material,
                     sort_state.values_b(),
+                    aux_data_buf.as_ref(),
                 );
                 let ic = create_interval_indirect_convert_bind_group(&device, ip, &buffers);
                 (Some(a), Some(b), Some(ic))
@@ -1815,6 +1983,7 @@ impl App {
                     ip,
                     &gpu.buffers,
                     &gpu.material_buffers,
+                    gpu.aux_data_buf.as_ref(),
                 ));
                 gpu.interval_render_bg_b =
                     Some(create_interval_render_bind_group_with_sort_values(
@@ -1823,6 +1992,7 @@ impl App {
                         &gpu.buffers,
                         &gpu.material_buffers,
                         gpu.sort_state.values_b(),
+                        gpu.aux_data_buf.as_ref(),
                     ));
                 gpu.interval_indirect_convert_bg = Some(
                     create_interval_indirect_convert_bind_group(&gpu.device, ip, &gpu.buffers),
@@ -2941,6 +3111,25 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if self.ignore_input
+            && matches!(
+                event,
+                WindowEvent::KeyboardInput { .. }
+                    | WindowEvent::ModifiersChanged(_)
+                    | WindowEvent::CursorMoved { .. }
+                    | WindowEvent::CursorEntered { .. }
+                    | WindowEvent::CursorLeft { .. }
+                    | WindowEvent::MouseWheel { .. }
+                    | WindowEvent::MouseInput { .. }
+                    | WindowEvent::Touch(_)
+                    | WindowEvent::PinchGesture { .. }
+                    | WindowEvent::DoubleTapGesture { .. }
+                    | WindowEvent::RotationGesture { .. }
+            )
+        {
+            return;
+        }
+
         // Feed events to egui first
         if let Some(gpu) = &mut self.gpu {
             if let Some(window) = &self.window {

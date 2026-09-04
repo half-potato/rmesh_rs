@@ -386,6 +386,7 @@ impl WebViewer {
             &scene.arrays.circumdata,
             self.camera.position,
             vp,
+            None,
         );
 
         let output = match self.surface.get_current_texture() {

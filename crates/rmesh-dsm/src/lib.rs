@@ -1364,6 +1364,10 @@ fn create_dsm_hw_compute_bg(
             buf_entry(9, &material.color_grads),
             buf_entry(10, sh_coeffs_buf),
             rmesh_util::gpu_helpers::tex_entry(11, shell_hiz_view),
+            // The same keep mask the camera pass applies: a tet that is under
+            // the importance bound from every free-space viewpoint is under
+            // it from the light's too.
+            buf_entry(12, &buffers.tet_visibility),
         ],
     })
 }
