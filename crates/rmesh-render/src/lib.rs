@@ -38,12 +38,17 @@ pub use rmesh_tile::{
     ScanPipelines, TileBuffers, TilePipelines,
 };
 
+pub mod overdraw;
 pub mod shell;
 pub mod shell_hiz;
 
 pub use shell::{
     create_shell_bind_group, record_shell_dsm_pass, record_shell_pass, ShellBuffers, ShellFace,
     ShellPipeline, ShellView,
+};
+pub use overdraw::{
+    record_overdraw_count, record_overdraw_viz, OverdrawPipelines, OverdrawTarget, OverdrawView,
+    VizUniforms,
 };
 pub use shell_hiz::{dummy_shell_hiz, record_shell_hiz, ShellHiZ, ShellHiZPipelines};
 
@@ -1000,6 +1005,10 @@ pub struct ComputeIntervalPipelines {
     pub render_pipeline: wgpu::RenderPipeline,
     /// Color-only render pipeline (no MRT)
     pub render_pipeline_color_only: wgpu::RenderPipeline,
+    /// Per-pixel overdraw probe: same vertex stage, depth state and draw as
+    /// `render_pipeline`, accumulating into one Rg16Float target instead of the
+    /// G-buffer. See [`crate::overdraw`].
+    pub overdraw_pipeline: wgpu::RenderPipeline,
     pub render_bg_layout: wgpu::BindGroupLayout,
     pub indirect_convert_pipeline: wgpu::ComputePipeline,
     pub indirect_convert_bg_layout: wgpu::BindGroupLayout,
@@ -1102,6 +1111,57 @@ impl ComputeIntervalPipelines {
                 operation: wgpu::BlendOperation::Add,
             },
         };
+
+        let overdraw_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("compute_interval_overdraw_pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vertex_shader,
+                entry_point: Some("main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            // Must match render_pipeline exactly, or the probe counts a
+            // different set of fragments than the one it is explaining.
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &fragment_shader,
+                entry_point: Some("fs_overdraw"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: crate::overdraw::OVERDRAW_FORMAT,
+                    // Accumulate, not `over`: the point is to count every
+                    // fragment, including the ones `over` would hide.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("compute_interval_render_pipeline"),
@@ -1267,6 +1327,7 @@ impl ComputeIntervalPipelines {
             gen_bg_layout,
             render_pipeline,
             render_pipeline_color_only,
+            overdraw_pipeline,
             render_bg_layout,
             indirect_convert_pipeline,
             indirect_convert_bg_layout,

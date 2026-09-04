@@ -209,6 +209,10 @@ pub struct GpuState {
     /// must be rebuilt whenever this is recreated (i.e. on resize).
     pub shell_hiz_pipelines: rmesh_render::ShellHiZPipelines,
     pub shell_hiz: rmesh_render::ShellHiZ,
+    /// Per-pixel overdraw heatmap. Recreated with the G-buffer on resize, since
+    /// its bind group holds the G-buffer colour view.
+    pub overdraw_pipelines: rmesh_render::OverdrawPipelines,
+    pub overdraw_target: rmesh_render::OverdrawTarget,
     /// Shell pyramid at DSM face resolution, built against the atlas's shared
     /// staging depth view so one instance serves every light and face.
     /// Rebuilt whenever the atlas is (re)allocated.

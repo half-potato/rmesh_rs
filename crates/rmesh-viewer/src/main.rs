@@ -221,6 +221,11 @@ struct App {
     // Flare gun
     flare_system: FlareSystem,
     shell_system: shell::ShellSystem,
+    /// Overdraw heatmap view. `RMESH_OVERDRAW=count|alpha|wasted` replaces the
+    /// final image with it; off costs nothing (the probe pass is not recorded).
+    overdraw_view: Option<rmesh_render::OverdrawView>,
+    /// Top of the heatmap's colour ramp, in fragments per pixel.
+    overdraw_scale: f32,
     /// `RMESH_SHOT` frame capture, for judging a change on the image.
     screenshot: Option<shell::Screenshot>,
     // Occlusion culling ('C' toggles). active_region -1 = no-cull (all visible);
@@ -371,6 +376,16 @@ impl App {
             rt_locate_ms: 0.0,
             flare_system: FlareSystem::default(),
             shell_system: shell::ShellSystem::from_env(),
+            overdraw_view: match std::env::var("RMESH_OVERDRAW").ok().as_deref() {
+                Some("count") | Some("1") => Some(rmesh_render::OverdrawView::Count),
+                Some("alpha") => Some(rmesh_render::OverdrawView::Alpha),
+                Some("wasted") => Some(rmesh_render::OverdrawView::Wasted),
+                _ => None,
+            },
+            overdraw_scale: std::env::var("RMESH_OVERDRAW_SCALE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(256.0),
             screenshot: shell::Screenshot::from_env(),
             cull_enabled: true,
             active_region: -2,
@@ -758,6 +773,16 @@ impl App {
             &sh_coeffs_buf,
             aux_data_buf.as_ref(),
         );
+        let overdraw_pipelines =
+            rmesh_render::OverdrawPipelines::new(&device, surface_config.format);
+        let overdraw_target = rmesh_render::OverdrawTarget::new(
+            &device,
+            &overdraw_pipelines,
+            &targets.color_view,
+            size.width.max(1),
+            size.height.max(1),
+        );
+
         let shell_hiz_pipelines = rmesh_render::ShellHiZPipelines::new(&device);
         let shell_hiz = rmesh_render::ShellHiZ::new(
             &device,
@@ -1498,6 +1523,8 @@ impl App {
             shell_pipeline,
             shell_buffers,
             shell_bg,
+            overdraw_pipelines,
+            overdraw_target,
             shell_hiz_pipelines,
             shell_hiz,
             dsm_shell_hiz: None,
@@ -2034,6 +2061,16 @@ impl App {
             // Recreate primitive depth target
             gpu.primitive_targets =
                 PrimitiveTargets::new(&gpu.device, new_size.width, new_size.height);
+
+            // Overdraw probe: screen-sized, and its bind group holds the
+            // G-buffer colour view that was just replaced.
+            gpu.overdraw_target = rmesh_render::OverdrawTarget::new(
+                &gpu.device,
+                &gpu.overdraw_pipelines,
+                &gpu.targets.color_view,
+                new_size.width,
+                new_size.height,
+            );
 
             // Recreate the density-shell Hi-Z, and with it every bind group that
             // holds its view. The projection bind groups sample the pyramid, and

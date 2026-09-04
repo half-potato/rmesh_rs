@@ -75,6 +75,49 @@ pub fn unpack_face(packed: u32) -> (usize, usize) {
 /// it, so faces shared by two dense tets (interior) drop out while faces on the
 /// domain boundary are kept. The result is therefore a closed surface, which is
 /// what makes its back faces a usable "ray exits the solid here" bound.
+/// Per-tet opacity: the alpha a single tet contributes to a ray that crosses it.
+///
+/// Thresholding raw density is the wrong test for "is this solid". Opacity is
+/// `1 - exp(-density * dt)`, so a large sparse tet can block more light than a
+/// small dense one, and a density-only threshold both admits tets that are
+/// nearly transparent and rejects tets that are not. `project_compute.wgsl`
+/// already makes this distinction for its own cull (`density * longest_edge`).
+///
+/// `dt` here is the mean chord `4V/S` — the average length of a ray's path
+/// through a convex body — rather than the longest edge, because the question is
+/// what a typical ray sees, not the worst case. Measured on `stump_conserv` the
+/// mean per-fragment alpha is 0.114, so the typical tet is nowhere near opaque
+/// on its own and the distinction matters.
+///
+/// The result is in [0, 1] and means the same thing in every scene, which is
+/// what makes a shared default threshold possible at all.
+pub fn tet_alphas(
+    verts: &[f32],
+    idxs: &[u32],
+    densities: &[f32],
+    tet_count: usize,
+) -> Vec<f32> {
+    (0..tet_count)
+        .map(|t| {
+            let p = |k: usize| v3_from(verts, idxs[t * 4 + k] as usize);
+            let (a, b, c, d) = (p(0), p(1), p(2), p(3));
+            let (e1, e2, e3) = (b - a, c - a, d - a);
+            let vol = e1.cross(e2).dot(e3).abs() / 6.0;
+            // Four faces of the tet, each half the cross product of two edges.
+            let area = 0.5
+                * (e1.cross(e2).length()
+                    + e1.cross(e3).length()
+                    + e2.cross(e3).length()
+                    + (c - b).cross(d - b).length());
+            if area <= 1e-20 {
+                return 0.0;
+            }
+            let dt = 4.0 * vol / area;
+            1.0 - (-densities[t] * dt).exp()
+        })
+        .collect()
+}
+
 /// Boundary faces of the dense set, given a prebuilt tet adjacency.
 ///
 /// The adjacency (`neighbors[tet * 4 + face]` = the tet across that face, or -1)
@@ -87,14 +130,16 @@ pub fn unpack_face(packed: u32) -> (usize, usize) {
 /// Face `f` of a dense tet is on the boundary exactly when the tet across it is
 /// absent or not dense. Output is ascending in packed id by construction, so it
 /// needs no sort to be reproducible.
+/// `metric` is a per-tet solidity score, not necessarily density: the shell
+/// passes [`tet_alphas`], the collision mesh passes raw densities.
 pub fn extract_boundary_faces_adj(
     neighbors: &[i32],
-    densities: &[f32],
+    metric: &[f32],
     tet_count: usize,
     threshold: f32,
     erosion_steps: u32,
 ) -> Vec<u32> {
-    let mut dense: Vec<bool> = (0..tet_count).map(|t| densities[t] >= threshold).collect();
+    let mut dense: Vec<bool> = (0..tet_count).map(|t| metric[t] >= threshold).collect();
     let initial_dense = dense.iter().filter(|&&d| d).count();
 
     // A tet owns a boundary face exactly when it is in the outer layer, so

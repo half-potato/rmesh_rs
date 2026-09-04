@@ -242,3 +242,20 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
 
     return out;
 }
+
+// Overdraw probe. Shares the vertex stage, depth state and draw call with
+// `main`, and has no discard, so its additive sum per pixel is exactly the
+// fragment count `main` shades — the spatial breakdown of the number the
+// FRAGMENT_SHADER_INVOCATIONS statistic only totals.
+//
+// `.g` accumulates each fragment's own alpha. Comparing that sum against the
+// final blended alpha in the G-buffer is what separates "this pixel has 200
+// fragments and needs them" from "this pixel saturated after 20 and blended 180
+// more into an already-opaque result". Target is Rg16Float, blend One/One:
+// integers are exact to 2048 there and degrade gracefully past it.
+@fragment
+fn fs_overdraw(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput)
+    -> @location(0) vec4<f32> {
+    let sc = shade_common(frag_coord, in);
+    return vec4<f32>(1.0, sc.alpha, 0.0, 0.0);
+}

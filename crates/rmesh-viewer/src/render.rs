@@ -532,12 +532,13 @@ impl App {
                         ui.label("Density Shell");
                         ui.checkbox(&mut shell_enabled, "Enable Shell");
                         ui.add_enabled_ui(shell_enabled, |ui| {
-                            // Log scale: densities are exp((u8 - 100) / 20), so
-                            // the useful range spans several decades and a linear
-                            // slider is unusable at the low end.
-                            let slider = egui::Slider::new(&mut shell_threshold, 0.001..=100.0)
-                                .logarithmic(true)
-                                .text("Density Threshold");
+                            // An opacity in [0, 1] -- the alpha one tet
+                            // contributes to a crossing ray -- so the range is
+                            // bounded and linear, and means the same thing in
+                            // every scene. It was raw density, which spanned
+                            // decades and had to be retuned per scene.
+                            let slider = egui::Slider::new(&mut shell_threshold, 0.0..=0.99)
+                                .text("Tet Opacity Threshold");
                             // Rebuild on release, not on drag: extraction is
                             // ~100ms on a multi-million-tet scene, fast enough
                             // to retune but not to hold a drag at frame rate.
@@ -1848,6 +1849,25 @@ impl App {
         // Labels of the postprocess passes bracketed this frame (encode order).
         // Empty when the deferred chain is skipped or encoder timestamps are
         // unavailable — then nothing is resolved.
+        // 2c. Overdraw probe. Replays the interval draw into a counting target,
+        //     so it measures the fragments that actually survived the shell
+        //     z-cull and the depth test this frame — not a geometric estimate.
+        if self.overdraw_view.is_some() && !skip_volume {
+            if self.render_mode == RenderMode::IntervalShader {
+                pp_time!("overdraw_probe", {
+                    rmesh_render::record_overdraw_count(
+                        &mut encoder,
+                        &gpu.compute_interval_pipelines,
+                        &gpu.buffers,
+                        &gpu.targets,
+                        &gpu.compute_interval_render_bg,
+                        &gpu.primitive_targets.depth_view,
+                        &gpu.overdraw_target,
+                    );
+                });
+            }
+        }
+
         // 3. Deferred shading pass (if enabled + PBR data present)
         if use_deferred {
             if let (Some(ref deferred), Some(ref bg), Some(ref out_view)) = (
@@ -2567,7 +2587,27 @@ impl App {
         }
 
         // 4. Blit to swapchain — from raytrace output, DSM debug, deferred output, or color_view
-        if self.render_mode == RenderMode::RayTrace {
+        if let Some(view_mode) = self.overdraw_view {
+            gpu.queue.write_buffer(
+                &gpu.overdraw_target.uniforms,
+                0,
+                bytemuck::bytes_of(&rmesh_render::VizUniforms {
+                    scale: self.overdraw_scale,
+                    mode: match view_mode {
+                        rmesh_render::OverdrawView::Count => 0,
+                        rmesh_render::OverdrawView::Alpha => 1,
+                        rmesh_render::OverdrawView::Wasted => 2,
+                    },
+                    _pad: [0; 2],
+                }),
+            );
+            rmesh_render::record_overdraw_viz(
+                &mut encoder,
+                &gpu.overdraw_pipelines,
+                &gpu.overdraw_target,
+                &view,
+            );
+        } else if self.render_mode == RenderMode::RayTrace {
             rmesh_render::record_blit_nf(
                 &mut encoder,
                 &gpu.rt_blit_pipeline,
@@ -2741,6 +2781,16 @@ impl App {
         // Capture before present: the surface texture is still ours to copy.
         if let Some(shot) = &self.screenshot {
             if gpu.ts_frame >= shot.at_frame {
+                if let Ok(path) = std::env::var("RMESH_OVERDRAW_DUMP") {
+                    if let Err(e) = crate::shell::dump_overdraw_probe(
+                        &gpu.device,
+                        &gpu.queue,
+                        &gpu.overdraw_target.texture,
+                        &path,
+                    ) {
+                        log::error!("[overdraw] {e}");
+                    }
+                }
                 if let Err(e) = shot.capture(&gpu.device, &gpu.queue, &output.texture) {
                     log::error!("[shot] {e}");
                 }
