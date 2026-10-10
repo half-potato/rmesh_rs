@@ -87,6 +87,14 @@ struct App {
     deferred_debug_mode: u32,
     ambient: f32,
     pbr_data: Option<rmesh_data::PbrData>,
+    // Occlusion culling ('C' toggles). active_region -1 = no-cull (all visible);
+    // -2 forces a first rebuild. active_mask_scratch is the bit-packed
+    // [ceil(M/32)] u32 mask uploaded to SceneBuffers.tet_visibility on change.
+    cull_enabled: bool,
+    active_region: i32,
+    active_mask_dirty: bool,
+    active_mask_scratch: Vec<u32>,
+    active_baked_count: u32,
 }
 
 impl App {
@@ -97,6 +105,7 @@ impl App {
         } else {
             pos
         };
+        let vis_words = ((scene.tet_count as usize + 31) / 32).max(1);
 
         Self {
             window: None,
@@ -128,7 +137,91 @@ impl App {
             deferred_debug_mode: 0,
             ambient: 0.05,
             pbr_data: pbr,
+            cull_enabled: false,
+            active_region: -2,
+            active_mask_dirty: true,
+            active_mask_scratch: vec![0xFFFF_FFFFu32; vis_words],
+            active_baked_count: 0,
         }
+    }
+
+    /// Occlusion-cull mask update: pick the region for the current camera and,
+    /// on any change, rebuild the bit-packed per-tet mask and upload it to
+    /// `SceneBuffers.tet_visibility`. No-op (all-ones) when cull is off, no
+    /// visibility data is baked, or the camera is outside all region coverage.
+    /// O(M) only on region/toggle change — cheap and infrequent.
+    fn update_cull_mask(&mut self) {
+        // Decide the target region (read-only borrows).
+        let cam = self.camera.position;
+        let target: i32 = match (&self.scene_data.visibility, self.cull_enabled) {
+            (Some(vis), true) => {
+                let mut best = -1i32;
+                let mut best_d2 = f32::INFINITY;
+                for r in 0..vis.num_regions as usize {
+                    let cx = vis.region_centroids[r * 3];
+                    let cy = vis.region_centroids[r * 3 + 1];
+                    let cz = vis.region_centroids[r * 3 + 2];
+                    let d2 = (cam.x - cx).powi(2) + (cam.y - cy).powi(2) + (cam.z - cz).powi(2);
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = r as i32;
+                    }
+                }
+                // Coverage check: outside radius (×margin) => no-cull fallback.
+                if best >= 0 {
+                    let radius = vis.region_radii.get(best as usize).copied().unwrap_or(0.0);
+                    let margin = 1.25_f32;
+                    if best_d2 > (radius * margin).powi(2) {
+                        best = -1;
+                    }
+                }
+                best
+            }
+            _ => -1, // cull off or no visibility data => render all
+        };
+
+        if target == self.active_region && !self.active_mask_dirty {
+            return;
+        }
+
+        // Rebuild the bit-packed active mask (disjoint field borrows).
+        let m = self.scene_data.tet_count as usize;
+        let words = self.active_mask_scratch.len();
+        if target < 0 {
+            // No-cull: all bits set.
+            for w in self.active_mask_scratch.iter_mut() {
+                *w = 0xFFFF_FFFFu32;
+            }
+        } else if let Some(vis) = self.scene_data.visibility.as_ref() {
+            let scratch = &mut self.active_mask_scratch;
+            for w in scratch.iter_mut() {
+                *w = 0;
+            }
+            let row = &vis.masks[(target as usize) * m..(target as usize) * m + m];
+            for (t, &v) in row.iter().enumerate() {
+                if v != 0 {
+                    scratch[t >> 5] |= 1u32 << (t & 31);
+                }
+            }
+        }
+        // popcount for HUD.
+        self.active_baked_count = self
+            .active_mask_scratch
+            .iter()
+            .map(|w| w.count_ones())
+            .sum::<u32>()
+            .min(m as u32);
+
+        // Upload (immutable borrows of gpu + scratch — disjoint, OK).
+        if let Some(gpu) = self.gpu.as_ref() {
+            gpu.queue.write_buffer(
+                &gpu.buffers.tet_visibility,
+                0,
+                bytemuck::cast_slice(&self.active_mask_scratch[..words]),
+            );
+        }
+        self.active_region = target;
+        self.active_mask_dirty = false;
     }
 
     fn init_gpu(&mut self, window: Arc<Window>) {
@@ -969,6 +1062,17 @@ impl ApplicationHandler for App {
                 // Track shift state for shift+left-click pan
                 if matches!(code, KeyCode::ShiftLeft | KeyCode::ShiftRight) {
                     self.shift_pressed = key_event.state == ElementState::Pressed;
+                }
+
+                // 'C' toggles occlusion culling (mask rebuilt next frame).
+                if code == KeyCode::KeyC && key_event.state == ElementState::Pressed {
+                    if self.scene_data.visibility.is_some() {
+                        self.cull_enabled = !self.cull_enabled;
+                        self.active_mask_dirty = true;
+                        log::info!("Occlusion cull: {}", if self.cull_enabled { "ON" } else { "OFF" });
+                    } else {
+                        log::info!("Occlusion cull: no visibility data baked in this .rmesh");
+                    }
                 }
 
                 // Try interaction system first

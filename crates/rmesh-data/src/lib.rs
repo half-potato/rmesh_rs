@@ -62,6 +62,25 @@ pub struct SceneData {
     pub vertex_count: u32,
     /// Number of tetrahedra
     pub tet_count: u32,
+    /// Optional per-region occlusion visibility (PVS) from tagged sections.
+    pub visibility: Option<VisibilityData>,
+}
+
+/// Per-region tet visibility (occlusion PVS), loaded from tagged extension
+/// sections. Used by the viewer to skip tets not visible from the current
+/// camera's region. See `bake_visibility.py` / `convert.py --visibility`.
+#[derive(Clone)]
+pub struct VisibilityData {
+    /// Number of regions K.
+    pub num_regions: u32,
+    /// Number of tets M (matches SceneData.tet_count).
+    pub tet_count: u32,
+    /// Row-major [K × M] u8 mask; 1 = tet visible from that region.
+    pub masks: Vec<u8>,
+    /// Region centroids [K × 3] f32, in the baked world frame (matches Camera.position).
+    pub region_centroids: Vec<f32>,
+    /// Region radii [K] f32 (coverage radius per region).
+    pub region_radii: Vec<f32>,
 }
 
 /// SH color coefficients loaded from an .rmesh file (separate from scene geometry).
@@ -326,9 +345,15 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     log::info!("Circumspheres: {:.2}s", t0.elapsed().as_secs_f64());
 
     // --- Parse tagged extension sections (if present) ---
-    let pbr_data = parse_tagged_extensions(data, &mut offset);
+    let (pbr_data, visibility) = parse_tagged_extensions(data, &mut offset);
     if pbr_data.is_some() {
         log::info!("Found PBR tagged extension sections");
+    }
+    if let Some(v) = &visibility {
+        log::info!(
+            "Found visibility (occlusion PVS) section: {} regions × {} tets",
+            v.num_regions, v.tet_count
+        );
     }
 
     log::info!("Total parse time: {:.2}s", t_total.elapsed().as_secs_f64());
@@ -348,6 +373,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
             start_pose,
             vertex_count,
             tet_count,
+            visibility,
         },
         sh,
         pbr_data,
@@ -358,23 +384,33 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
 // Tagged extension section parser
 // ---------------------------------------------------------------------------
 
-/// Try to parse PBR tagged extensions from remaining data after gradients.
-fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
+/// Try to parse PBR + visibility tagged extensions from remaining data after
+/// gradients. Returns (pbr, visibility); either may be None independently.
+fn parse_tagged_extensions(
+    data: &[u8],
+    offset: &mut usize,
+) -> (Option<PbrData>, Option<VisibilityData>) {
     // Align to 4 bytes
     *offset = (*offset + 3) & !3;
 
     // Need at least 8 bytes for magic + section count
     if *offset + 8 > data.len() {
-        return None;
+        return (None, None);
     }
 
-    let magic = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?);
+    let magic = match data[*offset..*offset + 4].try_into() {
+        Ok(b) => u32::from_le_bytes(b),
+        Err(_) => return (None, None),
+    };
     if magic != TAGGED_MAGIC {
-        return None;
+        return (None, None);
     }
     *offset += 4;
 
-    let num_sections = u32::from_le_bytes(data[*offset..*offset + 4].try_into().ok()?) as usize;
+    let num_sections = match data[*offset..*offset + 4].try_into() {
+        Ok(b) => u32::from_le_bytes(b) as usize,
+        Err(_) => return (None, None),
+    };
     *offset += 4;
 
     log::info!("Parsing {} tagged extension sections...", num_sections);
@@ -386,6 +422,11 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
     let mut brdf_layers = Vec::new();
     let mut retro_weights = Vec::new();
     let mut retro_bias = Vec::new();
+    // Visibility (occlusion PVS) sections.
+    let mut vis_masks: Vec<u8> = Vec::new();
+    let mut vis_shape: Vec<u32> = Vec::new();
+    let mut region_centroids: Vec<f32> = Vec::new();
+    let mut region_radii: Vec<f32> = Vec::new();
 
     for _ in 0..num_sections {
         if *offset + 16 > data.len() {
@@ -449,26 +490,66 @@ fn parse_tagged_extensions(data: &[u8], offset: &mut usize) -> Option<PbrData> {
                     retro_weights = vals;
                 }
             }
+            "tet_visibility" => {
+                // Raw u8 mask [K × M]; dtype must be 2 (u8). Copy verbatim.
+                if dtype == 2 {
+                    vis_masks = payload.to_vec();
+                    vis_shape = shape.clone();
+                } else {
+                    log::warn!("tet_visibility expected dtype=2 (u8), got {}", dtype);
+                }
+            }
+            "region_centroids" => {
+                region_centroids = f16_payload_to_f32(payload, dtype);
+            }
+            "region_radii" => {
+                region_radii = f16_payload_to_f32(payload, dtype);
+            }
             other => {
                 log::info!("  skipping unknown section '{}'", other);
             }
         }
     }
 
-    // Only return PbrData if we got at least the material channels
-    if roughness.is_empty() && env_feature.is_empty() && albedo.is_empty() {
-        return None;
-    }
+    // PbrData only if we got at least one material channel.
+    let pbr = if roughness.is_empty() && env_feature.is_empty() && albedo.is_empty() {
+        None
+    } else {
+        Some(PbrData {
+            roughness,
+            env_feature,
+            albedo,
+            vertex_normals,
+            brdf_layers,
+            retro_weights,
+            retro_bias,
+        })
+    };
 
-    Some(PbrData {
-        roughness,
-        env_feature,
-        albedo,
-        vertex_normals,
-        brdf_layers,
-        retro_weights,
-        retro_bias,
-    })
+    // VisibilityData only if a well-formed [K × M] mask was present.
+    let visibility = if !vis_masks.is_empty() && vis_shape.len() == 2 {
+        let num_regions = vis_shape[0];
+        let tet_count = vis_shape[1];
+        if vis_masks.len() == (num_regions as usize) * (tet_count as usize) {
+            Some(VisibilityData {
+                num_regions,
+                tet_count,
+                masks: vis_masks,
+                region_centroids,
+                region_radii,
+            })
+        } else {
+            log::warn!(
+                "tet_visibility size {} != K*M {}*{}; ignoring",
+                vis_masks.len(), num_regions, tet_count
+            );
+            None
+        }
+    } else {
+        None
+    };
+
+    (pbr, visibility)
 }
 
 /// Convert tagged section payload to f32 based on dtype code.
@@ -795,6 +876,7 @@ pub fn load_ply(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
             start_pose: [0.0; 7],
             vertex_count,
             tet_count,
+            visibility: None,
         },
         sh,
         None, // PLY files don't have tagged extensions

@@ -205,6 +205,7 @@ pub fn build_test_scene(
         start_pose: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
         vertex_count,
         tet_count,
+        visibility: None,
     }
 }
 
@@ -316,6 +317,7 @@ pub fn grid_tet_scene(grid_size: u32) -> SceneData {
         start_pose: [0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0],
         vertex_count,
         tet_count,
+        visibility: None,
     }
 }
 

@@ -33,6 +33,9 @@ impl App {
             return;
         }
 
+        // Occlusion-cull mask: pick region for current camera, upload on change.
+        self.update_cull_mask();
+
         let (w, h) = {
             let g = self.gpu.as_ref().unwrap();
             (g.surface_config.width, g.surface_config.height)
@@ -59,6 +62,10 @@ impl App {
         let pos = self.camera.position.to_array();
         let fps = self.fps;
         let visible_count = self.gpu.as_ref().map_or(0, |g| g.visible_instance_count);
+        let cull_on = self.cull_enabled;
+        let cull_region = self.active_region;
+        let cull_baked = self.active_baked_count;
+        let has_vis = self.scene_data.visibility.is_some();
         let gpu_times = self.gpu.as_ref().map_or(GpuTimings::default(), |g| g.gpu_times_ms.clone());
         let cpu_times = self.gpu.as_ref().map_or(CpuTimings::default(), |g| g.cpu_times_ms.clone());
 
@@ -262,9 +269,16 @@ impl App {
                         }
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let cull_str = if !has_vis {
+                            String::new()
+                        } else if cull_on {
+                            format!("  |  cull:ON r={} baked={}", cull_region, cull_baked)
+                        } else {
+                            "  |  cull:OFF".to_string()
+                        };
                         ui.label(format!(
-                            "FPS: {:.0}  |  {} vis / {} tets  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Pre:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
-                            fps, visible_count, tet_count,
+                            "FPS: {:.0}  |  {} vis / {} tets{}  |  GPU: {:.1}ms (SH:{:.1} Proj:{:.1} Sort:{:.1} Pre:{:.1} Rend:{:.1})  |  CPU: {:.1}ms (Poll:{:.1} Acq:{:.1} Egui:{:.1} Enc:{:.1} Sub:{:.1} Pres:{:.1})",
+                            fps, visible_count, tet_count, cull_str,
                             gpu_times.total_ms,
                             gpu_times.sh_eval_ms,
                             gpu_times.project_ms,

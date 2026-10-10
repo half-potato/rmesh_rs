@@ -127,6 +127,10 @@ pub struct SceneBuffers {
     pub interval_args_buf: wgpu::Buffer,
     /// Per-vertex normals [N × 3] f32 (optional, for interval tiled xyzd output)
     pub vertex_normals: wgpu::Buffer,
+    /// Occlusion-cull mask: ACTIVE region's per-tet visibility, bit-packed
+    /// [ceil(M/32)] u32 (bit t set = tet t visible). Initialized all-ones
+    /// (no-cull); the viewer rewrites it per region. Gated in project_compute.
+    pub tet_visibility: wgpu::Buffer,
 }
 
 /// GPU buffers for per-tet material/appearance data (pluggable per rendering mode).
@@ -291,6 +295,16 @@ impl SceneBuffers {
             mapped_at_creation: false,
         });
 
+        // Occlusion-cull mask, bit-packed [ceil(M/32)] u32. Default all-ones so
+        // every tet is visible (no-cull) until the viewer writes a region mask —
+        // guarantees byte-identical output to the pre-cull pipeline.
+        let vis_words = ((scene.tet_count as usize + 31) / 32).max(1);
+        let tet_visibility = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("tet_visibility"),
+            contents: bytemuck::cast_slice(&vec![0xFFFF_FFFFu32; vis_words]),
+            usage: storage_copy,
+        });
+
         Self {
             vertices,
             indices,
@@ -309,6 +323,7 @@ impl SceneBuffers {
             interval_fan_index_buf,
             interval_args_buf,
             vertex_normals,
+            tet_visibility,
         }
     }
 }
@@ -412,15 +427,17 @@ impl ForwardPipelines {
         // Bindings 6-11: read-write storage (colors, sort_keys, sort_values, indirect_args, tiles_touched, compact_tet_ids)
         // Binding 12: read-only storage (base_colors)
         // Binding 13: read-only storage (sh_coeffs, f16-packed)
+        // Binding 14: read-only storage (tet_visibility, occlusion-cull mask)
         let compute_read_only = [
             true, true, true, true, true, true, // 0-5 read-only
             false, false, false, false,          // 6-9 read-write
             false, false,                        // 10-11 read-write (tiles_touched, compact_tet_ids)
             true,                                // 12 read-only (base_colors)
             true,                                // 13 read-only (sh_coeffs)
+            true,                                // 14 read-only (tet_visibility)
         ];
         let compute_entries = storage_entries(
-            14,
+            15,
             wgpu::ShaderStages::COMPUTE,
             &compute_read_only,
         );
@@ -1578,14 +1595,14 @@ pub fn record_tex_to_buffer(
 // Bind Groups
 // ---------------------------------------------------------------------------
 
-/// Create the compute bind group (14 bindings).
+/// Create the compute bind group (15 bindings).
 ///
 /// Binding order matches `project_compute.wgsl`:
 ///   0: uniforms, 1: vertices, 2: indices, 3: densities,
 ///   4: color_grads, 5: circumdata,
 ///   6: colors, 7: sort_keys, 8: sort_values, 9: indirect_args,
 ///   10: tiles_touched, 11: compact_tet_ids, 12: base_colors,
-///   13: sh_coeffs (f16-packed)
+///   13: sh_coeffs (f16-packed), 14: tet_visibility (occlusion-cull mask)
 pub fn create_compute_bind_group(
     device: &wgpu::Device,
     pipelines: &ForwardPipelines,
@@ -1611,6 +1628,7 @@ pub fn create_compute_bind_group(
             buf_entry(11, &buffers.compact_tet_ids),
             buf_entry(12, &material.base_colors),
             buf_entry(13, sh_coeffs_buf),
+            buf_entry(14, &buffers.tet_visibility),
         ],
     })
 }
