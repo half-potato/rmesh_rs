@@ -27,7 +27,7 @@ use rmesh_interact::{
     VertexSelectInteraction, VertexSelectResult,
 };
 use rmesh_pbd::{
-    build_island, color_constraints, ConstraintColoring, Island, MeshTopology, PbdSolver,
+    MeshTopology, PbdSolver,
 };
 use rmesh_util::camera::Camera;
 use wgpu::util::DeviceExt;
@@ -47,90 +47,24 @@ use rmesh_render::{
     SceneBuffers,
 };
 
-mod flare;
+use rmesh_viewer_core::flare;
 mod gpu_state;
 mod shell;
-mod importance;
+use rmesh_viewer_core::importance;
 mod oracle;
 mod render;
+use rmesh_viewer_core::light_bake;
+mod reference_volume;
+mod benchmark;
 use flare::FlareSystem;
 use gpu_state::*;
 
-/// Read a 0/1 environment override for a boolean toggle, falling back to
-/// `default` when unset or unparseable.
-/// Quality presets: one menu pick that sets every speed/quality knob at once.
-/// Each preset is a full assignment of the knobs it lists, so picking one is
-/// reproducible regardless of what was fiddled with before; touching any of
-/// those knobs afterwards shows as "Custom".
-///
-/// Measured on stump_conserv at 1080p (sRGB PSNR against Reference):
-/// Reference 38 fps; High 44 fps, 37.1 dB / 0.996; Medium 49 fps, 36.8 dB /
-/// 0.995; Low 58 fps, 24.3 dB / 0.960 (SSGI off); Lowest 12 fps — the CPU sort
-/// of 6.5M tets is ~60 ms, so it is for backends without subgroups, not speed.
-/// Geometry is 16 of the ~23 ms at High; the whole screen-space chain is 5 ms.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QualityPreset {
-    /// CPU sort (no subgroups needed), no screen-space effects, aggressive
-    /// importance cull. The floor for weak or subgroup-less GPUs.
-    Lowest,
-    /// 16-bit GPU sort, no screen-space effects.
-    Low,
-    /// 16-bit GPU sort, SSGI kept, AO and SSR dropped. Measured on stump:
-    /// SSGI off costs 13 dB against the reference frame (it is most of the
-    /// indirect light), AO + SSR off together cost 0.3 dB — so this is the
-    /// cheap half of the chain to shed, not the obvious one.
-    Medium,
-    /// Everything on with the measured-safe culls (the default).
-    High,
-    /// Everything on, no shell, no importance cull: the ground truth.
-    Reference,
-}
-
-impl QualityPreset {
-    pub const ALL: [QualityPreset; 5] = [
-        QualityPreset::Lowest,
-        QualityPreset::Low,
-        QualityPreset::Medium,
-        QualityPreset::High,
-        QualityPreset::Reference,
-    ];
-
-    pub fn label(self) -> &'static str {
-        match self {
-            QualityPreset::Lowest => "Lowest",
-            QualityPreset::Low => "Low",
-            QualityPreset::Medium => "Medium",
-            QualityPreset::High => "High",
-            QualityPreset::Reference => "Reference",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|p| p.label().eq_ignore_ascii_case(name.trim()))
-    }
-
-    /// The knob values this preset stands for:
-    /// (sort, ao, ssgi, ssr, shell, importance, importance threshold).
-    fn knobs(self) -> (SortMode, bool, bool, bool, bool, bool, f32) {
-        match self {
-            QualityPreset::Lowest => (SortMode::Cpu, false, false, false, true, true, 0.03),
-            QualityPreset::Low => (SortMode::Gpu16, false, false, false, true, true, 0.02),
-            QualityPreset::Medium => (SortMode::Gpu16, false, true, false, true, true, 0.01),
-            QualityPreset::High => (SortMode::Gpu32, true, true, true, true, true, 0.01),
-            QualityPreset::Reference => (SortMode::Gpu32, true, true, true, false, false, 0.01),
-        }
-    }
-}
+pub use rmesh_viewer_core::quality::QualityPreset;
 
 /// The knobs a preset governs, borrowed individually so the render loop can
 /// use them while it holds `gpu` mutably.
 pub struct QualityKnobs<'a> {
     pub sort_mode: &'a mut SortMode,
-    pub ao_enabled: &'a mut bool,
-    pub ssgi_enabled: &'a mut bool,
-    pub ssr_enabled: &'a mut bool,
     pub shell: &'a mut shell::ShellSystem,
 }
 
@@ -138,11 +72,8 @@ impl QualityKnobs<'_> {
     /// Which preset the current knobs match exactly, if any.
     pub fn current(&self) -> Option<QualityPreset> {
         QualityPreset::ALL.into_iter().find(|p| {
-            let (sort, ao, ssgi, ssr, shell, imp, thr) = p.knobs();
+            let (sort, shell, imp, thr) = p.knobs();
             *self.sort_mode == sort
-                && *self.ao_enabled == ao
-                && *self.ssgi_enabled == ssgi
-                && *self.ssr_enabled == ssr
                 && self.shell.enabled == shell
                 && self.shell.importance_enabled == imp
                 && (!imp || (self.shell.importance_threshold - thr).abs() < 1e-6)
@@ -150,11 +81,8 @@ impl QualityKnobs<'_> {
     }
 
     pub fn apply(&mut self, preset: QualityPreset) {
-        let (sort, ao, ssgi, ssr, shell, imp, thr) = preset.knobs();
+        let (sort, shell, imp, thr) = preset.knobs();
         *self.sort_mode = sort;
-        *self.ao_enabled = ao;
-        *self.ssgi_enabled = ssgi;
-        *self.ssr_enabled = ssr;
         if shell && !self.shell.enabled {
             self.shell.mark_dirty();
         }
@@ -169,9 +97,6 @@ impl App {
     fn quality_knobs(&mut self) -> QualityKnobs<'_> {
         QualityKnobs {
             sort_mode: &mut self.sort_mode,
-            ao_enabled: &mut self.ao_enabled,
-            ssgi_enabled: &mut self.ssgi_enabled,
-            ssr_enabled: &mut self.ssr_enabled,
             shell: &mut self.shell_system,
         }
     }
@@ -185,72 +110,7 @@ fn env_flag(name: &str, default: bool) -> bool {
     }
 }
 
-/// Create an Rgba32Float texture for copying the raytrace buffer output to blit.
-/// Hard-fail when the loaded PbrData is missing the parametric BRDF channels
-/// (metallic / f0_dielectric / albedo / roughness). This is what we'd see
-/// for a .rmesh file produced by an old `convert.py` (env_feature/MLP era);
-/// the deferred shader has no way to render those, so refuse to upload garbage.
-fn require_parametric_pbr(pbr: &rmesh_data::PbrData, tet_count: usize) {
-    let lens = [
-        ("roughness", pbr.roughness.len()),
-        ("metallic", pbr.metallic.len()),
-        ("f0_dielectric", pbr.f0_dielectric.len()),
-        ("albedo", pbr.albedo.len() / 3),
-    ];
-    let bad: Vec<_> = lens.iter().filter(|(_, l)| *l != tet_count).collect();
-    if !bad.is_empty() {
-        let detail = bad
-            .iter()
-            .map(|(name, l)| format!("{}={}", name, l))
-            .collect::<Vec<_>>()
-            .join(", ");
-        panic!(
-            "PBR data missing parametric BRDF channels for {} tets ({}). \
-             This .rmesh was likely produced with an older convert.py — \
-             regenerate it with the parametric-BRDF convert.py that emits \
-             metallic / f0_dielectric tagged sections.",
-            tet_count, detail,
-        );
-    }
-}
-
-fn create_rt_texture(
-    device: &wgpu::Device,
-    width: u32,
-    height: u32,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("rt_output_texture"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba32Float,
-        usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
-/// Rich result from [`App::pick_vertex_info`]. The hover preview uses
-/// `screen_pos` to draw a marker; the click handler uses the other fields
-/// for the diagnostic log.
-#[derive(Clone, Copy, Debug)]
-pub struct PickInfo {
-    pub idx: u32,
-    pub screen_pos: [f32; 2],
-    pub screen_dist: f32,
-    pub view_depth: f32,
-    pub candidates_in_radius: u32,
-    pub candidates_passing_depth: u32,
-    pub visible_depth: Option<f32>,
-    pub depth_tol: f32,
-}
+pub use rmesh_viewer_core::vertices::PickInfo;
 
 struct App {
     window: Option<Arc<Window>>,
@@ -312,40 +172,7 @@ struct App {
     // Animation
     anim_clock: AnimationClock,
     animated_scene: Option<AnimatedScene>,
-    // Deferred PBR shading
-    deferred_enabled: bool,
-    deferred_debug_mode: u32,
-    ambient: f32,
-    sky_color: [f32; 3],
-    ground_color: [f32; 3],
-    exposure: f32,
-    ao_enabled: bool,
-    ao_strength: f32,
-    gtao_radius: f32,
-    ssgi_enabled: bool,
-    /// Screen-space reflections; off skips the SSR + temporal + copy passes
-    /// and zeroes the deferred blend weight.
-    ssr_enabled: bool,
-    ssgi_strength: f32,
-    ssgi_radius: f32,
-    /// History blend factor: 1.0 = no temporal accumulation, 0.0 = frozen.
-    ssgi_temporal_alpha: f32,
-    ao_temporal_alpha: f32,
-    ssr_temporal_alpha: f32,
-    /// Previous frame's view-projection (for inline camera motion vectors).
-    prev_view_proj: glam::Mat4,
-    dsm_query_depth: f32,
-    /// Cached light state for DSM dirty detection.
-    cached_dsm_lights: Vec<rmesh_render::GpuLight>,
-    cached_dsm_num_lights: u32,
-    /// Scene AABB (min, max) in world space, computed once for exact DSM
-    /// far-plane bounds. Lazily filled on first DSM build.
-    cached_scene_aabb: Option<(glam::Vec3, glam::Vec3)>,
     pbr_data: Option<rmesh_data::PbrData>,
-    // Ray trace CPU-side state
-    rt_neighbors_cpu: Vec<i32>,
-    rt_start_tet_hint: i32,
-    rt_locate_ms: f32,
     // Flare gun
     flare_system: FlareSystem,
     shell_system: shell::ShellSystem,
@@ -356,6 +183,7 @@ struct App {
     overdraw_scale: f32,
     /// `RMESH_SHOT` frame capture, for judging a change on the image.
     screenshot: Option<shell::Screenshot>,
+    benchmark: Option<benchmark::Benchmark>,
     /// `RMESH_QUALITY=<preset>`: applied on the first frame, so it overrides
     /// the individual env toggles.
     pending_quality: Option<QualityPreset>,
@@ -376,10 +204,6 @@ struct App {
     active_baked_count: u32,
     // One-shot sub-pixel tet measurement (press 'M' to re-run for the current view).
     measure_subpixel: bool,
-    /// One-shot: spawn RMESH_LIGHTS point lights on the first rendered frame.
-    /// Deferred until then because the orbit camera (which positions them) is
-    /// only meaningful once a scene is loaded.
-    profile_lights_pending: u32,
     // One-shot GPU timing probe: press 'T' to drain the swapchain for a few
     // frames so one completes, then log drawn-tet-count + per-stage GPU ms.
     timing_probe_frames: u32,
@@ -442,6 +266,7 @@ impl App {
         };
         let vis_words = ((scene.tet_count as usize + 31) / 32).max(1);
 
+        let initial_light = light_bake::default_light(&scene);
         Self {
             window: None,
             gpu: None,
@@ -458,20 +283,13 @@ impl App {
             fps: 0.0,
             loaded_path: None,
             pending_load: None,
-            vsync: env_flag("RMESH_VSYNC", true),
-            // Default to IntervalShader when PBR data is loaded — only this
-            // path runs interval_fragment.wgsl, which writes the metallic/F0
-            // channels the deferred shader expects. Other modes write
-            // legacy (t_min, t_max, od, dist) into aux0 and the deferred shader
-            // would misread them as PBR values (metallic ≈ t_max → all green).
-            render_mode: if pbr.is_some() {
-                RenderMode::IntervalShader
-            } else {
-                RenderMode::Regular
-            },
+            vsync: std::env::var_os("RMESH_BENCHMARK").is_none() && env_flag("RMESH_VSYNC", true),
+            // The production renderer integrates radiance into a single target.
+            render_mode: RenderMode::IntervalShader,
             mesh_shader_supported: false,
             use_mesh_shader: true,
-            show_primitives: true,
+            // Matched linear captures exclude light gizmos and opaque helpers.
+            show_primitives: std::env::var_os("RMESH_LINEAR_SHOT").is_none(),
             show_scene: true,
             // RMESH_SORT=gpu32|gpu16|cpu pins the sort path for headless A/Bs.
             sort_mode: match std::env::var("RMESH_SORT").ok().as_deref() {
@@ -488,37 +306,11 @@ impl App {
             pbd_radius: 0.25,
             pbd_hover_vertex: None,
             pbd_vertex_max_density: None,
-            primitives: Vec::new(),
+            primitives: vec![initial_light],
             next_primitive_id: 1,
             anim_clock: AnimationClock::new(),
             animated_scene: None,
-            // RMESH_DEFERRED/RMESH_AO/RMESH_SSGI (0|1) pin the effect toggles at
-            // startup so the profiler can sweep configurations non-interactively.
-            deferred_enabled: env_flag("RMESH_DEFERRED", pbr.is_some()),
-            deferred_debug_mode: 0,
-            ambient: 0.3,
-            sky_color: [0.0, 0.0, 0.0],
-            ground_color: [0.0, 0.0, 0.0],
-            exposure: 1.0,
-            ao_enabled: env_flag("RMESH_AO", true),
-            ao_strength: 1.0,
-            gtao_radius: 0.5,
-            ssgi_enabled: env_flag("RMESH_SSGI", true),
-            ssr_enabled: env_flag("RMESH_SSR", true),
-            ssgi_strength: 1.0,
-            ssgi_radius: 1.5,
-            ssgi_temporal_alpha: 0.2,
-            ao_temporal_alpha: 0.2,
-            ssr_temporal_alpha: 0.2,
-            prev_view_proj: glam::Mat4::IDENTITY,
-            dsm_query_depth: 1.0,
-            cached_dsm_lights: Vec::new(),
-            cached_dsm_num_lights: 0,
-            cached_scene_aabb: None,
             pbr_data: pbr,
-            rt_neighbors_cpu: Vec::new(),
-            rt_start_tet_hint: -1,
-            rt_locate_ms: 0.0,
             flare_system: FlareSystem::default(),
             shell_system: shell::ShellSystem::from_env(),
             overdraw_view: match std::env::var("RMESH_OVERDRAW").ok().as_deref() {
@@ -532,8 +324,9 @@ impl App {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(256.0),
             screenshot: shell::Screenshot::from_env(),
+            benchmark: benchmark::Benchmark::from_env(),
             pending_quality: std::env::var("RMESH_QUALITY").ok().and_then(|v| QualityPreset::from_name(&v)),
-            ignore_input: env_flag(
+            ignore_input: std::env::var_os("RMESH_BENCHMARK").is_some() || env_flag(
                 "RMESH_NO_INPUT",
                 std::env::var_os("RMESH_SHOT").is_some() || std::env::var_os("RMESH_ORACLE").is_some(),
             ),
@@ -550,10 +343,6 @@ impl App {
             // RMESH_OVERDRAW_PROBE=1 fires the 'M' sub-pixel/overdraw probe on the
             // first frame, so it can be captured without a keypress.
             measure_subpixel: env_flag("RMESH_OVERDRAW_PROBE", false),
-            profile_lights_pending: std::env::var("RMESH_LIGHTS")
-                .ok()
-                .and_then(|v| v.parse::<u32>().ok())
-                .unwrap_or(0),
             timing_probe_frames: 0,
         }
     }
@@ -784,24 +573,14 @@ impl App {
         };
         surface.configure(&device, &surface_config);
 
-        // `color_format` now covers only the non-G-buffer targets that happen to
-        // be Rgba16Float: the DSM moment atlas, the deferred output and the
-        // debug textures. The four G-buffer attachments are named separately by
-        // `gbuffer_formats` so narrowing one cannot leak into DSM.
         let color_format = wgpu::TextureFormat::Rgba16Float;
         // RMESH_GBUF="color=rgba8srgb,aux0=rgba16f" overrides the attachment
         // formats for a perf sweep without a rebuild.
-        let gbuffer_formats = rmesh_util::shared::GBufferFormats::from_env();
-        log::info!(
-            "G-buffer: color={:?} aux0={:?} normals={:?} depth={:?} ({} B/px, {} ROP slots)",
-            gbuffer_formats.color,
-            gbuffer_formats.aux0,
-            gbuffer_formats.normals,
-            gbuffer_formats.depth,
-            gbuffer_formats.bytes_per_pixel(),
-            gbuffer_formats.rop_slots(),
-        );
-
+        let gbuffer_formats = rmesh_util::shared::GBufferFormats {
+            color: wgpu::TextureFormat::Rgba16Float,
+            ..rmesh_util::shared::GBufferFormats::from_env()
+        };
+        log::info!("Volume output: one Rgba16Float radiance target");
         log::info!("Compiling shader pipelines...");
         let t0 = std::time::Instant::now();
         let pipelines = ForwardPipelines::new(&device, gbuffer_formats);
@@ -818,7 +597,7 @@ impl App {
         } else {
             None
         };
-        let compute_interval_pipelines = ComputeIntervalPipelines::new(&device, gbuffer_formats);
+        let mut compute_interval_pipelines = ComputeIntervalPipelines::new(&device, gbuffer_formats);
         log::info!("Pipelines compiled: {:.2}s", t0.elapsed().as_secs_f64());
 
         log::info!(
@@ -828,63 +607,17 @@ impl App {
         let t0 = std::time::Instant::now();
         let buffers = SceneBuffers::upload(&device, &queue, &self.scene_data);
 
-        // Allocate base_colors with zeros — GPU SH eval will fill them
-        let zero_colors = vec![0.0f32; self.scene_data.tet_count as usize * 3];
-        let material = MaterialBuffers::upload(
-            &device,
-            &zero_colors,
-            &self.scene_data.color_grads,
-            self.scene_data.tet_count,
-        );
+        let (material, sh_coeffs_buf) = light_bake::upload_material(
+            &device, &queue, &self.scene_data, self.pbr_data.as_ref(), &buffers);
+        let sh_degree = 0;
+        let light_bake = light_bake::LightBake::new(&device, &queue, &self.scene_data, &self.sh_coeffs, self.pbr_data.as_ref(), &buffers);
+        light_bake.configure_interval(&device, &mut compute_interval_pipelines);
 
-        // Upload SH coefficients to GPU as f16-packed u32 array
-        let sh_total_dims =
-            ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
-        let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
-        let sh_coeffs_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sh_coeffs"),
-            contents: bytemuck::cast_slice(&sh_coeffs_packed),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let sh_degree = self.sh_coeffs.degree;
-
-        // Upload PBR aux data if available: [M * 6] f32 packed as
-        //   [roughness, metallic, f0_dielectric, albedo.r, albedo.g, albedo.b]
-        // Matches the parametric BRDF format produced by convert.py.
-        let aux_data_buf = if let Some(ref pbr) = self.pbr_data {
-            let tet_count = self.scene_data.tet_count as usize;
-            require_parametric_pbr(pbr, tet_count);
-            let mut aux = vec![0.0f32; tet_count * 6];
-            for t in 0..tet_count {
-                aux[t * 6] = pbr.roughness[t];
-                aux[t * 6 + 1] = pbr.metallic[t];
-                aux[t * 6 + 2] = pbr.f0_dielectric[t];
-                for c in 0..3 {
-                    aux[t * 6 + 3 + c] = pbr.albedo[t * 3 + c];
-                }
-            }
-            // Override vertex normals from PBR data
-            if !pbr.vertex_normals.is_empty() {
-                queue.write_buffer(
-                    &buffers.vertex_normals,
-                    0,
-                    bytemuck::cast_slice(&pbr.vertex_normals),
-                );
-            }
-            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("aux_data"),
-                contents: bytemuck::cast_slice(&aux),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-            log::info!("Uploaded PBR aux data: {} tets × 8 channels", tet_count);
-            Some(buf)
-        } else {
-            None
-        };
+        let aux_data_buf: Option<wgpu::Buffer> = None;
 
         log::info!("Buffers uploaded: {:.2}s", t0.elapsed().as_secs_f64());
 
-        let targets = RenderTargets::new_with_formats(
+        let targets = RenderTargets::new_color_only(
             &device,
             size.width.max(1),
             size.height.max(1),
@@ -1138,7 +871,7 @@ impl App {
 
         // --- Postprocess-chain profiler ---
         // A second query set, written with encoder-level write_timestamp()
-        // calls that bracket each fullscreen pass in the deferred/GTAO/SSGI/SSR
+        // calls that bracket the shell, occlusion hierarchy, and diagnostics
         // chain. Slot count is dynamic per frame (passes are gated by toggles),
         // so `pp_ts_used` records how many were actually written and only that
         // prefix is ever resolved — see TS_WRITTEN_COUNT's warning.
@@ -1216,346 +949,6 @@ impl App {
             None,
         );
 
-        // Hi-Z mip pyramid over fused linear-Z. Built each frame; feeds GTAO
-        // (and later SSGI). Pipelines are global; texture + bind groups are
-        // resized when the surface size changes.
-        let hiz_pipelines = rmesh_postprocess::HizPipelines::new(&device);
-        let hiz_texture =
-            rmesh_postprocess::HizTexture::new(&device, size.width.max(1), size.height.max(1));
-        let hiz_linearize_bg = rmesh_postprocess::create_hiz_linearize_bind_group(
-            &device,
-            &hiz_pipelines,
-            &primitive_targets.depth_view,
-            &targets.depth_view,
-        );
-        let hiz_downsample_bgs: Vec<wgpu::BindGroup> = (0..(hiz_texture.mip_count as usize - 1))
-            .map(|i| {
-                rmesh_postprocess::create_hiz_downsample_bind_group(
-                    &device,
-                    &hiz_pipelines,
-                    &hiz_texture.mip_views[i],
-                )
-            })
-            .collect();
-
-        // GTAO pass — always created. AO target is in `targets`. Reads Hi-Z
-        // for fused depth (sample any mip) and the volume MRT for std.
-        let gtao_pipeline = rmesh_postprocess::GtaoPipeline::new(&device);
-        let gtao_bg = rmesh_postprocess::create_gtao_bind_group(
-            &device,
-            &gtao_pipeline,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-            &targets.depth_view,
-        );
-
-        // AO bilateral blur (separable, depth+normal aware). With temporal
-        // accumulation in front of it, H reads ao_temporal_view (the
-        // temporal-blended AO) and V writes back to ao_view (final).
-        let ao_blur_pipeline = rmesh_postprocess::AoBlurPipeline::new(&device);
-        let ao_blur_bg_h = rmesh_postprocess::create_ao_blur_bind_group(
-            &device,
-            &ao_blur_pipeline,
-            &ao_blur_pipeline.uniforms_h,
-            &targets.ao_temporal_view,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-        );
-        let ao_blur_bg_v = rmesh_postprocess::create_ao_blur_bind_group(
-            &device,
-            &ao_blur_pipeline,
-            &ao_blur_pipeline.uniforms_v,
-            &targets.ao_blur_temp_view,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-        );
-
-        // SSGI: compute (Hi-Z ray march, samples lit_history) + bilateral denoise.
-        // lit_history rotates → bind group doubled, indexed by parity.
-        let ssgi_pipeline = rmesh_postprocess::SsgiPipeline::new(&device);
-        let ssgi_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_postprocess::create_ssgi_bind_group(
-                &device,
-                &ssgi_pipeline,
-                &hiz_texture.full_view,
-                &targets.normals_view,
-                targets.lit_history(p as u32),
-            )
-        });
-        // SSGI blur reads the temporal-blended SSGI (ssgi_temporal_view), not
-        // the raw ssgi_view. V still writes back to ssgi_view (final).
-        let ssgi_blur_pipeline = rmesh_postprocess::SsgiBlurPipeline::new(&device);
-        let ssgi_blur_bg_h = rmesh_postprocess::create_ssgi_blur_bind_group(
-            &device,
-            &ssgi_blur_pipeline,
-            &ssgi_blur_pipeline.uniforms_h,
-            &targets.ssgi_temporal_view,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-        );
-        let ssgi_blur_bg_v = rmesh_postprocess::create_ssgi_blur_bind_group(
-            &device,
-            &ssgi_blur_pipeline,
-            &ssgi_blur_pipeline.uniforms_v,
-            &targets.ssgi_blur_temp_view,
-            &hiz_texture.full_view,
-            &targets.normals_view,
-        );
-
-        // Temporal accumulation pipelines (one per output format). Bind groups
-        // doubled for parity: each variant binds (current, history) in the
-        // orientation appropriate for that frame.
-        let ssgi_temporal_pipeline =
-            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
-        let ssgi_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_postprocess::create_temporal_bind_group(
-                &device,
-                &ssgi_temporal_pipeline,
-                targets.ssgi_current(p as u32),
-                targets.ssgi_history(p as u32),
-                &hiz_texture.full_view,
-            )
-        });
-        let ao_temporal_pipeline =
-            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::R8Unorm);
-        let ao_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_postprocess::create_temporal_bind_group(
-                &device,
-                &ao_temporal_pipeline,
-                targets.ao_current(p as u32),
-                targets.ao_history(p as u32),
-                &hiz_texture.full_view,
-            )
-        });
-
-        // SSR pipeline + temporal (third TemporalPipeline instance, Rgba16Float).
-        // lit_history + ssgi_current rotate → ssr_bg doubled. ssr_current /
-        // ssr_history rotate → ssr_temporal_bg doubled.
-        let ssr_pipeline = rmesh_postprocess::SsrPipeline::new(&device);
-        let ssr_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_postprocess::create_ssr_bind_group(
-                &device,
-                &ssr_pipeline,
-                &hiz_texture.full_view,
-                &targets.normals_view,
-                targets.lit_history(p as u32),
-                targets.ssgi_current(p as u32),
-                &targets.depth_view,
-            )
-        });
-        let ssr_temporal_pipeline =
-            rmesh_postprocess::TemporalPipeline::new(&device, wgpu::TextureFormat::Rgba16Float);
-        let ssr_temporal_bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-            rmesh_postprocess::create_temporal_bind_group(
-                &device,
-                &ssr_temporal_pipeline,
-                targets.ssr_current(p as u32),
-                targets.ssr_history(p as u32),
-                &hiz_texture.full_view,
-            )
-        });
-
-        // Clear history textures on first frame so SSGI/AO/SSR temporal reads
-        // are deterministic. Without this, contents are vendor-defined.
-        {
-            let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("history_init_clear"),
-            });
-            let black = wgpu::Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.0,
-            };
-            // Clear both slots of each ping-pong pair so whichever slot is
-            // "history" on frame 0 is deterministic regardless of parity.
-            for p in 0..2u32 {
-                rmesh_postprocess::clear_texture_view(&mut enc, targets.lit_history(p), black);
-                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssgi_history(p), black);
-                rmesh_postprocess::clear_texture_view(&mut enc, targets.ao_history(p), black);
-                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssr_history(p), black);
-                rmesh_postprocess::clear_texture_view(&mut enc, targets.ssr_current(p), black);
-            }
-            queue.submit(std::iter::once(enc.finish()));
-        }
-
-        // Deferred PBR shading pipeline (only when PBR data is loaded)
-        let has_pbr = self.pbr_data.is_some();
-        let (
-            deferred_pipeline,
-            deferred_bg,
-            deferred_output,
-            deferred_output_view,
-            deferred_blit_bg,
-            deferred_dsm_dummy_bg,
-        ) = if has_pbr {
-            log::info!("Creating deferred PBR shading pipeline...");
-            let dp = rmesh_postprocess::DeferredShadePipeline::new(&device, color_format);
-            // Deferred BG doubled for parity: ao/ssgi/ssr_current rotate, lit_history rotates.
-            let bg: [wgpu::BindGroup; 2] = std::array::from_fn(|p| {
-                rmesh_postprocess::create_deferred_bind_group(
-                    &device,
-                    &dp,
-                    &targets.color_view,
-                    &targets.aux0_view,
-                    &targets.normals_view,
-                    &targets.depth_view,
-                    &primitive_targets.depth_view,
-                    targets.ao_current(p as u32),
-                    targets.ssgi_current(p as u32),
-                    targets.lit_history(p as u32),
-                    targets.ssr_current(p as u32),
-                )
-            });
-            // Dummy DSM bind group (1x1 atlas, no lights)
-            let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&device);
-            let dummy_dsm_bg = rmesh_postprocess::create_deferred_dsm_bind_group(
-                &device,
-                &dp,
-                &dummy_atlas.cubemap_views[0],
-                &dummy_atlas.meta_buf,
-            );
-            // Separate output texture (can't read+write color_view in same pass)
-            let out_tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("deferred_output"),
-                size: wgpu::Extent3d {
-                    width: size.width.max(1),
-                    height: size.height.max(1),
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            let d_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &out_view);
-            (
-                Some(dp),
-                Some(bg),
-                Some(out_tex),
-                Some(out_view),
-                Some(d_blit_bg),
-                Some(dummy_dsm_bg),
-            )
-        } else {
-            (None, None, None, None, None, None)
-        };
-
-        // Ray trace pipeline — DIAGNOSTIC: stubbed to keep init fast; real path is RenderMode::RayTrace only
-        log::info!("Building ray trace data... (STUBBED FOR DIAGNOSTIC)");
-        let t0 = std::time::Instant::now();
-        let rt_neighbors: Vec<i32> = vec![-1];
-        let rt_bvh = rmesh_raytrace::BVHData {
-            nodes: Vec::new(),
-            boundary_faces: Vec::new(),
-        };
-        let rt_pipeline = rmesh_raytrace::RayTracePipeline::new(
-            &device,
-            size.width.max(1),
-            size.height.max(1),
-            0,
-        );
-        let rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&device, &rt_neighbors, &rt_bvh);
-        let start_tet: i32 = -1; // DIAGNOSTIC: skip find_containing_tet
-        queue.write_buffer(&rt_buffers.start_tet, 0, bytemuck::cast_slice(&[start_tet]));
-        self.rt_neighbors_cpu = rt_neighbors;
-        self.rt_start_tet_hint = start_tet;
-        let rt_bg = rmesh_raytrace::create_raytrace_bind_group(
-            &device,
-            &rt_pipeline,
-            &buffers,
-            &material,
-            &rt_buffers,
-        );
-        let (rt_texture, rt_texture_view) =
-            create_rt_texture(&device, size.width.max(1), size.height.max(1));
-        let rt_blit_pipeline = rmesh_render::BlitPipelineNonFiltering::new(&device, surface_format);
-        let rt_blit_bg =
-            rmesh_render::create_blit_nf_bind_group(&device, &rt_blit_pipeline, &rt_texture_view);
-        log::info!("Ray trace data: {:.2}s", t0.elapsed().as_secs_f64());
-
-        // DSM debug view (2-moment deep shadow map from camera perspective)
-        let dsm_pipeline = rmesh_dsm::DsmPipeline::new(&device, color_format);
-        let dsm_prim_pipeline = rmesh_dsm::DsmPrimitivePipeline::new(&device);
-        let dsm_resolve_pipeline = rmesh_dsm::DsmResolvePipeline::new(&device, color_format);
-        let (
-            dsm_moments_texture,
-            dsm_moments_view,
-            dsm_depth_texture,
-            dsm_depth_view,
-            dsm_resolve_output,
-            dsm_resolve_output_view,
-        ) = {
-            let w = size.width.max(1);
-            let h = size.height.max(1);
-            let mtex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("dsm_moments"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let mview = mtex.create_view(&wgpu::TextureViewDescriptor::default());
-            let dtex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("dsm_debug_depth"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            });
-            let dview = dtex.create_view(&wgpu::TextureViewDescriptor::default());
-            let resolve_tex = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("dsm_resolve_output"),
-                size: wgpu::Extent3d {
-                    width: w,
-                    height: h,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: color_format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            });
-            let resolve_view = resolve_tex.create_view(&wgpu::TextureViewDescriptor::default());
-            (mtex, mview, dtex, dview, resolve_tex, resolve_view)
-        };
-        let dsm_render_bg = rmesh_dsm::create_dsm_render_bind_group(
-            &device,
-            &dsm_pipeline,
-            &buffers.uniforms,
-            &buffers.interval_vertex_buf,
-            &buffers.interval_tet_data_buf,
-        );
-        let dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-            &device,
-            &dsm_resolve_pipeline,
-            &dsm_moments_view,
-        );
-        let dsm_blit_bg = create_blit_bind_group(&device, &blit_pipeline, &dsm_resolve_output_view);
-
         // Load flare 3D model and upload its meshes/materials
         {
             let exe_dir = std::env::current_exe()
@@ -1572,57 +965,8 @@ impl App {
             let flare_path = candidates.iter().chain(extra.iter()).find(|p| p.exists());
             if let Some(path) = flare_path {
                 if let Some(gltf_scene) = self.flare_system.load_model(path) {
-                    let prim_verts: Vec<Vec<rmesh_compositor::PrimitiveVertex>> = gltf_scene
-                        .meshes
-                        .iter()
-                        .map(|m| {
-                            (0..m.vertices.len())
-                                .map(|i| rmesh_compositor::PrimitiveVertex {
-                                    position: m.vertices[i],
-                                    normal: m.normals[i],
-                                    uv: if i < m.uvs.len() {
-                                        m.uvs[i]
-                                    } else {
-                                        [0.0, 0.0]
-                                    },
-                                    tangent: if i < m.tangents.len() {
-                                        m.tangents[i]
-                                    } else {
-                                        [1.0, 0.0, 0.0, 1.0]
-                                    },
-                                })
-                                .collect()
-                        })
-                        .collect();
                     self.flare_system.flare_mesh_base = 0;
-                    primitive_geometry.set_custom_meshes(&device, &prim_verts);
-
-                    // Upload flare material textures
-                    let tex_data: Vec<rmesh_compositor::TextureData> = gltf_scene
-                        .textures
-                        .iter()
-                        .map(|t| rmesh_compositor::TextureData {
-                            width: t.width,
-                            height: t.height,
-                            pixels: t.pixels.clone(),
-                        })
-                        .collect();
-                    let mat_defs: Vec<rmesh_compositor::MaterialDef> = gltf_scene
-                        .materials
-                        .iter()
-                        .map(|m| rmesh_compositor::MaterialDef {
-                            base_color_factor: m.base_color_factor,
-                            roughness_factor: m.roughness_factor,
-                            metallic_factor: m.metallic_factor,
-                            occlusion_strength: m.occlusion_strength,
-                            normal_scale: m.normal_scale,
-                            base_color_texture: m.base_color_texture,
-                            metallic_roughness_texture: m.metallic_roughness_texture,
-                            normal_texture: m.normal_texture,
-                            occlusion_texture: m.occlusion_texture,
-                        })
-                        .collect();
-                    material_registry.upload(&device, &queue, &tex_data, &mat_defs);
+                    rmesh_viewer_core::assets::upload_models(&device, &queue, &mut primitive_geometry, &mut material_registry, &[&gltf_scene]);
                 }
             } else {
                 log::warn!("Flare model not found, using default sphere");
@@ -1653,6 +997,7 @@ impl App {
             staging_belt,
             buffers,
             material_buffers: material,
+            light_bake,
             targets,
             compute_bg,
             hw_compute_bg,
@@ -1695,7 +1040,6 @@ impl App {
             overdraw_target,
             shell_hiz_pipelines,
             shell_hiz,
-            dsm_shell_hiz: None,
             egui_renderer,
             egui_state,
             instance_count_readback,
@@ -1719,8 +1063,6 @@ impl App {
             frag_ready,
             frag_mapped,
             frag_invocations: 0,
-            pp_lights: 0,
-            pp_dsm: false,
             ts_frame: 0,
             ts_period_ns,
             gpu_times_ms: GpuTimings::default(),
@@ -1728,58 +1070,6 @@ impl App {
             instance_count_ready: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             instance_count_mapped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             aux_data_buf,
-            deferred_pipeline,
-            deferred_bg,
-            gtao_pipeline,
-            gtao_bg,
-            hiz_pipelines,
-            hiz_texture,
-            hiz_linearize_bg,
-            hiz_downsample_bgs,
-            ao_blur_pipeline,
-            ao_blur_bg_h,
-            ao_blur_bg_v,
-            ssgi_pipeline,
-            ssgi_bg,
-            ssgi_blur_pipeline,
-            ssgi_blur_bg_h,
-            ssgi_blur_bg_v,
-            ssgi_temporal_pipeline,
-            ssgi_temporal_bg,
-            ao_temporal_pipeline,
-            ao_temporal_bg,
-            ssr_pipeline,
-            ssr_bg,
-            ssr_temporal_pipeline,
-            ssr_temporal_bg,
-            frame_counter: 0,
-            frame_parity: 0,
-            deferred_output,
-            deferred_output_view,
-            deferred_blit_bg,
-            has_pbr_data: has_pbr,
-            dsm_pipeline,
-            dsm_prim_pipeline,
-            dsm_resolve_pipeline,
-            dsm_moments_texture,
-            dsm_moments_view,
-            dsm_depth_texture,
-            dsm_depth_view,
-            dsm_resolve_output,
-            dsm_resolve_output_view,
-            dsm_render_bg,
-            dsm_resolve_bg,
-            dsm_blit_bg,
-            dsm_atlas: None,
-            deferred_dsm_bg: None,
-            deferred_dsm_dummy_bg,
-            rt_pipeline,
-            rt_buffers,
-            rt_bg,
-            rt_texture,
-            rt_texture_view,
-            rt_blit_pipeline,
-            rt_blit_bg,
         });
     }
 
@@ -1831,6 +1121,7 @@ impl App {
         self.scene_data = scene;
         self.sh_coeffs = sh;
         self.pbr_data = pbr;
+        self.primitives = vec![light_bake::default_light(&self.scene_data)];
         // Drop topology/grab state from the previous scene.
         self.mesh_topology = None;
         self.pbd_vertex_max_density = None;
@@ -1843,7 +1134,6 @@ impl App {
         self.flare_system.rebuild_collision_mesh(&self.scene_data);
         // Shell face ids index the previous scene's tet array — drop them.
         self.shell_system.reset();
-        self.deferred_enabled = env_flag("RMESH_DEFERRED", self.pbr_data.is_some());
 
         self.loaded_path = Some(path.to_path_buf());
 
@@ -1857,31 +1147,17 @@ impl App {
             self.camera = Camera::new(pos);
         }
 
+
         // Rebuild GPU buffers
         if let Some(gpu) = &mut self.gpu {
             gpu.buffers = SceneBuffers::upload(&gpu.device, &gpu.queue, &self.scene_data);
 
-            let zero_colors = vec![0.0f32; self.scene_data.tet_count as usize * 3];
-            gpu.material_buffers = MaterialBuffers::upload(
-                &gpu.device,
-                &zero_colors,
-                &self.scene_data.color_grads,
-                self.scene_data.tet_count,
-            );
+            (gpu.material_buffers, gpu.sh_coeffs_buf) = light_bake::upload_material(
+                &gpu.device, &gpu.queue, &self.scene_data, self.pbr_data.as_ref(), &gpu.buffers);
             gpu.tet_count = self.scene_data.tet_count;
-
-            // Recreate SH coeffs buffer (f16-packed)
-            let sh_total_dims =
-                ((self.sh_coeffs.degree + 1) * (self.sh_coeffs.degree + 1)) as usize * 3;
-            let sh_coeffs_packed = pack_sh_coeffs_f16(&self.sh_coeffs.coeffs, sh_total_dims);
-            gpu.sh_coeffs_buf = gpu
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("sh_coeffs"),
-                    contents: bytemuck::cast_slice(&sh_coeffs_packed),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-            gpu.sh_degree = self.sh_coeffs.degree;
+            gpu.sh_degree = 0;
+            gpu.light_bake = light_bake::LightBake::new(&gpu.device, &gpu.queue, &self.scene_data, &self.sh_coeffs, self.pbr_data.as_ref(), &gpu.buffers);
+            gpu.light_bake.configure_interval(&gpu.device, &mut gpu.compute_interval_pipelines);
 
             // Recreate sort state for new tet count
             let n_pow2 = gpu.tet_count.next_power_of_two();
@@ -2027,123 +1303,22 @@ impl App {
                     &gpu.material_buffers,
                     gpu.sort_state_16bit.values_b(),
                 );
-            // Upload PBR aux data if available
-            gpu.has_pbr_data = self.pbr_data.is_some();
-            if let Some(ref pbr) = self.pbr_data {
-                // Aux layout: [roughness, metallic, f0_dielectric, albedo.r, albedo.g, albedo.b]
-                let tc = self.scene_data.tet_count as usize;
-                require_parametric_pbr(pbr, tc);
-                let mut aux = vec![0.0f32; tc * 6];
-                for t in 0..tc {
-                    aux[t * 6] = pbr.roughness[t];
-                    aux[t * 6 + 1] = pbr.metallic[t];
-                    aux[t * 6 + 2] = pbr.f0_dielectric[t];
-                    for c in 0..3 {
-                        aux[t * 6 + 3 + c] = pbr.albedo[t * 3 + c];
-                    }
-                }
+            if let Some(pbr) = &self.pbr_data {
                 if !pbr.vertex_normals.is_empty() {
-                    gpu.queue.write_buffer(
-                        &gpu.buffers.vertex_normals,
-                        0,
-                        bytemuck::cast_slice(&pbr.vertex_normals),
-                    );
+                    gpu.queue.write_buffer(&gpu.buffers.vertex_normals, 0, bytemuck::cast_slice(&pbr.vertex_normals));
                 }
-                let aux_buf = gpu
-                    .device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("aux_data"),
-                        contents: bytemuck::cast_slice(&aux),
-                        usage: wgpu::BufferUsages::STORAGE,
-                    });
-                gpu.compute_interval_render_bg =
-                    rmesh_render::create_compute_interval_render_bind_group_pbr(
-                        &gpu.device,
-                        &gpu.compute_interval_pipelines,
-                        &gpu.buffers,
-                        &aux_buf,
-                        &gpu.buffers.indices,
-                    );
-                gpu.aux_data_buf = Some(aux_buf);
-
-                // Recreate deferred pipeline
-                let color_format = wgpu::TextureFormat::Rgba16Float;
-                let dp = rmesh_postprocess::DeferredShadePipeline::new(&gpu.device, color_format);
-                gpu.deferred_bg = Some(std::array::from_fn(|p| {
-                    rmesh_postprocess::create_deferred_bind_group(
-                        &gpu.device,
-                        &dp,
-                        &gpu.targets.color_view,
-                        &gpu.targets.aux0_view,
-                        &gpu.targets.normals_view,
-                        &gpu.targets.depth_view,
-                        &gpu.primitive_targets.depth_view,
-                        gpu.targets.ao_current(p as u32),
-                        gpu.targets.ssgi_current(p as u32),
-                        gpu.targets.lit_history(p as u32),
-                        gpu.targets.ssr_current(p as u32),
-                    )
-                }));
-                // Reset DSM state (will be regenerated on next frame with lights)
-                let dummy_atlas = rmesh_dsm::DsmAtlas::new_dummy(&gpu.device);
-                gpu.deferred_dsm_dummy_bg =
-                    Some(rmesh_postprocess::create_deferred_dsm_bind_group(
-                        &gpu.device,
-                        &dp,
-                        &dummy_atlas.cubemap_views[0],
-                        &dummy_atlas.meta_buf,
-                    ));
-                gpu.deferred_dsm_bg = None;
-                gpu.dsm_atlas = None;
-                self.cached_dsm_lights.clear();
-                self.cached_dsm_num_lights = 0;
-                let w = gpu.surface_config.width;
-                let h = gpu.surface_config.height;
-                let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("deferred_output"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.deferred_blit_bg = Some(create_blit_bind_group(
-                    &gpu.device,
-                    &gpu.blit_pipeline,
-                    &out_view,
-                ));
-                gpu.deferred_output = Some(out_tex);
-                gpu.deferred_output_view = Some(out_view);
-                gpu.deferred_pipeline = Some(dp);
-            } else {
-                gpu.compute_interval_render_bg = create_compute_interval_render_bind_group(
-                    &gpu.device,
-                    &gpu.compute_interval_pipelines,
-                    &gpu.buffers,
-                );
-                gpu.aux_data_buf = None;
-                gpu.deferred_pipeline = None;
-                gpu.deferred_bg = None;
-                gpu.deferred_output = None;
-                gpu.deferred_output_view = None;
-                gpu.deferred_blit_bg = None;
             }
+            gpu.compute_interval_render_bg = create_compute_interval_render_bind_group(
+                &gpu.device, &gpu.compute_interval_pipelines, &gpu.buffers,
+            );
+            gpu.aux_data_buf = None;
             gpu.compute_interval_convert_bg = create_compute_interval_indirect_convert_bind_group(
                 &gpu.device,
                 &gpu.compute_interval_pipelines,
                 &gpu.buffers,
             );
 
-            // Recreate ray trace neighbors + state
+            // Refresh adjacency used by vertex deformation
             let neighbors = rmesh_raytrace::compute_tet_neighbors(
                 &self.scene_data.indices,
                 self.scene_data.tet_count as usize,
@@ -2158,46 +1333,6 @@ impl App {
             gpu.pbd_solver = None;
             gpu.tet_neighbors_buf = Some(tet_neighbors_buf);
 
-            let rt_bvh = rmesh_raytrace::build_boundary_bvh(
-                &self.scene_data.vertices,
-                &self.scene_data.indices,
-                &neighbors,
-                self.scene_data.tet_count as usize,
-            );
-            let w = gpu.surface_config.width;
-            let h = gpu.surface_config.height;
-            gpu.rt_pipeline = rmesh_raytrace::RayTracePipeline::new(&gpu.device, w, h, 0);
-            gpu.rt_buffers = rmesh_raytrace::RayTraceBuffers::new(&gpu.device, &neighbors, &rt_bvh);
-            let start_tet = rmesh_raytrace::find_containing_tet(
-                &self.scene_data.vertices,
-                &self.scene_data.indices,
-                self.scene_data.tet_count as usize,
-                self.camera.position,
-            )
-            .map(|t| t as i32)
-            .unwrap_or(-1);
-            gpu.queue.write_buffer(
-                &gpu.rt_buffers.start_tet,
-                0,
-                bytemuck::cast_slice(&[start_tet]),
-            );
-            self.rt_neighbors_cpu = neighbors.clone();
-            self.rt_start_tet_hint = start_tet;
-            gpu.rt_bg = rmesh_raytrace::create_raytrace_bind_group(
-                &gpu.device,
-                &gpu.rt_pipeline,
-                &gpu.buffers,
-                &gpu.material_buffers,
-                &gpu.rt_buffers,
-            );
-            let (rt_tex, rt_view) = create_rt_texture(&gpu.device, w, h);
-            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(
-                &gpu.device,
-                &gpu.rt_blit_pipeline,
-                &rt_view,
-            );
-            gpu.rt_texture = rt_tex;
-            gpu.rt_texture_view = rt_view;
         }
 
         // Update window title
@@ -2218,7 +1353,7 @@ impl App {
             gpu.surface_config.width = new_size.width;
             gpu.surface_config.height = new_size.height;
             gpu.surface.configure(&gpu.device, &gpu.surface_config);
-            gpu.targets = RenderTargets::new_with_formats(
+            gpu.targets = RenderTargets::new_color_only(
                 &gpu.device,
                 new_size.width,
                 new_size.height,
@@ -2270,306 +1405,6 @@ impl App {
                 &gpu.shell_hiz.full_view,
             );
 
-            // Recreate Hi-Z (texture + per-mip bind groups) since size changed.
-            gpu.hiz_texture =
-                rmesh_postprocess::HizTexture::new(&gpu.device, new_size.width, new_size.height);
-            gpu.hiz_linearize_bg = rmesh_postprocess::create_hiz_linearize_bind_group(
-                &gpu.device,
-                &gpu.hiz_pipelines,
-                &gpu.primitive_targets.depth_view,
-                &gpu.targets.depth_view,
-            );
-            gpu.hiz_downsample_bgs = (0..(gpu.hiz_texture.mip_count as usize - 1))
-                .map(|i| {
-                    rmesh_postprocess::create_hiz_downsample_bind_group(
-                        &gpu.device,
-                        &gpu.hiz_pipelines,
-                        &gpu.hiz_texture.mip_views[i],
-                    )
-                })
-                .collect();
-
-            // Recreate GTAO bind group: Hi-Z full view + normals + volume depth.
-            gpu.gtao_bg = rmesh_postprocess::create_gtao_bind_group(
-                &gpu.device,
-                &gpu.gtao_pipeline,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-                &gpu.targets.depth_view,
-            );
-
-            // Recreate AO blur bind groups. H reads ao_temporal_view (post-temporal).
-            gpu.ao_blur_bg_h = rmesh_postprocess::create_ao_blur_bind_group(
-                &gpu.device,
-                &gpu.ao_blur_pipeline,
-                &gpu.ao_blur_pipeline.uniforms_h,
-                &gpu.targets.ao_temporal_view,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-            );
-            gpu.ao_blur_bg_v = rmesh_postprocess::create_ao_blur_bind_group(
-                &gpu.device,
-                &gpu.ao_blur_pipeline,
-                &gpu.ao_blur_pipeline.uniforms_v,
-                &gpu.targets.ao_blur_temp_view,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-            );
-
-            // Recreate SSGI bind groups (doubled for parity).
-            gpu.ssgi_bg = std::array::from_fn(|p| {
-                rmesh_postprocess::create_ssgi_bind_group(
-                    &gpu.device,
-                    &gpu.ssgi_pipeline,
-                    &gpu.hiz_texture.full_view,
-                    &gpu.targets.normals_view,
-                    gpu.targets.lit_history(p as u32),
-                )
-            });
-            gpu.ssgi_blur_bg_h = rmesh_postprocess::create_ssgi_blur_bind_group(
-                &gpu.device,
-                &gpu.ssgi_blur_pipeline,
-                &gpu.ssgi_blur_pipeline.uniforms_h,
-                &gpu.targets.ssgi_temporal_view,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-            );
-            gpu.ssgi_blur_bg_v = rmesh_postprocess::create_ssgi_blur_bind_group(
-                &gpu.device,
-                &gpu.ssgi_blur_pipeline,
-                &gpu.ssgi_blur_pipeline.uniforms_v,
-                &gpu.targets.ssgi_blur_temp_view,
-                &gpu.hiz_texture.full_view,
-                &gpu.targets.normals_view,
-            );
-
-            // Recreate temporal bind groups (doubled for parity).
-            gpu.ssgi_temporal_bg = std::array::from_fn(|p| {
-                rmesh_postprocess::create_temporal_bind_group(
-                    &gpu.device,
-                    &gpu.ssgi_temporal_pipeline,
-                    gpu.targets.ssgi_current(p as u32),
-                    gpu.targets.ssgi_history(p as u32),
-                    &gpu.hiz_texture.full_view,
-                )
-            });
-            gpu.ao_temporal_bg = std::array::from_fn(|p| {
-                rmesh_postprocess::create_temporal_bind_group(
-                    &gpu.device,
-                    &gpu.ao_temporal_pipeline,
-                    gpu.targets.ao_current(p as u32),
-                    gpu.targets.ao_history(p as u32),
-                    &gpu.hiz_texture.full_view,
-                )
-            });
-
-            // Recreate SSR + SSR temporal bind groups (doubled for parity).
-            gpu.ssr_bg = std::array::from_fn(|p| {
-                rmesh_postprocess::create_ssr_bind_group(
-                    &gpu.device,
-                    &gpu.ssr_pipeline,
-                    &gpu.hiz_texture.full_view,
-                    &gpu.targets.normals_view,
-                    gpu.targets.lit_history(p as u32),
-                    gpu.targets.ssgi_current(p as u32),
-                    &gpu.targets.depth_view,
-                )
-            });
-            gpu.ssr_temporal_bg = std::array::from_fn(|p| {
-                rmesh_postprocess::create_temporal_bind_group(
-                    &gpu.device,
-                    &gpu.ssr_temporal_pipeline,
-                    gpu.targets.ssr_current(p as u32),
-                    gpu.targets.ssr_history(p as u32),
-                    &gpu.hiz_texture.full_view,
-                )
-            });
-
-            // Re-clear history textures (resize gives new vendor-defined contents).
-            {
-                let mut enc = gpu
-                    .device
-                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                        label: Some("history_resize_clear"),
-                    });
-                let black = wgpu::Color {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 0.0,
-                };
-                for p in 0..2u32 {
-                    rmesh_postprocess::clear_texture_view(
-                        &mut enc,
-                        gpu.targets.lit_history(p),
-                        black,
-                    );
-                    rmesh_postprocess::clear_texture_view(
-                        &mut enc,
-                        gpu.targets.ssgi_history(p),
-                        black,
-                    );
-                    rmesh_postprocess::clear_texture_view(
-                        &mut enc,
-                        gpu.targets.ao_history(p),
-                        black,
-                    );
-                    rmesh_postprocess::clear_texture_view(
-                        &mut enc,
-                        gpu.targets.ssr_history(p),
-                        black,
-                    );
-                    rmesh_postprocess::clear_texture_view(
-                        &mut enc,
-                        gpu.targets.ssr_current(p),
-                        black,
-                    );
-                }
-                gpu.queue.submit(std::iter::once(enc.finish()));
-            }
-
-            // Recreate deferred resources since MRT texture views changed
-            if let Some(ref dp) = gpu.deferred_pipeline {
-                gpu.deferred_bg = Some(std::array::from_fn(|p| {
-                    rmesh_postprocess::create_deferred_bind_group(
-                        &gpu.device,
-                        dp,
-                        &gpu.targets.color_view,
-                        &gpu.targets.aux0_view,
-                        &gpu.targets.normals_view,
-                        &gpu.targets.depth_view,
-                        &gpu.primitive_targets.depth_view,
-                        gpu.targets.ao_current(p as u32),
-                        gpu.targets.ssgi_current(p as u32),
-                        gpu.targets.lit_history(p as u32),
-                        gpu.targets.ssr_current(p as u32),
-                    )
-                }));
-                let out_tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("deferred_output"),
-                    size: wgpu::Extent3d {
-                        width: new_size.width,
-                        height: new_size.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba16Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING
-                        | wgpu::TextureUsages::COPY_SRC,
-                    view_formats: &[],
-                });
-                let out_view = out_tex.create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.deferred_blit_bg = Some(create_blit_bind_group(
-                    &gpu.device,
-                    &gpu.blit_pipeline,
-                    &out_view,
-                ));
-                gpu.deferred_output = Some(out_tex);
-                gpu.deferred_output_view = Some(out_view);
-            }
-
-            // Recreate DSM debug textures
-            {
-                let w = new_size.width;
-                let h = new_size.height;
-                let color_format = wgpu::TextureFormat::Rgba16Float;
-                gpu.dsm_moments_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("dsm_moments"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                gpu.dsm_moments_view = gpu
-                    .dsm_moments_texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.dsm_depth_texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("dsm_debug_depth"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Depth32Float,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    view_formats: &[],
-                });
-                gpu.dsm_depth_view = gpu
-                    .dsm_depth_texture
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.dsm_resolve_output = gpu.device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("dsm_resolve_output"),
-                    size: wgpu::Extent3d {
-                        width: w,
-                        height: h,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: color_format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::TEXTURE_BINDING,
-                    view_formats: &[],
-                });
-                gpu.dsm_resolve_output_view = gpu
-                    .dsm_resolve_output
-                    .create_view(&wgpu::TextureViewDescriptor::default());
-                gpu.dsm_render_bg = rmesh_dsm::create_dsm_render_bind_group(
-                    &gpu.device,
-                    &gpu.dsm_pipeline,
-                    &gpu.buffers.uniforms,
-                    &gpu.buffers.interval_vertex_buf,
-                    &gpu.buffers.interval_tet_data_buf,
-                );
-                gpu.dsm_resolve_bg = rmesh_dsm::create_dsm_resolve_bind_group(
-                    &gpu.device,
-                    &gpu.dsm_resolve_pipeline,
-                    &gpu.dsm_moments_view,
-                );
-                gpu.dsm_blit_bg = create_blit_bind_group(
-                    &gpu.device,
-                    &gpu.blit_pipeline,
-                    &gpu.dsm_resolve_output_view,
-                );
-            }
-
-            // Recreate ray trace pipeline + texture for new size
-            gpu.rt_pipeline = rmesh_raytrace::RayTracePipeline::new(
-                &gpu.device,
-                new_size.width,
-                new_size.height,
-                0,
-            );
-            gpu.rt_bg = rmesh_raytrace::create_raytrace_bind_group(
-                &gpu.device,
-                &gpu.rt_pipeline,
-                &gpu.buffers,
-                &gpu.material_buffers,
-                &gpu.rt_buffers,
-            );
-            let (rt_tex, rt_view) = create_rt_texture(&gpu.device, new_size.width, new_size.height);
-            gpu.rt_blit_bg = rmesh_render::create_blit_nf_bind_group(
-                &gpu.device,
-                &gpu.rt_blit_pipeline,
-                &rt_view,
-            );
-            gpu.rt_texture = rt_tex;
-            gpu.rt_texture_view = rt_view;
         }
     }
 
@@ -2601,18 +1436,7 @@ impl App {
             }
             Some(Selection::Node(i)) => {
                 if let Some(ref mut scene) = self.animated_scene {
-                    if i < scene.nodes.len() {
-                        let parent_world = scene.parent_world_matrix(i);
-                        let local_mat = parent_world.inverse() * world_t.model_matrix();
-                        let (scale, rotation, translation) =
-                            local_mat.to_scale_rotation_translation();
-                        scene.nodes[i].local_transform = rmesh_interact::Transform {
-                            position: translation,
-                            rotation,
-                            scale,
-                        };
-                        scene.compute_world_transforms();
-                    }
+                    scene.set_node_world_transform(i, world_t);
                 }
             }
             None => {}
@@ -2657,24 +1481,7 @@ impl App {
             log::info!("[pbd] Topology built in {:.2}s", t0.elapsed().as_secs_f64());
         }
         if self.pbd_vertex_max_density.is_none() {
-            // Per-vertex max incident tet density. The volume renderer uses
-            // density in `od = density * dist`, so high-density tets are
-            // what's visually "there." Vertices that touch only low-density
-            // tets are basically in empty space and shouldn't be pickable.
-            let vc = self.scene_data.vertex_count as usize;
-            let mut max_d = vec![0.0_f32; vc];
-            let indices = &self.scene_data.indices;
-            let densities = &self.scene_data.densities;
-            for (t, dens) in densities.iter().enumerate() {
-                let base = t * 4;
-                for &vi in &indices[base..base + 4] {
-                    let slot = &mut max_d[vi as usize];
-                    if *dens > *slot {
-                        *slot = *dens;
-                    }
-                }
-            }
-            self.pbd_vertex_max_density = Some(max_d);
+            self.pbd_vertex_max_density = Some(rmesh_viewer_core::vertices::vertex_max_density(&self.scene_data));
         }
     }
 
@@ -2699,141 +1506,10 @@ impl App {
         let view = self.camera.view_matrix();
         let proj = self.camera.projection_matrix(w / h);
         let vp = proj * view;
-        let r_sq = radius_px * radius_px;
-
-        // Occlusion test: visible surface depth from the volume renderer.
-        let visible_depth = self.read_visible_depth_at(mouse_px);
-        let depth_tol = 0.15_f32;
-        // Density floor: in .rmesh's exp((val-100)/20) encoding, 1.0 = the
-        // middle value (val=100). Vertices touching only sub-1.0 tets are
-        // basically in empty fog space — reject.
-        let min_density = 1.0_f32;
-
-        let max_density = self.pbd_vertex_max_density.as_deref();
-        let mut best: Option<(u32, f32, f32, f32, f32)> = None;
-        let mut candidates_in_radius = 0u32;
-        let mut candidates_passing_depth = 0u32;
-        let mut candidates_passing_density = 0u32;
-        let verts = &self.scene_data.vertices;
-        let n = self.scene_data.vertex_count as usize;
-        for i in 0..n {
-            let b = i * 3;
-            let p = glam::Vec4::new(verts[b], verts[b + 1], verts[b + 2], 1.0);
-            let view_pos = view * p;
-            if view_pos.z >= -0.001 {
-                continue;
-            }
-            let view_depth = -view_pos.z;
-            let clip = vp * p;
-            if clip.w <= 0.0 {
-                continue;
-            }
-            let ndc = clip.truncate() / clip.w;
-            let sx = (ndc.x * 0.5 + 0.5) * w;
-            let sy = (1.0 - (ndc.y * 0.5 + 0.5)) * h;
-            let dx = sx - mouse_px[0];
-            let dy = sy - mouse_px[1];
-            let d_sq = dx * dx + dy * dy;
-            if d_sq >= r_sq {
-                continue;
-            }
-            candidates_in_radius += 1;
-            if let Some(vd) = visible_depth {
-                if (view_depth - vd).abs() > depth_tol {
-                    continue;
-                }
-            }
-            candidates_passing_depth += 1;
-            if let Some(md) = max_density {
-                if md[i] < min_density {
-                    continue;
-                }
-            }
-            candidates_passing_density += 1;
-            match best {
-                Some((_, _, bd, _, _)) if view_depth >= bd => {}
-                _ => best = Some((i as u32, d_sq, view_depth, sx, sy)),
-            }
-        }
-        let _ = candidates_passing_density; // tracked here for symmetry; could be surfaced
-        best.map(|(idx, d_sq, view_depth, sx, sy)| PickInfo {
-            idx,
-            screen_pos: [sx, sy],
-            screen_dist: d_sq.sqrt(),
-            view_depth,
-            candidates_in_radius,
-            candidates_passing_depth,
-            visible_depth,
-            depth_tol,
-        })
-    }
-
-    /// Read one pixel from the volume renderer's depth attachment
-    /// (`gpu.targets.depth_texture`, Rgba16Float, premul: `.r` = α·E[z_view],
-    /// `.a` = α). Returns `r / a` (view-space depth at the visible surface),
-    /// or `None` if the pixel has no volume contribution. Blocking 1-pixel
-    /// readback (~1 ms).
-    fn read_visible_depth_at(&self, mouse_px: [f32; 2]) -> Option<f32> {
-        let gpu = self.gpu.as_ref()?;
-        let tex_w = gpu.surface_config.width;
-        let tex_h = gpu.surface_config.height;
-        let mx = mouse_px[0] as i32;
-        let my = mouse_px[1] as i32;
-        if mx < 0 || my < 0 || mx as u32 >= tex_w || my as u32 >= tex_h {
-            return None;
-        }
-        let staging = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pbd_depth_pixel_readback"),
-            size: 256,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("pbd_depth_pixel_encoder"),
-            });
-        encoder.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &gpu.targets.depth_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: mx as u32,
-                    y: my as u32,
-                    z: 0,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &staging,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(256),
-                    rows_per_image: Some(1),
-                },
-            },
-            wgpu::Extent3d {
-                width: 1,
-                height: 1,
-                depth_or_array_layers: 1,
-            },
-        );
-        gpu.queue.submit(std::iter::once(encoder.finish()));
-
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        gpu.device.poll(wgpu::PollType::wait_indefinitely()).ok();
-        let data = slice.get_mapped_range();
-        let r = half::f16::from_le_bytes([data[0], data[1]]).to_f32();
-        let a = half::f16::from_le_bytes([data[6], data[7]]).to_f32();
-        drop(data);
-        staging.unmap();
-
-        if a < 1e-3 {
-            None
-        } else {
-            Some(r / a)
-        }
+        rmesh_viewer_core::vertices::pick_vertex(
+            &self.scene_data.vertices, self.pbd_vertex_max_density.as_deref(),
+            view, vp, [w, h], mouse_px, radius_px, None,
+        )
     }
 
     /// React to a [`VertexSelectResult`] from the vertex-select state machine.
@@ -2890,15 +1566,15 @@ impl App {
                     displacement,
                 );
                 self.pbd_pre_grab_vertices = None;
+                self.shell_system.reset();
+                self.active_mask_dirty = true;
                 if let Some(gpu) = &mut self.gpu {
+                    rmesh_viewer_core::vertices::refresh_bounds(&mut self.scene_data, &gpu.queue, &gpu.buffers);
+                    gpu.shell_buffers.face_count = 0;
                     gpu.pbd_solver = None;
+                    gpu.light_bake.invalidate();
                 }
                 self.pbd_handle_initial.clear();
-                // Force DSM atlas rebuild on next frame — the shadow cubemaps
-                // were baked against the old geometry. Cleared via the same
-                // idiom as render.rs:663-664 / main.rs:1534-1535.
-                self.cached_dsm_lights.clear();
-                self.cached_dsm_num_lights = 0;
                 // Kick off a background rebuild of the flare collision-mesh
                 // BVH so subsequent flares bounce off the deformed surface.
                 // Does not block confirm; the new mesh installs once ready.
@@ -2983,15 +1659,9 @@ impl App {
         let topology = self.mesh_topology.as_ref().unwrap();
         let radius = self.pbd_radius;
         let t0 = std::time::Instant::now();
-        let island: Island = build_island(
-            topology,
-            &self.scene_data.indices,
-            &self.scene_data.vertices,
-            &handles,
-            radius,
-        );
-        let coloring: ConstraintColoring =
-            color_constraints(island.particles.len(), &island.distance_constraints);
+        let prepared = rmesh_viewer_core::vertices::prepare_grab(&self.scene_data, topology, &handles, radius);
+        let island = prepared.island;
+        let coloring = prepared.coloring;
         let total = island.particles.len();
         let handles_n = island.handle_local_indices.len();
         let fixed_n = island
@@ -3014,20 +1684,7 @@ impl App {
         }
 
         // Cache initial handle world positions for the drag computation.
-        self.pbd_handle_initial = handles
-            .iter()
-            .map(|&h| {
-                let b = h as usize * 3;
-                (
-                    h,
-                    [
-                        self.scene_data.vertices[b],
-                        self.scene_data.vertices[b + 1],
-                        self.scene_data.vertices[b + 2],
-                    ],
-                )
-            })
-            .collect();
+        self.pbd_handle_initial = prepared.handle_initial;
 
         // Snapshot for cancel.
         self.pbd_pre_grab_vertices = Some(self.scene_data.vertices.clone());
@@ -3359,7 +2016,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::RedrawRequested => {
+                let start = std::time::Instant::now();
                 self.render();
+                if let Some(mut bench) = self.benchmark.take() {
+                    let done = bench.after_frame(self, start);
+                    self.benchmark = Some(bench);
+                    if done { event_loop.exit(); return; }
+                }
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -3374,6 +2037,9 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|a| a == "--reference-volume") {
+        return reference_volume::run_cli(&args);
+    }
     if args.len() < 2 {
         eprintln!("Usage: rmesh-viewer <input.rmesh|input.ply>");
         std::process::exit(1);

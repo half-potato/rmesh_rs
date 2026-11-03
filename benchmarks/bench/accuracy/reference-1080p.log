@@ -1,0 +1,2 @@
+[2026-10-29T03:40:18Z WARN  rmesh_raytrace] compute_tet_neighbors: 2134 of 16830288 faces have 3+ claimants; left unmatched (reported as boundary)
+[2026-10-29T03:40:19Z WARN  rmesh_raytrace] compute_tet_neighbors: 2134 of 16830288 faces have 3+ claimants; left unmatched (reported as boundary)

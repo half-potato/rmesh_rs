@@ -72,12 +72,29 @@ window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' +
       // Wrap onerror via pushErrorScope/popErrorScope for the entire run
       dev.pushErrorScope('validation');
       dev.pushErrorScope('internal');
+      window.__smoketest.buffers = {};
+      const createBuffer = dev.createBuffer.bind(dev);
+      dev.createBuffer = desc => {
+        const buffer = createBuffer(desc);
+        if (['sort_keys','sort_values','indirect_args'].includes(desc.label)) window.__smoketest.buffers[desc.label] = buffer;
+        return buffer;
+      };
+      const createTexture = dev.createTexture.bind(dev);
+      dev.createTexture = desc => {
+        const texture = createTexture(desc);
+        if (desc.label === 'color_target') window.__smoketest.color = texture;
+        return texture;
+      };
       window.__smoketest.device = dev;
       return dev;
     };
 
     log('WebViewer.create("canvas")...');
     const viewer = await mod.WebViewer.create('canvas');
+    const torchResponse = await fetch('./assets/flare.gltf');
+    if (!torchResponse.ok) throw new Error('Missing packaged desktop torch');
+    viewer.load_flare_model(new Uint8Array(await torchResponse.arrayBuffer()));
+    viewer.set_show_primitives(false);
     log('viewer created. has_scene=' + viewer.has_scene());
 
     const params = new URLSearchParams(location.search);
@@ -85,7 +102,7 @@ window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' +
 
     if (!skipLoad) {
       log('fetching test.rmesh...');
-      const resp = await fetch('./test.rmesh');
+      const resp = await fetch(params.get('mesh') || './test.rmesh');
       if (!resp.ok) throw new Error('fetch test.rmesh: HTTP ' + resp.status);
       const buf = new Uint8Array(await resp.arrayBuffer());
       log('test.rmesh bytes: ' + buf.length);
@@ -93,9 +110,247 @@ window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' +
       viewer.load_rmesh(buf);
       log('has_scene=' + viewer.has_scene());
 
-      log('resize(320,240) + render() x 5...');
+      viewer.set_gpu_sort(false);
       viewer.resize(320, 240);
-      for (let i = 0; i < 5; i++) viewer.render();
+      viewer.set_shell_enabled(!params.has('noshell'));
+      const device = window.__smoketest.device;
+      async function renderBake() {
+        let wasReady = false;
+        for (let frame=0; frame<64; frame++) {
+          viewer.render();
+          await device.queue.onSubmittedWorkDone();
+          // A completed snapshot can have a newer light state queued. Give
+          // the next frame a chance to start it before declaring convergence.
+          if (viewer.bake_ready() && wasReady) return;
+          wasReady = viewer.bake_ready();
+        }
+        throw new Error('Bake did not finish');
+      }
+      async function pixels() {
+        const texture = window.__smoketest.color;
+        const stride = Math.ceil(texture.width * 8 / 256) * 256;
+        const buffer = device.createBuffer({size: stride * texture.height, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ});
+        const encoder = device.createCommandEncoder();
+        encoder.copyTextureToBuffer({texture}, {buffer, bytesPerRow:stride}, [texture.width, texture.height]);
+        device.queue.submit([encoder.finish()]);
+        await buffer.mapAsync(GPUMapMode.READ);
+        const half = new Uint16Array(buffer.getMappedRange());
+        const values = [];
+        for(let y=0;y<texture.height;y++) for(let x=0;x<texture.width;x++) for(let c=0;c<3;c++) {
+          const h=half[y*stride/2+x*4+c], e=(h>>10)&31, m=h&1023;
+          values.push((h&32768 ? -1:1) * (e===0 ? m*2**-24 : e===31 ? Infinity : (1+m/1024)*2**(e-15)));
+        }
+        buffer.unmap(); buffer.destroy(); return values;
+      }
+      function peak(p) { return p.reduce((a,b)=>Math.max(a,b),0); }
+      function difference(a,b) { return a.reduce((m,v,i)=>Math.max(m,Math.abs(v-b[i])),0); }
+      await renderBake();
+      if (params.has('gpusort')) {
+        const cpu = await pixels();
+        viewer.set_gpu_sort(true); viewer.render(); await device.queue.onSubmittedWorkDone();
+        async function readU32(source, length) {
+          const buffer = device.createBuffer({size:length*4,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+          const enc=device.createCommandEncoder(); enc.copyBufferToBuffer(source,0,buffer,0,length*4);
+          device.queue.submit([enc.finish()]); await buffer.mapAsync(GPUMapMode.READ);
+          const result=new Uint32Array(buffer.getMappedRange()).slice(); buffer.unmap(); buffer.destroy(); return result;
+        }
+        const bufs=window.__smoketest.buffers;
+        const count=(await readU32(bufs.indirect_args,4))[1];
+        const keys=await readU32(bufs.sort_keys,count);
+        const values=await readU32(bufs.sort_values,count);
+        let inversions=0;
+        for(let i=1;i<count;i++) if(keys[i]<keys[i-1]) inversions++;
+        log('GPU sorted keys: '+count+', inversions: '+inversions+', unique IDs: '+new Set(values).size);
+        const error = difference(cpu, await pixels());
+        log('CPU / GPU sort max RGB difference: '+error);
+        if (error>0.01) throw new Error('GPU sort differs from CPU sort: '+error);
+        viewer.set_sort_mode('gpu16'); viewer.render(); await device.queue.onSubmittedWorkDone();
+        const count16=(await readU32(bufs.indirect_args,4))[1];
+        const keys16=await readU32(bufs.sort_keys,count16);
+        const values16=await readU32(bufs.sort_values,count16);
+        if(count16!==count || new Set(values16).size!==count16) throw new Error('16-bit sort lost cells');
+        for(let i=0;i<count16;i++) if(keys16[i]>65535 || (i && keys16[i]<keys16[i-1])) throw new Error('Invalid 16-bit sorted keys');
+        log('16-bit sorted keys: '+count16+'; max RGB difference from 32-bit: '+difference(cpu,await pixels()));
+        viewer.set_sort_mode('gpu'); viewer.render(); await device.queue.onSubmittedWorkDone();
+      }
+      if (params.has('benchmark')) {
+        viewer.resize(1920,1080);
+        for (const sort of ['cpu','gpu','gpu16']) for (const moving of [false,true]) {
+          viewer.set_sort_mode(sort);
+          const samples=[];
+          for(let i=0;i<24;i++) {
+            const start=performance.now();
+            if(moving) viewer.orbit(0.5,0);
+            viewer.render(); await device.queue.onSubmittedWorkDone();
+            if(i>=4) samples.push(performance.now()-start);
+          }
+          samples.sort((a,b)=>a-b);
+          log('BENCH 1920x1080 '+sort+' sort '+(moving?'orbit':'stationary')+
+              ': median '+samples[10].toFixed(2)+' ms; p95 '+samples[19].toFixed(2)+' ms');
+        }
+        viewer.set_sort_mode('gpu');
+        viewer.resize(320,240);
+        await renderBake();
+      }
+      const original = Array.from(viewer.light_parameters(0));
+      // Same-aspect resize must invalidate cached CPU subpixel culling.
+      viewer.set_gpu_sort(false); viewer.resize(320,240); viewer.render(); await device.queue.onSubmittedWorkDone();
+      viewer.resize(640,480); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const resizedCpu = await pixels();
+      viewer.set_gpu_sort(true); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(resizedCpu,await pixels())>0.01) throw new Error('CPU culling cache survived a same-aspect resize');
+      viewer.resize(320,240); await renderBake();
+      const lit = await pixels();
+      for(const preset of ['Lowest','Low','Medium','Reference','High']) {
+        viewer.set_quality_preset(preset);
+        if(viewer.quality_preset()!==preset) throw new Error('Preset settings mismatch: '+preset);
+        viewer.render(); await device.queue.onSubmittedWorkDone();
+        const image=await pixels();
+        if(!image.every(Number.isFinite) || peak(image)<0.01) throw new Error('Preset rendered invalid image: '+preset);
+      }
+      if(difference(lit,await pixels())>0.001) throw new Error('High preset did not restore original image');
+      log('All five shared quality presets rendered successfully');
+      viewer.set_show_scene(false); viewer.set_collision_parameters(0.05,true);
+      viewer.render(); await device.queue.onSubmittedWorkDone();
+      const collisionPixels = await pixels();
+      const collisionCount = viewer.collision_triangle_count();
+      if(collisionCount===0 || peak(collisionPixels)<0.01) throw new Error('Collision debug mesh did not render');
+      viewer.set_collision_parameters(0.1,true); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(viewer.collision_triangle_count()===collisionCount) throw new Error('Collision threshold did not rebuild geometry');
+      viewer.set_collision_parameters(0.05,false); viewer.set_show_scene(true);
+      viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(lit,await pixels())>0.001) throw new Error('Hiding collision debug mesh did not restore image');
+      const initialKept = viewer.importance_kept_count();
+      viewer.set_importance_threshold(0.03);
+      if(viewer.importance_kept_count()>=initialKept) throw new Error('Importance threshold did not reduce retained tets');
+      viewer.set_importance_threshold(0.01);
+      const initialShell = viewer.shell_face_count();
+      viewer.set_shell_parameters(0.2,2);
+      if(viewer.shell_face_count()===initialShell) throw new Error('Shell threshold did not rebuild geometry');
+      viewer.set_shell_parameters(0.1,2);
+      if(viewer.shell_face_count()!==initialShell) throw new Error('Restoring shell settings changed face count');
+      viewer.set_shell_entry(true); viewer.set_shell_cull(false,0.001); viewer.set_shell_only(true);
+      viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(peak(await pixels())<0.01) throw new Error('Shell-only preview is empty');
+      viewer.set_show_scene(false); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(peak(await pixels())>0.001) throw new Error('Show scene toggle did not hide the volume and shell');
+      viewer.set_show_scene(true); viewer.set_shell_entry(false); viewer.set_shell_cull(true,0); viewer.set_shell_only(false);
+      viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(lit,await pixels())>0.001) throw new Error('Restoring rendering controls did not restore the image');
+      viewer.set_importance_enabled(false); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const uncull = await pixels();
+      if(!uncull.every(Number.isFinite) || peak(uncull)<0.01) throw new Error('Disabling importance culling broke rendering');
+      viewer.set_importance_enabled(true); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(lit,await pixels())>0.001) throw new Error('Importance toggle did not restore image');
+      const originalColor = Array.from(viewer.light_color(0));
+      viewer.set_light_color(0, 1, 0, 0); await renderBake();
+      const redLight = await pixels();
+      let redPeak = 0, otherPeak = 0;
+      for (let i=0; i<redLight.length; i+=3) {
+        redPeak = Math.max(redPeak, redLight[i]);
+        otherPeak = Math.max(otherPeak, redLight[i+1], redLight[i+2]);
+      }
+      if(redPeak<0.01 || otherPeak>0.001) throw new Error('Linear light color did not reach baked radiance');
+      viewer.set_light_color(0, ...originalColor); await renderBake();
+      if(difference(lit,await pixels())>0.001) throw new Error('Restoring light color did not restore radiance');
+      viewer.set_light(0, original[0], original[1], original[2], 0);
+      const spot = viewer.add_primitive('spot');
+      viewer.set_light(spot, ...original);
+      viewer.set_light_color(spot, ...originalColor);
+      viewer.set_light_direction(spot, -original[0], -original[1], -original[2]);
+      await renderBake();
+      const aimedSpot = await pixels();
+      viewer.set_light_direction(spot, original[0], original[1], original[2]);
+      await renderBake();
+      if(difference(aimedSpot,await pixels())<0.001) throw new Error('Spot direction did not change rendered lighting');
+      viewer.set_selected(spot); viewer.delete_selected();
+      viewer.set_light(0, ...original); await renderBake();
+      if(difference(lit,await pixels())>0.001) throw new Error('Deleting spotlight did not restore scene lighting');
+      if (!lit.every(Number.isFinite) || peak(lit)<0.01) throw new Error('Initial bake is dark or invalid');
+      viewer.set_light(0,...original.slice(0,3),0);
+      await renderBake();
+      if (peak(await pixels())>0.00001) throw new Error('Zero ambient scene should be dark without lights');
+      viewer.set_light(0,...original);
+      await renderBake();
+      const restoredError=difference(lit,await pixels());
+      if(restoredError>0.001) throw new Error('Restoring the light changed the image: '+restoredError);
+      const generation=viewer.bake_generation();
+      for(let i=0;i<10;i++) {
+        viewer.set_light(0,original[0]+0.05*i,original[1],original[2],original[3]);
+        viewer.render(); await device.queue.onSubmittedWorkDone();
+      }
+      if(viewer.bake_generation()<=generation) throw new Error('Moving light starved the bake');
+      viewer.set_light(0,...original); await renderBake();
+      const beforeTorch=viewer.primitive_count();
+      const beforeTorchBake=viewer.bake_generation();
+      viewer.shoot_torch();
+      for(let i=0;i<10;i++) { viewer.render(); await device.queue.onSubmittedWorkDone(); }
+      if(viewer.primitive_count()<=beforeTorch || viewer.bake_generation()<=beforeTorchBake) throw new Error('Torch did not update lighting');
+      viewer.clear_torches(); await renderBake();
+      if(viewer.primitive_count()!==beforeTorch) throw new Error('Torch light was not removed');
+      if(difference(lit,await pixels())>0.001) throw new Error('Torch removal did not restore scene lighting');
+      viewer.resize(384,256); await renderBake();
+      if(peak(await pixels())<0.01) throw new Error('Resize lost the image');
+      viewer.set_render_mode('forward'); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const forwardPixels=await pixels();
+      for(const sort of ['gpu','cpu','gpu16']) {
+        viewer.set_sort_mode(sort); viewer.set_render_mode('quad');
+        viewer.render(); await device.queue.onSubmittedWorkDone();
+        const quadPixels=await pixels();
+        if(!quadPixels.every(Number.isFinite) || peak(quadPixels)<0.01) throw new Error('Quad renderer produced invalid pixels with '+sort);
+        log('Quad / forward max RGB difference ('+sort+'): '+difference(forwardPixels,quadPixels));
+      }
+      viewer.set_sort_mode('gpu');
+      viewer.set_render_mode('interval'); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const beforeGrab = await pixels();
+      const picked = viewer.begin_vertex_grab(192,128,0.25);
+      if(picked<0) throw new Error('Vertex picking found no bench vertex');
+      const initialVertex = Array.from(viewer.vertex_position(picked));
+      viewer.move_vertex_grab(12,0);
+      for(let i=0;i<4;i++) { viewer.render(); await device.queue.onSubmittedWorkDone(); }
+      viewer.end_vertex_grab(false); await renderBake();
+      if(difference(beforeGrab,await pixels())>0.001) throw new Error('Cancelling vertex grab did not restore image');
+      if(viewer.begin_vertex_grab(192,128,0.25)!==picked) throw new Error('Cancelled grab changed vertex selection');
+      viewer.move_vertex_grab(8,0);
+      for(let i=0;i<4;i++) { viewer.render(); await device.queue.onSubmittedWorkDone(); }
+      const bakeBeforeGrab = viewer.bake_generation();
+      viewer.end_vertex_grab(true);
+      for(let i=0;i<120 && viewer.vertex_grab_active();i++) {
+        viewer.render(); await device.queue.onSubmittedWorkDone();
+        await new Promise(resolve=>setTimeout(resolve,0));
+      }
+      if(viewer.vertex_grab_active()) throw new Error('Vertex readback did not finish');
+      const committedVertex = Array.from(viewer.vertex_position(picked));
+      if(difference(initialVertex,committedVertex)<0.001) throw new Error('Vertex deformation was not committed');
+      await renderBake();
+      if(viewer.bake_generation()<=bakeBeforeGrab) throw new Error('Vertex commit did not rebake lighting');
+      viewer.set_render_mode('interval');
+      const animationResponse=await fetch('./assets/animation-test.gltf');
+      viewer.load_animation(new Uint8Array(await animationResponse.arrayBuffer()), 'Slide test');
+      if(viewer.animation_clip_count()!==1 || viewer.animation_duration()!==1) throw new Error('Animation metadata mismatch');
+      viewer.set_animation_playing(false); viewer.set_animation_looping(false);
+      // Keep the fixture outside the bench so volume occlusion cannot hide it.
+      viewer.set_camera(100,-1,-0.4,100,-2,-0.4);
+      viewer.seek_animation(0); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const animationStart=await pixels();
+      viewer.seek_animation(1); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(animationStart,await pixels())<0.01) throw new Error('Animation seeking did not move rendered geometry');
+      const animationEnd = await pixels();
+      if(viewer.animation_node_count()!==2) throw new Error('Animation hierarchy missing');
+      viewer.set_selected_node(0);
+      for(const key of ['g','x','0','.','2']) viewer.on_key_down(key);
+      viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(animationEnd,await pixels())<0.01) throw new Error('Group transform preview did not move descendants');
+      viewer.on_key_down('Escape'); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(difference(animationEnd,await pixels())>0.001) throw new Error('Node transform cancel changed the scene');
+      for(const key of ['g','x','0','.','2','Enter']) viewer.on_key_down(key);
+      viewer.seek_animation(0); viewer.render(); await device.queue.onSubmittedWorkDone();
+      const editedAnimation = await pixels();
+      if(difference(animationStart,editedAnimation)<0.01) throw new Error('Animation evaluation erased node edit');
+      viewer.on_key_down('Delete'); viewer.render(); await device.queue.onSubmittedWorkDone();
+      if(viewer.animation_node_count()!==0 || viewer.selected_node()!==-1) throw new Error('Deleting group did not remove descendants and selection');
+      if(difference(editedAnimation,await pixels())<0.01) throw new Error('Deleted nodes are still rendered');
+      log('PASS: baked RGB, zero ambient, light color, spot direction, relight, continuous motion, modeled torch, removal, resize, render modes, vertex grab/cancel/commit/rebake, glTF animation and node edits');
     } else {
       log('?init mode — skipping rmesh load');
       viewer.resize(320, 240);
@@ -110,6 +365,7 @@ window.addEventListener('unhandledrejection', e => log('UNHANDLED REJECTION: ' +
     const validationErr = await dev.popErrorScope();
     if (internalErr) log('INTERNAL ERROR: ' + internalErr.message.split('\n')[0]);
     if (validationErr) log('VALIDATION ERROR: ' + validationErr.message.split('\n')[0]);
+    if (internalErr || validationErr || gpuErrors.length) throw new Error('WebGPU validation failed');
     // One more render after error scope pop so the next frame goes through cleanly
     if (!skipLoad) viewer.render();
     await dev.queue.onSubmittedWorkDone();

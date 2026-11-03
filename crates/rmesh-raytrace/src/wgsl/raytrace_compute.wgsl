@@ -12,6 +12,10 @@
 #import rmesh::math::{MAX_VAL, safe_clip_v3f, safe_exp_f32, phi}
 #import rmesh::intersect::FACES
 
+#ifdef VIEWER_DEPTH
+@group(1) @binding(0) var opaque_depth: texture_depth_2d;
+#endif
+
 struct Uniforms {
     vp_col0: vec4<f32>,
     vp_col1: vec4<f32>,
@@ -44,7 +48,11 @@ struct BVHNode {
     right_or_count: i32,  // internal: right child, leaf: face count
 };
 
+#ifdef VIEWER_COLOR_ONLY
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
+#else
 @group(0) @binding(0) var<storage, read> uniforms: Uniforms;
+#endif
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> colors_buf: array<f32>;
@@ -55,11 +63,13 @@ struct BVHNode {
 @group(0) @binding(8) var<storage, read> bvh_nodes: array<BVHNode>;
 @group(0) @binding(9) var<storage, read> boundary_faces: array<u32>;
 @group(0) @binding(10) var<storage, read> start_tet_buf: array<i32>;
+#ifndef VIEWER_COLOR_ONLY
 @group(0) @binding(11) var<storage, read> ray_origins: array<f32>;  // [W*H*3] per-pixel origins
 @group(0) @binding(12) var<storage, read> ray_dirs: array<f32>;     // [W*H*3] per-pixel directions
 
 @group(1) @binding(0) var<storage, read_write> aux_image: array<f32>;
 @group(1) @binding(1) var<storage, read> aux_data: array<f32>;
+#endif
 
 const LOG_T_THRESHOLD: f32 = -5.54;
 const MAX_TRAVERSAL_ITERS: u32 = 512u;
@@ -87,6 +97,7 @@ fn eval_tet_rt(
     cam: vec3<f32>,
     ray_dir: vec3<f32>,
     t_near: f32,
+    t_far: f32,
 ) -> RayTetResult {
     var result: RayTetResult;
     result.c_premul = vec3<f32>(0.0);
@@ -159,6 +170,7 @@ fn eval_tet_rt(
 
     // Clamp entry to t_near to avoid re-processing the entry face
     t_min_val = max(t_min_val, t_near);
+    t_max_val = min(t_max_val, t_far);
 
     if (!valid || t_min_val >= t_max_val) {
         return result;
@@ -312,13 +324,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var ray_dir: vec3<f32>;
     var start_tet_id: i32;
 
+    #ifndef VIEWER_COLOR_ONLY
     if (uniforms.ray_mode == 1u) {
         // Custom rays from buffers (multi-origin support)
         let ri = pixel_idx_flat * 3u;
         cam = vec3<f32>(ray_origins[ri], ray_origins[ri + 1u], ray_origins[ri + 2u]);
         ray_dir = normalize(vec3<f32>(ray_dirs[ri], ray_dirs[ri + 1u], ray_dirs[ri + 2u]));
         start_tet_id = start_tet_buf[pixel_idx_flat];
-    } else {
+    } else
+    #endif
+    {
         // Derive ray from camera intrinsics (matches camera.slang get_ray):
         let c2w = mat3x3<f32>(uniforms.c2w_col0.xyz, uniforms.c2w_col1.xyz, uniforms.c2w_col2.xyz);
         let fx = uniforms.intrinsics.x;
@@ -338,6 +353,16 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // Apply min_t ray origin offset (matches Slang camera.min_t)
     cam = cam + ray_dir * uniforms.min_t;
 
+    var ray_limit = 3.402823e38;
+    #ifdef VIEWER_DEPTH
+    let depth = textureLoad(opaque_depth, vec2<i32>(i32(px), i32(py)), 0);
+    if (depth < 1.0) {
+        let vp = mat4x4<f32>(uniforms.vp_col0, uniforms.vp_col1, uniforms.vp_col2, uniforms.vp_col3);
+        let origin_clip = vp * vec4<f32>(cam, 1.0);
+        let dir_clip = vp * vec4<f32>(ray_dir, 0.0);
+        ray_limit = max(0.0, (depth * origin_clip.w - origin_clip.z) / (dir_clip.z - depth * dir_clip.w));
+    }
+    #endif
     var current_tet: i32;
     var t_cursor: f32;
 
@@ -355,11 +380,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             rendered_image[pixel_idx_flat * 4u + 1u] = 0.0;
             rendered_image[pixel_idx_flat * 4u + 2u] = 0.0;
             rendered_image[pixel_idx_flat * 4u + 3u] = 0.0;
+            #ifndef VIEWER_COLOR_ONLY
             // Write zeros to aux_image
             let aux_base = pixel_idx_flat * AUX_STRIDE;
             for (var ai = 0u; ai < AUX_STRIDE; ai++) {
                 aux_image[aux_base + ai] = 0.0;
             }
+            #endif
             return;
         }
         current_tet = hit.tet_id;
@@ -368,6 +395,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Adjacency traversal loop
     var color_accum = vec3<f32>(0.0);
+    #ifndef VIEWER_COLOR_ONLY
     var normal_accum = vec3<f32>(0.0);
     var depth_accum: f32 = 0.0;
     var entropy = vec4<f32>(0.0);
@@ -375,16 +403,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for (var ai = 0u; ai < AUX_DIM; ai++) {
         aux_accum[ai] = 0.0;
     }
+    #endif
     var log_t: f32 = 0.0;
     var iter = 0u;
 
-    while (current_tet >= 0 && log_t > LOG_T_THRESHOLD && iter < MAX_TRAVERSAL_ITERS) {
-        let result = eval_tet_rt(u32(current_tet), cam, ray_dir, t_cursor);
+    while (current_tet >= 0 && t_cursor < ray_limit && log_t > LOG_T_THRESHOLD && iter < MAX_TRAVERSAL_ITERS) {
+        let result = eval_tet_rt(u32(current_tet), cam, ray_dir, t_cursor, ray_limit);
 
         if (result.od > 0.0) {
             let T_j = safe_exp_f32(log_t);
             color_accum += result.c_premul * T_j;
 
+            #ifndef VIEWER_COLOR_ONLY
             let alpha = 1.0 - exp(-result.od);
 
             // Entry face normal (outward = toward camera)
@@ -412,6 +442,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 aux_accum[ai] += T_j * alpha * aux_data[u32(current_tet) * AUX_DIM + ai];
             }
 
+            #endif
             log_t -= result.od;
         }
 
@@ -434,6 +465,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     rendered_image[pixel_idx_flat * 4u + 2u] = color_accum.z;
     rendered_image[pixel_idx_flat * 4u + 3u] = 1.0 - T_final;
 
+    #ifndef VIEWER_COLOR_ONLY
     // Write aux output: [normal.xyz, depth, entropy.4, aux_data...]
     let aux_base = pixel_idx_flat * AUX_STRIDE;
     aux_image[aux_base + 0u] = normal_accum.x;
@@ -447,4 +479,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     for (var ai = 0u; ai < AUX_DIM; ai++) {
         aux_image[aux_base + 8u + ai] = aux_accum[ai];
     }
+    #endif
 }

@@ -181,7 +181,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         }
         let ext_x = (max_x - min_x) * uniforms.screen_width;
         let ext_y = (max_y - min_y) * uniforms.screen_height;
-        if (ext_x * ext_y < 1.0) {
+        if (ext_x * ext_y < 1.0 && (uniforms.shell_cull_flags & 8u) == 0u) {
             visible = false;
         }
 
@@ -205,13 +205,32 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let cz = circumdata[tet_id * 4u + 2u];
 
     let cam = uniforms.cam_pos_pad.xyz;
-    let center = vec3<f32>(cx, cy, cz);
+    var center = vec3<f32>(cx, cy, cz);
+    // During a GPU vertex grab the CPU circumspheres describe the pre-grab
+    // mesh. Recompute regular cells from the current vertices for the preview.
+    // Commit refreshes the full double-precision circumsphere cache.
+    if ((uniforms.shell_cull_flags & 2u) != 0u) {
+        let a = v1 - v0;
+        let b = v2 - v0;
+        let c = v3 - v0;
+        let denom = 2.0 * dot(a, cross(b, c));
+        if (abs(denom) >= 1e-10) {
+            center = v0 + (dot(a,a) * cross(b,c) + dot(b,b) * cross(c,a) + dot(c,c) * cross(a,b)) / denom;
+        }
+    }
     let depth_raw = dot(cam - v0, cam + v0 - 2.0 * center);
     let depth = clamp(depth_raw, -1e20, 1e20);
     let depth_bits = bitcast<u32>(depth);
 
     let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
-    sort_keys[vis_idx] = ~depth_bits;
+    if ((uniforms.shell_cull_flags & 4u) != 0u) {
+        // Same linear distance quantization as project_compute_16bit, without
+        // tile bookkeeping or its extra storage bindings.
+        let t = clamp(sqrt(max(depth_raw, 0.0)) / uniforms.far_plane, 0.0, 1.0);
+        sort_keys[vis_idx] = 65535u - u32(t * 65535.0);
+    } else {
+        sort_keys[vis_idx] = ~depth_bits;
+    }
     sort_values[vis_idx] = tet_id;
 
     // --- 4. Color evaluation (only for visible tets) ---

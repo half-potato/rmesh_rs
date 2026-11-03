@@ -50,6 +50,7 @@ rmesh-compositor    ← Opaque primitive rendering (cube, sphere, plane, cylinde
 rmesh-pbd           ← GPU XPBD distance-constraint solver for interactive vertex grabs
 rmesh-anim          ← Animation clock, keyframe evaluation, glTF scene loader
 rmesh-interact      ← Input handling & transform interactions (translate, rotate, scale, vertex select)
+rmesh-viewer-core   ← Shared desktop/web light baking, importance culling, vertex picking/PBD preparation, torch simulation, glTF GPU upload
 rmesh-viewer        ← Interactive winit/wgpu viewer (orbit camera, egui UI, loads .rmesh files)
 rmesh-viewer-web    ← WebAssembly viewer
 rmesh-python        ← PyO3/maturin bindings exposing RMeshRenderer to Python/PyTorch
@@ -72,8 +73,14 @@ The interval shading path is the active rendering approach for the viewer and fo
 1. **Project compute** — Projects tet vertices, evaluates SH color, generates sort keys (`project_compute.wgsl`, or the lean `project_compute_hw.wgsl` when tile counts are not needed)
 2. **Radix sort** — GPU radix sort of tets by depth (`rmesh-sort`, 5-pass: count → reduce → scan → scan_add → scatter). Falls back to CPU `radsort` + sphere-frustum cull on backends without subgroups (Chrome WebGPU).
 3. **Interval compute** — Generates screen-space triangles per tet and writes vertex + per-tet data to fixed-slot buffers (`interval_compute.wgsl`)
-4. **Interval vertex/fragment** — Hardware rasterizes the interval geometry with MRT output: color, depth, normals (`interval_vertex.wgsl`, `interval_fragment.wgsl`)
-5. **Deferred shading** — Fullscreen pass combining the MRT G-buffer with PBR lighting and DSM shadows (`deferred_shade_frag.wgsl`)
+4. **Interval vertex/fragment** — The desktop viewer uses `main_color_only` to integrate cached baked radiance into one HDR RGBA target (`interval_vertex.wgsl`, `interval_fragment.wgsl`). PBR albedo remains separate in scene data; it is not substituted for radiance on this path.
+5. **Present** — Blit integrated radiance to the display. The desktop viewer no longer runs deferred PBR, DSM lighting, GTAO, SSGI, SSR, or their temporal/blur passes. Hardware depth remains for opaque occlusion. The density shell, its Hi-Z, and importance culling are enabled in the normal quality presets. On macOS, shell color vertices are prepared in compute and rasterized from a conventional vertex buffer to avoid intermittent black frames in Metal’s procedural vertex path; Linux retains the direct vertex path. The compute preparation uses the same shell geometry, facing tests, colors, and depth pipeline, with no CPU readback. Legacy MRT APIs remain available to other consumers/tests; the viewer allocates their unused textures as 1×1 placeholders. For temporal regression captures, set `RMESH_SHOT_COUNT=N` with `RMESH_LINEAR_SHOT=/tmp/frame`; exports are `/tmp/frame.0.npy`, etc., from consecutive frames after bake completion.
+
+The desktop and web viewers share `rmesh-viewer-core` and retain albedo separately and automatically bakes scene point/spot lights with zero ambient. Its `light_bake.rs` and `wgsl/light_bake.wgsl` trace volumetric transmittance through tet adjacency at shared vertices, apply the material's SGGX projected area, and combine the cached irradiance with per-tet albedo into radiance. Light changes start an incremental bake in batches of 16,384 vertices ordered spatially (Morton order) for coherent shadow traversal. Each in-flight bake finishes a fixed light snapshot, then picks up the latest state so moving torches cannot starve completion. Single-light color/intensity edits reuse completed cached transport and only recombine radiance. Flare models carry an explicit point light through movement, fade, and removal. The diffuse bake uses shared BVH recovery to cross culled gaps and re-enter disconnected components; diffuse baking indexes exposed boundary faces; missing adjacency is not treated as escape to the light. Diffuse baking packs BVH nodes and faces into one buffer to stay within eight storage bindings. Unchanged lights require no baking work. The previous completed bake remains visible until its replacement is ready. Legacy assets without albedo use an approximate SH DC fallback. Learned vertex normals remain bake inputs; there is no screen-space normal attachment. This diffuse bake does not reproduce view-dependent specular terms.
+
+The desktop and web viewers use the shared diffuse light bake. The separate interactive energy renderer and its specular toggle have been removed. Energy material metadata remains available to data loading and the standalone reference-volume validation tools.
+
+Accuracy validation is separate from that approximate viewer bake. `scripts/sdir_checkpoint_reference.py` executes sdir's actual CPU Warp volume quadrature and M3 shading with CPU-evaluated checkpoint materials, and can export a full-precision `RMLIT001` scene. `rmesh-viewer --reference-volume` runs the native float32 per-ray equivalent (including M3 and face-BVH shadow recovery), without opening a window. `scripts/validate_reference_volume.py` renders the exported rays and gates maximum absolute linear RGB error against the sdir image, with default epsilon 0.01. This command-line path is not yet an interactive bake replacement. A passing comparison covers only its matched camera, lights, quadrature, and CPU-evaluated inputs; it does not certify the vertex-average bake or equivalence to original CUDA/TF32 checkpoint evaluation. The optimized `.rmesh` density quantization and missing M3 channels must not be silently treated as full-precision reference data.
 
 The two pipeline structs that drive this path:
 - `ComputeIntervalPipelines` — compute → vertex/fragment draw. **Universal** — works on every backend (Metal/Vulkan/DX12/WebGPU).
@@ -93,12 +100,12 @@ Opaque primitives (cubes, spheres, planes, cylinders) are rendered via `Primitiv
 
 ### Mesh-Style Shader (old pathway)
 
-The original vertex/fragment and mesh-shader forward path predates interval shading. It still compiles and the viewer exposes it via `RenderMode::Regular`, `RenderMode::Quad`, `RenderMode::MeshShader`, and `RenderMode::RayTrace`, but is no longer the default and is not used by training or the Python bindings:
+The original vertex/fragment and mesh-shader forward path predates interval shading. It still compiles and the viewer exposes it via `RenderMode::Regular`, `RenderMode::Quad`, and `RenderMode::MeshShader`, but is no longer the default and is not used by training or the Python bindings:
 
 - **Hardware rasterization** (`forward_vertex.wgsl`, `forward_fragment.wgsl`, `ForwardPipelines`) — the original 12-tri-per-tet draw with sorted indices.
 - **Quad billboard** (`forward_vertex_quad.wgsl`, `forward_fragment_quad.wgsl`, `forward_prepass_compute.wgsl`) — 4 verts/tet via triangle strip, reads a precomputed per-tet buffer.
 - **Mesh-shader forward** (`forward_mesh.wgsl`, `MeshForwardPipelines`) — non-interval mesh-shader path.
-- **Ray-tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`) — software ray-tet intersection used for the viewer's diagnostic mode.
+- **Ray-tracing compute** (`raytrace_compute.wgsl`, `RayTracePipeline`) — software ray-tet intersection retained for tests and reference validation; removed from both interactive viewers.
 
 Also retained but not wired into the active viewer modes: `project_compute_16bit.wgsl` (half-precision projection) and `shadow_ray_gen.wgsl` (pre-DSM shadow approach).
 
@@ -121,7 +128,7 @@ The older `rasterize_compute.wgsl` (`RasterizeComputePipeline`) — a pre-interv
 ### Interaction & Physics
 
 - **rmesh-interact** — Input handling, transform manipulators (translate/rotate/scale) and vertex-select picking for the viewer.
-- **rmesh-pbd** — GPU XPBD distance-constraint solver for localized vertex grabs. CPU BFS island construction + greedy edge coloring feed a per-step compute pipeline (`apply_handles`, `predict`, `solve_distance` × iters × colors, `finalize`). Ported from DelTetRenderer's `PBDMove.hpp`.
+- **rmesh-pbd** — GPU XPBD distance-constraint solver for localized vertex grabs in both desktop and web viewers. Shared picking, drag math, island preparation and asynchronous readback live in `rmesh-viewer-core::vertices`; browser controls use V or Grab vertices, release to commit, and Escape to cancel. CPU BFS island construction + greedy edge coloring feed a per-step compute pipeline (`apply_handles`, `predict`, `solve_distance` × iters × colors, `finalize`). Ported from DelTetRenderer's `PBDMove.hpp`.
 - **rmesh-anim** — Animation clock, keyframe interpolation (step/linear/cubic spline), scene hierarchy, glTF loader.
 
 ### Key Design Patterns

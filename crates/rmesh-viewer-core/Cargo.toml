@@ -1,0 +1,28 @@
+[package]
+name = "rmesh-viewer-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rmesh-render = { path = "../rmesh-render" }
+rmesh-pbd = { path = "../rmesh-pbd" }
+rmesh-data = { path = "../rmesh-data", default-features = false }
+rmesh-raytrace = { path = "../rmesh-raytrace" }
+rmesh-interact = { path = "../rmesh-interact" }
+rmesh-compositor = { path = "../rmesh-compositor" }
+wgpu = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+log = { workspace = true }
+web-time = { workspace = true }
+
+rmesh-anim = { path = "../rmesh-anim" }
+
+[dev-dependencies]
+rmesh-sort = { path = "../rmesh-sort" }
+half = { workspace = true }
+pollster = { workspace = true }
+rmesh-util = { path = "../rmesh-util", features = ["test-util"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }

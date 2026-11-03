@@ -5,6 +5,7 @@
 
 use glam::{Quat, Vec3};
 use rmesh_interact::{Primitive, PrimitiveKind};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::mpsc;
 
@@ -19,17 +20,13 @@ const FLARE_RADIUS: f32 = 0.25;
 /// The model is ~17 units tall along its local axis.
 const FLARE_MODEL_HEIGHT: f32 = 17.0;
 const FLARE_MODEL_SCALE: f32 = 2.0 * FLARE_RADIUS / FLARE_MODEL_HEIGHT;
+/// Outer face of the glowing cap: source +Y becomes local -Z on import.
+const FLARE_LIGHT_OFFSET: Vec3 = Vec3::new(0.0, 0.0, -8.842294 * FLARE_MODEL_SCALE);
 /// Half-width of the body cylinder after scaling: the source body has
 /// R ≈ 0.92 in the Y-up glTF, and `FLARE_MODEL_SCALE` carries it to ~0.027
 /// in world units. Used to lift the model off angled walls on collision.
 const FLARE_BODY_RADIUS: f32 = 0.92 * FLARE_MODEL_SCALE;
 
-/// Model-local position of the bright cap's centroid (in COLMAP coords, before
-/// `prim.transform.scale` is applied). The cap mesh spans Y ∈ [6.40, 8.84] in
-/// the Y-up source; the center Y ≈ 7.62 maps to Z = -7.62 via `yup_to_colmap`.
-/// Used by the deferred renderer to emit the flare's point light from the cap
-/// rather than the model's geometric center.
-pub const FLARE_LIGHT_LOCAL_OFFSET: Vec3 = Vec3::new(0.0, 0.0, -7.62);
 const BVH_MAX_LEAF: usize = 4;
 
 // -----------------------------------------------------------------------
@@ -91,12 +88,7 @@ pub fn unpack_face(packed: u32) -> (usize, usize) {
 ///
 /// The result is in [0, 1] and means the same thing in every scene, which is
 /// what makes a shared default threshold possible at all.
-pub fn tet_alphas(
-    verts: &[f32],
-    idxs: &[u32],
-    densities: &[f32],
-    tet_count: usize,
-) -> Vec<f32> {
+pub fn tet_alphas(verts: &[f32], idxs: &[u32], densities: &[f32], tet_count: usize) -> Vec<f32> {
     (0..tet_count)
         .map(|t| {
             let p = |k: usize| v3_from(verts, idxs[t * 4 + k] as usize);
@@ -582,7 +574,6 @@ struct Flare {
 pub struct FlareSystem {
     flares: Vec<Flare>,
     pub density_threshold: f32,
-    pub force_dsm_recompute: bool,
     pub show_collision_mesh: bool,
     collision_mesh: Option<CollisionMesh>,
     last_built_threshold: f32,
@@ -610,7 +601,6 @@ impl Default for FlareSystem {
         Self {
             flares: Vec::new(),
             density_threshold: 0.05,
-            force_dsm_recompute: false,
             show_collision_mesh: false,
             collision_mesh: None,
             last_built_threshold: -1.0,
@@ -670,6 +660,25 @@ impl FlareSystem {
             primitives.push(prim);
         }
 
+        // The model meshes are visual geometry; the baker consumes explicit
+        // lights. Track this light with the same lifetime/physics as the model.
+        if self.has_flare_model {
+            let mut light = Primitive::new(
+                PrimitiveKind::PointLight,
+                format!("Flare.{:03}.Light", flare_id),
+            );
+            light.transform.position = camera_pos + dir_to_rotation(camera_forward) * FLARE_LIGHT_OFFSET;
+            light.transform.scale = Vec3::splat(FLARE_MODEL_SCALE);
+            light.color = Some([
+                FLARE_COLOR[0],
+                FLARE_COLOR[1],
+                FLARE_COLOR[2],
+                FLARE_INTENSITY,
+            ]);
+            indices.push(primitives.len());
+            primitives.push(light);
+        }
+
         self.flares.push(Flare {
             position: camera_pos,
             velocity: camera_forward * INITIAL_SPEED,
@@ -695,6 +704,7 @@ impl FlareSystem {
     /// result. Replaces any in-flight rebuild; the old result is dropped.
     /// Used after a PBD soft-body grab confirm so flares track the deformed
     /// surface without blocking the user.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start_async_rebuild(&mut self, scene_data: &rmesh_data::SceneData) {
         if scene_data.tet_count == 0 {
             return;
@@ -746,6 +756,11 @@ impl FlareSystem {
     }
 
     /// Rebuild the collision mesh if the threshold changed or it hasn't been built yet.
+    pub fn invalidate_geometry(&mut self) {
+        self.collision_mesh = None;
+        self.collision_mesh_dirty = true;
+    }
+
     pub fn ensure_collision_mesh(&mut self, scene_data: &rmesh_data::SceneData) {
         if scene_data.tet_count == 0 {
             return;
@@ -829,7 +844,12 @@ impl FlareSystem {
 
             for &prim_idx in &flare.primitive_indices {
                 if let Some(prim) = primitives.get_mut(prim_idx) {
-                    prim.transform.position = flare.position;
+                    prim.transform.position = flare.position
+                        + if self.has_flare_model && prim.kind == PrimitiveKind::PointLight {
+                            rotation * FLARE_LIGHT_OFFSET
+                        } else {
+                            Vec3::ZERO
+                        };
                     prim.transform.rotation = rotation;
                     prim.color = Some([FLARE_COLOR[0], FLARE_COLOR[1], FLARE_COLOR[2], intensity]);
                 }
@@ -868,6 +888,35 @@ impl FlareSystem {
         }
     }
 
+    /// Delete a user-selected primitive, or its whole torch when it belongs to
+    /// one, preserving the remaining torches' indices into the shared list.
+    pub fn remove_primitive(&mut self, primitives: &mut Vec<Primitive>, index: usize) {
+        if index >= primitives.len() {
+            return;
+        }
+        let mut indices = if let Some(flare) = self
+            .flares
+            .iter()
+            .position(|f| f.primitive_indices.contains(&index))
+        {
+            self.flares.remove(flare).primitive_indices
+        } else {
+            vec![index]
+        };
+        indices.sort_unstable();
+        indices.dedup();
+        for index in indices.into_iter().rev() {
+            primitives.remove(index);
+            for flare in &mut self.flares {
+                for remaining in &mut flare.primitive_indices {
+                    if *remaining > index {
+                        *remaining -= 1;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn clear(&mut self, primitives: &mut Vec<Primitive>) {
         let mut prim_indices: Vec<usize> = self
             .flares
@@ -884,10 +933,6 @@ impl FlareSystem {
         self.flares.clear();
     }
 
-    pub fn has_moving_flares(&self) -> bool {
-        self.flares.iter().any(|f| !f.stuck && f.lifetime > 0.0)
-    }
-
     pub fn flare_count(&self) -> usize {
         self.flares.len()
     }
@@ -897,29 +942,36 @@ impl FlareSystem {
         self.collision_mesh.as_ref().map(|m| m.to_debug_vertices())
     }
 
+    /// Upload debug geometry only when requested, retaining the dirty flag while hidden.
+    pub fn upload_collision_debug(&mut self, device: &wgpu::Device, geometry: &mut rmesh_compositor::PrimitiveGeometry) {
+        if self.show_collision_mesh && self.collision_mesh_dirty {
+            let vertices = self.collision_debug_vertices().unwrap_or_default();
+            geometry.set_collision_mesh(device, &vertices);
+            self.collision_mesh_dirty = false;
+        }
+    }
+
     pub fn collision_triangle_count(&self) -> usize {
         self.collision_mesh
             .as_ref()
             .map_or(0, |m| m.triangle_count())
     }
 
+    pub fn configure_model(&mut self, scene: &rmesh_anim::GltfScene) {
+        self.flare_mesh_count = scene.meshes.len();
+        self.has_flare_model = !scene.meshes.is_empty();
+        self.flare_material_indices = (0..scene.meshes.len())
+            .map(|i| if i < scene.materials.len() { i } else { 0 })
+            .collect();
+    }
+
     /// Load the flare 3D model from a glTF file. Returns the converted mesh vertices
     /// and material data for upload to the GPU. Call this once at startup.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn load_model(&mut self, path: &Path) -> Option<rmesh_anim::gltf_loader::GltfScene> {
         match rmesh_anim::gltf_loader::load_gltf(path) {
             Ok(scene) => {
-                self.flare_mesh_count = scene.meshes.len();
-                self.has_flare_model = true;
-                // Each mesh maps to a material by index (matching the glTF primitive order)
-                self.flare_material_indices = (0..scene.meshes.len())
-                    .map(|i| if i < scene.materials.len() { i } else { 0 })
-                    .collect();
-                log::info!(
-                    "Loaded flare model: {} meshes, {} textures, {} materials",
-                    scene.meshes.len(),
-                    scene.textures.len(),
-                    scene.materials.len(),
-                );
+                self.configure_model(&scene);
                 Some(scene)
             }
             Err(e) => {
@@ -951,6 +1003,88 @@ fn dir_to_rotation(dir: Vec3) -> Quat {
 mod tests {
     use super::*;
 
+    #[test]
+    fn deleting_primitives_keeps_torch_indices_and_lights_together() {
+        let mut system = FlareSystem::default();
+        system.has_flare_model = true;
+        system.flare_mesh_count = 2;
+        let mut primitives = vec![Primitive::new(PrimitiveKind::Cube, "User cube")];
+        let mut id = 0;
+        for _ in 0..2 {
+            system.shoot(Vec3::ZERO, Vec3::X, &mut primitives, &mut id);
+        }
+        system.remove_primitive(&mut primitives, 0);
+        assert_eq!(system.flares[0].primitive_indices, vec![0, 1, 2]);
+        assert_eq!(system.flares[1].primitive_indices, vec![3, 4, 5]);
+        // Selecting one mesh removes its attached light and other mesh too.
+        system.remove_primitive(&mut primitives, 1);
+        assert_eq!(system.flare_count(), 1);
+        assert_eq!(system.flares[0].primitive_indices, vec![0, 1, 2]);
+        assert_eq!(primitives.len(), 3);
+        assert_eq!(
+            primitives
+                .iter()
+                .filter(|p| p.kind == PrimitiveKind::PointLight)
+                .count(),
+            1
+        );
+        system.clear(&mut primitives);
+        assert!(primitives.is_empty());
+    }
+
+    #[test]
+    fn modeled_torch_light_follows_fades_and_is_removed() {
+        let scene = rmesh_util::test_util::build_test_scene(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            vec![0, 1, 2, 3],
+            vec![0.0],
+            vec![0.0; 3],
+        );
+        for modeled in [false, true] {
+            let mut system = FlareSystem::default();
+            system.has_flare_model = modeled;
+            system.flare_mesh_count = 2;
+            let mut primitives = vec![];
+            let mut id = 0;
+            system.shoot(Vec3::splat(10.0), Vec3::X, &mut primitives, &mut id);
+            assert_eq!(
+                primitives
+                    .iter()
+                    .filter(|p| p.kind == PrimitiveKind::PointLight)
+                    .count(),
+                1
+            );
+            let spawned_light = primitives.iter().find(|p| p.kind == PrimitiveKind::PointLight).unwrap();
+            let spawn_expected = Vec3::splat(10.0) - if modeled {
+                Vec3::X * FLARE_LIGHT_OFFSET.length()
+            } else { Vec3::ZERO };
+            assert!((spawned_light.transform.position - spawn_expected).length() < 1e-6);
+            system.flares[0].lifetime = FADE_DURATION;
+            system.tick(0.1, &mut primitives, &scene);
+            let light = primitives
+                .iter()
+                .find(|p| p.kind == PrimitiveKind::PointLight)
+                .unwrap();
+            assert_ne!(light.transform.position, Vec3::splat(10.0));
+            let expected = system.flares[0].position + if modeled {
+                dir_to_rotation(system.flares[0].last_dir) * FLARE_LIGHT_OFFSET
+            } else { Vec3::ZERO };
+            assert!((light.transform.position - expected).length() < 1e-6);
+            if modeled {
+                // The glowing end trails the velocity; the dim end hits first.
+                assert!((light.transform.position - system.flares[0].position)
+                    .dot(system.flares[0].last_dir) < 0.0);
+            }
+            assert!(light.color.unwrap()[3] < FLARE_INTENSITY);
+            system.flares[0].lifetime = 0.0;
+            system.tick(0.1, &mut primitives, &scene);
+            assert!(primitives.is_empty());
+            system.shoot(Vec3::ZERO, Vec3::X, &mut primitives, &mut id);
+            system.clear(&mut primitives);
+            assert!(primitives.is_empty());
+        }
+    }
+
     /// Two tets sharing the face (v0, v1, v2). Vertices are shared by index so
     /// the shared face really is one face, not two coincident ones.
     fn two_tets_sharing_a_face(densities: [f32; 2]) -> (Vec<u32>, Vec<f32>) {
@@ -965,7 +1099,11 @@ mod tests {
         let faces = extract_boundary_faces(&indices, &densities, 2, 0.5, 0);
 
         // 8 faces total, minus the one interior face counted from both sides.
-        assert_eq!(faces.len(), 6, "expected a closed 6-face surface: {faces:?}");
+        assert_eq!(
+            faces.len(),
+            6,
+            "expected a closed 6-face surface: {faces:?}"
+        );
 
         // Every face must belong to one of the two tets, and no (tet, face)
         // pair may repeat.
@@ -1010,7 +1148,10 @@ mod tests {
         // volume, so an opaque shell over it both looks wrong and wrongly
         // occludes whatever is behind it.
         let (indices, densities) = two_tets_sharing_a_face([1.0, 1.0]);
-        assert_eq!(extract_boundary_faces(&indices, &densities, 2, 0.5, 0).len(), 6);
+        assert_eq!(
+            extract_boundary_faces(&indices, &densities, 2, 0.5, 0).len(),
+            6
+        );
         assert!(
             extract_boundary_faces(&indices, &densities, 2, 0.5, 1).is_empty(),
             "one erosion step should peel a two-tet slab away entirely"

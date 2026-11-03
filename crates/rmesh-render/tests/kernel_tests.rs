@@ -118,7 +118,7 @@ fn test_project_compute_kernel() {
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipelines.compute_pipeline);
+        pass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         pass.set_bind_group(0, &compute_bg.bg0, &[]);
         pass.set_bind_group(1, &compute_bg.bg1, &[]);
         let n_pow2 = scene.tet_count.next_power_of_two();
@@ -625,7 +625,7 @@ fn project_visible_count_with_shell(
             label: Some("project_compute_shell_cull"),
             timestamp_writes: None,
         });
-        pass.set_pipeline(&pipelines.compute_pipeline);
+        pass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         pass.set_bind_group(0, &compute_bg.bg0, &[]);
         pass.set_bind_group(1, &compute_bg.bg1, &[]);
         let n_pow2 = scene.tet_count.next_power_of_two();

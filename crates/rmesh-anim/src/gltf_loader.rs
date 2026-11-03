@@ -209,6 +209,38 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene> {
         .file_stem()
         .map_or("scene".into(), |n| n.to_string_lossy().into_owned());
 
+    decode_gltf(document, buffers, images, &file_name)
+}
+
+/// Load a self-contained GLB or glTF with embedded resources (no filesystem).
+pub fn load_gltf_bytes(data: &[u8], name: &str) -> Result<GltfScene> {
+    let gltf::Gltf { document, blob } =
+        gltf::Gltf::from_slice(data).context("Failed to parse embedded glTF/GLB")?;
+    // gltf's image importer requires a base even for data URIs. Validate every
+    // URI first so supplying that base can never cause filesystem access.
+    for buffer in document.buffers() {
+        if let gltf::buffer::Source::Uri(uri) = buffer.source() {
+            anyhow::ensure!(uri.starts_with("data:"), "Buffer must be embedded: {uri}");
+        }
+    }
+    for image in document.images() {
+        if let gltf::image::Source::Uri { uri, .. } = image.source() {
+            anyhow::ensure!(uri.starts_with("data:"), "Image must be embedded: {uri}");
+        }
+    }
+    let buffers =
+        gltf::import_buffers(&document, None, blob).context("Failed to decode embedded buffers")?;
+    let images = gltf::import_images(&document, Some(Path::new("")), &buffers)
+        .context("Failed to decode embedded images")?;
+    decode_gltf(document, buffers, images, name)
+}
+
+fn decode_gltf(
+    document: gltf::Document,
+    buffers: Vec<gltf::buffer::Data>,
+    images: Vec<gltf::image::Data>,
+    file_name: &str,
+) -> Result<GltfScene> {
     // --- Load textures ---
     let textures: Vec<LoadedTexture> = images
         .iter()
@@ -422,10 +454,11 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene> {
     let mut nodes: Vec<SceneNode> = Vec::new();
     let mut node_index_map: HashMap<usize, usize> = HashMap::new();
 
-    // Insert root coordinate-conversion node (Y-up → COLMAP)
+    // Keep a grouping root; geometry, local transforms and animation channels
+    // are all converted to COLMAP below. Rotating this root would convert the
+    // already converted mesh vertices a second time.
     {
         let mut root = SceneNode::new(format!("{}_root", file_name));
-        root.local_transform.rotation = Quat::from_rotation_x(-std::f32::consts::FRAC_PI_2);
         root.parent = None;
         root.visible = true;
         nodes.push(root);
@@ -456,9 +489,9 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene> {
 
         let (translation, rotation, scale) = gltf_node.transform().decomposed();
         let local_transform = rmesh_interact::Transform {
-            position: Vec3::from(translation),
-            rotation: Quat::from_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
-            scale: Vec3::from(scale),
+            position: Vec3::from(yup_to_colmap(translation)),
+            rotation: Quat::from_xyzw(rotation[0], rotation[2], -rotation[1], rotation[3]),
+            scale: Vec3::new(scale[0], scale[2], scale[1]),
         };
 
         let gltf_mesh = gltf_node.mesh();
@@ -581,12 +614,15 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene> {
             let values: Vec<f32> = match reader.read_outputs() {
                 Some(outputs) => match outputs {
                     gltf::animation::util::ReadOutputs::Translations(iter) => {
-                        iter.flatten().collect()
+                        iter.flat_map(yup_to_colmap).collect()
                     }
-                    gltf::animation::util::ReadOutputs::Rotations(iter) => {
-                        iter.into_f32().flatten().collect()
+                    gltf::animation::util::ReadOutputs::Rotations(iter) => iter
+                        .into_f32()
+                        .flat_map(|q| [q[0], q[2], -q[1], q[3]])
+                        .collect(),
+                    gltf::animation::util::ReadOutputs::Scales(iter) => {
+                        iter.flat_map(|s| [s[0], s[2], s[1]]).collect()
                     }
-                    gltf::animation::util::ReadOutputs::Scales(iter) => iter.flatten().collect(),
                     gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => continue,
                 },
                 None => continue,
@@ -609,7 +645,7 @@ pub fn load_gltf(path: &Path) -> Result<GltfScene> {
     }
 
     // --- Assemble scene ---
-    let mut scene = AnimatedScene::new(&file_name);
+    let mut scene = AnimatedScene::new(file_name);
     scene.nodes = nodes;
     scene.clips = clips;
     scene.playback = PlaybackState {

@@ -1,0 +1,11 @@
+Model Information:
+* title:	Flare
+* source:	https://sketchfab.com/3d-models/flare-3b85d4d0368242f0a0deb15182e434eb
+* author:	FrodoUndead (https://sketchfab.com/FrodoUndead)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Flare" (https://sketchfab.com/3d-models/flare-3b85d4d0368242f0a0deb15182e434eb) by FrodoUndead (https://sketchfab.com/FrodoUndead) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

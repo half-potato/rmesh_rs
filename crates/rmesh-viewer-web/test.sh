@@ -18,7 +18,7 @@ cd "$(dirname "$0")"
 
 PORT="${PORT:-8000}"
 URL="http://localhost:${PORT}/smoketest.html"
-DEV_PORT=9333
+DEV_PORT="${DEV_PORT:-9333}"
 
 curl -fsS -o /dev/null "$URL" || {
   echo "Server not running on port $PORT. Start with: ./serve.sh"; exit 1
@@ -29,9 +29,10 @@ TMP="$(mktemp -d)"
 LOG="$(mktemp)"
 SHOT="$(mktemp -t rmesh-shot.XXXXXX.png)"
 
-# Make sure no stale headless chrome is holding DEV_PORT
-pkill -f "Google Chrome --headless" 2>/dev/null || true
-sleep 1
+# Never terminate unrelated browser sessions.
+if curl -fsS "http://localhost:${DEV_PORT}/json/version" >/dev/null 2>&1; then
+  echo "Debug port $DEV_PORT is in use; choose another DEV_PORT."; exit 1
+fi
 
 "$CHROME" \
   --headless=new \
@@ -44,7 +45,7 @@ sleep 1
   --remote-debugging-port="$DEV_PORT" \
   "$URL" > "$LOG" 2>&1 &
 CHROME_PID=$!
-trap 'kill "$CHROME_PID" 2>/dev/null || true; pkill -f "Google Chrome --headless" 2>/dev/null || true' EXIT
+trap 'kill "$CHROME_PID" 2>/dev/null || true' EXIT
 
 # Wait for the page to appear in the tab list.
 for _ in 1 2 3 4 5 6; do

@@ -42,6 +42,40 @@ pub struct ShellView {
 
 pub const SHELL_VIEW_SIZE: u64 = std::mem::size_of::<ShellView>() as u64;
 
+fn prepared_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("shell_prepared_layout"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    })
+}
+
+fn prepared_buffers(device: &wgpu::Device, faces: u64) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shell_prepared_vertices"),
+        size: faces.max(1) * 3 * 32,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shell_prepared_vertices"),
+        layout: &prepared_layout(device),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, group)
+}
+
 /// GPU-side shell: the packed face-id buffer plus its count.
 ///
 /// The buffer is grown on demand and never shrunk — thresholds get dragged back
@@ -71,6 +105,8 @@ pub enum ShellFace {
 }
 
 pub struct ShellBuffers {
+    prepared: wgpu::Buffer,
+    prepared_bg: wgpu::BindGroup,
     pub faces: wgpu::Buffer,
     /// Faces actually live in `faces` (may be less than its capacity).
     pub face_count: u32,
@@ -83,6 +119,7 @@ pub struct ShellBuffers {
 
 impl ShellBuffers {
     pub fn new(device: &wgpu::Device) -> Self {
+        let (prepared, prepared_bg) = prepared_buffers(device, 1);
         // One dummy face so the binding is never zero-sized (WebGPU rejects
         // zero-sized storage bindings) and `arrayLength` stays well-defined.
         let faces = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -97,6 +134,8 @@ impl ShellBuffers {
             mapped_at_creation: false,
         });
         Self {
+            prepared,
+            prepared_bg,
             faces,
             face_count: 0,
             capacity: 1,
@@ -117,6 +156,9 @@ impl ShellBuffers {
 
         let mut realloc = false;
         if faces.len() as u32 > self.capacity {
+            if cfg!(any(target_os = "macos", target_arch = "wasm32")) {
+                (self.prepared, self.prepared_bg) = prepared_buffers(device, faces.len() as u64);
+            }
             self.faces = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("shell_faces"),
                 size: (faces.len() * 4) as u64,
@@ -170,6 +212,9 @@ impl ShellBuffers {
 }
 
 pub struct ShellPipeline {
+    baked: bool,
+    prepare_color: Option<wgpu::ComputePipeline>,
+    pub color_pipeline: wgpu::RenderPipeline,
     pub mrt_pipeline: wgpu::RenderPipeline,
     /// Writes depth plus an alpha=1 absorber moment, for the DSM cube faces.
     pub dsm_pipeline: wgpu::RenderPipeline,
@@ -187,16 +232,36 @@ impl ShellPipeline {
         dsm_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
+        Self::new_internal(device, formats, dsm_format, depth_format, false)
+    }
+    pub fn new_baked(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats,
+        dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat) -> Self {
+        Self::new_internal(device, formats, dsm_format, depth_format, true)
+    }
+    fn new_internal(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats,
+        dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, baked: bool) -> Self {
+        let mut source=SHELL_WGSL.to_string();
+        if baked {
+            source=source.lines().filter(|l| !l.contains("@binding(6)") && !l.contains("@binding(7)")).collect::<Vec<_>>().join("\n");
+            let start=source.find("fn read_sh_f16").unwrap();
+            let end=source[start..].find("fn load_vertex").unwrap()+start;
+            source.replace_range(start..end, "");
+            let start=source.find("fn eval_sh_color").unwrap();
+            let end=source[start..].find("struct VsOut").unwrap()+start;
+            source.replace_range(start..end, "fn eval_sh_color(tet_id:u32, dir:vec3<f32>, at:vec3<f32>, centroid:vec3<f32>) -> vec3<f32> { return vec3<f32>(base_colors_buf[tet_id*3u],base_colors_buf[tet_id*3u+1u],base_colors_buf[tet_id*3u+2u]); }\n");
+        }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shell.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SHELL_WGSL.as_str().into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
         // binding 0 = uniform (ShellView), 1..=9 = read-only storage.
         // That is 9 storage buffers per stage, inside WebGPU's cap of 10.
         let mut entries = vec![wgpu::BindGroupLayoutEntry {
             binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            visibility: wgpu::ShaderStages::VERTEX
+                | wgpu::ShaderStages::FRAGMENT
+                | wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::Buffer {
                 ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: false,
@@ -205,9 +270,12 @@ impl ShellPipeline {
             count: None,
         }];
         for binding in 1..=9u32 {
+            if baked && [6,7].contains(&binding) { continue; }
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                visibility: wgpu::ShaderStages::VERTEX
+                    | wgpu::ShaderStages::FRAGMENT
+                    | wgpu::ShaderStages::COMPUTE,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -265,7 +333,7 @@ impl ShellPipeline {
                 compilation_options: Default::default(),
             },
             primitive,
-            depth_stencil: Some(depth_stencil),
+            depth_stencil: Some(depth_stencil.clone()),
             multisample: wgpu::MultisampleState::default(),
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -293,6 +361,66 @@ impl ShellPipeline {
                         write_mask: wgpu::ColorWrites::ALL,
                     }),
                 ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // The procedural storage-fetch vertex path intermittently produces
+        // black frames on macOS/Metal with large real shells. The same shell
+        // evaluation is stable in compute followed by a conventional vertex
+        // stream. Keep the direct path elsewhere; no CPU readback or extra
+        // queue submission is needed for the Metal workaround.
+        let prepare_color = cfg!(any(target_os = "macos", target_arch = "wasm32")).then(|| {
+            let output_layout = prepared_layout(device);
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shell_prepare_layout"),
+                bind_group_layouts: &[&bg_layout, &output_layout],
+                immediate_size: 0,
+            });
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("shell_prepare_color"),
+                layout: Some(&layout),
+                module: &shader,
+                entry_point: Some("prepare_color"),
+                compilation_options: Default::default(),
+                cache: None,
+            })
+        });
+        let vertex_layout = wgpu::VertexBufferLayout {
+            array_stride: 32,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4],
+        };
+        let color_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shell_color_pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some(if prepare_color.is_some() {
+                    "vs_prepared"
+                } else {
+                    "vs_main"
+                }),
+                buffers: if prepare_color.is_some() {
+                    std::slice::from_ref(&vertex_layout)
+                } else {
+                    &[]
+                },
+                compilation_options: Default::default(),
+            },
+            primitive,
+            depth_stencil: Some(depth_stencil),
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_color"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: formats.color,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
                 compilation_options: Default::default(),
             }),
             multiview_mask: None,
@@ -351,6 +479,9 @@ impl ShellPipeline {
         });
 
         Self {
+            baked,
+            prepare_color,
+            color_pipeline,
             mrt_pipeline,
             dsm_pipeline,
             bg_layout,
@@ -391,7 +522,7 @@ pub fn create_shell_bind_group(
             buf_entry(7, &material.color_grads),
             buf_entry(8, aux_data),
             buf_entry(9, &material.base_colors),
-        ],
+        ].into_iter().filter(|e| !pipeline.baked || ![6,7].contains(&e.binding)).collect::<Vec<_>>(),
     })
 }
 
@@ -455,6 +586,71 @@ pub fn record_shell_pass(
 
     pass.set_pipeline(&pipeline.mrt_pipeline);
     pass.set_bind_group(0, bind_group, &[]);
+    pass.draw(0..shell.vertex_count(), 0..1);
+}
+
+/// Render the radiance shell without material, normals or depth-moment MRTs.
+pub fn record_shell_color_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &ShellPipeline,
+    bind_group: &wgpu::BindGroup,
+    shell: &ShellBuffers,
+    color_view: &wgpu::TextureView,
+    depth_view: &wgpu::TextureView,
+) {
+    if shell.face_count == 0 {
+        return;
+    }
+
+    if let Some(pipeline) = &pipeline.prepare_color {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("shell_prepare_color"),
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.set_bind_group(1, &shell.prepared_bg, &[]);
+        let groups = shell.vertex_count().div_ceil(64);
+        pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
+    }
+
+    let load_store = wgpu::Operations {
+        load: wgpu::LoadOp::Load,
+        store: wgpu::StoreOp::Store,
+    };
+    fn attach(
+        view: &wgpu::TextureView,
+        ops: wgpu::Operations<wgpu::Color>,
+    ) -> Option<wgpu::RenderPassColorAttachment<'_>> {
+        Some(wgpu::RenderPassColorAttachment {
+            view,
+            resolve_target: None,
+            ops,
+            depth_slice: None,
+        })
+    }
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("shell_pass"),
+        color_attachments: &[attach(color_view, load_store)],
+        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+            view: depth_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Load,
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        }),
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+
+    pass.set_pipeline(&pipeline.color_pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    if pipeline.prepare_color.is_some() {
+        pass.set_vertex_buffer(0, shell.prepared.slice(..));
+    }
     pass.draw(0..shell.vertex_count(), 0..1);
 }
 

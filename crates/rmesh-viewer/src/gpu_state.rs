@@ -16,7 +16,6 @@ pub enum RenderMode {
     Quad,
     MeshShader,
     IntervalShader,
-    RayTrace,
 }
 
 impl std::fmt::Display for RenderMode {
@@ -26,38 +25,11 @@ impl std::fmt::Display for RenderMode {
             RenderMode::Quad => write!(f, "Quad"),
             RenderMode::MeshShader => write!(f, "Mesh Shader"),
             RenderMode::IntervalShader => write!(f, "Interval Shader"),
-            RenderMode::RayTrace => write!(f, "Ray Trace"),
         }
     }
 }
 
-/// Which sort path the interval-shading render uses. Replaces the old
-/// `sort_16bit: bool` toggle and adds a CPU option (sphere-frustum cull +
-/// `radsort` on the CPU, two-submit dispatch with `queue.write_buffer` in
-/// between — same code path the web viewer uses).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SortMode {
-    /// GPU radix sort, 32-bit depth keys. Default; fastest on Metal/Vulkan
-    /// with subgroups (Drs backend).
-    Gpu32,
-    /// GPU radix sort, 16-bit linearly-quantized depth keys. ~2× faster
-    /// than `Gpu32` (4 passes vs 8) with negligible visual diff.
-    Gpu16,
-    /// CPU sphere-frustum cull + `radsort` on packed (depth_key, tet_id).
-    /// Necessary on Chrome WebGPU because subgroups aren't exposed; correct
-    /// on every backend.
-    Cpu,
-}
-
-impl std::fmt::Display for SortMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SortMode::Gpu32 => write!(f, "GPU 32-bit"),
-            SortMode::Gpu16 => write!(f, "GPU 16-bit"),
-            SortMode::Cpu => write!(f, "CPU"),
-        }
-    }
-}
+pub use rmesh_viewer_core::quality::SortMode;
 
 /// Per-frame GPU timing breakdown from timestamp queries.
 #[derive(Clone, Default)]
@@ -97,44 +69,11 @@ pub const TS_QUERY_COUNT: u32 = 8;
 /// `TS_QUERY_COUNT` only on the frames that actually dispatch it.
 pub const TS_WRITTEN_COUNT: u32 = 6;
 
-/// Slot capacity for the postprocess-chain profiler query set. The deferred
-/// chain records at most ~16 bracketed passes (hi-z linearize + N downsample
-/// mips + gtao + ao temporal + 2 ao blurs + ssgi + ssgi temporal + 2 ssgi
-/// blurs + ssr + ssr temporal + ssr copy + deferred shade), each needing 2
-/// slots. 64 leaves headroom for a deep Hi-Z pyramid at 4K.
+/// Timestamp capacity for the shell, occlusion hierarchy, and overdraw probe.
 pub const PP_TS_COUNT: u32 = 64;
 
-/// Pack f32 SH coefficients into f16 pairs stored as u32 (matching WGSL `unpack2x16float` layout).
-/// Pack SH coefficients as f16 pairs into u32 words.
-///
-/// The GPU shader indexes per-tet with stride `((num_coeffs*3 + 1) / 2)` u32 words,
-/// so each tet's data must be padded to an even number of f16 values (u32-aligned).
-/// `total_dims` = `num_coeffs * 3` (e.g. 3 for degree 0, 48 for degree 3).
-pub fn pack_sh_coeffs_f16(coeffs: &[f32], total_dims: usize) -> Vec<u32> {
-    if total_dims == 0 {
-        return vec![];
-    }
-    let tet_count = coeffs.len() / total_dims;
-    // Words per tet: ceil(total_dims / 2) — matches WGSL: (stride + 1) / 2
-    let words_per_tet = total_dims.div_ceil(2);
-    let mut packed = vec![0u32; tet_count * words_per_tet];
-    for t in 0..tet_count {
-        let src_base = t * total_dims;
-        let dst_base = t * words_per_tet;
-        for i in (0..total_dims).step_by(2) {
-            let lo = half::f16::from_f32(coeffs[src_base + i]);
-            let hi = if i + 1 < total_dims {
-                half::f16::from_f32(coeffs[src_base + i + 1])
-            } else {
-                half::f16::ZERO
-            };
-            packed[dst_base + i / 2] = (lo.to_bits() as u32) | ((hi.to_bits() as u32) << 16);
-        }
-    }
-    packed
-}
-
 pub struct GpuState {
+    pub light_bake: crate::light_bake::LightBake,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub surface: wgpu::Surface<'static>,
@@ -213,10 +152,6 @@ pub struct GpuState {
     /// its bind group holds the G-buffer colour view.
     pub overdraw_pipelines: rmesh_render::OverdrawPipelines,
     pub overdraw_target: rmesh_render::OverdrawTarget,
-    /// Shell pyramid at DSM face resolution, built against the atlas's shared
-    /// staging depth view so one instance serves every light and face.
-    /// Rebuilt whenever the atlas is (re)allocated.
-    pub dsm_shell_hiz: Option<rmesh_render::ShellHiZ>,
     // egui
     pub egui_renderer: egui_wgpu::Renderer,
     pub egui_state: egui_winit::State,
@@ -252,88 +187,10 @@ pub struct GpuState {
     pub frag_mapped: Arc<AtomicBool>,
     /// Last completed readback of the fragment-invocation counter.
     pub frag_invocations: u64,
-    /// Shading workload the last encoded deferred pass saw, for the profile log.
-    pub pp_lights: u32,
-    pub pp_dsm: bool,
     pub gpu_times_ms: GpuTimings,
     pub cpu_times_ms: CpuTimings,
     pub instance_count_ready: Arc<AtomicBool>,
     pub instance_count_mapped: Arc<AtomicBool>,
     // PBR aux data (per-tet material channels, uploaded when PBR data present)
     pub aux_data_buf: Option<wgpu::Buffer>,
-    // Deferred PBR shading (only when PBR data is loaded)
-    pub deferred_pipeline: Option<rmesh_postprocess::DeferredShadePipeline>,
-    /// Deferred bind group, doubled for ping-pong parity. Index by frame_parity.
-    pub deferred_bg: Option<[wgpu::BindGroup; 2]>,
-    /// GTAO ambient-occlusion pass (always created; AO target lives in `targets`).
-    pub gtao_pipeline: rmesh_postprocess::GtaoPipeline,
-    pub gtao_bg: wgpu::BindGroup,
-    /// Hi-Z mip pyramid (linear view-space Z fused from hw + volume depth).
-    /// Built each frame before GTAO; will also feed SSGI.
-    pub hiz_pipelines: rmesh_postprocess::HizPipelines,
-    pub hiz_texture: rmesh_postprocess::HizTexture,
-    pub hiz_linearize_bg: wgpu::BindGroup,
-    pub hiz_downsample_bgs: Vec<wgpu::BindGroup>,
-    /// AO bilateral blur (depth+normal aware). Two passes (H, V) using one
-    /// pipeline; ping-pongs between `targets.ao_view` and `ao_blur_temp_view`.
-    pub ao_blur_pipeline: rmesh_postprocess::AoBlurPipeline,
-    pub ao_blur_bg_h: wgpu::BindGroup,
-    pub ao_blur_bg_v: wgpu::BindGroup,
-    /// SSGI compute (Hi-Z ray-march, samples lit_history) + bilateral denoise.
-    /// ssgi_bg doubled for parity (lit_history rotates each frame).
-    pub ssgi_pipeline: rmesh_postprocess::SsgiPipeline,
-    pub ssgi_bg: [wgpu::BindGroup; 2],
-    pub ssgi_blur_pipeline: rmesh_postprocess::SsgiBlurPipeline,
-    pub ssgi_blur_bg_h: wgpu::BindGroup,
-    pub ssgi_blur_bg_v: wgpu::BindGroup,
-    /// Temporal accumulation pipelines for SSGI (Rgba16Float) and AO (R8Unorm).
-    /// Bind groups doubled for parity: each variant binds (current, history) in
-    /// the orientation appropriate for that frame.
-    pub ssgi_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
-    pub ssgi_temporal_bg: [wgpu::BindGroup; 2],
-    pub ao_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
-    pub ao_temporal_bg: [wgpu::BindGroup; 2],
-    /// SSR (specular reflections via Hi-Z reflection-direction ray-march) +
-    /// its temporal pipeline. Both bind groups doubled for parity.
-    pub ssr_pipeline: rmesh_postprocess::SsrPipeline,
-    pub ssr_bg: [wgpu::BindGroup; 2],
-    pub ssr_temporal_pipeline: rmesh_postprocess::TemporalPipeline,
-    pub ssr_temporal_bg: [wgpu::BindGroup; 2],
-    /// Frame counter for SSGI per-pixel jitter rotation.
-    pub frame_counter: u32,
-    /// Frame parity (0 or 1) — selects which slot of each ping-pong texture
-    /// pair is "current" this frame. Flipped at end of frame.
-    pub frame_parity: u32,
-    /// Separate output texture for deferred pass (can't read+write color_view simultaneously)
-    pub deferred_output: Option<wgpu::Texture>,
-    pub deferred_output_view: Option<wgpu::TextureView>,
-    /// Blit bind group pointing to deferred output (swapped when deferred is active)
-    pub deferred_blit_bg: Option<wgpu::BindGroup>,
-    pub has_pbr_data: bool,
-    // DSM debug view (2-moment deep shadow map from camera perspective)
-    pub dsm_pipeline: rmesh_dsm::DsmPipeline,
-    pub dsm_prim_pipeline: rmesh_dsm::DsmPrimitivePipeline,
-    pub dsm_resolve_pipeline: rmesh_dsm::DsmResolvePipeline,
-    pub dsm_moments_texture: wgpu::Texture,
-    pub dsm_moments_view: wgpu::TextureView,
-    pub dsm_depth_texture: wgpu::Texture,
-    pub dsm_depth_view: wgpu::TextureView,
-    pub dsm_resolve_output: wgpu::Texture,
-    pub dsm_resolve_output_view: wgpu::TextureView,
-    pub dsm_render_bg: wgpu::BindGroup,
-    pub dsm_resolve_bg: wgpu::BindGroup,
-    pub dsm_blit_bg: wgpu::BindGroup,
-    // Per-light DSM cache (2-moment deep shadow maps)
-    pub dsm_atlas: Option<rmesh_dsm::DsmAtlas>,
-    pub deferred_dsm_bg: Option<wgpu::BindGroup>,
-    pub deferred_dsm_dummy_bg: Option<wgpu::BindGroup>,
-    // Ray trace
-    pub rt_pipeline: rmesh_raytrace::RayTracePipeline,
-    pub rt_buffers: rmesh_raytrace::RayTraceBuffers,
-    pub rt_bg: wgpu::BindGroup,
-    /// Rgba32Float texture for copying raytrace buffer output for blitting
-    pub rt_texture: wgpu::Texture,
-    pub rt_texture_view: wgpu::TextureView,
-    pub rt_blit_pipeline: rmesh_render::BlitPipelineNonFiltering,
-    pub rt_blit_bg: wgpu::BindGroup,
 }

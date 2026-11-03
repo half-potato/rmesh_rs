@@ -15,13 +15,14 @@
 //!
 //! For training, we decompress PCA back to direct SH coefficients per tet.
 
+mod energy_format;
 pub mod gpu_buffers;
 pub use gpu_buffers::{MaterialBuffers, SceneBuffers, UNIFORMS_BUFFER_SIZE};
 
 use anyhow::{Context, Result};
 use flate2::read::GzDecoder;
 use half::f16;
-#[cfg(feature = "parallel")]
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
 use rayon::prelude::*;
 use std::io::Read;
 
@@ -29,14 +30,14 @@ use std::io::Read;
 /// enabled, sequential fallback otherwise.
 macro_rules! par_chunks_for_each {
     ($data:expr, $chunk_size:expr, $closure:expr) => {{
-        #[cfg(feature = "parallel")]
+        #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
         {
             $data
                 .par_chunks_mut($chunk_size)
                 .enumerate()
                 .for_each($closure);
         }
-        #[cfg(not(feature = "parallel"))]
+        #[cfg(any(not(feature = "parallel"), target_arch = "wasm32"))]
         {
             $data.chunks_mut($chunk_size).enumerate().for_each($closure);
         }
@@ -169,12 +170,18 @@ fn validate_tagged_header(data: &[u8], p: usize) -> bool {
     }
     let dtype = u32::from_le_bytes(data[h + 16..h + 20].try_into().unwrap());
     let shape_rank = u32::from_le_bytes(data[h + 20..h + 24].try_into().unwrap());
-    dtype < 16 && shape_rank >= 1 && shape_rank <= 4
+    dtype < 16 && shape_rank <= 8
 }
 
 /// PBR material data loaded from tagged .rmesh extension sections.
 #[derive(Clone, Debug)]
 pub struct PbrData {
+    /// Explicit sdir mode 4 rows [roughness, F0.r, F0.g, F0.b, retro].
+    /// Empty for legacy materials; env_feature is never interpreted as F0.
+    pub energy_material: Vec<f32>,
+    pub energy_lut: Vec<f32>,
+    pub geom_normals: Vec<f32>,
+    pub render_min_t: Option<f32>,
     /// Per-tet roughness [M] f32 (pre-activated sigmoid).
     pub roughness: Vec<f32>,
     /// Per-tet specular features [M × 4] f32 (pre-activated tanh).
@@ -491,7 +498,28 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         }
         offset = p;
     }
-    let (pbr_data, visibility) = parse_tagged_extensions(data, &mut offset);
+    let energy = tagged_at.map(|p| energy_format::parse(data, p, vertex_count as usize, tet_count as usize)).transpose()?.flatten();
+    let (mut pbr_data, visibility) = parse_tagged_extensions(data, &mut offset);
+    if let Some(energy) = energy {
+        anyhow::ensure!(indices.iter().all(|&i| i < vertex_count), "Invalid energy vertex index");
+        anyhow::ensure!(vertices.iter().all(|x| x.is_finite()), "Nonfinite energy vertices");
+        densities = energy.density;
+        let pbr = pbr_data.as_mut().context("Energy export missing materials")?;
+        pbr.energy_material = energy.material;
+        pbr.energy_lut = energy.lut;
+        pbr.geom_normals = energy.geom_normals;
+        pbr.render_min_t = Some(energy.min_t);
+    }
+    if let Some(pbr) = &pbr_data {
+        if !pbr.energy_material.is_empty() {
+            anyhow::ensure!(pbr.energy_material.len() == tet_count as usize * 5
+                && pbr.albedo.len() == tet_count as usize * 3
+                && pbr.vertex_normals.len() == vertex_count as usize * 3,
+                "Energy materials require one 5-float row per tet, albedo and vertex normals");
+            anyhow::ensure!(pbr.energy_material.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)),
+                "Energy material values must be finite and in [0,1]");
+        }
+    }
     if pbr_data.is_some() {
         log::info!("Found PBR tagged extension sections");
     } else if data.len().saturating_sub(offset) > 64 {
@@ -570,6 +598,7 @@ fn parse_tagged_extensions(
 
     log::info!("Parsing {} tagged extension sections...", num_sections);
 
+    let mut energy_material = Vec::new();
     let mut roughness = Vec::new();
     let mut env_feature = Vec::new();
     let mut albedo = Vec::new();
@@ -624,6 +653,7 @@ fn parse_tagged_extensions(
         );
 
         match tag.as_str() {
+            "energy_material" => { energy_material = f16_payload_to_f32(payload, dtype); }
             "roughness" => {
                 roughness = f16_payload_to_f32(payload, dtype);
             }
@@ -671,6 +701,10 @@ fn parse_tagged_extensions(
         None
     } else {
         Some(PbrData {
+            energy_material,
+            energy_lut: Vec::new(),
+            geom_normals: Vec::new(),
+            render_min_t: None,
             roughness,
             env_feature,
             albedo,
@@ -731,7 +765,7 @@ fn f16_payload_to_f32(payload: &[u8], dtype: u32) -> Vec<f32> {
 
 /// Parallel circumsphere computation using rayon.
 /// Matches stable_power.slang: double precision + degenerate tet handling.
-fn compute_circumspheres_parallel(vertices: &[f32], indices: &[u32], tet_count: usize) -> Vec<f32> {
+pub fn compute_circumspheres_parallel(vertices: &[f32], indices: &[u32], tet_count: usize) -> Vec<f32> {
     use glam::DVec3;
 
     let mut circumdata = vec![0.0f32; tet_count * 4];

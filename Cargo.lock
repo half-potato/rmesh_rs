@@ -3360,6 +3360,7 @@ dependencies = [
  "glam",
  "gltf",
  "rmesh-interact",
+ "web-time",
 ]
 
 [[package]]
@@ -3614,16 +3615,39 @@ dependencies = [
  "rmesh-anim",
  "rmesh-compositor",
  "rmesh-data",
- "rmesh-dsm",
  "rmesh-interact",
  "rmesh-pbd",
- "rmesh-postprocess",
  "rmesh-raytrace",
  "rmesh-render",
  "rmesh-sort",
  "rmesh-util",
+ "rmesh-viewer-core",
+ "web-time",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "rmesh-viewer-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
+ "half",
+ "log",
+ "pollster",
+ "rayon",
+ "rmesh-anim",
+ "rmesh-compositor",
+ "rmesh-data",
+ "rmesh-interact",
+ "rmesh-pbd",
+ "rmesh-raytrace",
+ "rmesh-render",
+ "rmesh-sort",
+ "rmesh-util",
+ "web-time",
+ "wgpu",
 ]
 
 [[package]]
@@ -3637,15 +3661,20 @@ dependencies = [
  "half",
  "js-sys",
  "log",
+ "rmesh-anim",
  "rmesh-compositor",
  "rmesh-data",
  "rmesh-interact",
+ "rmesh-pbd",
+ "rmesh-raytrace",
  "rmesh-render",
  "rmesh-sort",
  "rmesh-util",
+ "rmesh-viewer-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+ "web-time",
  "wgpu",
 ]
 

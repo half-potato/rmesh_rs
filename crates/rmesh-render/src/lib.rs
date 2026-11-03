@@ -43,8 +43,8 @@ pub mod shell;
 pub mod shell_hiz;
 
 pub use shell::{
-    create_shell_bind_group, record_shell_dsm_pass, record_shell_pass, ShellBuffers, ShellFace,
-    ShellPipeline, ShellView,
+    create_shell_bind_group, record_shell_color_pass, record_shell_dsm_pass, record_shell_pass,
+    ShellBuffers, ShellFace, ShellPipeline, ShellView,
 };
 pub use overdraw::{
     record_overdraw_count, record_overdraw_viz, OverdrawPipelines, OverdrawTarget, OverdrawView,
@@ -105,14 +105,16 @@ pub struct ForwardHwComputeBindGroups {
 
 /// Compiled pipelines for the forward pass.
 pub struct ForwardPipelines {
-    pub compute_pipeline: wgpu::ComputePipeline,
+    pub compute_pipeline: Option<wgpu::ComputePipeline>,
     /// 16-bit linear sort key variant of compute_pipeline (same layout).
-    pub compute_pipeline_16bit: wgpu::ComputePipeline,
+    pub compute_pipeline_16bit: Option<wgpu::ComputePipeline>,
     pub compute_bg0_layout: wgpu::BindGroupLayout,
     pub compute_bg1_layout: wgpu::BindGroupLayout,
     /// Lean HW-only projection compute (no tile counting)
     pub hw_compute_pipeline: wgpu::ComputePipeline,
     pub hw_compute_bind_group_layout: wgpu::BindGroupLayout,
+    pub hw_has_visibility_mask: bool,
+    hw_baked: bool,
     pub render_pipeline: wgpu::RenderPipeline,
     /// Color-only render pipeline (no MRT — skips aux/normals/depth targets for perf)
     pub render_pipeline_color_only: wgpu::RenderPipeline,
@@ -153,6 +155,17 @@ impl ForwardPipelines {
     /// `RenderTargets` these pipelines render into.
     /// Total bytes per sample must not exceed 32 bytes (4 * 8 = 32 for Rgba16Float).
     pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
+        Self::new_internal(device, formats, false)
+    }
+
+    /// Baked radiance does not need SH input; reuse that binding for the keep
+    /// mask so importance culling also fits devices with ten storage bindings.
+    /// Draw bindings must read cached radiance directly (material.colors aliases base_colors).
+    pub fn new_baked(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
+        Self::new_internal(device, formats, true)
+    }
+
+    fn new_internal(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats, hw_baked: bool) -> Self {
         // ----- Compute pipeline (split into 2 bind groups, 14 storage total) -----
         // Split along read-only / read-write boundary for code organization:
         //   group 0 (8 read-only): uniforms, vertices, indices, densities,
@@ -169,17 +182,21 @@ impl ForwardPipelines {
         // +1 read-only binding (8) for the occlusion-cull mask (tet_visibility).
         let mut compute_bg0_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &[true; 9]);
         compute_bg0_entries.push(shell_hiz_layout_entry(9));
+        if device.limits().max_storage_buffers_per_shader_stage < 15 { compute_bg0_entries.clear(); }
         let compute_bg0_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg0_layout"),
                 entries: &compute_bg0_entries,
             });
-        let compute_bg1_entries = storage_entries(6, wgpu::ShaderStages::COMPUTE, &[false; 6]);
+        let compute_bg1_entries = storage_entries(if device.limits().max_storage_buffers_per_shader_stage < 15 {0} else {6}, wgpu::ShaderStages::COMPUTE, &[false; 6]);
         let compute_bg1_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("compute_bg1_layout"),
                 entries: &compute_bg1_entries,
             });
+        // Tile-counting projection is unavailable on low-binding-limit adapters.
+        // Do not create invalid pipelines for paths the browser never dispatches.
+        let (compute_pipeline, compute_pipeline_16bit) = if device.limits().max_storage_buffers_per_shader_stage >= 15 {
         let compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("compute_pipeline_layout"),
@@ -213,6 +230,8 @@ impl ForwardPipelines {
                 compilation_options: Default::default(),
                 cache: None,
             });
+            (Some(compute_pipeline), Some(compute_pipeline_16bit))
+        } else { (None, None) };
 
         // ----- HW projection compute pipeline (11 bindings, single group) -----
         // Bindings: uniforms(r), vertices(r), indices(r), circumdata(r),
@@ -248,11 +267,14 @@ impl ForwardPipelines {
                 count: None,
             });
         }
+        if hw_baked { hw_compute_entries.retain(|e| ![7,8,9].contains(&e.binding)); }
         hw_compute_entries.push(shell_hiz_layout_entry(11));
         // 12 = tet_visibility (occlusion / keep mask), same as project_compute's
         // binding 8. This makes eleven storage buffers in the stage: fine on
         // native (the viewer asks for 20) but past WebGPU's default cap of 8,
         // so the web viewer must request the adapter's real limit.
+        let hw_has_visibility_mask = !hw_baked && device.limits().max_storage_buffers_per_shader_stage >= 11;
+        if hw_has_visibility_mask {
         hw_compute_entries.push(wgpu::BindGroupLayoutEntry {
             binding: 12,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -263,6 +285,7 @@ impl ForwardPipelines {
             },
             count: None,
         });
+        }
         let hw_compute_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("hw_compute_bind_group_layout"),
@@ -274,9 +297,24 @@ impl ForwardPipelines {
                 bind_group_layouts: &[&hw_compute_bind_group_layout],
                 immediate_size: 0,
             });
+        let mut hw_source = PROJECT_COMPUTE_HW_WGSL.to_string();
+        if hw_baked {
+            hw_source = hw_source.replace("@group(0) @binding(12) var<storage, read> tet_visibility: array<u32>;", "");
+            hw_source = hw_source.replace("arrayLength(&sh_coeffs) > 1u", "false");
+            hw_source = hw_source.replace("sh_coeffs", "tet_visibility");
+            // Cached radiance is bound directly by the draw stages.
+            hw_source = hw_source.lines().filter(|line| !["@binding(7)", "@binding(8)", "@binding(9)"].iter().any(|b| line.contains(b))).collect::<Vec<_>>().join("\n");
+            hw_source.truncate(hw_source.find("    // --- 4. Color evaluation").unwrap());
+            hw_source.push_str("}\n");
+        } else if !hw_has_visibility_mask {
+            hw_source = hw_source.replace(
+                "@group(0) @binding(12) var<storage, read> tet_visibility: array<u32>;", "");
+            hw_source = hw_source.replace(
+                "if ((tet_visibility[tet_id >> 5u] & (1u << (tet_id & 31u))) == 0u)", "if (false)");
+        }
         let hw_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("project_compute_hw.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(PROJECT_COMPUTE_HW_WGSL.as_str().into()),
+            source: wgpu::ShaderSource::Wgsl(hw_source.into()),
         });
         let hw_compute_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -402,7 +440,8 @@ impl ForwardPipelines {
             false, // 5 read-write (precomputed)
             true, true, true, // 6-8 read-only (colors, densities, color_grads)
         ];
-        let prepass_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &prepass_read_only);
+        let mut prepass_entries = storage_entries(9, wgpu::ShaderStages::COMPUTE, &prepass_read_only);
+        prepass_entries[0].ty = wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset:false, min_binding_size:None };
         let prepass_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("prepass_bg_layout"),
             entries: &prepass_entries,
@@ -608,6 +647,8 @@ impl ForwardPipelines {
             compute_bg1_layout,
             hw_compute_pipeline,
             hw_compute_bind_group_layout,
+            hw_has_visibility_mask,
+            hw_baked,
             render_pipeline,
             render_pipeline_color_only,
             render_bind_group_layout,
@@ -1054,6 +1095,10 @@ impl IntervalPipelines {
 /// Replaces mesh shader with compute → vertex/fragment draw, making interval
 /// shading available on all GPUs.
 pub struct ComputeIntervalPipelines {
+    baked: bool,
+    color_format: wgpu::TextureFormat,
+    pub color_only_override: Option<(wgpu::RenderPipeline, wgpu::BindGroup)>,
+    gen_source: String,
     pub gen_pipeline: wgpu::ComputePipeline,
     pub gen_bg_layout: wgpu::BindGroupLayout,
     pub render_pipeline: wgpu::RenderPipeline,
@@ -1070,6 +1115,13 @@ pub struct ComputeIntervalPipelines {
 
 impl ComputeIntervalPipelines {
     pub fn new(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
+        Self::new_internal(device, formats, false)
+    }
+    /// Baked radiance has zero color gradients and needs no screen-space normals.
+    pub fn new_baked(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats) -> Self {
+        Self::new_internal(device, formats, true)
+    }
+    fn new_internal(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats, baked: bool) -> Self {
         // ----- Gen compute pipeline (11 bindings) -----
         // Binding 0 (uniforms) is bound as a UNIFORM buffer so the COMPUTE-stage
         // storage-buffer count is 10, fitting WebGPU's per-stage cap.
@@ -1102,6 +1154,7 @@ impl ComputeIntervalPipelines {
                 count: None,
             });
         }
+        if baked { gen_entries.retain(|e| ![5,10].contains(&e.binding)); }
         let gen_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute_interval_gen_bg_layout"),
             entries: &gen_entries,
@@ -1111,9 +1164,15 @@ impl ComputeIntervalPipelines {
             bind_group_layouts: &[&gen_bg_layout],
             immediate_size: 0,
         });
+        let mut source = INTERVAL_COMPUTE_WGSL.to_string();
+        if baked {
+            source = source.lines().filter(|l| !l.contains("@binding(5)") && !l.contains("@binding(10)")).collect::<Vec<_>>().join("\n");
+            source = source.replace("vec3<f32>(color_grads[idx * 3u], color_grads[idx * 3u + 1u], color_grads[idx * 3u + 2u])", "vec3<f32>(0.0)")
+                .replace("vec3<f32>(vertex_normals[vi * 3u], vertex_normals[vi * 3u + 1u], vertex_normals[vi * 3u + 2u])", "vec3<f32>(0.0)");
+        }
         let gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("interval_compute.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_WGSL.as_str().into()),
+            source: wgpu::ShaderSource::Wgsl(source.clone().into()),
         });
         let gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("compute_interval_gen_pipeline"),
@@ -1128,11 +1187,15 @@ impl ComputeIntervalPipelines {
         // 0: uniforms, 1: interval_vertex_buf, 2: interval_tet_data_buf
         // 3: aux_data, 4: vertex_normals, 5: tet_indices
         let render_read_only = [true; 6];
-        let render_entries = storage_entries(
+        let mut render_entries = storage_entries(
             6,
             wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
             &render_read_only,
         );
+        // Vertex data is not fragment-visible: reserve the WebGPU budget for
+        // optional per-sample material shading without adding render targets.
+        for i in [1usize,2] { render_entries[i].visibility=wgpu::ShaderStages::VERTEX; }
+        for i in [3usize,4,5] { render_entries[i].visibility=wgpu::ShaderStages::FRAGMENT; }
         let render_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("compute_interval_render_bg_layout"),
             entries: &render_entries,
@@ -1377,6 +1440,10 @@ impl ComputeIntervalPipelines {
             });
 
         Self {
+            baked,
+            color_only_override: None,
+            color_format: formats.color,
+            gen_source: source,
             gen_pipeline,
             gen_bg_layout,
             render_pipeline,
@@ -1530,7 +1597,27 @@ impl RenderTargets {
         height: u32,
         formats: rmesh_util::shared::GBufferFormats,
     ) -> Self {
+        Self::create(device, width, height, formats, false)
+    }
 
+    /// Single HDR color target; unused legacy attachments are 1x1 placeholders.
+    /// Only color-only passes may render into this target set.
+    pub fn new_color_only(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        formats: rmesh_util::shared::GBufferFormats,
+    ) -> Self {
+        Self::create(device, width, height, formats, true)
+    }
+
+    fn create(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        formats: rmesh_util::shared::GBufferFormats,
+        color_only: bool,
+    ) -> Self {
         let color_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("color_target"),
             size: wgpu::Extent3d {
@@ -1551,8 +1638,8 @@ impl RenderTargets {
         let aux0_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("aux0_target"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: if color_only { 1 } else { width },
+                height: if color_only { 1 } else { height },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1573,8 +1660,8 @@ impl RenderTargets {
         let normals_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("normals_target"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: if color_only { 1 } else { width },
+                height: if color_only { 1 } else { height },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1590,8 +1677,8 @@ impl RenderTargets {
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("depth_target"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: if color_only { 1 } else { width },
+                height: if color_only { 1 } else { height },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1609,8 +1696,8 @@ impl RenderTargets {
         let ao_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ao_target"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: if color_only { 1 } else { width },
+                height: if color_only { 1 } else { height },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1624,8 +1711,8 @@ impl RenderTargets {
         let ao_blur_temp_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("ao_blur_temp"),
             size: wgpu::Extent3d {
-                width,
-                height,
+                width: if color_only { 1 } else { width },
+                height: if color_only { 1 } else { height },
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -1641,8 +1728,8 @@ impl RenderTargets {
                 device.create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d {
-                        width,
-                        height,
+                        width: if color_only { 1 } else { width },
+                        height: if color_only { 1 } else { height },
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -1902,6 +1989,11 @@ pub fn create_compute_bind_group(
     sh_coeffs_buf: &wgpu::Buffer,
     shell_hiz_view: &wgpu::TextureView,
 ) -> ForwardComputeBindGroups {
+    if pipelines.compute_pipeline.is_none() {
+        let bg0=device.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("unused tile projection"),layout:&pipelines.compute_bg0_layout,entries:&[]});
+        let bg1=device.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("unused tile projection"),layout:&pipelines.compute_bg1_layout,entries:&[]});
+        return ForwardComputeBindGroups {bg0,bg1};
+    }
     let bg0 = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_bind_group_0"),
         layout: &pipelines.compute_bg0_layout,
@@ -1947,10 +2039,8 @@ pub fn create_hw_compute_bind_group(
     sh_coeffs_buf: &wgpu::Buffer,
     shell_hiz_view: &wgpu::TextureView,
 ) -> ForwardHwComputeBindGroups {
-    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("hw_compute_bind_group"),
-        layout: &pipelines.hw_compute_bind_group_layout,
-        entries: &[
+    let mut entries = vec![
+
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
             buf_entry(2, &buffers.indices),
@@ -1961,10 +2051,16 @@ pub fn create_hw_compute_bind_group(
             buf_entry(7, &material.colors),
             buf_entry(8, &material.base_colors),
             buf_entry(9, &material.color_grads),
-            buf_entry(10, sh_coeffs_buf),
+            buf_entry(10, if pipelines.hw_baked { &buffers.tet_visibility } else { sh_coeffs_buf }),
             rmesh_util::gpu_helpers::tex_entry(11, shell_hiz_view),
-            buf_entry(12, &buffers.tet_visibility),
-        ],
+
+    ];
+    if pipelines.hw_baked { entries.retain(|e| ![7,8,9].contains(&e.binding)); }
+    if pipelines.hw_has_visibility_mask { entries.push(buf_entry(12, &buffers.tet_visibility)); }
+    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("hw_compute_bind_group"),
+        layout: &pipelines.hw_compute_bind_group_layout,
+        entries: &entries,
     });
     ForwardHwComputeBindGroups { bg }
 }
@@ -2246,7 +2342,7 @@ pub fn create_compute_interval_gen_bind_group_with_sort_values(
             buf_entry(8, &buffers.interval_vertex_buf),
             buf_entry(9, &buffers.interval_tet_data_buf),
             buf_entry(10, &buffers.vertex_normals),
-        ],
+        ].into_iter().filter(|e| !pipelines.baked || ![5,10].contains(&e.binding)).collect::<Vec<_>>(),
     })
 }
 
@@ -2275,7 +2371,7 @@ pub fn create_compute_interval_render_bind_group(
             buf_entry(2, &buffers.interval_tet_data_buf),
             buf_entry(3, &dummy),                  // aux_data
             buf_entry(4, &buffers.vertex_normals), // vertex_normals
-            buf_entry(5, &dummy),                  // tet_indices (use dummy, tet_id will be 0)
+            buf_entry(5, &buffers.indices),        // topology for direct material shading
         ],
     })
 }
@@ -2354,7 +2450,7 @@ pub fn record_project_compute(
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
@@ -2396,7 +2492,7 @@ pub fn record_project_compute_and_sort(
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
@@ -2446,7 +2542,7 @@ pub fn record_forward_pass(
             label: Some("project_compute"),
             timestamp_writes: None,
         });
-        cpass.set_pipeline(&pipelines.compute_pipeline);
+        cpass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
 
@@ -2618,7 +2714,7 @@ pub fn record_sorted_forward_pass(
             cpass.set_pipeline(&pipelines.hw_compute_pipeline);
             cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
-            cpass.set_pipeline(&pipelines.compute_pipeline);
+            cpass.set_pipeline(pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
             cpass.set_bind_group(0, &compute_bg.bg0, &[]);
             cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
@@ -2652,13 +2748,34 @@ pub fn record_sorted_forward_pass(
         &buffers.sort_values,
     );
 
+    record_forward_after_sort(
+        encoder, pipelines, buffers, targets,
+        if use_quad { quad_render_bg.expect("quad bindings required") }
+        else if result_in_b { render_bg_b } else { render_bg_a },
+        if result_in_b { prepass_bg_b } else { prepass_bg_a },
+        tet_count, depth_view, profiler, use_quad, mrt_enabled,
+    );
+}
+
+/// Draw legacy face or quad geometry from an already sorted index buffer.
+/// Shared by native GPU sorting and browser CPU/portable GPU sorting.
+#[allow(clippy::too_many_arguments)]
+pub fn record_forward_after_sort(
+    encoder: &mut wgpu::CommandEncoder,
+    pipelines: &ForwardPipelines,
+    buffers: &SceneBuffers,
+    targets: &RenderTargets,
+    render_bg: &wgpu::BindGroup,
+    prepass_bg: Option<&wgpu::BindGroup>,
+    tet_count: u32,
+    depth_view: &wgpu::TextureView,
+    profiler: Option<&wgpu::QuerySet>,
+    use_quad: bool,
+    mrt_enabled: bool,
+) {
     // ----- 3.5. Compute prepass (quad path only) -----
     if use_quad {
-        let prepass_bg = if result_in_b {
-            prepass_bg_b.expect("prepass_bg_b required for quad path")
-        } else {
-            prepass_bg_a.expect("prepass_bg_a required for quad path")
-        };
+        let prepass_bg = prepass_bg.expect("prepass bindings required for quad path");
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("forward_prepass"),
             timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
@@ -2679,14 +2796,6 @@ pub fn record_sorted_forward_pass(
     }
 
     // ----- 4. Render pass -----
-    let render_bg = if use_quad {
-        quad_render_bg.expect("quad_render_bg required for quad path")
-    } else if result_in_b {
-        render_bg_b
-    } else {
-        render_bg_a
-    };
-
     let color_attachment = Some(wgpu::RenderPassColorAttachment {
         view: &targets.color_view,
         resolve_target: None,
@@ -2839,7 +2948,7 @@ pub fn record_sorted_mesh_forward_pass(
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
             cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
-            cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+            cpass.set_pipeline(fwd_pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
             cpass.set_bind_group(0, &compute_bg.bg0, &[]);
             cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
@@ -3041,7 +3150,7 @@ pub fn record_sorted_interval_forward_pass(
             cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
             cpass.set_bind_group(0, &hw_bg.bg, &[]);
         } else {
-            cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+            cpass.set_pipeline(fwd_pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
             cpass.set_bind_group(0, &compute_bg.bg0, &[]);
             cpass.set_bind_group(1, &compute_bg.bg1, &[]);
         }
@@ -3194,7 +3303,7 @@ pub fn record_sorted_interval_forward_pass(
 pub fn record_compute_interval_project(
     encoder: &mut wgpu::CommandEncoder,
     fwd_pipelines: &ForwardPipelines,
-    sort_state: &rmesh_sort::RadixSortState,
+    sort_state: Option<&rmesh_sort::RadixSortState>,
     buffers: &SceneBuffers,
     compute_bg: &ForwardComputeBindGroups,
     hw_compute_bg: Option<&ForwardHwComputeBindGroups>,
@@ -3238,14 +3347,14 @@ pub fn record_compute_interval_project(
         }),
     });
     if use_16bit_sort {
-        cpass.set_pipeline(&fwd_pipelines.compute_pipeline_16bit);
+        cpass.set_pipeline(fwd_pipelines.compute_pipeline_16bit.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
     } else if let Some(hw_bg) = hw_compute_bg {
         cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
         cpass.set_bind_group(0, &hw_bg.bg, &[]);
     } else {
-        cpass.set_pipeline(&fwd_pipelines.compute_pipeline);
+        cpass.set_pipeline(fwd_pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
     }
@@ -3261,6 +3370,7 @@ pub fn record_compute_interval_project(
     // Publish the key count for the sort. The projection compacts its output, so
     // this is only known once it has run, and it belongs next to the pass that
     // establishes it rather than at the sort call site.
+    if let Some(sort_state) = sort_state {
     encoder.copy_buffer_to_buffer(
         &buffers.indirect_args,
         4, // DrawIndirectArgs.instance_count
@@ -3268,6 +3378,7 @@ pub fn record_compute_interval_project(
         0,
         4,
     );
+    }
 }
 
 /// Record steps 4–6 of the compute-interval pipeline: indirect-convert (turns
@@ -3340,7 +3451,7 @@ pub fn record_sorted_compute_interval_forward_pass(
     record_compute_interval_project(
         encoder,
         fwd_pipelines,
-        sort_state,
+        Some(sort_state),
         buffers,
         compute_bg,
         hw_compute_bg,
@@ -3506,7 +3617,10 @@ fn record_compute_interval_after_sort_impl(
         if mrt_enabled {
             rpass.set_pipeline(&ci_pipelines.render_pipeline);
         } else {
-            rpass.set_pipeline(&ci_pipelines.render_pipeline_color_only);
+            if let Some((pipeline, bg)) = &ci_pipelines.color_only_override {
+                rpass.set_pipeline(pipeline);
+                rpass.set_bind_group(1, bg, &[]);
+            } else { rpass.set_pipeline(&ci_pipelines.render_pipeline_color_only); }
         }
         rpass.set_bind_group(0, ci_render_bg, &[]);
         rpass.set_index_buffer(
@@ -3936,3 +4050,41 @@ pub fn record_blit_nf(
 
 // Interval tiled pipeline (`IntervalTiledBuffers`, `IntervalGeneratePipeline`,
 // `IntervalTiledRasterizePipeline`) moved to `rmesh-trainable`.
+
+impl ComputeIntervalPipelines {
+    /// Install a shared viewer's direct material closure, preserving interval
+    /// generation, sorting, depth compositing and a single HDR color target.
+    /// Preserve actual projected silhouettes for point-ray material quadrature.
+    pub fn set_point_samples(&mut self, device: &wgpu::Device, enabled: bool) {
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interval point samples"),
+            bind_group_layouts: &[&self.gen_bg_layout], immediate_size: 0,
+        });
+        let source = self.gen_source.replace("const point_samples: bool = false;",
+            if enabled { "const point_samples: bool = true;" } else { "const point_samples: bool = false;" });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval point samples"), source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+        self.gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("interval point samples"), layout: Some(&layout), module: &shader,
+            entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+    }
+    pub fn set_color_shader(&mut self, device: &wgpu::Device, extra: &wgpu::BindGroupLayout,
+                            source: &str, bg: wgpu::BindGroup) {
+        let vertex=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("energy interval vertex"),source:wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.as_str().into())});
+        let base=INTERVAL_FRAGMENT_WGSL.replace("fn main_color_only(","fn main_cached_color_only(");
+        let fragment=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("energy interval fragment"),source:wgpu::ShaderSource::Wgsl(format!("{base}\n{source}").into())});
+        let layout=device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:Some("energy interval"),bind_group_layouts:&[&self.render_bg_layout,extra],immediate_size:0});
+        let pipeline=device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:Some("energy interval"),layout:Some(&layout),
+            vertex:wgpu::VertexState {module:&vertex,entry_point:Some("main"),buffers:&[],compilation_options:Default::default()},
+            primitive:wgpu::PrimitiveState {topology:wgpu::PrimitiveTopology::TriangleList,cull_mode:None,..Default::default()},
+            depth_stencil:Some(wgpu::DepthStencilState {format:wgpu::TextureFormat::Depth32Float,depth_write_enabled:false,depth_compare:wgpu::CompareFunction::LessEqual,stencil:Default::default(),bias:Default::default()}),
+            multisample:Default::default(),
+            fragment:Some(wgpu::FragmentState {module:&fragment,entry_point:Some("main_color_only"),targets:&[Some(wgpu::ColorTargetState {format:self.color_format,blend:Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),write_mask:wgpu::ColorWrites::ALL}),None,None,None],compilation_options:Default::default()}),
+            multiview_mask:None,cache:None,
+        });
+        self.color_only_override=Some((pipeline,bg));
+    }
+}

@@ -1,0 +1,76 @@
+[
+  {
+    "passed": false,
+    "metric": "maximum_absolute_linear_rgb_error",
+    "epsilon": 0.01,
+    "shape_hwc": [
+      720,
+      1280,
+      3
+    ],
+    "max_abs_error": 0.0885009765625,
+    "mean_abs_error": 0.0025435240417115254,
+    "mse": 1.6509763623982353e-05,
+    "mse_rgb": [
+      2.1972627799463507e-05,
+      1.644078518097552e-05,
+      1.1115877891508022e-05
+    ],
+    "rmse": 0.00406322084361438,
+    "max_abs_error_rgb": [
+      0.0885009765625,
+      0.0799560546875,
+      0.07501220703125
+    ],
+    "failed_pixels": 45027,
+    "total_pixels": 921600,
+    "worst_y_x_channel": [
+      647,
+      917,
+      0
+    ],
+    "reference_at_worst": 0.15478515625,
+    "candidate_at_worst": 0.2432861328125,
+    "resolution": "720p",
+    "candidate": "benchmarks/bench/accuracy/high-720p.npy",
+    "reference": "benchmarks/bench/accuracy/reference-720p.npy",
+    "scope": "High vs Reference preset; all pixels; linear RGB"
+  },
+  {
+    "passed": false,
+    "metric": "maximum_absolute_linear_rgb_error",
+    "epsilon": 0.01,
+    "shape_hwc": [
+      1080,
+      1920,
+      3
+    ],
+    "max_abs_error": 0.1004638671875,
+    "mean_abs_error": 0.002544864786361486,
+    "mse": 1.6555044171088923e-05,
+    "mse_rgb": [
+      2.2027602301753998e-05,
+      1.6486990627536694e-05,
+      1.1150539583972686e-05
+    ],
+    "rmse": 0.004068789030054141,
+    "max_abs_error_rgb": [
+      0.1004638671875,
+      0.095947265625,
+      0.0836181640625
+    ],
+    "failed_pixels": 101710,
+    "total_pixels": 2073600,
+    "worst_y_x_channel": [
+      972,
+      881,
+      0
+    ],
+    "reference_at_worst": 0.3046875,
+    "candidate_at_worst": 0.2042236328125,
+    "resolution": "1080p",
+    "candidate": "benchmarks/bench/accuracy/high-1080p.npy",
+    "reference": "benchmarks/bench/accuracy/reference-1080p.npy",
+    "scope": "High vs Reference preset; all pixels; linear RGB"
+  }
+]

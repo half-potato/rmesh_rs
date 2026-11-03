@@ -38,7 +38,7 @@ struct DrawIndirectArgs {
     first_instance: u32,
 };
 
-@group(0) @binding(0) var<storage, read> uniforms: Uniforms;
+@group(0) @binding(0) var<uniform> uniforms: Uniforms;
 @group(0) @binding(1) var<storage, read> vertices: array<f32>;
 @group(0) @binding(2) var<storage, read> indices: array<u32>;
 @group(0) @binding(3) var<storage, read> sorted_indices: array<u32>;

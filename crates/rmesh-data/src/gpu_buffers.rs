@@ -97,7 +97,7 @@ impl SceneBuffers {
         let circumdata = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("circumdata"),
             contents: bytemuck::cast_slice(&scene.circumdata),
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
 
         let m = scene.tet_count as u64;

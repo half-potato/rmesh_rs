@@ -60,6 +60,16 @@ pub fn create_shader_module(
     label: &str,
     source: &str,
 ) -> Result<wgpu::ShaderModule, String> {
+    create_shader_module_with_defs(device, label, source, &[])
+}
+
+/// Compose a shared shader with boolean feature definitions.
+pub fn create_shader_module_with_defs(
+    device: &wgpu::Device,
+    label: &str,
+    source: &str,
+    definitions: &[(&str, bool)],
+) -> Result<wgpu::ShaderModule, String> {
     let mut composer = create_composer()?;
 
     let module = composer
@@ -67,6 +77,8 @@ pub fn create_shader_module(
             source,
             file_path: label,
             shader_type: ShaderType::Wgsl,
+            shader_defs: definitions.iter().map(|(name, value)|
+                ((*name).into(), naga_oil::compose::ShaderDefValue::Bool(*value))).collect(),
             ..Default::default()
         })
         .map_err(|e| format!("Failed to compose shader {label}: {e:?}"))?;

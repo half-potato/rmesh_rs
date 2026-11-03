@@ -1,0 +1,70 @@
+{
+  "asset": "bench_energy_control_seed43_3000.rmesh",
+  "sdir_commit": "ca400203be00332ff6aad2526f002eb3d7600c71",
+  "scope": "96x54 full image, exported starting camera, default scene point light; CPU Warp/PyTorch evaluated exported fields, not CUDA checkpoint inference",
+  "material_source_max_abs_error": 3.6239624e-05,
+  "material_cases": 2048,
+  "checkpoint_material_probe_count": 32,
+  "checkpoint_material_max_abs_error": 5.960464477539063e-08,
+  "shadowed": {
+    "passed": false,
+    "metric": "maximum_absolute_linear_rgb_error",
+    "epsilon": 0.01,
+    "shape_hwc": [
+      54,
+      96,
+      3
+    ],
+    "max_abs_error": 0.021472200751304626,
+    "mean_abs_error": 0.0009693152404623353,
+    "rmse": 0.0016723861916793875,
+    "max_abs_error_rgb": [
+      0.02114275097846985,
+      0.01728031039237976,
+      0.021472200751304626
+    ],
+    "failed_pixels": 22,
+    "total_pixels": 5184,
+    "worst_y_x_channel": [
+      29,
+      47,
+      2
+    ],
+    "reference_at_worst": 0.10609127581119537,
+    "candidate_at_worst": 0.1275634765625
+  },
+  "unshadowed_diagnostic": {
+    "passed": false,
+    "metric": "maximum_absolute_linear_rgb_error",
+    "epsilon": 0.01,
+    "shape_hwc": [
+      54,
+      96,
+      3
+    ],
+    "max_abs_error": 0.014049679040908813,
+    "mean_abs_error": 0.0008010898963250767,
+    "rmse": 0.0016087287736158472,
+    "max_abs_error_rgb": [
+      0.013900548219680786,
+      0.014049679040908813,
+      0.011909246444702148
+    ],
+    "failed_pixels": 17,
+    "total_pixels": 5184,
+    "worst_y_x_channel": [
+      35,
+      51,
+      1
+    ],
+    "reference_at_worst": 0.3121453821659088,
+    "candidate_at_worst": 0.298095703125
+  },
+  "limitations": [
+    "Cached external optical depth is approximate.",
+    "RGBA16F blending and rasterized interval integration differ from float32 per-ray reference.",
+    "Environment lighting, spatial plaster, camera ISP and colocated flash integration are not implemented."
+  ],
+  "native_web_max_abs_error": 0.0001220703125,
+  "browser_regression": "Passed: eight storage buffers, CPU/GPU sort, camera cache reuse, recoloring, darkness, moving-light snapshots"
+}

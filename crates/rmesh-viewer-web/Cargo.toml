@@ -7,6 +7,11 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+rmesh-pbd = { path = "../rmesh-pbd" }
+rmesh-anim = { path = "../rmesh-anim" }
+rmesh-raytrace = { path = "../rmesh-raytrace" }
+rmesh-viewer-core = { path = "../rmesh-viewer-core" }
+web-time = { workspace = true }
 rmesh-render = { path = "../rmesh-render" }
 rmesh-data = { path = "../rmesh-data", default-features = false }
 rmesh-sort = { path = "../rmesh-sort" }

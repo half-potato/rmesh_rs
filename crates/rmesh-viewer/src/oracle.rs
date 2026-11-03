@@ -983,7 +983,7 @@ pub fn report(out: &OracleOutput, dir: &str, tet_count: usize) {
 // Image metrics (tonemapped LDR, values in [0,1])
 // ---------------------------------------------------------------------------
 
-/// The deferred output is linear; the swapchain is sRGB. Scoring in sRGB
+/// The radiance output is linear; the swapchain is sRGB. Scoring in sRGB
 /// matches what a screenshot of the presented frame scores, which is how the
 /// project's 35 dB / 0.99 bar has been judged, and it weights the dark regions
 /// where culling errors actually show.
@@ -1408,18 +1408,13 @@ impl crate::App {
             // The walk can leave the hull on a concave boundary even for an
             // interior point, so confirm "outside" by brute force before
             // falling back to boundary-face entry.
-            let hint = if self.rt_start_tet_hint >= 0 {
-                self.rt_start_tet_hint as usize
-            } else {
-                0
-            };
             let located = rmesh_raytrace::find_containing_tet_walk(
                 &self.scene_data.vertices,
                 &self.scene_data.indices,
                 &cache.neighbors,
                 tet_count,
                 self.camera.position,
-                hint,
+                0,
             )
             .or_else(|| {
                 rmesh_raytrace::find_containing_tet(
@@ -1429,9 +1424,6 @@ impl crate::App {
                     self.camera.position,
                 )
             });
-            if let Some(t) = located {
-                self.rt_start_tet_hint = t as i32;
-            }
             let bvh = rmesh_raytrace::build_boundary_bvh(
                 &self.scene_data.vertices,
                 &self.scene_data.indices,
@@ -1528,7 +1520,7 @@ impl crate::App {
 }
 
 /// After the frame's submit: on a candidate's last frame, read the probe and
-/// the deferred output back and score it. A free function over the fields it
+/// the radiance output back and score it. A free function over the fields it
 /// touches, because the render loop holds `gpu` borrowed for the whole frame.
 pub(crate) fn oracle_post_frame(
     oracle: &mut Option<OracleRun>,
@@ -1550,15 +1542,9 @@ pub(crate) fn oracle_post_frame(
             (f32::NAN, f32::NAN)
         }
     };
-    let img = match gpu.deferred_output.as_ref() {
-        Some(t) => read_rgba16(&gpu.device, &gpu.queue, t)
-            .map_err(|e| log::error!("[oracle] frame readback: {e}"))
-            .ok(),
-        None => {
-            log::warn!("[oracle] no deferred output; PSNR unavailable");
-            None
-        }
-    };
+    let img = read_rgba16(&gpu.device, &gpu.queue, &gpu.targets.color_texture)
+        .map_err(|e| log::error!("[oracle] frame readback: {e}"))
+        .ok();
     let (w, h) = (
         gpu.surface_config.width as usize,
         gpu.surface_config.height as usize,

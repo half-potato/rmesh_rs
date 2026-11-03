@@ -1,0 +1,16 @@
+{
+  "date_local": "2026-10-28",
+  "comparison": "High versus Reference preset",
+  "sha256": {
+    "target/release/rmesh-viewer": "467fc9a8a84dfa299c071528c391e3ca966c32177d1f1b1ddb55b612da3c6dae",
+    "crates/rmesh-viewer-web/web/bench.rmesh": "541874516ca7e74cc3496b617491ccf29ebf15f5d4052b18893d19be95ac1608",
+    "benchmarks/bench/accuracy/high-1080p.npy": "ac6917467b1b7da3d8f81e7886e05c25986b35311132a9ba77f64bc7c2f6191f",
+    "benchmarks/bench/accuracy/high-720p.npy": "8829f4327fb033d9f2d5492b615d3e8d2f0ce6660f4ff33c518363764b533488",
+    "benchmarks/bench/accuracy/reference-1080p.npy": "79dcec47c46fd7f706b7b0ab16554b254d4d8473f0e22810dc31d4af3c60a99c",
+    "benchmarks/bench/accuracy/reference-720p.npy": "20d3128aff497ab43083dfdc15fc7263d2d2c2977598980389d3ea0edc896b03",
+    "benchmarks/bench/accuracy/high-1080p.npy.json": "46e308cf4983aab32ce01dbdf6d3c8bcc87584b9be5fa1b81cc036a2ac08c3eb",
+    "benchmarks/bench/accuracy/high-720p.npy.json": "0e20eeb99a4cf27daecac1a21c213458a47837a1006479a1624d8a5b5b3aced0",
+    "benchmarks/bench/accuracy/reference-1080p.npy.json": "e300e097d03c8a0c4bf7f84243168a1c9e8771c43a2aecfdda74ba7d9e2513d5",
+    "benchmarks/bench/accuracy/reference-720p.npy.json": "d2fc62ed0ce86189cab4eec434f39f9c8cdea69dab6bd9894fbca1dadca1bf6d"
+  }
+}

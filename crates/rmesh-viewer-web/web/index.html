@@ -6,16 +6,19 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { background: #1a1a1a; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+    #ui { position: absolute; top: 10px; left: 10px; right: 10px; z-index: 10;
+      display: flex; flex-direction: column; align-items: flex-start; gap: 8px;
+      max-height: 70vh; overflow: auto; pointer-events: none; }
+    #ui > * { pointer-events: auto; }
     #controls {
-      position: absolute; top: 10px; left: 10px; z-index: 10;
-      display: flex; gap: 8px; align-items: center;
+      display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+      background: rgba(30,30,30,0.9); border-radius: 6px; padding: 8px; max-width: 100%;
     }
     #controls label, #controls span {
       font-size: 13px; opacity: 0.8;
     }
     #file-input { font-size: 13px; }
     #primitives-panel {
-      position: absolute; top: 50px; left: 10px; z-index: 10;
       background: rgba(30,30,30,0.9); border-radius: 6px; padding: 8px;
       font-size: 13px; min-width: 140px;
     }
@@ -30,6 +33,9 @@
     }
     #prim-list div:hover { background: #444; }
     #prim-list div.selected { background: #2a5a8a; }
+    #animation-nodes { max-height: 180px; overflow: auto; }
+    #animation-nodes button { display: block; width: 95%; text-align: left; }
+    #animation-nodes button[aria-pressed="true"] { background: #2a5a8a; }
     #interact-hud {
       position: absolute; bottom: 40px; left: 50%; transform: translateX(-50%);
       z-index: 10; background: rgba(0,0,0,0.7); border-radius: 6px; padding: 6px 16px;
@@ -50,28 +56,88 @@
   </style>
 </head>
 <body>
+  <div id="ui">
   <div id="controls">
-    <input type="file" id="file-input" accept=".rmesh,.ply">
+    <input type="file" id="file-input" accept=".rmesh,.ply" aria-label="Radiance mesh">
+    <label>Animation <input type="file" id="animation-input" accept=".glb,.gltf"></label>
     <label style="font-size:13px; opacity:0.8; margin-left:6px;">
       Mode:
       <select id="render-mode" style="font-size:12px;">
-        <option value="interval" selected>Interval (CPU sort)</option>
+        <option value="interval" selected>Interval</option>
         <option value="forward">Forward (HW raster)</option>
+        <option value="quad">Quad</option>
       </select>
     </label>
+    <label>Quality <select id="quality-preset"><option>Lowest</option><option>Low</option><option>Medium</option><option selected>High</option><option title="Disables shell and importance culling; uses the same approximate lighting bake">Reference</option><option disabled>Custom</option></select></label>
+    <label>Sort <select id="sort-mode"><option value="gpu">GPU 32-bit</option><option value="gpu16">GPU 16-bit (approximate)</option><option value="cpu">CPU</option></select></label>
+    <label><input type="checkbox" id="shell-enabled" checked> Density shell</label>
+    <label><input type="checkbox" id="importance-enabled" checked> Importance culling</label>
+    <span id="fps"></span>
     <span id="info"></span>
   </div>
   <div id="primitives-panel">
-    <strong>Primitives</strong><br>
+    <strong>Scene</strong><br>
+    <details id="quality-controls">
+      <summary>Rendering controls</summary>
+      <label><input id="show-scene" type="checkbox" checked> Show scene</label><br>
+      <label>Importance threshold <input id="importance-threshold" type="number" min="0.001" max="0.3" step="0.001" value="0.01" style="width:70px"></label><br>
+      <label>Shell opacity <input id="shell-threshold" type="number" min="0" max="0.99" step="0.01" value="0.1" style="width:70px"></label>
+      <label>Erosion <input id="shell-erosion" type="number" min="0" max="24" step="1" value="2" style="width:55px"></label><br>
+      <label>Shell surface <select id="shell-surface"><option value="exit">Exit</option><option value="entry">Entry</option></select></label>
+      <label><input id="shell-only" type="checkbox"> Shell only</label><br>
+      <label><input id="shell-cull" type="checkbox" checked> Cull behind shell</label>
+      <label>Cull bias <input id="shell-bias" type="number" min="0" max="0.01" step="0.0001" value="0" style="width:70px"></label>
+      <div id="culling-stats"></div>
+      <label>Collision density <input id="collision-density" type="number" min="0" max="1" step="0.01" value="0.05" style="width:70px"></label>
+      <label><input id="collision-visible" type="checkbox"> Show collision mesh</label>
+      <div id="collision-stats"></div>
+    </details>
+    <label><input type="checkbox" id="vertex-mode"> Grab vertices (V)</label>
+    <label>Radius <input id="vertex-radius" aria-label="Vertex grab radius" type="number" min="0.001" step="0.05" value="0.25" style="width:65px"></label>
+    <div id="vertex-status">Drag to deform; release to keep, Esc to cancel.</div>
+    <button onclick="addPrimitive('light')">Point light</button>
+    <button onclick="addPrimitive('spot')">Spot light</button>
+    <button onclick="throwTorch()">Throw torch (L)</button>
+    <button onclick="clearTorches()">Clear torches</button><br>
+    <div id="bake-status" aria-live="polite"></div>
+    <fieldset id="light-editor" style="display:none; max-width:200px">
+      <legend>Selected light</legend>
+      <label>X <input id="light-x" type="number" step="0.1" style="width:65px"></label>
+      <label>Y <input id="light-y" type="number" step="0.1" style="width:65px"></label>
+      <label>Z <input id="light-z" type="number" step="0.1" style="width:65px"></label>
+      <label>Intensity <input id="light-intensity" type="number" min="0" step="0.5" style="width:65px"></label>
+      <div>Linear color</div>
+      <label>Red <input id="light-red" type="number" min="0" step="0.05" style="width:65px"></label>
+      <label>Green <input id="light-green" type="number" min="0" step="0.05" style="width:65px"></label>
+      <label>Blue <input id="light-blue" type="number" min="0" step="0.05" style="width:65px"></label>
+      <div id="spot-direction" style="display:none">
+        <div>Spot direction</div>
+        <label>X <input id="direction-x" aria-label="Spot direction X" type="number" step="0.1" style="width:65px"></label>
+        <label>Y <input id="direction-y" aria-label="Spot direction Y" type="number" step="0.1" style="width:65px"></label>
+        <label>Z <input id="direction-z" aria-label="Spot direction Z" type="number" step="0.1" style="width:65px"></label>
+      </div>
+    </fieldset>
     <button onclick="addPrimitive('cube')">Cube</button>
     <button onclick="addPrimitive('sphere')">Sphere</button>
     <button onclick="addPrimitive('plane')">Plane</button>
     <button onclick="addPrimitive('cylinder')">Cylinder</button>
     <button id="delete-btn" onclick="deleteSelected()" style="display:none; background:#833;">Delete</button>
     <div style="margin-top:6px;">
-      <label><input type="checkbox" id="show-prims-cb" onchange="toggleShowPrimitives(this.checked)"> Show Primitives</label>
+      <label><input type="checkbox" checked id="show-prims-cb" onchange="toggleShowPrimitives(this.checked)"> Show Primitives</label>
     </div>
     <div id="prim-list"></div>
+    <fieldset id="animation-panel" style="display:none">
+      <legend>Animation</legend>
+      <select id="animation-clips" aria-label="Animation clip"></select>
+      <label><input id="animation-playing" type="checkbox" checked> Play</label>
+      <label><input id="animation-loop" type="checkbox" checked> Loop</label>
+      <label>Speed <input id="animation-speed" type="number" value="1" step="0.25" style="width:50px"></label>
+      <input id="animation-time" type="range" min="0" max="1" step="0.01" value="0" aria-label="Animation time">
+      <div>Nodes · select, then G / R / S to transform</div>
+      <div id="animation-nodes"></div>
+      <button id="delete-node" onclick="deleteSelected()" style="display:none">Delete node</button>
+    </fieldset>
+  </div>
   </div>
   <div id="interact-hud">
     <span class="mode"></span>
@@ -96,6 +162,26 @@
     let viewer = null;
     let leftDown = false, middleDown = false, rightDown = false;
     let lastX = 0, lastY = 0;
+    let grabStart = null;
+    let grabPending = false;
+
+    window.throwTorch = () => { if (viewer) { viewer.shoot_torch(); refreshPrimList(); } };
+    window.clearTorches = () => { if (viewer) { viewer.clear_torches(); refreshPrimList(); } };
+    const lightFields = ['light-x','light-y','light-z','light-intensity'].map(id => document.getElementById(id));
+    for (const field of lightFields) field.addEventListener('change', () => {
+      if (viewer && viewer.get_selected() >= 0) viewer.set_light(viewer.get_selected(), ...lightFields.map(f => Number(f.value)));
+    });
+    const colorFields = ['light-red','light-green','light-blue'].map(id => document.getElementById(id));
+    for (const field of colorFields) field.addEventListener('change', () => {
+      if (viewer) viewer.set_light_color(viewer.get_selected(), ...colorFields.map(f => Number(f.value)));
+    });
+    const directionFields = ['direction-x','direction-y','direction-z'].map(id => document.getElementById(id));
+    for (const field of directionFields) field.addEventListener('change', () => {
+      if (viewer) {
+        viewer.set_light_direction(viewer.get_selected(), ...directionFields.map(f => Number(f.value)));
+        refreshPrimList();
+      }
+    });
 
     // Expose to onclick handlers
     window.addPrimitive = function(kind) {
@@ -129,6 +215,28 @@
         primList.appendChild(div);
       }
       deleteBtn.style.display = sel >= 0 ? '' : 'none';
+      const nodeSelection = viewer.selected_node();
+      const nodes = document.getElementById('animation-nodes');
+      nodes.innerHTML = '';
+      for (let i=0;i<viewer.animation_node_count();i++) {
+        const button=document.createElement('button');
+        let depth=0, parent=viewer.animation_node_parent(i);
+        while(parent>=0 && depth<viewer.animation_node_count()) { depth++; parent=viewer.animation_node_parent(parent); }
+        button.style.paddingLeft=(8+depth*12)+'px';
+        button.textContent=viewer.animation_node_name(i);
+        button.setAttribute('aria-pressed', String(nodeSelection===i));
+        button.addEventListener('click',()=> { viewer.set_selected_node(nodeSelection===i ? -1 : i); refreshPrimList(); });
+        nodes.appendChild(button);
+      }
+      document.getElementById('delete-node').style.display=nodeSelection>=0 ? '' : 'none';
+      const light = sel >= 0 ? viewer.light_parameters(sel) : [];
+      document.getElementById('light-editor').style.display = light.length ? '' : 'none';
+      if (light.length) lightFields.forEach((field, i) => field.value = light[i]);
+      const color = sel >= 0 ? viewer.light_color(sel) : [];
+      if (color.length) colorFields.forEach((field, i) => field.value = color[i]);
+      const direction = sel >= 0 ? viewer.light_direction(sel) : [];
+      document.getElementById('spot-direction').style.display = direction.length ? '' : 'none';
+      if (direction.length) directionFields.forEach((field, i) => field.value = Number(direction[i].toFixed(4)));
     }
 
     function updateHud() {
@@ -149,9 +257,7 @@
       if (!navigator.gpu) {
         const msg = 'WebGPU is not supported in this browser.\n\n'
           + 'Requirements:\n'
-          + '  - Chrome 113+ / Edge 113+\n'
-          + '  - Firefox: enable dom.webgpu.enabled in about:config\n'
-          + '  - Safari 18+\n\n'
+          + '  - A browser and GPU with WebGPU support\n\n'
           + 'Make sure hardware acceleration is enabled.';
         alert(msg);
         status.textContent = 'WebGPU not available';
@@ -162,6 +268,10 @@
       try {
         viewer = await WebViewer.create('canvas');
         status.textContent = 'Ready — load an .rmesh or .ply file';
+        try {
+          const response = await fetch('./assets/flare.gltf');
+          if (response.ok) viewer.load_flare_model(new Uint8Array(await response.arrayBuffer()));
+        } catch (error) { console.warn('Torch model unavailable; using light marker', error); }
       } catch (e) {
         alert('WebGPU initialization failed:\n\n' + e);
         status.textContent = 'WebGPU init failed: ' + e;
@@ -169,6 +279,39 @@
         return;
       }
 
+      document.getElementById('quality-preset').addEventListener('change', e => {
+        viewer.set_quality_preset(e.target.value);
+        document.getElementById('sort-mode').value = viewer.sort_mode();
+        document.getElementById('shell-enabled').checked = viewer.shell_enabled();
+        document.getElementById('importance-enabled').checked = viewer.importance_enabled();
+        document.getElementById('importance-threshold').value = viewer.importance_threshold();
+      });
+      document.getElementById('sort-mode').addEventListener('change', e => viewer.set_sort_mode(e.target.value));
+      document.getElementById('shell-enabled').addEventListener('change', e => viewer.set_shell_enabled(e.target.checked));
+      document.getElementById('importance-enabled').addEventListener('change', e => viewer.set_importance_enabled(e.target.checked));
+      document.getElementById('show-scene').addEventListener('change', e=>viewer.set_show_scene(e.target.checked));
+      document.getElementById('importance-threshold').addEventListener('change', e=>viewer.set_importance_threshold(Number(e.target.value)));
+      for(const id of ['shell-threshold','shell-erosion']) document.getElementById(id).addEventListener('change',()=>viewer.set_shell_parameters(Number(document.getElementById('shell-threshold').value),Number(document.getElementById('shell-erosion').value)));
+      for(const id of ['shell-cull','shell-bias']) document.getElementById(id).addEventListener('change',()=>viewer.set_shell_cull(document.getElementById('shell-cull').checked,Number(document.getElementById('shell-bias').value)));
+      document.getElementById('shell-surface').addEventListener('change',e=>viewer.set_shell_entry(e.target.value==='entry'));
+      document.getElementById('shell-only').addEventListener('change',e=>viewer.set_shell_only(e.target.checked));
+      for(const id of ['collision-density','collision-visible']) document.getElementById(id).addEventListener('change',()=>viewer.set_collision_parameters(Number(document.getElementById('collision-density').value),document.getElementById('collision-visible').checked));
+      document.getElementById('animation-input').addEventListener('change', async e => {
+        const file=e.target.files[0]; if(!file) return;
+        try {
+          viewer.load_animation(new Uint8Array(await file.arrayBuffer()), file.name);
+          document.getElementById('show-prims-cb').checked=true;
+          const clips=document.getElementById('animation-clips'); clips.innerHTML='';
+          for(let i=0;i<viewer.animation_clip_count();i++) clips.add(new Option(viewer.animation_clip_name(i), i));
+          document.getElementById('animation-panel').style.display='';
+          refreshPrimList();
+        } catch(error) { status.textContent='Animation load error: '+error; }
+      });
+      document.getElementById('animation-clips').addEventListener('change', e=>viewer.set_animation_clip(Number(e.target.value)));
+      document.getElementById('animation-playing').addEventListener('change', e=>viewer.set_animation_playing(e.target.checked));
+      document.getElementById('animation-loop').addEventListener('change', e=>viewer.set_animation_looping(e.target.checked));
+      document.getElementById('animation-speed').addEventListener('change', e=>viewer.set_animation_speed(Number(e.target.value)));
+      document.getElementById('animation-time').addEventListener('input', e=>viewer.seek_animation(Number(e.target.value)));
       // Initialize the dropdown to match the viewer's default mode.
       renderModeSelect.value = viewer.get_render_mode();
       renderModeSelect.addEventListener('change', () => {
@@ -188,15 +331,37 @@
           }
           info.textContent = file.name;
           status.textContent = '';
+          refreshPrimList();
         } catch (err) {
           status.textContent = 'Load error: ' + err;
           console.error(err);
         }
       });
 
+      const sample = new URLSearchParams(location.search).get('mesh');
+      if (sample) {
+        try {
+          status.textContent = 'Loading ' + sample + '…';
+          const response=await fetch(sample);
+          if(!response.ok) throw new Error('HTTP '+response.status);
+          viewer.load_rmesh(new Uint8Array(await response.arrayBuffer()));
+          info.textContent=sample; status.textContent=''; refreshPrimList();
+        } catch(error) { status.textContent='Load error: '+error; }
+      }
+
       // --- Keyboard controls ---
       window.addEventListener('keydown', (e) => {
         if (!viewer) return;
+        if (e.key === 'Escape' && viewer.vertex_grab_active()) {
+          viewer.end_vertex_grab(false); grabStart = null; grabPending = false;
+          document.getElementById('vertex-status').textContent = 'Deformation cancelled.';
+          e.preventDefault(); return;
+        }
+        if (/INPUT|SELECT|TEXTAREA/.test(e.target.tagName)) return;
+        if (e.key.toLowerCase() === 'v') {
+          const mode = document.getElementById('vertex-mode'); mode.checked = !mode.checked;
+          e.preventDefault(); return;
+        }
         const result = viewer.on_key_down(e.key);
         if (result !== 'NotConsumed') {
           e.preventDefault();
@@ -213,6 +378,17 @@
       // --- Mouse controls ---
       canvas.addEventListener('mousedown', (e) => {
         if (!viewer) return;
+        canvas.focus();
+        if (viewer.vertex_grab_active()) return;
+        if (e.button === 0 && !e.shiftKey && document.getElementById('vertex-mode').checked) {
+          const rect = canvas.getBoundingClientRect();
+          const x = (e.clientX-rect.left)*canvas.width/rect.width;
+          const y = (e.clientY-rect.top)*canvas.height/rect.height;
+          const id = viewer.begin_vertex_grab(x,y,Number(document.getElementById('vertex-radius').value));
+          if (id >= 0) grabStart = [x,y];
+          document.getElementById('vertex-status').textContent = id >= 0 ? `Dragging vertex ${id}; release to keep, Esc to cancel.` : 'No dense vertex near cursor.';
+          e.preventDefault(); return;
+        }
         if (viewer.is_interacting()) {
           const result = viewer.on_interact_mouse_down(e.button);
           if (result !== 'NotConsumed') {
@@ -229,6 +405,10 @@
       });
 
       window.addEventListener('mouseup', (e) => {
+        if (e.button === 0 && grabStart) {
+          viewer.end_vertex_grab(true); grabStart = null; grabPending = true;
+          document.getElementById('vertex-status').textContent = 'Updating geometry and lighting…';
+        }
         if (e.button === 0) leftDown = false;
         if (e.button === 1) middleDown = false;
         if (e.button === 2) rightDown = false;
@@ -241,14 +421,25 @@
         lastY = e.clientY;
 
         if (!viewer) return;
+        if (viewer.vertex_grab_active()) return;
         if (viewer.is_interacting()) {
           viewer.on_interact_mouse_move(dx, dy);
           updateHud();
           return;
         }
-        if (leftDown)   viewer.orbit(dx, dy);
+        if (leftDown) {
+          if (e.shiftKey) viewer.pan(dx, dy);
+          else viewer.orbit(dx, dy);
+        }
         if (middleDown) viewer.pan(dx, dy);
         if (rightDown)  viewer.zoom(dy);
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!viewer || !grabStart) return;
+        const rect = canvas.getBoundingClientRect();
+        viewer.move_vertex_grab((e.clientX-rect.left)*canvas.width/rect.width-grabStart[0],
+          (e.clientY-rect.top)*canvas.height/rect.height-grabStart[1]);
       });
 
       canvas.addEventListener('wheel', (e) => {
@@ -273,9 +464,31 @@
       onResize();
 
       // --- Render loop ---
+      let lastFrame = performance.now(), frameMean = 0;
       function frame() {
+        const now = performance.now();
+        frameMean = frameMean ? frameMean * 0.9 + (now-lastFrame)*0.1 : now-lastFrame;
+        lastFrame = now;
+        document.getElementById('fps').textContent = viewer?.has_scene() ? (1000/frameMean).toFixed(0)+' FPS' : '';
         if (viewer && viewer.has_scene()) {
-          try { viewer.render(); } catch (e) { console.error('render:', e); }
+          try {
+            viewer.render();
+            document.getElementById('quality-preset').value = viewer.quality_preset();
+            document.getElementById('shell-enabled').checked = viewer.shell_enabled();
+            document.getElementById('importance-enabled').checked = viewer.importance_enabled();
+            const timeline=document.getElementById('animation-time');
+            timeline.max=viewer.animation_duration();
+            if(document.activeElement!==timeline) timeline.value=viewer.animation_time();
+            document.getElementById('bake-status').textContent = viewer.bake_ready()
+              ? 'Baked · ambient off' : 'Baking lighting ' + Math.round(viewer.bake_progress()*100) + '%';
+            if (primList.children.length !== viewer.primitive_count()) refreshPrimList();
+            if(document.getElementById('quality-controls').open) document.getElementById('culling-stats').textContent = `${viewer.shell_face_count().toLocaleString()} shell faces · ${viewer.importance_kept_count().toLocaleString()} tets above threshold`;
+            if(document.getElementById('quality-controls').open) document.getElementById('collision-stats').textContent = `${viewer.collision_triangle_count().toLocaleString()} collision triangles`;
+            if (grabPending && !viewer.vertex_grab_active()) {
+              grabPending = false;
+              document.getElementById('vertex-status').textContent = 'Deformation kept.';
+            }
+          } catch (e) { status.textContent = 'Render error: ' + e; console.error('render:', e); return; }
         }
         requestAnimationFrame(frame);
       }

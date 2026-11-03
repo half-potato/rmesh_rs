@@ -519,7 +519,7 @@ fn print_breakdown(s: &State) {
                 end_of_pass_write_index: Some(e),
             }),
         });
-        cpass.set_pipeline(&s.fwd_pipelines.compute_pipeline);
+        cpass.set_pipeline(s.fwd_pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &s.compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &s.compute_bg.bg1, &[]);
         let n_pow2 = s.tet_count.next_power_of_two();

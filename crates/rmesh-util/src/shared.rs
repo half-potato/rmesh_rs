@@ -47,8 +47,9 @@ pub struct Uniforms {
     /// NDC depth slack added to the shell z-cull bound in `project_compute*`.
     /// Positive values cull less (safer); 0 culls exactly at the shell exit.
     pub shell_cull_bias: f32,
-    /// Bit 0: shell z-cull enabled. Remaining bits reserved (keeps the struct
-    /// at 192 bytes without reintroducing a pad field).
+    /// Bit 0: shell z-cull. Bit 1: refresh circumcenters during GPU deformation.
+    /// Bit 2: HW projection emits linear 16-bit depth keys.
+    /// Bit 3: preserve subpixel cells for energy point-ray integration.
     pub shell_cull_flags: u32,
 }
 

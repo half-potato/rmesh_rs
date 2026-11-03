@@ -74,8 +74,7 @@ fn phi_from_alpha(x: f32, alpha: f32) -> f32 {
 // Shared front-to-back volume integral for a tet's ray segment. Produces the
 // premultiplied slot-0 color plus the intermediates (alpha, weights, view-space
 // depths) that the MRT outputs need. Both the MRT `main` and the lean
-// `main_color_only` entry call this, so slot-0 color is byte-identical between
-// them.
+// `main_color_only` entry call this; only legacy MRT substitutes PBR albedo.
 struct ShadeCommon {
     color: vec4<f32>,   // location(0): premultiplied-alpha color
     alpha: f32,
@@ -87,7 +86,7 @@ struct ShadeCommon {
     z_b: f32,
 }
 
-fn shade_common(frag_coord: vec4<f32>, in: FragmentInput) -> ShadeCommon {
+fn shade_common(frag_coord: vec4<f32>, in: FragmentInput, material_output: bool) -> ShadeCommon {
     let near = uniforms.near_plane;
     let far = uniforms.far_plane;
 
@@ -120,19 +119,6 @@ fn shade_common(frag_coord: vec4<f32>, in: FragmentInput) -> ShadeCommon {
     let alpha_t = exp(-od);
     let alpha = 1.0 - alpha_t;
 
-    // Per-tet aux channels lookup (parametric BRDF layout, AUX_DIM=6).
-    // For non-PBR scenes, aux_data is bound to a 4-byte dummy buffer (see
-    // `create_compute_interval_render_bind_group`); detect that and use the
-    // proper volume-integrated SH color so the color-only path matches what the
-    // Regular forward pass produces.
-    let has_pbr = arrayLength(&aux_data) > 1u;
-    let aux_base = in.tet_id * AUX_DIM;
-    let albedo = select(in.base_color,
-                        vec3f(aux_data[aux_base + 3u],
-                              aux_data[aux_base + 4u],
-                              aux_data[aux_base + 5u]),
-                        has_pbr);
-
     // Shared w0/w1 across the color (slot 0) and depth-moment (slot 3) outputs —
     // both blends use the same exponential-transmittance weights, so phi(od)
     // only needs evaluating once (and reuses alpha to dodge a second exp()).
@@ -140,9 +126,14 @@ fn shade_common(frag_coord: vec4<f32>, in: FragmentInput) -> ShadeCommon {
     let w0 = phi_val - alpha_t;   // back weight (z_b)
     let w1 = 1.0 - phi_val;       // front weight (z_f)
     let integrated = c_back * w0 + c_front * w1;  // already × α
-    let color = select(vec4f(integrated, alpha),
-                       vec4f(albedo * alpha, alpha),
-                       has_pbr);
+    var color = vec4f(integrated, alpha);
+    // The color-only path consumes already-lit radiance. Material lookup is
+    // exclusive to legacy deferred rendering, where slot 0 holds albedo.
+    if (material_output && arrayLength(&aux_data) > 1u) {
+        let aux_base = in.tet_id * AUX_DIM;
+        let albedo = vec3f(aux_data[aux_base + 3u], aux_data[aux_base + 4u], aux_data[aux_base + 5u]);
+        color = vec4f(albedo * alpha, alpha);
+    }
 
     return ShadeCommon(color, alpha, alpha_t, w0, w1, od, z_f, z_b);
 }
@@ -154,14 +145,14 @@ fn main_color_only(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput)
     -> @location(0) vec4<f32> {
     // `coverage` scales the whole premultiplied contribution (rgb and a), so a
     // sub-pixel tet composites as if it only covered `coverage` of the pixel.
-    return shade_common(frag_coord, in).color * in.coverage;
+    return shade_common(frag_coord, in, false).color * in.coverage;
 }
 
 @fragment
 fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> FragmentOutput {
     var out: FragmentOutput;
 
-    let sc = shade_common(frag_coord, in);
+    let sc = shade_common(frag_coord, in, true);
     let alpha = sc.alpha;
     let alpha_t = sc.alpha_t;
     let w0 = sc.w0;
@@ -256,6 +247,6 @@ fn main(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput) -> Fragment
 @fragment
 fn fs_overdraw(@builtin(position) frag_coord: vec4<f32>, in: FragmentInput)
     -> @location(0) vec4<f32> {
-    let sc = shade_common(frag_coord, in);
+    let sc = shade_common(frag_coord, in, true);
     return vec4<f32>(1.0, sc.alpha, 0.0, 0.0);
 }

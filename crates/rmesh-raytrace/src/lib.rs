@@ -169,6 +169,16 @@ pub fn build_boundary_bvh(
     neighbors: &[i32],
     tet_count: usize,
 ) -> BVHData {
+    build_boundary_bvh_impl(vertices, indices, neighbors, tet_count, false)
+}
+
+mod bvh_sah;
+
+/// Higher-quality hierarchy for repeatedly queried shadow boundary faces.
+pub fn build_boundary_bvh_sah(vertices: &[f32], indices: &[u32], neighbors: &[i32], tet_count: usize) -> BVHData {
+    build_boundary_bvh_impl(vertices, indices, neighbors, tet_count, true)
+}
+fn build_boundary_bvh_impl(vertices: &[f32], indices: &[u32], neighbors: &[i32], tet_count: usize, sah: bool) -> BVHData {
     use rmesh_util::shared::TET_FACE_INDICES;
 
     // Collect boundary faces
@@ -274,6 +284,7 @@ pub fn build_boundary_bvh(
         start: usize,
         end: usize,
         node_idx: usize,
+        depth: u32,
     }
 
     let mut nodes: Vec<BVHNode> = Vec::with_capacity(2 * n_faces);
@@ -288,6 +299,7 @@ pub fn build_boundary_bvh(
         start: 0,
         end: n_faces,
         node_idx: 0,
+        depth: 0,
     }];
 
     while let Some(task) = stack.pop() {
@@ -309,7 +321,12 @@ pub fn build_boundary_bvh(
                 right_or_count: count as i32,
             };
         } else {
-            let mid = task.start + count / 2;
+            // Cap heuristic depth; balanced splits afterward keep traversal
+            // comfortably within the GPU stack even for skewed distributions.
+            let mid = if sah && task.depth < 32 {
+                bvh_sah::partition(&mut aabbs[task.start..task.end], &mut boundary_faces[task.start..task.end])
+                    .map(|n| task.start+n).unwrap_or(task.start+count/2)
+            } else { task.start + count / 2 };
             let left_idx = nodes.len();
             nodes.push(BVHNode {
                 aabb_min: [0.0; 3],
@@ -336,11 +353,13 @@ pub fn build_boundary_bvh(
                 start: task.start,
                 end: mid,
                 node_idx: left_idx,
+                depth: task.depth+1,
             });
             stack.push(BuildTask {
                 start: mid,
                 end: task.end,
                 node_idx: right_idx,
+                depth: task.depth+1,
             });
         }
     }
@@ -435,11 +454,27 @@ pub struct RayTracePipeline {
     pub height: u32,
     pub aux_dim: u32,
     pub aux_stride: u32,
+    color_only: bool,
 }
 
 impl RayTracePipeline {
     pub fn new(device: &wgpu::Device, width: u32, height: u32, aux_dim: u32) -> Self {
-        let aux_stride = 8 + aux_dim;
+        Self::new_impl(device, width, height, aux_dim, false, None)
+    }
+
+    /// Camera-ray diagnostic rendering with ten storage buffers and no aux outputs.
+    /// Uses the same adjacency traversal and radiance integration as the full path.
+    pub fn new_color_only(device: &wgpu::Device, width: u32, height: u32) -> Self {
+        Self::new_impl(device, width, height, 0, true, None)
+    }
+
+    /// Color-only camera rays clipped against opaque scene depth.
+    pub fn new_color_only_with_depth(device: &wgpu::Device, width: u32, height: u32, depth: &wgpu::TextureView) -> Self {
+        Self::new_impl(device, width, height, 0, true, Some(depth))
+    }
+
+    fn new_impl(device: &wgpu::Device, width: u32, height: u32, aux_dim: u32, color_only: bool, depth: Option<&wgpu::TextureView>) -> Self {
+        let aux_stride = if color_only { 0 } else { 8 + aux_dim };
 
         // String-substitute AUX_DIM and AUX_ACC_SIZE in shader source
         let source = RAYTRACE_COMPUTE_WGSL
@@ -447,14 +482,21 @@ impl RayTracePipeline {
             .replace("/*AUX_ACC_SIZE*/1u", &format!("{}u", aux_dim.max(1)));
 
         let shader =
-            rmesh_util::compose::create_shader_module(device, "raytrace_compute.wgsl", &source)
+            rmesh_util::compose::create_shader_module_with_defs(device, "raytrace_compute.wgsl", &source,
+                if depth.is_some() { &[("VIEWER_COLOR_ONLY", true), ("VIEWER_DEPTH", true)] }
+                else if color_only { &[("VIEWER_COLOR_ONLY", true)] } else { &[] })
                 .expect("Failed to compose raytrace_compute.wgsl");
 
         // Group 0: 13 bindings (0-6 read, 7 rw, 8-12 read)
         let read_only = [
             true, true, true, true, true, true, true, false, true, true, true, true, true,
         ];
-        let entries = storage_entries(13, wgpu::ShaderStages::COMPUTE, &read_only);
+        let mut entries = storage_entries(if color_only { 11 } else { 13 }, wgpu::ShaderStages::COMPUTE, &read_only);
+        if color_only {
+            entries[0].ty = wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None,
+            };
+        }
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("raytrace_bgl"),
@@ -462,7 +504,13 @@ impl RayTracePipeline {
         });
 
         // Group 1: aux_image (rw), aux_data (read)
-        let aux_entries = storage_entries(2, wgpu::ShaderStages::COMPUTE, &[false, true]);
+        let mut aux_entries = storage_entries(if color_only { 0 } else { 2 }, wgpu::ShaderStages::COMPUTE, &[false, true]);
+        if depth.is_some() {
+            aux_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None,
+            });
+        }
         let aux_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("raytrace_aux_bgl"),
@@ -495,7 +543,7 @@ impl RayTracePipeline {
 
         let aux_image = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("raytrace_aux_image"),
-            size: (width as u64) * (height as u64) * (aux_stride as u64) * 4,
+            size: ((width as u64) * (height as u64) * (aux_stride as u64) * 4).max(4),
             usage: wgpu::BufferUsages::STORAGE
                 | wgpu::BufferUsages::COPY_DST
                 | wgpu::BufferUsages::COPY_SRC,
@@ -510,10 +558,12 @@ impl RayTracePipeline {
             mapped_at_creation: false,
         });
 
+        let aux_bindings = [buf_entry(0, &aux_image), buf_entry(1, &aux_data_dummy)];
+        let depth_bindings = depth.map(|view| [rmesh_util::gpu_helpers::tex_entry(0, view)]);
         let aux_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("raytrace_aux_bg_default"),
             layout: &aux_bind_group_layout,
-            entries: &[buf_entry(0, &aux_image), buf_entry(1, &aux_data_dummy)],
+            entries: if let Some(entries) = &depth_bindings { entries } else if color_only { &[] } else { &aux_bindings },
         });
 
         Self {
@@ -527,6 +577,7 @@ impl RayTracePipeline {
             height,
             aux_dim,
             aux_stride,
+            color_only,
         }
     }
 
@@ -623,6 +674,14 @@ pub fn create_raytrace_bind_group(
     material: &MaterialBuffers,
     rt_buffers: &RayTraceBuffers,
 ) -> wgpu::BindGroup {
+    create_raytrace_bind_group_with_colors(device, rt_pipeline, scene_buffers, material, rt_buffers, &material.colors)
+}
+
+/// Bind cached radiance directly when projection/SH evaluation is unnecessary.
+pub fn create_raytrace_bind_group_with_colors(
+    device: &wgpu::Device, rt_pipeline: &RayTracePipeline, scene_buffers: &SceneBuffers,
+    material: &MaterialBuffers, rt_buffers: &RayTraceBuffers, colors: &wgpu::Buffer,
+) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("raytrace_bg"),
         layout: rt_pipeline.bind_group_layout(),
@@ -630,7 +689,7 @@ pub fn create_raytrace_bind_group(
             buf_entry(0, &scene_buffers.uniforms),
             buf_entry(1, &scene_buffers.vertices),
             buf_entry(2, &scene_buffers.indices),
-            buf_entry(3, &material.colors),
+            buf_entry(3, colors),
             buf_entry(4, &scene_buffers.densities),
             buf_entry(5, &material.color_grads),
             buf_entry(6, &rt_buffers.tet_neighbors),
@@ -640,7 +699,7 @@ pub fn create_raytrace_bind_group(
             buf_entry(10, &rt_buffers.start_tet),
             buf_entry(11, &rt_buffers.ray_origins),
             buf_entry(12, &rt_buffers.ray_dirs),
-        ],
+        ][..if rt_pipeline.color_only { 11 } else { 13 }],
     })
 }
 

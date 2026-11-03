@@ -23,27 +23,30 @@
 //! this bound is what can be had without knowing the camera.
 
 use glam::Vec3;
+#[cfg(not(target_arch = "wasm32"))]
 use rayon::prelude::*;
 
 /// Per-tet `density · longest_edge`, the quantity `project_compute` culls on.
 pub fn tet_max_od(verts: &[f32], idxs: &[u32], dens: &[f32], tet_count: usize) -> Vec<f32> {
-    (0..tet_count)
-        .into_par_iter()
-        .map(|t| {
-            let p = |k: usize| {
-                let b = idxs[t * 4 + k] as usize * 3;
-                Vec3::new(verts[b], verts[b + 1], verts[b + 2])
-            };
-            let v = [p(0), p(1), p(2), p(3)];
-            let mut m = 0.0f32;
-            for i in 0..4 {
-                for j in i + 1..4 {
-                    m = m.max(v[i].distance_squared(v[j]));
-                }
+    #[cfg(not(target_arch = "wasm32"))]
+    let tets = (0..tet_count).into_par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let tets = 0..tet_count;
+    tets.map(|t| {
+        let p = |k: usize| {
+            let b = idxs[t * 4 + k] as usize * 3;
+            Vec3::new(verts[b], verts[b + 1], verts[b + 2])
+        };
+        let v = [p(0), p(1), p(2), p(3)];
+        let mut m = 0.0f32;
+        for i in 0..4 {
+            for j in i + 1..4 {
+                m = m.max(v[i].distance_squared(v[j]));
             }
-            dens[t] * m.sqrt()
-        })
-        .collect()
+        }
+        dens[t] * m.sqrt()
+    })
+    .collect()
 }
 
 /// Per tet, `d_t`: the least optical depth any path through the mesh
@@ -144,9 +147,11 @@ pub fn weight_bound(
         .map(|&a| -(1.0 - a.min(0.999_999)).ln() * CHORD_SCALE)
         .collect();
     let d = optical_distance(neighbors, &od_path, alphas, tet_count);
-    (0..tet_count)
-        .into_par_iter()
-        .map(|t| (1.0 - (-max_od[t]).exp()) * (-d[t]).exp())
+    #[cfg(not(target_arch = "wasm32"))]
+    let tets = (0..tet_count).into_par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let tets = 0..tet_count;
+    tets.map(|t| (1.0 - (-max_od[t]).exp()) * (-d[t]).exp())
         .collect()
 }
 

@@ -436,16 +436,90 @@ impl ShellSystem {
 ///
 /// `RMESH_SHOT=<path>` writes the presented frame once `RMESH_SHOT_FRAME` (default
 /// 240) frames have gone by — late enough for the background extraction to have
-/// landed and the temporal passes to have converged — then exits.
+/// landed — then exits. `RMESH_SHOT_COUNT=N` captures N consecutive frames;
+/// linear exports gain a `.0.npy`, `.1.npy`, ... suffix for temporal checks.
 pub struct Screenshot {
     pub path: String,
     pub at_frame: usize,
+    pub remaining: usize,
+    pub captured: usize,
+}
+
+/// Save the pre-blit color attachment as HWC float32 RGB in NumPy format.
+/// This preserves HDR and excludes tone mapping, sRGB conversion and egui.
+pub fn dump_linear_rgb(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    path: &str,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let bytes_per_pixel = match texture.format() {
+        wgpu::TextureFormat::Rgba16Float => 8,
+        wgpu::TextureFormat::Rgba32Float => 16,
+        other => anyhow::bail!("Linear capture requires a float attachment, got {other:?}"),
+    };
+    let (w, h) = (texture.width(), texture.height());
+    let padded = (w * bytes_per_pixel).div_ceil(256) * 256;
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("linear_rgb_capture"),
+        size: padded as u64 * h as u64,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    encoder.copy_texture_to_buffer(
+        texture.as_image_copy(),
+        wgpu::TexelCopyBufferInfo {
+            buffer: &buffer,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0, bytes_per_row: Some(padded), rows_per_image: Some(h),
+            },
+        },
+        texture.size(),
+    );
+    queue.submit(Some(encoder.finish()));
+    let (send, recv) = std::sync::mpsc::channel();
+    buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| { let _ = send.send(result); });
+    device.poll(wgpu::PollType::wait_indefinitely())?;
+    recv.recv()??;
+    let view = buffer.slice(..).get_mapped_range();
+    let mut values = Vec::with_capacity(w as usize * h as usize * 12);
+    for row in view.chunks_exact(padded as usize) {
+        for pixel in row[..(w * bytes_per_pixel) as usize].chunks_exact(bytes_per_pixel as usize) {
+            for channel in 0..3 {
+                let value = if bytes_per_pixel == 8 {
+                    half::f16::from_le_bytes(pixel[channel * 2..channel * 2 + 2].try_into()?).to_f32()
+                } else {
+                    f32::from_le_bytes(pixel[channel * 4..channel * 4 + 4].try_into()?)
+                };
+                anyhow::ensure!(value.is_finite(), "Nonfinite linear RGB value: capture rejected");
+                values.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+    }
+    drop(view);
+    buffer.unmap();
+    // NumPy v1 header: 10-byte prefix + padded ASCII dictionary + newline.
+    let mut header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': ({h}, {w}, 3), }}");
+    while (10 + header.len() + 1) % 64 != 0 { header.push(' '); }
+    header.push('\n');
+    let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+    file.write_all(b"\x93NUMPY\x01\x00")?;
+    file.write_all(&(header.len() as u16).to_le_bytes())?;
+    file.write_all(header.as_bytes())?;
+    file.write_all(&values)?;
+    file.flush()?;
+    log::info!("[linear] wrote {path} ({w}x{h}, linear RGB, no display transform)");
+    Ok(())
 }
 
 impl Screenshot {
     pub fn from_env() -> Option<Self> {
         Some(Self {
             path: std::env::var("RMESH_SHOT").ok()?,
+            remaining: std::env::var("RMESH_SHOT_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            captured: 0,
             at_frame: std::env::var("RMESH_SHOT_FRAME")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -454,7 +528,7 @@ impl Screenshot {
     }
 
     /// Copy the presented surface texture into a mapped buffer and write a PNG.
-    /// Blocks on the device — this ends the process, so the stall is free.
+    /// Blocks on the device; intended only for diagnostic captures.
     pub fn capture(
         &self,
         device: &wgpu::Device,

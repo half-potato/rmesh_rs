@@ -228,8 +228,7 @@ fn degenerate() -> VsOut {
     return out;
 }
 
-@vertex
-fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+fn shell_vertex(vid: u32) -> VsOut {
     let tri = vid / 3u;
     let corner = vid % 3u;
 
@@ -294,14 +293,9 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
     var out: VsOut;
     out.pos = clip;
-    // `fs_main` prefers the PBR aux albedo whenever it exists and only falls
-    // back to SH otherwise, so evaluating SH on a PBR scene is dead work — up
-    // to 48 f16 reads per vertex thrown away. Same test the fragment uses.
-    if (arrayLength(&aux_data) > 1u) {
-        out.sh_color = vec3<f32>(0.0);
-    } else {
-        out.sh_color = eval_sh_color(tet_id, dir, center, centroid);
-    }
+    // Both baked-radiance and legacy SH color-only rendering need this even
+    // when a separate PBR albedo buffer exists.
+    out.sh_color = eval_sh_color(tet_id, dir, center, centroid);
     out.view_depth = clip.w;
     if (arrayLength(&vertex_normals) > 1u) {
         out.grad = load_normal(vn_idx);
@@ -382,4 +376,35 @@ fn fs_dsm_moment(in: VsOut) -> @location(0) vec4<f32> {
     let z_linear = near * far / (far - in.pos.z * (far - near));
     let z = clamp((z_linear - near) / (far - near), 0.0, 1.0);
     return vec4<f32>(z, z * z, 0.0, 1.0);
+}
+
+// SH stores already-lit radiance; albedo remains a separate material input.
+@fragment
+fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(in.sh_color, 1.0);
+}
+
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    return shell_vertex(vid);
+}
+
+struct PreparedVertex { position: vec4f, color: vec4f }
+@group(1) @binding(0) var<storage, read_write> prepared_vertices: array<PreparedVertex>;
+
+@compute @workgroup_size(64)
+fn prepare_color(@builtin(global_invocation_id) id: vec3u) {
+    let vid = id.x + id.y * 65535u * 64u;
+    if (vid >= u32(view.params.x) * 3u) { return; }
+    let vertex = shell_vertex(vid);
+    prepared_vertices[vid] = PreparedVertex(vertex.pos, vec4f(vertex.sh_color, 1.0));
+}
+
+@vertex
+fn vs_prepared(@location(0) position: vec4f, @location(1) color: vec4f) -> VsOut {
+    var out: VsOut;
+    out.pos = position;
+    out.sh_color = color.rgb;
+    return out;
 }

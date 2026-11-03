@@ -1,0 +1,83 @@
+[2026-10-29T03:04:49Z INFO  rmesh_viewer] Loading: crates/rmesh-viewer-web/web/bench.rmesh
+[2026-10-29T03:04:49Z INFO  rmesh_data] Decompressing gzip (121.4 MB)...
+[2026-10-29T03:04:50Z INFO  rmesh_data] Decompressed: 184.2 MB in 0.53s
+[2026-10-29T03:04:50Z INFO  rmesh_data] rmesh: 650000 vertices, 4207572 tets, SH degree 0, 12 PCA components
+[2026-10-29T03:04:50Z INFO  rmesh_data] Vertices + indices: 0.01s (75.1 MB)
+[2026-10-29T03:04:50Z INFO  rmesh_data] Densities + SH + gradients: 0.05s
+[2026-10-29T03:04:50Z INFO  rmesh_data] Decompressing PCA (4207572 tets × 3 dims × 3 components)...
+[2026-10-29T03:04:50Z INFO  rmesh_data] PCA decompression: 0.02s
+[2026-10-29T03:04:50Z INFO  rmesh_data] Computing circumspheres (4207572 tets)...
+[2026-10-29T03:04:50Z INFO  rmesh_data] Circumspheres: 0.02s
+[2026-10-29T03:04:50Z INFO  rmesh_data] Parsing 6 tagged extension sections...
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'roughness': dtype=0, shape=[4207572], 8415144 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'albedo': dtype=0, shape=[4207572, 3], 25245432 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'vertex_normals': dtype=0, shape=[650000, 3], 3900000 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'metallic': dtype=0, shape=[4207572], 8415144 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'f0_dielectric': dtype=0, shape=[4207572], 8415144 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data]   section 'tone_curve': dtype=0, shape=[19], 38 bytes
+[2026-10-29T03:04:50Z INFO  rmesh_data] Found PBR tagged extension sections
+[2026-10-29T03:04:50Z INFO  rmesh_data] Total parse time: 0.13s
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Scene: 650000 vertices, 4207572 tets, SH degree 0, PBR: yes
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Requesting GPU adapter...
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] GPU: "Apple M1 Pro" (backend: Metal, driver: "")
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Subgroup support: true
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Mesh shader support: false
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Encoder timestamp support: true
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Pipeline statistics support: false
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Volume output: one Rgba16Float radiance target
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Compiling shader pipelines...
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Pipelines compiled: 0.01s
+[2026-10-29T03:04:50Z INFO  rmesh_viewer] Uploading scene buffers (4207572 tets)...
+[2026-10-29T03:04:51Z WARN  rmesh_raytrace] compute_tet_neighbors: 2134 of 16830288 faces have 3+ claimants; left unmatched (reported as boundary)
+[2026-10-29T03:04:51Z INFO  rmesh_viewer_core::light_bake] Light bake geometry prepared in 0.81s
+[2026-10-29T03:04:51Z INFO  rmesh_viewer] Buffers uploaded: 0.97s
+[2026-10-29T03:04:51Z INFO  rmesh_viewer] Creating radix sort pipelines (backend: Drs)...
+[2026-10-29T03:04:51Z INFO  rmesh_viewer] Sort pipelines: 0.00s
+[2026-10-29T03:04:51Z INFO  rmesh_viewer] GPU init total: 1.01s
+[2026-10-29T03:04:52Z WARN  rmesh_raytrace] compute_tet_neighbors: 2134 of 16830288 faces have 3+ claimants; left unmatched (reported as boundary)
+[2026-10-29T03:04:52Z INFO  rmesh_viewer_core::flare] [shell] dense 3834833/4207572 (91.14%) -> after erosion 3834833 (91.14%), 222470 boundary faces
+[2026-10-29T03:04:52Z INFO  rmesh_viewer_core::flare] Collision mesh: 222470 boundary triangles from 222470 dense-tet boundary faces (threshold=0.050)
+[2026-10-29T03:04:52Z INFO  rmesh_viewer] Viewer initialized: 4207572 tets, 650000 vertices (SH degree 0)
+[2026-10-29T03:04:52Z INFO  rmesh_viewer] [quality] preset High
+[2026-10-29T03:04:52Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:04:53Z WARN  rmesh_raytrace] compute_tet_neighbors: 2134 of 16830288 faces have 3+ claimants; left unmatched (reported as boundary)
+[2026-10-29T03:04:53Z INFO  rmesh_viewer::shell] [shell] built adjacency + per-tet opacity for 4207572 tets in 1.30s
+[2026-10-29T03:04:53Z INFO  rmesh_viewer_core::flare] [shell] dense 1215383/4207572 (28.89%) -> after erosion 505925 (12.02%), 342188 boundary faces
+[2026-10-29T03:04:53Z INFO  rmesh_viewer::shell] [shell] extracted 342188 boundary faces at threshold 0.1000, erosion 2 in 0.042s
+[2026-10-29T03:04:54Z INFO  rmesh_viewer::shell] [importance] weight bound for 4207572 tets in 0.91s
+[2026-10-29T03:04:54Z INFO  rmesh_viewer::shell] [importance] threshold 0.010: keep 3382659 of 4207572 tets (80.4%); 79092 of the 824913 culled were removed by the distance term, the rest by opacity alone (12.6 ms)
+[2026-10-29T03:04:56Z INFO  rmesh_viewer_core::light_bake] Light bake 1 complete in 4.55s
+[2026-10-29T03:05:17Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:18Z INFO  rmesh_viewer_core::light_bake] Light bake 2 complete in 1.35s
+[2026-10-29T03:05:18Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:19Z INFO  rmesh_viewer_core::light_bake] Light bake 3 complete in 1.32s
+[2026-10-29T03:05:19Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:21Z INFO  rmesh_viewer_core::light_bake] Light bake 4 complete in 1.31s
+[2026-10-29T03:05:21Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:22Z INFO  rmesh_viewer_core::light_bake] Light bake 5 complete in 1.31s
+[2026-10-29T03:05:22Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:23Z INFO  rmesh_viewer_core::light_bake] Light bake 6 complete in 1.32s
+[2026-10-29T03:05:23Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:25Z INFO  rmesh_viewer_core::light_bake] Light bake 7 complete in 1.31s
+[2026-10-29T03:05:25Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:26Z INFO  rmesh_viewer_core::light_bake] Light bake 8 complete in 1.31s
+[2026-10-29T03:05:26Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:27Z INFO  rmesh_viewer_core::light_bake] Light bake 9 complete in 1.31s
+[2026-10-29T03:05:27Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:29Z INFO  rmesh_viewer_core::light_bake] Light bake 10 complete in 1.30s
+[2026-10-29T03:05:29Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:30Z INFO  rmesh_viewer_core::light_bake] Light bake 11 complete in 1.30s
+[2026-10-29T03:05:30Z INFO  rmesh_viewer_core::light_bake] Rebaking 1 lights
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 12 complete in 1.31s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 13 complete in 1.35s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 14 complete in 1.35s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 15 complete in 1.36s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 16 complete in 1.36s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 17 complete in 1.37s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 18 complete in 1.37s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 19 complete in 1.37s
+[2026-10-29T03:05:31Z INFO  rmesh_viewer_core::light_bake] Light bake 20 complete in 1.38s
+[2026-10-29T03:05:32Z INFO  rmesh_viewer_core::light_bake] Light bake 21 complete in 1.38s
+[2026-10-29T03:05:32Z INFO  rmesh_viewer_core::light_bake] Light bake 22 complete in 1.39s
+[2026-10-29T03:05:32Z INFO  rmesh_viewer_core::light_bake] Light bake 23 complete in 1.39s
+[2026-10-29T03:05:32Z INFO  rmesh_viewer::benchmark] Benchmark saved: benchmarks/bench/1080p.csv (650000 vertices, 4207572 tets)

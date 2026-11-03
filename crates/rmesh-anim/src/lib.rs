@@ -13,7 +13,7 @@ pub use gltf_loader::{GltfScene, LoadedMaterial, LoadedMesh, LoadedTexture};
 
 /// Tracks wall-clock delta time between frames.
 pub struct AnimationClock {
-    last: Option<std::time::Instant>,
+    last: Option<web_time::Instant>,
 }
 
 impl AnimationClock {
@@ -23,7 +23,7 @@ impl AnimationClock {
 
     /// Call once per frame. Returns delta time in seconds.
     pub fn tick(&mut self) -> f32 {
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
         let dt = match self.last {
             Some(prev) => now.duration_since(prev).as_secs_f32(),
             None => 0.0,
@@ -223,6 +223,8 @@ pub struct SceneNode {
     pub parent: Option<usize>,
     pub children: Vec<usize>,
     pub local_transform: Transform,
+    /// User edit in parent space, composed before the animated local transform.
+    pub edit_transform: glam::Mat4,
     /// Computed each frame from hierarchy. Do not set manually.
     pub world_transform: Transform,
     /// Which primitive mesh to draw (None = group/bone node, no geometry).
@@ -249,6 +251,7 @@ impl SceneNode {
             parent: None,
             children: Vec::new(),
             local_transform: Transform::default(),
+            edit_transform: glam::Mat4::IDENTITY,
             world_transform: Transform::default(),
             mesh_kind: None,
             color: [1.0, 1.0, 1.0, 1.0],
@@ -362,6 +365,37 @@ impl AnimatedScene {
         }
     }
 
+    /// Keep edits independent of animation channels so playback cannot erase them.
+    pub fn set_node_world_transform(&mut self, index: usize, transform: Transform) {
+        let Some(node) = self.nodes.get(index) else {
+            return;
+        };
+        let base = node.local_transform.model_matrix();
+        let parent = self.parent_world_matrix(index);
+        if base.determinant().abs() < 1e-12 || parent.determinant().abs() < 1e-12 {
+            return;
+        }
+        let edit = parent.inverse() * transform.model_matrix() * base.inverse();
+        if !edit.is_finite() {
+            return;
+        }
+        self.nodes[index].edit_transform = edit;
+        self.compute_world_transforms();
+    }
+
+    /// Render a temporary world-space edit, including all affected descendants.
+    pub fn render_node_preview(&mut self, index: usize, transform: Transform) -> Vec<Primitive> {
+        let Some(node) = self.nodes.get(index) else {
+            return self.render_primitives();
+        };
+        let original = node.edit_transform;
+        self.set_node_world_transform(index, transform);
+        let primitives = self.render_primitives();
+        self.nodes[index].edit_transform = original;
+        self.compute_world_transforms();
+        primitives
+    }
+
     /// Remove a node and every descendant. Other nodes' indices may change, so
     /// the caller must clear any cached node-indices (e.g. the current selection).
     /// Animation channels targeting removed nodes are dropped; surviving channels
@@ -417,7 +451,8 @@ impl AnimatedScene {
     /// Assumes nodes are ordered so that parents appear before children.
     pub fn compute_world_transforms(&mut self) {
         for i in 0..self.nodes.len() {
-            let local_mat = self.nodes[i].local_transform.model_matrix();
+            let local_mat =
+                self.nodes[i].edit_transform * self.nodes[i].local_transform.model_matrix();
             let world_mat = match self.nodes[i].parent {
                 Some(p) if p < i => self.nodes[p].world_transform.model_matrix() * local_mat,
                 _ => local_mat,

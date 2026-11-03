@@ -1,0 +1,8 @@
+{
+  "source": "/Users/amai/sdir/renderer/energy_material.py",
+  "sha256": "fb563cad8144e280b095113dfe449690f11ba0dc56baf6783b496442a922c163",
+  "cases": 2048,
+  "seed": 43,
+  "layout": "6 vec4: normal+roughness, light+retro, view, F0, albedo, expected source",
+  "max_source": 64.0
+}

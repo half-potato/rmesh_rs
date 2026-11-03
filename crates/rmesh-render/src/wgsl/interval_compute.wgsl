@@ -1,3 +1,4 @@
+const point_samples: bool = false;
 // Compute-based interval shading: generates screen-space triangles per tet.
 //
 // Port of interval_mesh.wgsl from mesh shader to compute shader.
@@ -295,7 +296,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     // 1-pixel splat snapped to the nearest pixel center (so it reliably covers
     // exactly one pixel instead of flickering in and out between samples). The
     // fragment shader weights it by `coverage` (= area, capped at 1).
-    if area_px < 1.0 {
+    if area_px < 1.0 && !point_samples {
         let scr = vec2<f32>(uniforms.screen_width, uniforms.screen_height);
         let cen = 0.25 * (ndc_xy[0] + ndc_xy[1] + ndc_xy[2] + ndc_xy[3]);
         let px = (cen * 0.5 + 0.5) * scr;          // NDC -> pixel coords

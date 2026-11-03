@@ -6,6 +6,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd ../.. && pwd)"
 
+python3 pack_assets.py
+
 MODE="${1:---release}"
 case "$MODE" in
   --release) PROFILE=release; CARGO_FLAG=--release ;;

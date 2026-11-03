@@ -20,6 +20,8 @@ pub struct CpuSorter {
     /// key in the high 32 bits, the sort orders by key with tet_id as the
     /// piggy-backed value.
     packed: Vec<u64>,
+    /// Keep subpixel cells for exact point-ray material integration.
+    pub preserve_subpixel: bool,
     /// Tet IDs in back-to-front order. Length = visible count from the most
     /// recent `cull_and_sort` call.
     pub sorted_indices: Vec<u32>,
@@ -30,6 +32,7 @@ impl CpuSorter {
     pub fn new(tet_count: usize) -> Self {
         Self {
             packed: Vec::with_capacity(tet_count),
+            preserve_subpixel: false,
             sorted_indices: Vec::with_capacity(tet_count),
         }
     }
@@ -59,6 +62,25 @@ impl CpuSorter {
         cam_pos: Vec3,
         vp: Mat4,
         keep_mask: Option<&[u32]>,
+    ) -> usize {
+        self.sort_impl(vertices, indices, circumdata, cam_pos, vp, keep_mask, None)
+    }
+
+    /// CPU fallback matching the projection shader's per-vertex and subpixel
+    /// culls. Use when consuming colors produced by that shader: including
+    /// rejected tets would read stale/unwritten colors.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cull_and_sort_projected(
+        &mut self, vertices: &[f32], indices: &[u32], circumdata: &[f32],
+        cam_pos: Vec3, vp: Mat4, keep_mask: Option<&[u32]>, viewport: [u32; 2],
+    ) -> usize {
+        self.sort_impl(vertices, indices, circumdata, cam_pos, vp, keep_mask, Some(viewport))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn sort_impl(
+        &mut self, vertices: &[f32], indices: &[u32], circumdata: &[f32],
+        cam_pos: Vec3, vp: Mat4, keep_mask: Option<&[u32]>, viewport: Option<[u32; 2]>,
     ) -> usize {
         let tet_count = indices.len() / 4;
         self.packed.clear();
@@ -97,6 +119,22 @@ impl CpuSorter {
             // compute_circumspheres_parallel). Take sqrt for the plane test.
             let radius = circumdata[base + 3].sqrt();
 
+            if let Some([width, height]) = viewport {
+                let p: [Vec4; 4] = std::array::from_fn(|j| {
+                    let i = indices[base+j] as usize * 3;
+                    let clip = vp * Vec4::new(vertices[i],vertices[i+1],vertices[i+2],1.0);
+                    (clip.truncate() / (clip.w + 1e-6)).extend(clip.w)
+                });
+                if p.iter().all(|p| p.w <= 0.0) { continue; }
+                if p.iter().all(|p| p.w > 0.0) {
+                    let lo = p.iter().fold(Vec4::splat(f32::INFINITY), |a,p| a.min(*p));
+                    let hi = p.iter().fold(Vec4::splat(f32::NEG_INFINITY), |a,p| a.max(*p));
+                    if hi.x < -1.0 || lo.x > 1.0 || hi.y < -1.0 || lo.y > 1.0 || lo.z > 1.0
+                        || (!self.preserve_subpixel && (hi.x-lo.x) * width as f32 * (hi.y-lo.y) * (height as f32) < 1.0) {
+                        continue;
+                    }
+                }
+            } else {
             // Sphere-vs-frustum: reject if the sphere is fully outside any
             // single plane. Conservative — keeps slightly more tets than the
             // GPU's per-vertex test, but never culls a visible tet.
@@ -110,6 +148,8 @@ impl CpuSorter {
             }
             if culled {
                 continue;
+            }
+
             }
 
             // Depth key — same formula as project_compute_hw.wgsl line 153:
@@ -139,5 +179,23 @@ impl CpuSorter {
             self.sorted_indices.push((p & 0xFFFF_FFFF) as u32);
         }
         self.sorted_indices.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn point_samples_preserve_subpixel_cells() {
+        let vertices = [-0.001, -0.001, 0.4, 0.001, -0.001, 0.4,
+                        0.0, 0.001, 0.4, 0.0, 0.0, 0.6];
+        let mut sorter = CpuSorter::new(1);
+        let run = |s: &mut CpuSorter| s.cull_and_sort_projected(
+            &vertices, &[0,1,2,3], &[0.0,0.0,0.5,0.01],
+            Vec3::ZERO, Mat4::IDENTITY, None, [96,54]);
+        assert_eq!(run(&mut sorter), 0);
+        sorter.preserve_subpixel = true;
+        assert_eq!(run(&mut sorter), 1);
+        assert_eq!(sorter.sorted_indices, [0]);
     }
 }

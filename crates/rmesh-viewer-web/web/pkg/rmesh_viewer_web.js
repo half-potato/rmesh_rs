@@ -28,6 +28,116 @@ export class WebViewer {
         return ret;
     }
     /**
+     * @returns {number}
+     */
+    animation_clip_count() {
+        const ret = wasm.webviewer_animation_clip_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} index
+     * @returns {string}
+     */
+    animation_clip_name(index) {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.webviewer_animation_clip_name(this.__wbg_ptr, index);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {number}
+     */
+    animation_duration() {
+        const ret = wasm.webviewer_animation_duration(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    animation_node_count() {
+        const ret = wasm.webviewer_animation_node_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @param {number} index
+     * @returns {string}
+     */
+    animation_node_name(index) {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.webviewer_animation_node_name(this.__wbg_ptr, index);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @param {number} index
+     * @returns {number}
+     */
+    animation_node_parent(index) {
+        const ret = wasm.webviewer_animation_node_parent(this.__wbg_ptr, index);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    animation_time() {
+        const ret = wasm.webviewer_animation_time(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {number}
+     */
+    bake_generation() {
+        const ret = wasm.webviewer_bake_generation(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    bake_progress() {
+        const ret = wasm.webviewer_bake_progress(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @returns {boolean}
+     */
+    bake_ready() {
+        const ret = wasm.webviewer_bake_ready(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Begin a PBD grab at framebuffer coordinates. Returns the picked ID or -1.
+     * @param {number} x
+     * @param {number} y
+     * @param {number} radius
+     * @returns {number}
+     */
+    begin_vertex_grab(x, y, radius) {
+        const ret = wasm.webviewer_begin_vertex_grab(this.__wbg_ptr, x, y, radius);
+        return ret;
+    }
+    clear_torches() {
+        wasm.webviewer_clear_torches(this.__wbg_ptr);
+    }
+    /**
+     * @returns {number}
+     */
+    collision_triangle_count() {
+        const ret = wasm.webviewer_collision_triangle_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
      * Create a viewer attached to a `<canvas>` element by its DOM id. Async — must `await` in JS.
      * @param {string} canvas_id
      * @returns {Promise<WebViewer>}
@@ -59,6 +169,12 @@ export class WebViewer {
         } finally {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
+    }
+    /**
+     * @param {boolean} commit
+     */
+    end_vertex_grab(commit) {
+        wasm.webviewer_end_vertex_grab(this.__wbg_ptr, commit);
     }
     /**
      * Returns the current render mode label (matching the setter strings).
@@ -101,12 +217,89 @@ export class WebViewer {
         return ret !== 0;
     }
     /**
+     * @returns {boolean}
+     */
+    importance_enabled() {
+        const ret = wasm.webviewer_importance_enabled(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {number}
+     */
+    importance_kept_count() {
+        const ret = wasm.webviewer_importance_kept_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    /**
+     * @returns {number}
+     */
+    importance_threshold() {
+        const ret = wasm.webviewer_importance_threshold(this.__wbg_ptr);
+        return ret;
+    }
+    /**
      * Returns true if the interaction system is active (suppress camera controls in JS).
      * @returns {boolean}
      */
     is_interacting() {
         const ret = wasm.webviewer_is_interacting(this.__wbg_ptr);
         return ret !== 0;
+    }
+    /**
+     * Linear RGB, matching the desktop light color and cached transport.
+     * @param {number} index
+     * @returns {Float32Array}
+     */
+    light_color(index) {
+        const ret = wasm.webviewer_light_color(this.__wbg_ptr, index);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @param {number} index
+     * @returns {Float32Array}
+     */
+    light_direction(index) {
+        const ret = wasm.webviewer_light_direction(this.__wbg_ptr, index);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @param {number} index
+     * @returns {Float32Array}
+     */
+    light_parameters(index) {
+        const ret = wasm.webviewer_light_parameters(this.__wbg_ptr, index);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
+    }
+    /**
+     * @param {Uint8Array} data
+     * @param {string} name
+     */
+    load_animation(data, name) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ptr1 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len1 = WASM_VECTOR_LEN;
+        const ret = wasm.webviewer_load_animation(this.__wbg_ptr, ptr0, len0, ptr1, len1);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
+    }
+    /**
+     * @param {Uint8Array} data
+     */
+    load_flare_model(data) {
+        const ptr0 = passArray8ToWasm0(data, wasm.__wbindgen_malloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.webviewer_load_flare_model(this.__wbg_ptr, ptr0, len0);
+        if (ret[1]) {
+            throw takeFromExternrefTable0(ret[0]);
+        }
     }
     /**
      * Load a `.ply` file from a `Uint8Array`.
@@ -131,6 +324,13 @@ export class WebViewer {
         if (ret[1]) {
             throw takeFromExternrefTable0(ret[0]);
         }
+    }
+    /**
+     * @param {number} dx
+     * @param {number} dy
+     */
+    move_vertex_grab(dx, dy) {
+        wasm.webviewer_move_vertex_grab(this.__wbg_ptr, dx, dy);
     }
     /**
      * Feed mouse button to interaction. button: 0=left, 1=middle, 2=right.
@@ -225,6 +425,21 @@ export class WebViewer {
         }
     }
     /**
+     * @returns {string}
+     */
+    quality_preset() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.webviewer_quality_preset(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Render one frame. JS calls this from `requestAnimationFrame`.
      */
     render() {
@@ -240,6 +455,116 @@ export class WebViewer {
      */
     resize(width, height) {
         wasm.webviewer_resize(this.__wbg_ptr, width, height);
+    }
+    /**
+     * @param {number} time
+     */
+    seek_animation(time) {
+        wasm.webviewer_seek_animation(this.__wbg_ptr, time);
+    }
+    /**
+     * @returns {number}
+     */
+    selected_node() {
+        const ret = wasm.webviewer_selected_node(this.__wbg_ptr);
+        return ret;
+    }
+    /**
+     * @param {number} index
+     */
+    set_animation_clip(index) {
+        wasm.webviewer_set_animation_clip(this.__wbg_ptr, index);
+    }
+    /**
+     * @param {boolean} looping
+     */
+    set_animation_looping(looping) {
+        wasm.webviewer_set_animation_looping(this.__wbg_ptr, looping);
+    }
+    /**
+     * @param {boolean} playing
+     */
+    set_animation_playing(playing) {
+        wasm.webviewer_set_animation_playing(this.__wbg_ptr, playing);
+    }
+    /**
+     * @param {number} speed
+     */
+    set_animation_speed(speed) {
+        wasm.webviewer_set_animation_speed(this.__wbg_ptr, speed);
+    }
+    /**
+     * Set an orbit camera pose, useful for bookmarks and reproducible captures.
+     * @param {number} x
+     * @param {number} y
+     * @param {number} z
+     * @param {number} tx
+     * @param {number} ty
+     * @param {number} tz
+     */
+    set_camera(x, y, z, tx, ty, tz) {
+        wasm.webviewer_set_camera(this.__wbg_ptr, x, y, z, tx, ty, tz);
+    }
+    /**
+     * @param {number} threshold
+     * @param {boolean} show
+     */
+    set_collision_parameters(threshold, show) {
+        wasm.webviewer_set_collision_parameters(this.__wbg_ptr, threshold, show);
+    }
+    /**
+     * @param {boolean} enabled
+     */
+    set_gpu_sort(enabled) {
+        wasm.webviewer_set_gpu_sort(this.__wbg_ptr, enabled);
+    }
+    /**
+     * @param {boolean} enabled
+     */
+    set_importance_enabled(enabled) {
+        wasm.webviewer_set_importance_enabled(this.__wbg_ptr, enabled);
+    }
+    /**
+     * @param {number} threshold
+     */
+    set_importance_threshold(threshold) {
+        wasm.webviewer_set_importance_threshold(this.__wbg_ptr, threshold);
+    }
+    /**
+     * @param {number} index
+     * @param {number} x
+     * @param {number} y
+     * @param {number} z
+     * @param {number} intensity
+     */
+    set_light(index, x, y, z, intensity) {
+        wasm.webviewer_set_light(this.__wbg_ptr, index, x, y, z, intensity);
+    }
+    /**
+     * @param {number} index
+     * @param {number} r
+     * @param {number} g
+     * @param {number} b
+     */
+    set_light_color(index, r, g, b) {
+        wasm.webviewer_set_light_color(this.__wbg_ptr, index, r, g, b);
+    }
+    /**
+     * @param {number} index
+     * @param {number} x
+     * @param {number} y
+     * @param {number} z
+     */
+    set_light_direction(index, x, y, z) {
+        wasm.webviewer_set_light_direction(this.__wbg_ptr, index, x, y, z);
+    }
+    /**
+     * @param {string} name
+     */
+    set_quality_preset(name) {
+        const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webviewer_set_quality_preset(this.__wbg_ptr, ptr0, len0);
     }
     /**
      * Switch render path. Accepts `"interval"` (compute-interval shading,
@@ -259,11 +584,112 @@ export class WebViewer {
         wasm.webviewer_set_selected(this.__wbg_ptr, idx);
     }
     /**
+     * @param {number} index
+     */
+    set_selected_node(index) {
+        wasm.webviewer_set_selected_node(this.__wbg_ptr, index);
+    }
+    /**
+     * @param {boolean} enabled
+     * @param {number} bias
+     */
+    set_shell_cull(enabled, bias) {
+        wasm.webviewer_set_shell_cull(this.__wbg_ptr, enabled, bias);
+    }
+    /**
+     * @param {boolean} enabled
+     */
+    set_shell_enabled(enabled) {
+        wasm.webviewer_set_shell_enabled(this.__wbg_ptr, enabled);
+    }
+    /**
+     * @param {boolean} entry
+     */
+    set_shell_entry(entry) {
+        wasm.webviewer_set_shell_entry(this.__wbg_ptr, entry);
+    }
+    /**
+     * @param {boolean} only
+     */
+    set_shell_only(only) {
+        wasm.webviewer_set_shell_only(this.__wbg_ptr, only);
+    }
+    /**
+     * @param {number} threshold
+     * @param {number} erosion
+     */
+    set_shell_parameters(threshold, erosion) {
+        wasm.webviewer_set_shell_parameters(this.__wbg_ptr, threshold, erosion);
+    }
+    /**
      * Toggle the primitive compositor overlay.
      * @param {boolean} show
      */
     set_show_primitives(show) {
         wasm.webviewer_set_show_primitives(this.__wbg_ptr, show);
+    }
+    /**
+     * @param {boolean} show
+     */
+    set_show_scene(show) {
+        wasm.webviewer_set_show_scene(this.__wbg_ptr, show);
+    }
+    /**
+     * @param {string} mode
+     */
+    set_sort_mode(mode) {
+        const ptr0 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.webviewer_set_sort_mode(this.__wbg_ptr, ptr0, len0);
+    }
+    /**
+     * @returns {boolean}
+     */
+    shell_enabled() {
+        const ret = wasm.webviewer_shell_enabled(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @returns {number}
+     */
+    shell_face_count() {
+        const ret = wasm.webviewer_shell_face_count(this.__wbg_ptr);
+        return ret >>> 0;
+    }
+    shoot_torch() {
+        wasm.webviewer_shoot_torch(this.__wbg_ptr);
+    }
+    /**
+     * @returns {string}
+     */
+    sort_mode() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.webviewer_sort_mode(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
+     * @returns {boolean}
+     */
+    vertex_grab_active() {
+        const ret = wasm.webviewer_vertex_grab_active(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * @param {number} index
+     * @returns {Float32Array}
+     */
+    vertex_position(index) {
+        const ret = wasm.webviewer_vertex_position(this.__wbg_ptr, index);
+        var v1 = getArrayF32FromWasm0(ret[0], ret[1]).slice();
+        wasm.__wbindgen_free(ret[0], ret[1] * 4, 4);
+        return v1;
     }
     /**
      * @param {number} delta
@@ -457,6 +883,12 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2);
             return ret;
         }, arguments); },
+        __wbg_clearBuffer_1d2fa28049240bde: function(arg0, arg1, arg2) {
+            arg0.clearBuffer(arg1, arg2);
+        },
+        __wbg_clearBuffer_591d8dce25a4a8fa: function(arg0, arg1, arg2, arg3) {
+            arg0.clearBuffer(arg1, arg2, arg3);
+        },
         __wbg_clearBufferfv_ec80930351b38bfb: function(arg0, arg1, arg2, arg3, arg4) {
             arg0.clearBufferfv(arg1 >>> 0, arg2, getArrayF32FromWasm0(arg3, arg4));
         },
@@ -1080,6 +1512,10 @@ function __wbg_get_imports() {
             return ret;
         },
         __wbg_limits_0f372ba0de53c8fa: function(arg0) {
+            const ret = arg0.limits;
+            return ret;
+        },
+        __wbg_limits_b07b967d1572556f: function(arg0) {
             const ret = arg0.limits;
             return ret;
         },
@@ -2218,12 +2654,12 @@ function __wbg_get_imports() {
             arg0.writeTexture(arg1, arg2, arg3, arg4);
         }, arguments); },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 599, function: Function { arguments: [Externref], shim_idx: 600, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 625, function: Function { arguments: [Externref], shim_idx: 626, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h5099a9b6e995c023, wasm_bindgen__convert__closures_____invoke__h42d2efe72d2a85cc);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 952, function: Function { arguments: [Externref], shim_idx: 953, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 972, function: Function { arguments: [Externref], shim_idx: 973, ret: Result(Unit), inner_ret: Some(Result(Unit)) }, mutable: true }) -> Externref`.
             const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__hbff1e879642c999f, wasm_bindgen__convert__closures_____invoke__h5625310ab6c01d7e);
             return ret;
         },

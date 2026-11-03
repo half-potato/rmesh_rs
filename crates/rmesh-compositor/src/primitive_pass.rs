@@ -475,6 +475,7 @@ pub fn record_collision_debug_pass(
     color_view: &wgpu::TextureView,
     depth_view: &wgpu::TextureView,
     vp: &glam::Mat4,
+    materials: &MaterialRegistry,
 ) {
     let vb = match geometry.collision_vertex_buffer {
         Some(ref vb) => vb,
@@ -527,5 +528,6 @@ pub fn record_collision_debug_pass(
     rpass.set_pipeline(&pipeline.pipeline);
     rpass.set_vertex_buffer(0, vb.slice(..));
     rpass.set_bind_group(0, &pipeline.bind_group, &[offset as u32]);
+    rpass.set_bind_group(1, materials.bind_group_for(None), &[]);
     rpass.draw(0..geometry.collision_vertex_count, 0..1);
 }

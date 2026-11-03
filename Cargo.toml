@@ -15,6 +15,7 @@ members = [
     "crates/rmesh-interact",
     "crates/rmesh-compositor",
     "crates/rmesh-viewer",
+    "crates/rmesh-viewer-core",
     "crates/rmesh-viewer-web",
     "crates/rmesh-python",
     "crates/rmesh-dsm",
