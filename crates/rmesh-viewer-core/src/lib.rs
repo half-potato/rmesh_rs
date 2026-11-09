@@ -12,3 +12,5 @@ pub mod quality;
 
 pub mod energy;
 
+
+mod energy_forward;

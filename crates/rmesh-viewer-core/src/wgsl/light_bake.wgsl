@@ -24,6 +24,21 @@ fn bake(@builtin(global_invocation_id) id:vec3u) {
     // A tiny relative inset makes the starting cell unambiguous at shared
     // vertices. Unlike a receiver-depth bias it shrinks with the cell size.
     let p=mix(vertex(i),center,0.0001);
+    if(params.control.z==1u){
+        // No material response, intensity, or distance attenuation in this cache.
+        for(var block=0u;block<4u;block++){
+            var values=vec4f(0.0);
+            for(var lane=0u;lane<4u;lane++){
+                let li=block*4u+lane;
+                if(li<params.lights){
+                    let delta=params.lamps[li].position.xyz-p;let d=length(delta);
+                    values[lane]=visibility(p,delta/max(d,1e-8),d,i32(cell));
+                }
+            }
+            irradiance[4u*i+block]=values;
+        }
+        return;
+    }
     let raw_n=-normal(i);
     let roughness=bitcast<f32>(sample_meta.y);
     var incoming=vec3f(0.0);

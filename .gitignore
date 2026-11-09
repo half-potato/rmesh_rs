@@ -23,3 +23,7 @@ target
 *.spv
 **/*.so
 .claude/*
+
+# Python helper bytecode
+__pycache__/
+*.py[codz]

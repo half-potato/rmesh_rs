@@ -31,7 +31,7 @@ fn shell_color_and_depth_are_stable_at_4k() {
         device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,
             contents: bytes,
-            usage: wgpu::BufferUsages::STORAGE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         })
     };
     let buffers = [
@@ -98,6 +98,14 @@ fn shell_color_and_depth_are_stable_at_4k() {
         mapped_at_creation: false,
     });
     for frame in 0..6u64 {
+        if frame == 3 {
+            let uniforms = rmesh_render::make_uniforms(
+                glam::Mat4::IDENTITY, glam::Mat3::IDENTITY,
+                [1920., 1920., 1920., 1080.], glam::Vec3::ZERO,
+                3840., 2160., 1, 0, 16, 4., 0, 1., 3.,
+            );
+            queue.write_buffer(&buffers[0], 0, bytemuck::bytes_of(&uniforms));
+        }
         let mut encoder = device.create_command_encoder(&Default::default());
         {
             let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -174,8 +182,8 @@ fn shell_color_and_depth_are_stable_at_4k() {
         for pixel in data[..64 * 64 * 4].chunks_exact(4) {
             assert_eq!(
                 pixel,
-                [204, 102, 51, 255],
-                "frame {frame}: shell color vanished"
+                if frame < 3 { [204, 102, 51, 255] } else { [0, 0, 0, 255] },
+                "frame {frame}: unexpected shell color with camera cutoff"
             );
         }
         for z in data
@@ -183,11 +191,13 @@ fn shell_color_and_depth_are_stable_at_4k() {
             .chunks_exact(4)
         {
             let z = f32::from_le_bytes(z.try_into().unwrap());
-            assert!(z > 0.3 && z < 0.9, "frame {frame}: invalid shell depth {z}");
+            assert!(if frame < 3 { z > 0.3 && z < 0.9 } else { z == 1.0 },
+                "frame {frame}: excluded shell must not write depth: {z}");
         }
         assert_eq!(
             data,
-            &bytes[..64 * 64 * 4 + 3840 * 2160 * 4],
+            &bytes[(if frame < 3 { 0 } else { 3 }) * (64 * 64 * 4 + 3840 * 2160 * 4)
+                ..(if frame < 3 { 1 } else { 4 }) * (64 * 64 * 4 + 3840 * 2160 * 4)],
             "frame {frame}: stationary shell changed"
         );
     }

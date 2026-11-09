@@ -146,7 +146,11 @@ impl App {
             if gpu.ts_readback_ready[prev].load(Ordering::Acquire) {
                 let slice = gpu.ts_readback[prev].slice(..);
                 let data = slice.get_mapped_range();
-                let ts: &[u64] = bytemuck::cast_slice(&data);
+                // Mapped byte ranges need not be aligned for u64 on every backend.
+                let ts: Vec<u64> = data
+                    .chunks_exact(8)
+                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                    .collect();
                 let p = gpu.ts_period_ns as f64 / 1_000_000.0; // convert to ms
 
                 let project = (ts[1].wrapping_sub(ts[0])) as f64 * p;
@@ -183,7 +187,11 @@ impl App {
                 {
                     let slice = gpu.pp_readback[prev].slice(..);
                     let data = slice.get_mapped_range();
-                    let ts: &[u64] = bytemuck::cast_slice(&data);
+                    // Mapped byte ranges need not be aligned for u64 on every backend.
+                    let ts: Vec<u64> = data
+                        .chunks_exact(8)
+                        .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect();
                     let p = gpu.ts_period_ns as f64 / 1_000_000.0;
                     let mut out = Vec::with_capacity(labels.len());
                     for (i, label) in labels.iter().enumerate() {
@@ -354,7 +362,7 @@ impl App {
             // (the egui frame runs after this upload). Harmless either way: the
             // pyramid is cleared to the far plane, so a stale-but-set flag finds
             // no occluder rather than an invalid one.
-            shell_cull_flags: u32::from(self.shell_system.cull_active()),
+            shell_cull_flags: u32::from(self.shell_system.cull_active() && !gpu.light_bake.uses_energy()),
         };
 
         gpu.queue
@@ -512,7 +520,7 @@ impl App {
                         ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
                         ui.separator();
                         ui.label("Density Shell");
-                        ui.checkbox(&mut shell_enabled, "Enable Shell");
+                        ui.add_enabled(!gpu.light_bake.uses_energy(), egui::Checkbox::new(&mut shell_enabled, "Enable Shell"));
                         ui.add_enabled_ui(shell_enabled, |ui| {
                             // An opacity in [0, 1] -- the alpha one tet
                             // contributes to a crossing ray -- so the range is
@@ -911,6 +919,13 @@ impl App {
                 shell: &mut self.shell_system,
             }
             .apply(p);
+        }
+
+        if gpu.light_bake.uses_energy() {
+            self.render_mode = RenderMode::IntervalShader;
+            self.use_mesh_shader = false;
+            self.shell_system.enabled = false;
+            self.shell_system.show_only = false;
         }
 
         // Density shell: kick off a background extraction if the threshold moved,
@@ -1321,7 +1336,7 @@ impl App {
                             // sort_values), the StagingBelt copy (overwrites it),
                             // and interval_gen (reads it) so the encoded order is
                             // the executed order.
-                            gpu.cpu_sorter.preserve_subpixel = false;
+                            gpu.cpu_sorter.preserve_subpixel = gpu.light_bake.uses_energy();
                             let visible_count = gpu.cpu_sorter.cull_and_sort_projected(
                                 &self.scene_data.vertices,
                                 &self.scene_data.indices,
@@ -1746,7 +1761,7 @@ impl App {
                         uniforms.intrinsics, pos, [uniforms.c2w_col0, uniforms.c2w_col1, uniforms.c2w_col2],
                         self.pbr_data.as_ref().and_then(|p|p.render_min_t).unwrap_or(self.camera.near_z), self.camera.far_z, light_data, intensities,
                         self.shell_system.enabled, self.shell_system.importance_enabled,
-                        "vertex_average_diffuse_unverified",
+                        if gpu.light_bake.uses_energy() {"energy_mode4_interpolated_visibility"} else {"vertex_average_diffuse_unverified"},
                     );
                     if let Err(e) = std::fs::write(format!("{path}.json"), metadata) {
                         log::error!("[linear] metadata: {e}");

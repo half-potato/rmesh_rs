@@ -6,6 +6,7 @@ fn main() {
     let (device, queue) = pollster::block_on(async {
         let instance = wgpu::Instance::new(&Default::default());
         let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+        eprintln!("adapter={:?}", adapter.get_info());
         adapter
             .request_device(&wgpu::DeviceDescriptor {
                 required_limits: wgpu::Limits {
@@ -23,7 +24,10 @@ fn main() {
     let mut bake = LightBake::new(&device, &queue, &scene, &sh, pbr.as_ref(), &buffers);
     eprintln!("prepare_ms={:.1}", start.elapsed().as_secs_f64() * 1000.);
     let lights = [default_light(&scene)];
-    for run in 0..2 {
+    let runs = std::env::var("RMESH_BENCH_RUNS")
+        .map(|v| v.parse::<u32>().expect("RMESH_BENCH_RUNS must be an integer"))
+        .unwrap_or(2);
+    for run in 0..runs {
         bake.invalidate();
         let start = std::time::Instant::now();
         let mut batches = 0;

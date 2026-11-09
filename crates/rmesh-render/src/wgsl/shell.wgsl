@@ -314,8 +314,19 @@ struct FragmentOutput {
     @location(3) expected_depth: vec4<f32>,
 };
 
+// Match interval rendering's unit-ray distance cutoff. Reconstruct from
+// fragment depth so the Metal prepared-vertex path uses the same test.
+fn before_camera_cutoff(pos: vec4f) -> bool {
+    if (uniforms.min_t <= 0.0) { return false; }
+    let z = uniforms.near_plane * uniforms.far_plane /
+        (uniforms.far_plane - pos.z * (uniforms.far_plane - uniforms.near_plane));
+    let xy = (pos.xy - uniforms.intrinsics.zw) / uniforms.intrinsics.xy;
+    return z * length(vec3f(xy, 1.0)) < uniforms.min_t;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> FragmentOutput {
+    if (before_camera_cutoff(in.pos)) { discard; }
     // Learned normals are gradient-like (inward), so negate for the outward
     // surface normal. Fall back to the face normal when the learned one is
     // unusable, and flip it if it disagrees with the geometric orientation —
@@ -381,6 +392,7 @@ fn fs_dsm_moment(in: VsOut) -> @location(0) vec4<f32> {
 // SH stores already-lit radiance; albedo remains a separate material input.
 @fragment
 fn fs_color(in: VsOut) -> @location(0) vec4<f32> {
+    if (before_camera_cutoff(in.pos)) { discard; }
     return vec4<f32>(in.sh_color, 1.0);
 }
 

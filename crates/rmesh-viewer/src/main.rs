@@ -264,6 +264,25 @@ impl App {
         } else {
             pos
         };
+        // Reproducible capture views without interactive camera input.
+        let cam_pos = if let Ok(value) = std::env::var("RMESH_CAMERA_POSITION") {
+            let coords: Vec<f32> = value
+                .split(',')
+                .map(|v| v.parse().expect("camera coordinate"))
+                .collect();
+            assert!(
+                coords.len() == 3 && coords.iter().all(|v| v.is_finite()),
+                "RMESH_CAMERA_POSITION requires three finite coordinates"
+            );
+            let position = Vec3::new(coords[0], coords[1], coords[2]);
+            assert!(
+                position.length() > 0.001,
+                "camera cannot coincide with orbit target"
+            );
+            position
+        } else {
+            cam_pos
+        };
         let vis_words = ((scene.tet_count as usize + 31) / 32).max(1);
 
         let initial_light = light_bake::default_light(&scene);
@@ -472,6 +491,7 @@ impl App {
 
                 let mut required_features =
                     wgpu::Features::SHADER_FLOAT32_ATOMIC | wgpu::Features::TIMESTAMP_QUERY;
+                required_features |= adapter_features & wgpu::Features::FLOAT32_FILTERABLE;
                 if subgroup_supported {
                     required_features |= wgpu::Features::SUBGROUP;
                 }

@@ -47,6 +47,12 @@ fn check_radiance() {
     input.coverage = 1.0;
     result[0] = shade_common(vec4f(0.5, 0.5, 0.0, 1.0), input, false).color;
     result[1] = shade_common(vec4f(0.5, 0.5, 0.0, 1.0), input, true).color;
+    result[2] = shade_common(vec4f(1.5, 0.5, 0.0, 1.0), input, false).color;
+    input.depths = vec2f(0.0, 0.2);
+    result[3] = shade_common(vec4f(0.5, 0.5, 0.0, 1.0), input, false).color;
+    input.depths = vec2f(0.0, 0.5);
+    input.color_offsets = vec2f(0.0, 1.0);
+    result[4] = shade_common(vec4f(0.5, 0.5, 0.0, 1.0), input, false).color;
 }
 "#
     );
@@ -62,7 +68,7 @@ fn check_radiance() {
         compilation_options: Default::default(),
         cache: None,
     });
-    let uniforms = rmesh_render::make_uniforms(
+    let mut uniforms = rmesh_render::make_uniforms(
         glam::Mat4::IDENTITY,
         glam::Mat3::IDENTITY,
         [1.0, 1.0, 0.5, 0.5],
@@ -80,7 +86,7 @@ fn check_radiance() {
     let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
         contents: bytemuck::bytes_of(&uniforms),
-        usage: wgpu::BufferUsages::STORAGE,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
     });
     let aux = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: None,
@@ -89,7 +95,7 @@ fn check_radiance() {
     });
     let output = device.create_buffer(&wgpu::BufferDescriptor {
         label: None,
-        size: 32,
+        size: 80,
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     });
@@ -139,5 +145,38 @@ fn check_radiance() {
             "channel {i}: {} != {expected}",
             values[i]
         );
+    }
+
+    // Clip by distance along the unit camera ray, not view-space Z. The
+    // center interval is [1, 1.5], while the oblique ray starts at sqrt(2).
+    uniforms.min_t = 1.2;
+    queue.write_buffer(&uniform_buf, 0, bytemuck::bytes_of(&uniforms));
+    let mut encoder = device.create_command_encoder(&Default::default());
+    {
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    queue.submit([encoder.finish()]);
+    let values: Vec<f32> = read_buffer(&device, &queue, &output, 20);
+    let clipped_alpha = 1.0 - (-4.0f32 * 0.3).exp();
+    assert!((values[3] - clipped_alpha).abs() < 1e-5,
+        "near-distance cutoff must shorten the center interval: {values:?}");
+    let oblique_alpha = 1.0 - (-2.0f32 * 2.0f32.sqrt()).exp();
+    assert!((values[11] - oblique_alpha).abs() < 1e-5,
+        "cutoff must use ray distance, not camera Z");
+    assert!(values[12..16].iter().all(|v| v.abs() < 1e-6),
+        "intervals entirely before the cutoff must be transparent");
+    // Independent midpoint integration of c(t)=base+2*(t-1), starting at
+    // t=1.2 with unit incoming camera transmission after clipping.
+    for (channel, base) in [4.0, 2.0, 1.0].iter().enumerate() {
+        let dt = 0.3f64 / 10000.;
+        let expected: f64 = (0..10000).map(|i| {
+            let t = 1.2 + (i as f64 + 0.5) * dt;
+            (base + 2. * (t - 1.)) * 4. * (-4. * (t - 1.2)).exp() * dt
+        }).sum();
+        assert!((values[16 + channel] as f64 - expected).abs() < 1e-5,
+            "clipping must also advance the color gradient: {values:?}");
     }
 }

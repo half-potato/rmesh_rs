@@ -64,7 +64,10 @@ fn segment(o:vec3f,d:vec3f,t:f32,far:f32,current:i32)->Segment {
             let den=dot(nn,d);
             if(den>0.0){let t0=dot(nn,vs[ids.x]-o)/den;if(t0>=t && t0<best){best=t0;face=i32(f);}}
         }
-        if(face>=0 && best>t){
+        // A ray on a shared face must cross to its neighbor even when this
+        // cell contributes zero length. Boundary-only BVH recovery cannot
+        // recover an internal crossing, and would otherwise leak light.
+        if(face>=0 && best>=t){
             let end=min(best,far);var next=-1;let candidate=neighbors[u32(current)*4u+u32(face)];
             if(candidate>=0 && (shadow_boundary_only() || inside(o+d*(end+shadow_epsilon()),candidate))){next=candidate;}
             return Segment(end,current,next,true);

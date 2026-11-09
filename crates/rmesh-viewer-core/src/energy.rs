@@ -44,3 +44,21 @@ pub fn upload_bytes(device: &wgpu::Device, queue: &wgpu::Queue, bytes: &[u8]) ->
     );
     texture.create_view(&Default::default())
 }
+
+/// Same float32 table and bilinear coordinates; use hardware interpolation
+/// only when the device supports FLOAT32_FILTERABLE. Caller binds energy_sampler.
+pub fn shader_source(filtered: bool) -> String {
+    if !filtered {
+        return WGSL.to_owned();
+    }
+    format!(
+        "{}\n{}",
+        WGSL.replace("fn energy_lookup(", "fn energy_lookup_manual("),
+        r#"
+fn energy_lookup(roughness:f32,cosine:f32)->vec4f {
+    let xy=vec2f(clamp(cosine,0.0,1.0),(clamp(roughness,0.04,1.0)-0.04)/0.96)*64.0;
+    return textureSampleLevel(energy_lut,energy_sampler,(xy+vec2f(0.5))/65.0,0.0);
+}
+"#
+    )
+}

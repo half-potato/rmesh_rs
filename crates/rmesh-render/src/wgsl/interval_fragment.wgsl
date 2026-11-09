@@ -94,7 +94,7 @@ fn shade_common(frag_coord: vec4<f32>, in: FragmentInput, material_output: bool)
     let range = far - near;
     let z_front_clamped = clamp(in.depths.x, 0.0, 1.0);
     let z_back_clamped = clamp(in.depths.y, 0.0, 1.0);
-    let z_f = near * far / (far - z_front_clamped * range);
+    var z_f = near * far / (far - z_front_clamped * range);
     let z_b = near * far / (far - z_back_clamped * range);
 
     // Reconstruct ray direction scale factor from pixel position
@@ -107,11 +107,19 @@ fn shade_common(frag_coord: vec4<f32>, in: FragmentInput, material_output: bool)
     let y_cam = (frag_coord.y - cy) / fy;
     let ray_scale = length(vec3<f32>(x_cam, y_cam, 1.0));
 
-    // Distance through tet = |z_b - z_f| * ray_scale
-    let dist = abs(z_b - z_f) * ray_scale;
-
     // Colors at entry/exit from interpolated offsets
-    let c_front = max(in.base_color + vec3<f32>(in.color_offsets.x), vec3<f32>(0.0));
+    var front_offset = in.color_offsets.x;
+    if (uniforms.min_t > 0.0) {
+        // min_t is distance along a unit camera ray, not view-space Z.
+        // Clip both the optical path and its linear color field; excluded
+        // foreground must contribute neither radiance nor opacity.
+        let start = min(z_b, max(z_f, uniforms.min_t / ray_scale));
+        let fraction = clamp((start - z_f) / max(z_b - z_f, 1e-20), 0.0, 1.0);
+        front_offset = mix(front_offset, in.color_offsets.y, fraction);
+        z_f = start;
+    }
+    let dist = abs(z_b - z_f) * ray_scale;
+    let c_front = max(in.base_color + vec3<f32>(front_offset), vec3<f32>(0.0));
     let c_back = max(in.base_color + vec3<f32>(in.color_offsets.y), vec3<f32>(0.0));
 
     // Volume rendering integral

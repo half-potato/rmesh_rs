@@ -225,7 +225,7 @@ impl WebViewer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("rmesh-web device"),
-                required_features: wgpu::Features::empty(),
+                required_features: adapter.features() & wgpu::Features::FLOAT32_FILTERABLE,
                 required_limits: wgpu::Limits { max_storage_buffers_per_shader_stage: 8, ..adapter_limits.clone() },
                 ..Default::default()
             })
@@ -393,7 +393,9 @@ impl WebViewer {
     /// Render one frame. JS calls this from `requestAnimationFrame`.
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.poll_vertex_grab()?;
-        let shell_enabled = self.show_scene && self.shell_enabled && self.vertex_grab.is_none();
+        let shell_enabled = self.show_scene && self.shell_enabled && self.vertex_grab.is_none()
+            && !self.scene.as_ref().is_some_and(|s|s.light_bake.uses_energy());
+        if self.scene.as_ref().is_some_and(|s|s.light_bake.uses_energy()) {self.render_mode=WebRenderMode::Interval;self.shell_only=false;}
         // Mutable borrow — CPU sort mutates `scene.cpu_sorter`.
         let scene = match self.scene.as_mut() {
             Some(s) => s,
@@ -491,7 +493,7 @@ impl WebViewer {
         // CPU fallback: reuse the sorted list while the view is unchanged.
         // Resize and importance-mask edits invalidate this cache explicitly.
         if self.show_scene && !self.shell_only && !self.use_gpu_sort && scene.last_sort_vp != Some(vp.to_cols_array()) {
-            scene.cpu_sorter.preserve_subpixel = false;
+            scene.cpu_sorter.preserve_subpixel = scene.light_bake.uses_energy();
             scene.visible_count = scene.cpu_sorter.cull_and_sort_projected(
                 &scene.arrays.vertices,
                 &scene.arrays.indices,

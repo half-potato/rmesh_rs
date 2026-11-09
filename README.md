@@ -2,6 +2,34 @@
 
 wgpu-based differentiable tetrahedral volume renderer for Radiance Meshes. Rust/WebGPU port of the rendering and training backend, replacing the Slang/CUDA pipeline.
 
+## Viewer relighting
+
+Energy-v1 assets use the exported mode-4 point-light material by default. The
+viewer bakes visibility separately for each light and evaluates the canonical
+energy closure inside camera-ray intervals, using interpolated geometric
+normals and the current viewing direction. RGB Fresnel, multiple scattering,
+diffuse energy allocation, and backscatter come from the exported model.
+Color/intensity edits reuse visibility, including for multiple lights. A new
+transport bake replaces the previous completed light snapshot atomically.
+
+Visibility is interpolated from shared vertices; it remains an approximation to
+per-sample shadow tracing. The opaque density shell and legacy render modes are
+disabled for energy assets because they cannot reproduce this material. This
+path costs more per frame than the former cell-color bake. Assets without
+energy metadata retain the legacy diffuse approximation.
+
+Avoiding shading behind opaque volume is already a purpose of the density
+shell and its depth/Hi-Z culling. For the energy path, the outstanding work is
+adapting this existing acceleration to the exported material; its current
+disablement does not mean the renderer lacks shell-based occlusion technology.
+
+The interval shader reuses per-light visibility loads and barycentric basis
+terms across quadrature samples, and skips provably zero lighting contributions
+while retaining their absorption. On adapters with `FLOAT32_FILTERABLE`, it uses
+hardware bilinear filtering of the original float32 energy table; other adapters
+retain the explicit bilinear lookup. These optimizations preserve the material
+equations and absorption-coordinate sample count.
+
 ## Prerequisites
 
 - Rust stable (`rustup` — see `rust-toolchain.toml`)

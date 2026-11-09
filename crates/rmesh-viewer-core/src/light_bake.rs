@@ -1,4 +1,5 @@
-//! Automatic light baking; no lighting work is done while lights are unchanged.
+//! Incremental transport baking. Energy materials shade camera samples each frame;
+//! legacy assets retain the diffuse cell-color bake.
 use rmesh_data::{MaterialBuffers, PbrData, SceneBuffers, SceneData, ShCoeffs};
 use rmesh_interact::{Primitive, PrimitiveKind};
 use wgpu::util::DeviceExt;
@@ -58,6 +59,9 @@ pub struct DiffuseBake {
     params: wgpu::Buffer,
     pending: wgpu::Buffer,
     _irradiance: wgpu::Buffer,
+    published_transport: wgpu::Buffer,
+    published_snapshot: wgpu::Buffer,
+    energy: bool,
     cached: Vec<Light>,
     offset: u32,
     count: u32,
@@ -100,6 +104,7 @@ impl DiffuseBake {
         buffers: &SceneBuffers,
     ) -> Self {
         let now = web_time::Instant::now();
+        let energy = pbr.is_some_and(|p| !p.energy_material.is_empty());
         let adjacency =
             rmesh_raytrace::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
         let nc = ((sh.degree + 1) * (sh.degree + 1)) as usize;
@@ -199,24 +204,32 @@ impl DiffuseBake {
         let shadow_epsilon = ((glam::Vec3::from_array(hi)-glam::Vec3::from_array(lo)).length()*1e-7).max(1e-7);
         let vertex_meta = upload("bake_vertex_meta", bytemuck::cast_slice(&meta));
         let neighbors = upload("bake_neighbors", bytemuck::cast_slice(&adjacency));
-        let albedo = upload("bake_albedo", bytemuck::cast_slice(&material));
+        let albedo = upload("bake_albedo", if energy { bytemuck::bytes_of(&[0f32;4]) } else { bytemuck::cast_slice(&material) });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bake_params"),
             size: std::mem::size_of::<Params>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let pending = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bake_radiance"),
-            size: scene.tet_count as u64 * 12,
+            size: if energy {16} else {scene.tet_count as u64 * 12},
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
         let irradiance = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("baked_irradiance"),
-            size: scene.vertex_count as u64 * 16,
-            usage: wgpu::BufferUsages::STORAGE,
+            size: scene.vertex_count as u64 * if energy {64} else {16},
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
+        });
+        let published_transport = device.create_buffer(&wgpu::BufferDescriptor {
+            label:Some("completed light transport"),size:if energy {irradiance.size()} else {16},
+            usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false,
+        });
+        let published_snapshot = device.create_buffer(&wgpu::BufferDescriptor {
+            label:Some("completed light snapshot"),size:std::mem::size_of::<Params>() as u64,
+            usage:wgpu::BufferUsages::UNIFORM|wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false,
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("light_bake"),
@@ -308,6 +321,7 @@ impl DiffuseBake {
             params,
             pending,
             _irradiance: irradiance,
+            published_transport, published_snapshot, energy,
             cached: Vec::new(),
             offset: 0,
             count: scene.vertex_count,
@@ -371,10 +385,9 @@ impl DiffuseBake {
         // A single light's transport is independent of its RGB/intensity.
         // Keep an in-flight snapshot fixed, including its color/intensity.
         let reuse_transport = self.ready()
-            && lights.len() == 1
-            && self.cached.len() == 1
-            && lights[0].position == self.cached[0].position
-            && lights[0].direction == self.cached[0].direction;
+            && (self.energy || lights.len() == 1)
+            && lights.len() == self.cached.len()
+            && lights.iter().zip(&self.cached).all(|(a,b)|a.position==b.position && a.direction==b.direction);
         let recolor = reuse_transport && lights != self.cached;
         if recolor {
             self.cached = lights.clone();
@@ -393,6 +406,7 @@ impl DiffuseBake {
         }
         if self.cached.is_empty() {
             encoder.clear_buffer(&material.base_colors, 0, None);
+            encoder.clear_buffer(&self.published_snapshot, 0, None);
             self.offset = self.count;
             self.generation += 1;
             return;
@@ -402,7 +416,7 @@ impl DiffuseBake {
             count: self.count,
             lights: self.cached.len() as u32,
             tet_count: self.tet_count,
-            control: [self.shadow_epsilon.to_bits(), 4096, 0, 0],
+            control: [self.shadow_epsilon.to_bits(), 4096, u32::from(self.energy), 0],
             lamps: [Light::default(); 16],
         };
         p.lamps[..self.cached.len()].copy_from_slice(&self.cached);
@@ -419,6 +433,12 @@ impl DiffuseBake {
         }
         self.offset += batch;
         if self.offset == self.count {
+            if self.energy {
+                if !recolor { encoder.copy_buffer_to_buffer(&self._irradiance,0,&self.published_transport,0,self._irradiance.size()); }
+                encoder.copy_buffer_to_buffer(&self.params,0,&self.published_snapshot,0,self.params.size());
+                self.generation += 1;
+                return;
+            }
             {
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("combine baked lighting"),
@@ -450,6 +470,101 @@ impl DiffuseBake {
 mod tests {
     use super::*;
     use rmesh_util::test_util::{build_test_scene, create_test_device_default, read_buffer};
+    #[test]
+    fn energy_transport_is_material_free_and_reuses_multiple_lights() {
+        let (device,queue)=create_test_device_default().expect("GPU required");
+        let scene=build_test_scene(vec![0.,0.,0., 1.,0.,0., 0.,1.,0., 0.,0.,1.],vec![0,1,2,3],vec![0.],vec![0.;3]);
+        let pbr=PbrData {roughness:vec![0.04],albedo:vec![0.5;3],energy_material:vec![0.04,0.1,0.3,0.7,0.8],
+            energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
+            geom_normals:vec![0.,0.,1.].repeat(4),render_min_t:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+        let buffers=SceneBuffers::upload(&device,&queue,&scene);
+        let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
+        let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;3]},Some(&pbr),&buffers);
+        let mut pipelines=rmesh_render::ComputeIntervalPipelines::new(&device,Default::default());
+        bake.configure_interval(&device,&mut pipelines);
+        assert!(pipelines.color_only_override.is_some());
+        let mut a=default_light(&scene);a.transform.position=glam::Vec3::splat(3.);
+        let mut b=a.clone();b.transform.position.x=-3.;
+        let run=|bake:&mut LightBake,lights:&[Primitive]|{
+            let mut encoder=device.create_command_encoder(&Default::default());
+            bake.record(&queue,&mut encoder,&material,lights,[2.;3]);queue.submit([encoder.finish()]);
+            read_buffer::<f32>(&device,&queue,&bake.inner.published_transport,64)
+        };
+        let first=run(&mut bake,&[a.clone(),b.clone()]);
+        for vertex in first.chunks_exact(16){assert_eq!(&vertex[..2],&[1.,1.]);}
+        a.color.as_mut().unwrap()[3]*=2.;b.color.as_mut().unwrap()[0]=0.2;
+        // A density change would alter freshly traced transport. Recoloring
+        // alone must retain the existing cache even for multiple lights.
+        queue.write_buffer(&buffers.densities,0,bytemuck::cast_slice(&[20f32]));
+        assert_eq!(run(&mut bake,&[a.clone(),b.clone()]),first);
+        assert_eq!(bake.generation,2);
+        let snapshot=read_buffer::<Params>(&device,&queue,&bake.inner.published_snapshot,1)[0];
+        assert_eq!(snapshot.lamps[0].color,a.color.unwrap());
+        assert_eq!(snapshot.lamps[1].color,b.color.unwrap());
+        a.transform.position.x+=1.;
+        for batch in 0..2 {
+            let mut encoder=device.create_command_encoder(&Default::default());
+            bake.inner.record_batch(&queue,&mut encoder,&material,&[a.clone(),b.clone()],2);
+            queue.submit([encoder.finish()]);
+            let transport=read_buffer::<f32>(&device,&queue,&bake.inner.published_transport,64);
+            let published=read_buffer::<Params>(&device,&queue,&bake.inner.published_snapshot,1)[0];
+            if batch==0 {
+                assert_eq!(transport,first,"partial bake must not replace completed lighting");
+                assert_eq!(published.lamps[0].position,snapshot.lamps[0].position);
+            } else {
+                assert_ne!(transport,first);
+                assert_eq!(published.lamps[0].position[0],a.transform.position.x);
+            }
+        }
+    }
+    #[test]
+    fn shadow_ray_on_shared_face_enters_absorbing_neighbor() {
+        let Some((device, queue)) = create_test_device_default() else {
+            eprintln!("No GPU: skipping shared-face shadow test");
+            return;
+        };
+        let scene = build_test_scene(
+            vec![-1., 0., 0., 0., -2., -2., 0., 2., -2., 0., 0., 2., 3., 0., 0.],
+            vec![0, 1, 2, 3, 4, 1, 2, 3], vec![0., 2.], vec![0.; 6],
+        );
+        let sh = ShCoeffs { degree: 0, coeffs: vec![2.; 6] };
+        let buffers = SceneBuffers::upload(&device, &queue, &scene);
+        let bake = DiffuseBake::new(&device, &scene, &sh, None, &buffers);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("shared_face_shadow_regression"),
+            source: wgpu::ShaderSource::Wgsl(format!("{}\n{}\n{}\n{}",
+                include_str!("wgsl/bake_visibility.wgsl"),
+                include_str!("wgsl/shadow_visibility.wgsl"),
+                include_str!("wgsl/light_bake.wgsl"),
+                r#"@compute @workgroup_size(1) fn boundary_test() {
+                    irradiance[0] = vec4f(visibility(vec3f(0.0), vec3f(1.0,0.0,0.0), 1.0, 0));
+                    irradiance[1] = vec4f(visibility(vec3f(-0.0001,0.0,0.0), vec3f(1.0,0.0,0.0), 1.0001, 0));
+                }"#).into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[&bake.pipeline.get_bind_group_layout(0)], immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: Some(&layout), module: &shader, entry_point: Some("boundary_test"),
+            compilation_options: Default::default(), cache: None,
+        });
+        queue.write_buffer(&bake.params, 0, bytemuck::bytes_of(&Params {
+            offset: 0, count: 5, lights: 0, tet_count: 2,
+            control: [bake.shadow_epsilon.to_bits(), 4096, 0, 0], lamps: [Light::default(); 16],
+        }));
+        let mut encoder = device.create_command_encoder(&Default::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline); pass.set_bind_group(0, &bake.bg, &[]);
+            pass.dispatch_workgroups(1, 1, 1);
+        }
+        queue.submit([encoder.finish()]);
+        let result = read_buffer::<f32>(&device, &queue, &bake._irradiance, 8);
+        let expected = (-2.0f32).exp();
+        assert!((result[4] - expected).abs() < 1e-5, "inset control: {result:?}");
+        assert!((result[0] - expected).abs() < 1e-5,
+            "shared-face origin must traverse the absorbing neighbor: {result:?}");
+    }
     #[test]
     fn automatic_bake_is_dark_without_lights_and_rebakes_shadows() {
         let Some((device, queue)) = create_test_device_default() else {
@@ -554,21 +669,28 @@ mod tests {
     }
 }
 
-/// Shared diffuse lighting path for both frontends.
+/// Shared lighting path: canonical mode-4 closure for versioned energy assets,
+/// legacy diffuse approximation only for assets without energy metadata.
 pub struct LightBake {
     inner: DiffuseBake,
+    forward: Option<crate::energy_forward::EnergyForward>,
     pub generation: u64,
 }
 impl LightBake {
-    pub fn new(device: &wgpu::Device, _queue: &wgpu::Queue, scene: &SceneData,
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, scene: &SceneData,
         sh: &ShCoeffs, pbr: Option<&PbrData>, buffers: &SceneBuffers) -> Self {
-        Self { inner: DiffuseBake::new(device, scene, sh, pbr, buffers), generation: 0 }
+        let inner=DiffuseBake::new(device,scene,sh,pbr,buffers);
+        let forward=pbr.filter(|p|!p.energy_material.is_empty()).map(|p|
+            crate::energy_forward::EnergyForward::new(device,queue,p,buffers,&inner.published_transport,&inner.published_snapshot));
+        Self {inner,forward,generation:0}
     }
     pub fn configure_interval(&self, device: &wgpu::Device,
         pipelines: &mut rmesh_render::ComputeIntervalPipelines) {
+        if let Some(forward)=&self.forward {forward.configure(device,pipelines);return;}
         pipelines.color_only_override = None;
         pipelines.set_point_samples(device, false);
     }
+    pub fn uses_energy(&self)->bool {self.forward.is_some()}
     pub fn invalidate(&mut self) { self.inner.invalidate(); }
     pub fn ready(&self) -> bool { self.inner.ready() }
     pub fn progress(&self) -> f32 { self.inner.progress() }
