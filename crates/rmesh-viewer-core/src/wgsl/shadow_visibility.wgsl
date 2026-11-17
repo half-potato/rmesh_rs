@@ -62,13 +62,15 @@ fn segment(o:vec3f,d:vec3f,t:f32,far:f32,current:i32)->Segment {
             let ids=FACES[f];var nn=cross(vs[ids.y]-vs[ids.x],vs[ids.z]-vs[ids.x]);
             if(dot(nn,vs[ids.w]-vs[ids.x])>0.0){nn=-nn;}
             let den=dot(nn,d);
-            if(den>0.0){let t0=dot(nn,vs[ids.x]-o)/den;if(t0>=t && t0<best){best=t0;face=i32(f);}}
+            // Carry topology across a rounded crossing even if its plane is a
+            // few ulps behind t; discarding that exit can leak the remaining ray.
+            if(den>0.0){let t0=dot(nn,vs[ids.x]-o)/den;if(t0<best){best=t0;face=i32(f);}}
         }
         // A ray on a shared face must cross to its neighbor even when this
         // cell contributes zero length. Boundary-only BVH recovery cannot
         // recover an internal crossing, and would otherwise leak light.
-        if(face>=0 && best>=t){
-            let end=min(best,far);var next=-1;let candidate=neighbors[u32(current)*4u+u32(face)];
+        if(face>=0){
+            let end=max(t,min(best,far));var next=-1;let candidate=neighbors[u32(current)*4u+u32(face)];
             if(candidate>=0 && (shadow_boundary_only() || inside(o+d*(end+shadow_epsilon()),candidate))){next=candidate;}
             return Segment(end,current,next,true);
         }
@@ -76,7 +78,14 @@ fn segment(o:vec3f,d:vec3f,t:f32,far:f32,current:i32)->Segment {
     let hit=bvh(o+d*(t+shadow_epsilon()),d,max(far-t-shadow_epsilon(),0.0));
     if(hit.face>=0){
         let crossing=t+shadow_epsilon()+hit.distance;let end=min(crossing,far);
-        return Segment(end,classify(o+d*((t+end)*0.5),hit.face),classify(o+d*(crossing+shadow_epsilon()),hit.face),true);
+        // Classify the two sides by orientation, not by an epsilon-offset
+        // point: that point can jump completely through a thin absorbing cell.
+        let cell=u32(hit.face)>>2u;let f=u32(hit.face)&3u;let ids=FACES[f];let vs=tet(cell);
+        var n=cross(vs[ids.y]-vs[ids.x],vs[ids.z]-vs[ids.x]);
+        if(dot(n,vs[ids.w]-vs[ids.x])>0.0){n=-n;}
+        let neighbor=neighbors[4u*cell+f];
+        if(dot(n,d)<0.0){return Segment(end,neighbor,i32(cell),true);}
+        return Segment(end,i32(cell),neighbor,true);
     }
     return Segment(far,current,-1,false);
 }

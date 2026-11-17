@@ -1761,7 +1761,7 @@ impl App {
                         uniforms.intrinsics, pos, [uniforms.c2w_col0, uniforms.c2w_col1, uniforms.c2w_col2],
                         self.pbr_data.as_ref().and_then(|p|p.render_min_t).unwrap_or(self.camera.near_z), self.camera.far_z, light_data, intensities,
                         self.shell_system.enabled, self.shell_system.importance_enabled,
-                        if gpu.light_bake.uses_energy() {"energy_mode4_interpolated_visibility"} else {"vertex_average_diffuse_unverified"},
+                        if gpu.light_bake.uses_energy() {"energy_cell_corner_probe_falloff"} else {"vertex_average_diffuse_unverified"},
                     );
                     if let Err(e) = std::fs::write(format!("{path}.json"), metadata) {
                         log::error!("[linear] metadata: {e}");
