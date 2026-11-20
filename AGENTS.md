@@ -176,6 +176,15 @@ Tile-shader (trainable) tests: `gradient_test.rs` (finite-difference gradient ch
 
 ## Data Format
 
+Shared mode-4 energy exports now use the gzip-compressed `RMESH002` container:
+one float32 density array, one geometric-normal array, and explicit material
+tags, with no legacy SH/color gradients or duplicate compatibility fields.
+New exports use energy version [1,4,2]: UNORM8 albedo, roughness, RGB Fresnel,
+and backscatter; the loader also accepts the earlier float32 [1,4,1] fields.
+See `../docs/rmesh_export_contract.md` for its exact layout and migration rules.
+Both viewers must be rebuilt to consume it. The loader still supports the
+legacy layout below for existing assets.
+
 `.rmesh` files are gzip-compressed binary:
 - Header: `[vertex_count, tet_count, sh_degree, k_components]` as u32
 - Start pose: 8× f32 (position + quaternion + pad)

@@ -307,13 +307,19 @@ fn read_f32_val(data: &[u8], off: &mut usize) -> f32 {
 
 fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let t_total = web_time::Instant::now();
+    anyhow::ensure!(data.len() >= 48, "Truncated rmesh header");
+    let compact = data.starts_with(b"RMESH002");
+    anyhow::ensure!(!data.starts_with(b"RMESH") || compact, "Unsupported rmesh container version");
     let mut offset = 0usize;
 
     // Header
+    if compact { offset = 8; }
     let vertex_count = read_u32_val(data, &mut offset);
     let tet_count = read_u32_val(data, &mut offset);
-    let sh_degree = read_u32_val(data, &mut offset);
-    let k_components = read_u32_val(data, &mut offset);
+    let sh_degree = if compact { 0 } else { read_u32_val(data, &mut offset) };
+    let k_components = if compact { 0 } else { read_u32_val(data, &mut offset) };
+    let geometry_end = 48u64 + vertex_count as u64 * 12 + tet_count as u64 * 16;
+    anyhow::ensure!(geometry_end <= data.len() as u64, "Truncated rmesh geometry");
 
     log::info!(
         "rmesh: {} vertices, {} tets, SH degree {}, {} PCA components",
@@ -334,6 +340,10 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let t0 = web_time::Instant::now();
     let vertices = slice_f32(data, &mut offset, (vertex_count * 3) as usize);
     let indices = slice_u32(data, &mut offset, (tet_count * 4) as usize);
+    if compact {
+        anyhow::ensure!(vertices.iter().all(|v| v.is_finite()), "Nonfinite energy vertices");
+        anyhow::ensure!(indices.iter().all(|&i| i < vertex_count), "Invalid energy vertex index");
+    }
     log::info!(
         "Vertices + indices: {:.2}s ({:.1} MB)",
         t0.elapsed().as_secs_f64(),
@@ -347,15 +357,17 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         offset,
         data.len()
     );
-    let densities_u8 = &data[offset..offset + tet_count as usize];
-    offset += tet_count as usize;
     let mut densities = vec![0.0f32; tet_count as usize];
-    par_chunks_for_each!(densities, 8192, |(ci, chunk): (usize, &mut [f32])| {
-        let start = ci * 8192;
-        for (i, d) in chunk.iter_mut().enumerate() {
-            *d = ((densities_u8[start + i] as f32 - 100.0) / 20.0).exp();
-        }
-    });
+    if !compact {
+        let densities_u8 = &data[offset..offset + tet_count as usize];
+        offset += tet_count as usize;
+        par_chunks_for_each!(densities, 8192, |(ci, chunk): (usize, &mut [f32])| {
+            let start = ci * 8192;
+            for (i, d) in chunk.iter_mut().enumerate() {
+                *d = ((densities_u8[start + i] as f32 - 100.0) / 20.0).exp();
+            }
+        });
+    }
 
     // Align to 4 bytes
     offset = (offset + 3) & !3;
@@ -391,11 +403,11 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
     let color_grads_bytes = color_grads_count * 2;
     let cg_end = (sh_end + color_grads_bytes + 3) & !3;
 
-    let tagged_at = find_tagged_magic(data, scan_start);
+    let tagged_at = if compact { Some(scan_start) } else { find_tagged_magic(data, scan_start) };
     // A block that starts before a legacy section would end means that section
     // is absent from the file.
-    let has_sh = tagged_at.is_none_or(|p| p >= sh_end);
-    let has_color_grads = tagged_at.is_none_or(|p| p >= cg_end);
+    let has_sh = !compact && tagged_at.is_none_or(|p| p >= sh_end);
+    let has_color_grads = !compact && tagged_at.is_none_or(|p| p >= cg_end);
     if let Some(p) = tagged_at {
         if !has_sh || !has_color_grads {
             log::info!(
@@ -499,6 +511,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         offset = p;
     }
     let energy = tagged_at.map(|p| energy_format::parse(data, p, vertex_count as usize, tet_count as usize)).transpose()?.flatten();
+    anyhow::ensure!(!compact || energy.is_some(), "RMESH002 requires energy materials");
     let (mut pbr_data, visibility) = parse_tagged_extensions(data, &mut offset);
     if let Some(energy) = energy {
         anyhow::ensure!(indices.iter().all(|&i| i < vertex_count), "Invalid energy vertex index");
@@ -509,6 +522,9 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         pbr.energy_lut = energy.lut;
         pbr.geom_normals = energy.geom_normals;
         pbr.render_min_t = Some(energy.min_t);
+        // Existing runtime APIs expect vertex_normals. Both names refer to
+        // geometric normals for compact energy assets; only one is serialized.
+        if compact { pbr.vertex_normals = pbr.geom_normals.clone(); }
     }
     if let Some(pbr) = &pbr_data {
         if !pbr.energy_material.is_empty() {
@@ -655,13 +671,17 @@ fn parse_tagged_extensions(
         match tag.as_str() {
             "energy_material" => { energy_material = f16_payload_to_f32(payload, dtype); }
             "roughness" => {
-                roughness = f16_payload_to_f32(payload, dtype);
+                roughness = if dtype == 2 {
+                    payload.iter().map(|&x| 0.04 + 0.96 * (x as f32 / 255.0)).collect()
+                } else { f16_payload_to_f32(payload, dtype) };
             }
             "env_feature" => {
                 env_feature = f16_payload_to_f32(payload, dtype);
             }
             "albedo" => {
-                albedo = f16_payload_to_f32(payload, dtype);
+                albedo = if dtype == 2 {
+                    payload.iter().map(|&x| x as f32 / 255.0).collect()
+                } else { f16_payload_to_f32(payload, dtype) };
             }
             "vertex_normals" => {
                 vertex_normals = f16_payload_to_f32(payload, dtype);

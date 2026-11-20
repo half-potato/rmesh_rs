@@ -4,11 +4,14 @@ import argparse,gzip,json,struct,sys,hashlib
 from pathlib import Path
 import numpy as np
 p=argparse.ArgumentParser();p.add_argument('asset',type=Path);p.add_argument('--checkpoint',type=Path);p.add_argument('--sdir',type=Path);p.add_argument('--mesh-source',type=Path);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
-raw=gzip.decompress(a.asset.read_bytes());nv,nt,degree,k=struct.unpack_from('<4I',raw);assert degree==0
+raw=gzip.decompress(a.asset.read_bytes());compact=raw.startswith(b'RMESH002')
+if compact:nv,nt=struct.unpack_from('<2I',raw,8)
+else:nv,nt,degree,k=struct.unpack_from('<4I',raw);assert degree==0
 pos=48;vertices=np.frombuffer(raw,'<f4',nv*3,pos).reshape(nv,3);pos+=nv*12
 indices=np.frombuffer(raw,'<i4',nt*4,pos).reshape(nt,4);pos+=nt*16
 assert indices.min()>=0 and indices.max()<nv and np.isfinite(vertices).all()
-pos=(pos+nt+3)&~3;pos=(pos+(3+min(k,3)*3+nt*min(k,3))*2+3)&~3;pos=(pos+nt*3*2+3)&~3
+if not compact:
+    pos=(pos+nt+3)&~3;pos=(pos+(3+min(k,3)*3+nt*min(k,3))*2+3)&~3;pos=(pos+nt*3*2+3)&~3
 magic,count=struct.unpack_from('<2I',raw,pos);pos+=8;assert magic==0x524d5458
 sections={}
 for _ in range(count):
@@ -16,13 +19,23 @@ for _ in range(count):
     shape=struct.unpack_from('<'+'I'*rank,raw,pos);pos+=rank*4;length,=struct.unpack_from('<I',raw,pos);pos+=4
     kind=['<f2','<f4','u1','<i4'][dtype];assert length==int(np.prod(shape))*np.dtype(kind).itemsize
     assert tag not in sections;sections[tag]=np.frombuffer(raw,kind,int(np.prod(shape)),pos).reshape(shape);pos=(pos+length+3)&~3
-assert pos==len(raw);assert sections['energy_version'].tolist()==[1,4,1]
-expected={'density_f32':(nt,),'albedo':(nt,3),'roughness':(nt,),'fresnel_rgb':(nt,3),'backscatter':(nt,),'geom_normals':(nv,3),'vertex_normals':(nv,3),'ggx_table':(2,65,65),'ggx_average':(2,65)}
+assert pos==len(raw);version=sections['energy_version'].tolist();assert version in ([1,4,1],[1,4,2])
+if version==[1,4,2]:
+    assert compact
+    for key in ['roughness','albedo','fresnel_rgb','backscatter']:
+        assert sections[key].dtype==np.uint8,key
+        sections[key]=sections[key].astype(np.float32)/255
+        if key=='roughness':sections[key]=np.float32(.04)+np.float32(.96)*sections[key]
+expected={'density_f32':(nt,),'albedo':(nt,3),'roughness':(nt,),'fresnel_rgb':(nt,3),'backscatter':(nt,),'geom_normals':(nv,3),'ggx_table':(2,65,65),'ggx_average':(2,65),'min_t':(2,)}
+if compact:
+    assert not {'vertex_normals','env_feature','plaster_rgb','plaster_grad','metallic','f0_dielectric'} & sections.keys()
+    assert 'tone_curve' in sections and 'energy_meta' in sections
+else:expected['vertex_normals']=(nv,3)
 for key,shape in expected.items():assert sections[key].shape==shape and sections[key].dtype==np.float32 and np.isfinite(sections[key]).all(),key
 for key in ['albedo','fresnel_rgb','backscatter']:assert sections[key].min()>=0 and sections[key].max()<=1,key
 assert sections['roughness'].min()>=.04 and sections['roughness'].max()<=1 and sections['density_f32'].min()>=0
 lut=np.concatenate([sections['ggx_table'],np.broadcast_to(sections['ggx_average'][:,:,None],(2,65,65))]).transpose(1,2,0).astype('<f4')
-report={'vertices':nv,'tets':nt,'sections':count,'version':[1,4,1],'density_sum':float(sections['density_f32'].sum(dtype=np.float64)),'embedded_reference_lut_exact':lut.tobytes()==Path('crates/rmesh-viewer-core/src/assets/ggx_energy.rgba32f').read_bytes()}
+report={'container':'RMESH002' if compact else 'legacy','vertices':nv,'tets':nt,'sections':count,'version':version,'density_sum':float(sections['density_f32'].sum(dtype=np.float64)),'embedded_reference_lut_exact':lut.tobytes()==(Path(__file__).resolve().parents[1]/'crates/rmesh-viewer-core/src/assets/ggx_energy.rgba32f').read_bytes()}
 if a.checkpoint:
     import torch,types
     from sdir_checkpoint_reference import hash_encoder,load_module
