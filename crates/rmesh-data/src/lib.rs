@@ -173,6 +173,17 @@ fn validate_tagged_header(data: &[u8], p: usize) -> bool {
     dtype < 16 && shape_rank <= 8
 }
 
+/// Sparse entry-face linear UNORM8 albedo textures for fixed tetrahedral scenes.
+#[derive(Clone, Debug)]
+pub struct FaceTextureData {
+    /// Per-active-tet face chart IDs [M × 4] i32 (-1 = unallocated face).
+    pub face_ids: Vec<i32>,
+    /// Packed chart headers [F × 2] i32: (site_offset, resolution).
+    pub charts: Vec<i32>,
+    /// Packed UNORM8 linear RGB8 texels [S] u32: r | (g << 8) | (b << 16).
+    pub albedo_rgb8: Vec<u32>,
+}
+
 /// PBR material data loaded from tagged .rmesh extension sections.
 #[derive(Clone, Debug)]
 pub struct PbrData {
@@ -185,6 +196,8 @@ pub struct PbrData {
     /// Optional zero-density tetrahedra [E × 4] completing the Delaunay hull for
     /// cavity-free adjacency traversal during light baking and probe capture.
     pub empty_indices: Vec<u32>,
+    /// Optional sparse entry-face albedo texture atlas.
+    pub face_textures: Option<FaceTextureData>,
     /// Per-tet roughness [M] f32 (pre-activated sigmoid).
     pub roughness: Vec<f32>,
     /// Per-tet specular features [M × 4] f32 (pre-activated tanh).
@@ -526,6 +539,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         pbr.geom_normals = energy.geom_normals;
         pbr.render_min_t = Some(energy.min_t);
         pbr.empty_indices = energy.empty_indices;
+        pbr.face_textures = energy.face_textures;
         // Existing runtime APIs expect vertex_normals. Both names refer to
         // geometric normals for compact energy assets; only one is serialized.
         if compact { pbr.vertex_normals = pbr.geom_normals.clone(); }
@@ -730,6 +744,7 @@ fn parse_tagged_extensions(
             geom_normals: Vec::new(),
             render_min_t: None,
             empty_indices: Vec::new(),
+            face_textures: None,
             roughness,
             env_feature,
             albedo,

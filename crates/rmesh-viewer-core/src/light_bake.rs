@@ -531,7 +531,7 @@ mod tests {
         let scene=build_test_scene(vec![-1.,-1.,0., 1.,-1.,0., 0.,1.,0., 0.,0.,1.],vec![0,1,2,3],vec![0.],vec![0.;3]);
         let pbr=PbrData {roughness:vec![0.3],albedo:vec![0.5;3],energy_material:vec![0.3,0.4,0.4,0.4,0.0],
             energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-            geom_normals:vec![0.,0.,-1.].repeat(4),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+            geom_normals:vec![0.,0.,-1.].repeat(4),render_min_t:None,empty_indices:vec![],face_textures:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
         let buffers=SceneBuffers::upload(&device,&queue,&scene);
         let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
         let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;3]},Some(&pbr),&buffers);
@@ -567,7 +567,7 @@ mod tests {
             let pbr=PbrData {roughness:vec![0.5;2],albedo:vec![1.;6],
                 energy_material:vec![0.5,0.04,0.04,0.04,0., 0.5,neighbor_f0,neighbor_f0,neighbor_f0,0.],
                 energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-                geom_normals:vec![0.,0.,normal_z].repeat(5),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+                geom_normals:vec![0.,0.,normal_z].repeat(5),render_min_t:None,empty_indices:vec![],face_textures:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
             let buffers=SceneBuffers::upload(&device,&queue,&scene);
             let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
             let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;6]},Some(&pbr),&buffers);
@@ -591,7 +591,7 @@ mod tests {
         let scene=build_test_scene(vec![0.,0.,0., 1.,0.,0., 0.,1.,0., 0.,0.,1.],vec![0,1,2,3],vec![0.],vec![0.;3]);
         let pbr=PbrData {roughness:vec![0.04],albedo:vec![0.5;3],energy_material:vec![0.04,0.1,0.3,0.7,0.8],
             energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-            geom_normals:vec![0.,0.,1.].repeat(4),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+            geom_normals:vec![0.,0.,1.].repeat(4),render_min_t:None,empty_indices:vec![],face_textures:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
         let buffers=SceneBuffers::upload(&device,&queue,&scene);
         let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
         let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;3]},Some(&pbr),&buffers);

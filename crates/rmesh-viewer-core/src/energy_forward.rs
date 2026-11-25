@@ -218,6 +218,7 @@ pub struct EnergyForward {
     #[allow(dead_code)] // Used by GPU regression readback.
     pub(crate) radiance: wgpu::Buffer,
     pub(crate) probe_raw: wgpu::Texture,
+    face_tex: Option<(wgpu::BindGroupLayout, wgpu::BindGroup)>,
     #[cfg(test)]
     weights: wgpu::Buffer,
 }
@@ -283,11 +284,96 @@ impl EnergyForward {
             "baked cell diffuse/material",
             scene.tet_count as u64 * 8,
         );
+        let has_face_textures = pbr.face_textures.is_some();
         let radiance = storage(
             device,
             "material-consistent cell-corner radiance",
-            scene.tet_count as u64 * 32,
+            scene.tet_count as u64 * if has_face_textures { 96 } else { 32 },
         );
+        let face_tex = pbr.face_textures.as_ref().map(|ft| {
+            let fallback_offset = ft.albedo_rgb8.len() as u32;
+            let mut albedo_all = Vec::with_capacity(ft.albedo_rgb8.len() + scene.tet_count as usize);
+            albedo_all.extend_from_slice(&ft.albedo_rgb8);
+            for rgb in pbr.albedo.chunks_exact(3) {
+                let r = (rgb[0].clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                let g = (rgb[1].clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                let b = (rgb[2].clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
+                albedo_all.push(r | (g << 8) | (b << 16));
+            }
+            let face_ids_buf = buffer(
+                device,
+                "ft_face_ids",
+                bytemuck::cast_slice(&ft.face_ids),
+                wgpu::BufferUsages::STORAGE,
+            );
+            let charts_buf = buffer(
+                device,
+                "ft_charts",
+                bytemuck::cast_slice(&ft.charts),
+                wgpu::BufferUsages::STORAGE,
+            );
+            let albedo_buf = buffer(
+                device,
+                "ft_albedo",
+                bytemuck::cast_slice(&albedo_all),
+                wgpu::BufferUsages::STORAGE,
+            );
+            let info_buf = buffer(
+                device,
+                "ft_info",
+                bytemuck::cast_slice(&[fallback_offset, 0u32, 0u32, 0u32]),
+                wgpu::BufferUsages::UNIFORM,
+            );
+            let ro_storage = |binding| wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            };
+            let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("energy_face_textures_bgl"),
+                entries: &[
+                    ro_storage(0),
+                    ro_storage(1),
+                    ro_storage(2),
+                    ro_storage(3),
+                    ro_storage(4),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("energy_face_textures_bg"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: buffers.vertices.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: buffers.indices.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: face_ids_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: charts_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: albedo_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: info_buf.as_entire_binding() },
+                ],
+            });
+            log::info!(
+                "Uploaded entry-face albedo atlas: {} charts, {} sites ({:.1} MB)",
+                ft.charts.len() / 2,
+                ft.albedo_rgb8.len(),
+                (albedo_all.len() * 4 + ft.face_ids.len() * 4 + ft.charts.len() * 4) as f64 / 1e6,
+            );
+            (layout, bg)
+        });
         let lut = crate::energy::upload_bytes(device, queue, bytemuck::cast_slice(&pbr.energy_lut));
         let mut lo = Vec3::splat(f32::INFINITY);
         let mut hi = Vec3::splat(f32::NEG_INFINITY);
@@ -327,7 +413,7 @@ impl EnergyForward {
                 let p = probes[k];
                 [p.x, p.y, p.z, f32::from_bits(probe_cells[k])]
             }),
-            influence: [radius, falloff_distance, PROBE_SIZE as f32, 0.],
+            influence: [radius, falloff_distance, PROBE_SIZE as f32, if has_face_textures { 1.0 } else { 0.0 }],
             eye: [
                 0.,
                 0.,
@@ -622,6 +708,7 @@ impl EnergyForward {
             last: None,
             radiance,
             probe_raw: raw,
+            face_tex,
             #[cfg(test)]
             weights,
         }
@@ -634,11 +721,21 @@ impl EnergyForward {
         device: &wgpu::Device,
         pipelines: &mut rmesh_render::ComputeIntervalPipelines,
     ) {
-        pipelines.set_energy_interval(
-            device,
-            &self.radiance,
-            include_str!("wgsl/energy_interval.wgsl"),
-        );
+        if let Some((layout, bg)) = &self.face_tex {
+            pipelines.set_energy_interval_ft(
+                device,
+                &self.radiance,
+                include_str!("wgsl/energy_interval_ft.wgsl"),
+                layout,
+                bg.clone(),
+            );
+        } else {
+            pipelines.set_energy_interval(
+                device,
+                &self.radiance,
+                include_str!("wgsl/energy_interval.wgsl"),
+            );
+        }
     }
     pub fn record(
         &mut self,
@@ -745,6 +842,7 @@ mod tests {
             geom_normals: vec![],
             render_min_t: None,
             empty_indices: vec![],
+            face_textures: None,
             env_feature: vec![],
             vertex_normals: vec![],
             tone_curve: vec![],

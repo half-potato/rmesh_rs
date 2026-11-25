@@ -11,18 +11,31 @@ fn render_probe_asset() {
     drop(bytes);
     let pbr = pbr.expect("energy asset");
     assert!(!pbr.energy_material.is_empty());
-    let eye = Vec3::from_slice(&scene.start_pose[..3]);
+    let eye = if let Ok(v) = std::env::var("RMESH_TEST_CAMERA") {
+        let c: Vec<f32> = v.split(',').map(|x| x.trim().parse().expect("cam coord")).collect();
+        assert_eq!(c.len(), 3, "RMESH_TEST_CAMERA expects x,y,z");
+        Vec3::from_slice(&c)
+    } else {
+        Vec3::from_slice(&scene.start_pose[..3])
+    };
+    let (w, h) = if let Ok(v) = std::env::var("RMESH_TEST_SIZE") {
+        let p: Vec<u32> = v.split('x').map(|x| x.trim().parse().expect("size")).collect();
+        assert_eq!(p.len(), 2, "RMESH_TEST_SIZE expects WxH");
+        (p[0], p[1])
+    } else {
+        (512u32, 320u32)
+    };
     let mut camera = rmesh_util::camera::Camera::new(eye);
     camera.near_z = test_near();
     let view = camera.view_matrix();
-    let vp = camera.projection_matrix(512. / 320.) * view;
+    let vp = camera.projection_matrix(w as f32 / h as f32) * view;
     let inv = view.inverse();
     let c2w = Mat3::from_cols(
         inv.x_axis.truncate(),
         -inv.y_axis.truncate(),
         -inv.z_axis.truncate(),
     );
-    let f = 160. / (camera.fov_y / 2.).tan();
+    let f = (h as f32 * 0.5) / (camera.fov_y / 2.).tan();
     if std::env::var_os("RMESH_TEST_MATERIALS").is_some() {
         inspect_materials(&scene, &pbr, eye, c2w, f);
         return;
@@ -35,9 +48,9 @@ fn render_probe_asset() {
         eye,
         vp,
         c2w,
-        [f, f, 256., 160.],
-        512,
-        320,
+        [f, f, w as f32 * 0.5, h as f32 * 0.5],
+        w,
+        h,
         true,
     ))
     .expect("GPU render");

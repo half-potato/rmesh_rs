@@ -79,6 +79,8 @@ static INTERVAL_COMPUTE_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_compute.wgsl");
 static INTERVAL_COMPUTE_ENERGY_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_compute_energy.wgsl");
+static INTERVAL_COMPUTE_ENERGY_FT_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_compute_energy_ft.wgsl");
 static INTERVAL_VERTEX_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_vertex.wgsl");
 static INTERVAL_INDIRECT_CONVERT_WGSL: rmesh_util::HotShader =
@@ -4215,6 +4217,144 @@ impl ComputeIntervalPipelines {
             cache: None,
         });
         self.color_only_override = Some((pipeline, None));
+        self.overdraw_override = Some(overdraw);
+    }
+    /// Install entry-face-textured energy interval shading:
+    /// `interval_compute_energy_ft` writes split diffuse/specular corner intervals (3 vec4/vert)
+    /// and `tet_id`, while the fragment shader evaluates the `@group(1)` triangular face atlas.
+    pub fn set_energy_interval_ft(
+        &mut self,
+        device: &wgpu::Device,
+        corner_radiance: &wgpu::Buffer,
+        render_source: &str,
+        extra_layout: &wgpu::BindGroupLayout,
+        extra_bg: wgpu::BindGroup,
+    ) {
+        self.energy_radiance = Some(corner_radiance.clone());
+        let gen_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interval energy ft gen"),
+            bind_group_layouts: &[&self.gen_bg_layout],
+            immediate_size: 0,
+        });
+        let gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_compute_energy_ft.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_ENERGY_FT_WGSL.as_str().into()),
+        });
+        self.gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("interval energy ft gen"),
+            layout: Some(&gen_layout),
+            module: &gen_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let use_f16 = device.features().contains(wgpu::Features::SHADER_F16);
+        let full_source = if use_f16 {
+            format!("enable f16;\nalias ScalarF = f16;\nalias Color3 = vec3<f16>;\n{render_source}")
+        } else {
+            format!("alias ScalarF = f32;\nalias Color3 = vec3<f32>;\n{render_source}")
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("energy_interval_ft.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(full_source.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("energy interval ft"),
+            bind_group_layouts: &[&self.render_bg_layout, extra_layout],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("energy interval ft"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_energy"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("main_color_only"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: self.color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let overdraw_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("energy interval ft overdraw"),
+            bind_group_layouts: &[&self.render_bg_layout],
+            immediate_size: 0,
+        });
+        let overdraw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("energy interval ft overdraw"),
+            layout: Some(&overdraw_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_energy"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_overdraw"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: crate::overdraw::OVERDRAW_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.color_only_override = Some((pipeline, Some(extra_bg)));
         self.overdraw_override = Some(overdraw);
     }
     pub fn clear_energy_interval(&mut self, device: &wgpu::Device) {

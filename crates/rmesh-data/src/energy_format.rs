@@ -10,6 +10,7 @@ pub struct EnergyData {
     pub lut: Vec<f32>,
     pub min_t: f32,
     pub empty_indices: Vec<u32>,
+    pub face_textures: Option<crate::FaceTextureData>,
 }
 struct Section<'a> {
     dtype: u32,
@@ -196,6 +197,75 @@ pub fn parse(data: &[u8], offset: usize, nv: usize, nt: usize) -> Result<Option<
     } else {
         Vec::new()
     };
+    let has_ft = sections.contains_key("ft_face_ids")
+        || sections.contains_key("ft_charts")
+        || sections.contains_key("ft_albedo");
+    let face_textures = if has_ft {
+        let s_ids = sections
+            .get("ft_face_ids")
+            .context("Incomplete face textures: missing ft_face_ids")?;
+        let s_charts = sections
+            .get("ft_charts")
+            .context("Incomplete face textures: missing ft_charts")?;
+        let s_alb = sections
+            .get("ft_albedo")
+            .context("Incomplete face textures: missing ft_albedo")?;
+        ensure!(
+            s_ids.dtype == 3 && s_ids.shape == [nt, 4],
+            "Invalid dtype/shape for ft_face_ids"
+        );
+        ensure!(
+            s_charts.dtype == 3 && s_charts.shape.len() == 2 && s_charts.shape[1] == 2,
+            "Invalid dtype/shape for ft_charts"
+        );
+        ensure!(
+            s_alb.dtype == 2 && s_alb.shape.len() == 2 && s_alb.shape[1] == 3,
+            "Invalid dtype/shape for ft_albedo"
+        );
+        let num_charts = s_charts.shape[0];
+        let num_sites = s_alb.shape[0];
+        let face_ids: Vec<i32> = s_ids
+            .bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        ensure!(
+            face_ids
+                .iter()
+                .all(|&c| c == -1 || (c >= 0 && (c as usize) < num_charts)),
+            "Out-of-bounds chart id in ft_face_ids"
+        );
+        let charts: Vec<i32> = s_charts
+            .bytes
+            .chunks_exact(4)
+            .map(|b| i32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for ch in charts.chunks_exact(2) {
+            let off = ch[0];
+            let res = ch[1];
+            ensure!(off >= 0 && res >= 1, "Invalid ft_charts offset/resolution");
+            let count = (res as usize)
+                .checked_mul(res as usize + 1)
+                .map(|v| v / 2)
+                .context("ft_charts site count overflow")?;
+            let end = (off as usize)
+                .checked_add(count)
+                .context("ft_charts site range overflow")?;
+            ensure!(end <= num_sites, "ft_charts site range exceeds ft_albedo");
+        }
+        let albedo_rgb8: Vec<u32> = s_alb
+            .bytes
+            .chunks_exact(3)
+            .map(|rgb| (rgb[0] as u32) | ((rgb[1] as u32) << 8) | ((rgb[2] as u32) << 16))
+            .collect();
+        Some(crate::FaceTextureData {
+            face_ids,
+            charts,
+            albedo_rgb8,
+        })
+    } else {
+        None
+    };
     Ok(Some(EnergyData {
         density,
         material,
@@ -203,6 +273,7 @@ pub fn parse(data: &[u8], offset: usize, nv: usize, nt: usize) -> Result<Option<
         lut,
         min_t: near[1],
         empty_indices,
+        face_textures,
     }))
 }
 
@@ -392,5 +463,82 @@ mod tests {
         let mut broken = fixture([1, 4, 1], 1.);
         broken.truncate(broken.len() - 1);
         assert!(crate::load_rmesh_raw(&broken).is_err());
+    }
+    #[test]
+    fn face_textures_decode_and_reject_invalid() {
+        let append_tags = |base: &[u8], extra: &[(&str, u32, &[u32], &[u8])]| -> Vec<u8> {
+            let mut out = base.to_vec();
+            let magic = 0x524d5458u32.to_le_bytes();
+            let pos = out.windows(4).position(|w| w == magic).unwrap();
+            let count = u32::from_le_bytes(out[pos + 4..pos + 8].try_into().unwrap());
+            out[pos + 4..pos + 8].copy_from_slice(&(count + extra.len() as u32).to_le_bytes());
+            for (tag, dtype, shape, data) in extra {
+                let mut name = [0u8; 16];
+                name[..tag.len()].copy_from_slice(tag.as_bytes());
+                out.extend(name);
+                out.extend(dtype.to_le_bytes());
+                out.extend((shape.len() as u32).to_le_bytes());
+                for d in *shape {
+                    out.extend(d.to_le_bytes());
+                }
+                out.extend((data.len() as u32).to_le_bytes());
+                out.extend(*data);
+                while out.len() % 4 != 0 {
+                    out.push(0);
+                }
+            }
+            out
+        };
+        let base = v2_fixture(true);
+        let ids: Vec<u8> = [-1i32, -1, -1, 0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let charts: Vec<u8> = [0i32, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let alb: Vec<u8> = vec![255, 0, 0, 0, 255, 0, 0, 0, 255];
+        let valid = append_tags(
+            &base,
+            &[
+                ("ft_face_ids", 3, &[1, 4], &ids),
+                ("ft_charts", 3, &[1, 2], &charts),
+                ("ft_albedo", 2, &[3, 3], &alb),
+            ],
+        );
+        let (_, _, pbr) = crate::load_rmesh_raw(&valid).unwrap();
+        let ft = pbr.unwrap().face_textures.expect("face textures decoded");
+        assert_eq!(ft.face_ids, [-1, -1, -1, 0]);
+        assert_eq!(ft.charts, [0, 2]);
+        assert_eq!(ft.albedo_rgb8, [0x0000ff, 0x00ff00, 0xff0000]);
+
+        // Missing ft_albedo -> error
+        let incomplete = append_tags(
+            &base,
+            &[
+                ("ft_face_ids", 3, &[1, 4], &ids),
+                ("ft_charts", 3, &[1, 2], &charts),
+            ],
+        );
+        assert!(crate::load_rmesh_raw(&incomplete).is_err());
+
+        // Out-of-bounds chart id -> error
+        let bad_ids: Vec<u8> = [-1i32, -1, -1, 1].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let oob_id = append_tags(
+            &base,
+            &[
+                ("ft_face_ids", 3, &[1, 4], &bad_ids),
+                ("ft_charts", 3, &[1, 2], &charts),
+                ("ft_albedo", 2, &[3, 3], &alb),
+            ],
+        );
+        assert!(crate::load_rmesh_raw(&oob_id).is_err());
+
+        // Chart site count exceeds ft_albedo -> error
+        let bad_charts: Vec<u8> = [0i32, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let oob_sites = append_tags(
+            &base,
+            &[
+                ("ft_face_ids", 3, &[1, 4], &ids),
+                ("ft_charts", 3, &[1, 2], &bad_charts),
+                ("ft_albedo", 2, &[3, 3], &alb),
+            ],
+        );
+        assert!(crate::load_rmesh_raw(&oob_sites).is_err());
     }
 }

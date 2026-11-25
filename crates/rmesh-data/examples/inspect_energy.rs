@@ -18,11 +18,15 @@ fn main() -> Result<()> {
         scene.start_pose
     );
     println!(
-        "energy_rows={} geom_normals={} LUT={} density_sum={:.9}",
+        "energy_rows={} geom_normals={} LUT={} density_sum={:.9} face_textures={}",
         pbr.energy_material.len() / 5,
         pbr.geom_normals.len() / 3,
         pbr.energy_lut.len(),
-        scene.densities.iter().map(|&x| x as f64).sum::<f64>()
+        scene.densities.iter().map(|&x| x as f64).sum::<f64>(),
+        match &pbr.face_textures {
+            Some(ft) => format!("{}charts/{}sites", ft.charts.len() / 2, ft.albedo_rgb8.len()),
+            None => "none".to_string(),
+        }
     );
     if let Some(path) = args.get(2) {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);

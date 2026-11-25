@@ -336,6 +336,17 @@ fn prepare_vertex_view(@builtin(global_invocation_id) id:vec3u){
     );
 }
 
+struct CornerShade {
+    total: vec2u,
+    diff: vec2u,
+    spec: vec2u,
+}
+
+fn pack_rgb16(rgb:vec3f)->vec2u {
+    let c=clamp(rgb,vec3f(0.0),vec3f(65504.0));
+    return vec2u(pack2x16float(c.rg),pack2x16float(vec2f(c.b,0.0)));
+}
+
 fn shade_one_corner(
     i:u32,
     vcount:u32,
@@ -351,13 +362,14 @@ fn shade_one_corner(
     comp_d:f32,
     comp_s:f32,
     comp_p:f32,
-)->vec2u {
+)->CornerShade {
+    let zero_c=CornerShade(vec2u(0u,0u),vec2u(0u,0u),vec2u(0u,0u));
     let v0=vertex_view[i];
-    if(v0.x==0u){return vec2u(0u,0u);}
+    if(v0.x==0u){return zero_c;}
     let flags=v0.w>>16u;
     let lit_code=flags & 0x1fu;
     let probe_active=(flags & 0x20u)!=0u;
-    if(lit_code==0u && !probe_active){return vec2u(0u,0u);}
+    if(lit_code==0u && !probe_active){return zero_c;}
 
     let co_ci=unpack2x16unorm(v0.x);
     let co=co_ci.x;
@@ -367,7 +379,7 @@ fn shade_one_corner(
     let eo_mean=clamp(m.f0*lut_o.z+(1.0-m.f0)*lut_o.w+C_o*(1.0-lut_o.z),vec3f(0.0),vec3f(1.0));
     let eo=EnergyAllocation(eo_total,eo_mean,lut_o.x,lut_o.z,C_o);
 
-    var direct_diffuse=vec3f(0.0);
+    var direct_diffuse_unit=vec3f(0.0);
     var direct_specular=vec3f(0.0);
 
     if(lit_code==1u){
@@ -381,7 +393,7 @@ fn shade_one_corner(
         let power=vec3f(prg.x,prg.y,pb);
 
         let ei=energy_alloc_fb(m.roughness,ci,m.f0,fb);
-        let view_diffuse=one_minus_retro*m.albedo*(1.0-ei.total)*(1.0-eo.total)/max(1.0-ei.mean,vec3f(1e-6))*ci;
+        let view_diffuse_unit=one_minus_retro*(1.0-ei.total)*(1.0-eo.total)/max(1.0-ei.mean,vec3f(1e-6))*ci;
         let F=m.f0+(1.0-m.f0)*lh5;
         let denom=tt+a2*nh2;
         let D=a2/(3.141592653589793*max(denom*denom,1e-20));
@@ -389,7 +401,7 @@ fn shade_one_corner(
         let go=2.0/max(co+sqrt(a2+one_minus_a2*co*co),1e-8);
         let ss=(0.25*D*gi*go)*F;
         let ms=ei.compensation*(1.0-ei.unit)*(1.0-eo.unit)/(3.141592653589793*max(1.0-ei.average,1e-6));
-        direct_diffuse=view_diffuse*power;
+        direct_diffuse_unit=view_diffuse_unit*power;
         direct_specular=(one_minus_retro*(ss+ms)*ci*3.141592653589793)*power;
         if(m.retro>0.0 && (flags & 0x40u)!=0u){
             direct_specular+=m.retro*load_retro_rgb(i,vcount);
@@ -409,7 +421,7 @@ fn shade_one_corner(
             if(ci<=0.0){continue;}
             let power=light_power_vis(vis,lamp,delta,dist2);
             let ei=energy_alloc_fb(m.roughness,ci,m.f0,fb);
-            let view_diffuse=one_minus_retro*m.albedo*(1.0-ei.total)*(1.0-eo.total)/max(1.0-ei.mean,vec3f(1e-6))*ci;
+            let view_diffuse_unit=one_minus_retro*(1.0-ei.total)*(1.0-eo.total)/max(1.0-ei.mean,vec3f(1e-6))*ci;
             let h=energy_unit(l+v);
             let om=1.0-clamp(dot(l,h),0.0,1.0);
             let om2=om*om;
@@ -421,7 +433,7 @@ fn shade_one_corner(
             let gi=2.0/max(ci+sqrt(a2+one_minus_a2*ci*ci),1e-8);
             let ss=(0.25*D*gi*go)*F;
             let ms=ei.compensation*(1.0-ei.unit)*(1.0-eo.unit)/(3.141592653589793*max(1.0-ei.average,1e-6));
-            direct_diffuse+=view_diffuse*power;
+            direct_diffuse_unit+=view_diffuse_unit*power;
             direct_specular+=(one_minus_retro*(ss+ms)*ci*3.141592653589793)*power;
         }
         if(m.retro>0.0 && (flags & 0x40u)!=0u){
@@ -443,15 +455,21 @@ fn shade_one_corner(
             eo.compensation*(1.0-lut_o.x)*broad_light);
     }
 
-    let rgb=clamp(comp_d*direct_diffuse+comp_s*direct_specular+comp_p*probe_spec,vec3f(0.0),vec3f(65504.0));
-    return vec2u(pack2x16float(rgb.rg),pack2x16float(vec2f(rgb.b,0.0)));
+    let diff_unit=comp_d*direct_diffuse_unit;
+    let spec_tot=comp_s*direct_specular+comp_p*probe_spec;
+    return CornerShade(
+        pack_rgb16(diff_unit*m.albedo+spec_tot),
+        pack_rgb16(diff_unit),
+        pack_rgb16(spec_tot),
+    );
 }
 
 // Stage 2b (per-cell, runs on camera or light change): scalarized 4-corner shading with
 // 16-byte coalesced index loads and radiance writes.
 @compute @workgroup_size(64)
 fn shade_corners(@builtin(global_invocation_id) id:vec3u){
-    let cell=id.x+id.y*65535u*64u;if(cell>=frame.counts.y){return;}
+    let tcount=frame.counts.y;
+    let cell=id.x+id.y*65535u*64u;if(cell>=tcount){return;}
     let m=unpack_material(cell_materials[cell]);
     let ids=indices[cell];
     let vcount=frame.counts.x;
@@ -475,6 +493,14 @@ fn shade_corners(@builtin(global_invocation_id) id:vec3u){
     let r1=shade_one_corner(ids.y,vcount,n_lights,m,one_minus_retro,fb,a2,one_minus_a2,mip_lo,mip_hi,mip_f,comp_d,comp_s,comp_p);
     let r2=shade_one_corner(ids.z,vcount,n_lights,m,one_minus_retro,fb,a2,one_minus_a2,mip_lo,mip_hi,mip_f,comp_d,comp_s,comp_p);
     let r3=shade_one_corner(ids.w,vcount,n_lights,m,one_minus_retro,fb,a2,one_minus_a2,mip_lo,mip_hi,mip_f,comp_d,comp_s,comp_p);
-    radiance[2u*cell]=vec4u(r0,r1);
-    radiance[2u*cell+1u]=vec4u(r2,r3);
+    radiance[2u*cell]=vec4u(r0.total,r1.total);
+    radiance[2u*cell+1u]=vec4u(r2.total,r3.total);
+    if(frame.influence.w>0.5){
+        let d_off=2u*tcount+2u*cell;
+        let s_off=4u*tcount+2u*cell;
+        radiance[d_off]=vec4u(r0.diff,r1.diff);
+        radiance[d_off+1u]=vec4u(r2.diff,r3.diff);
+        radiance[s_off]=vec4u(r0.spec,r1.spec);
+        radiance[s_off+1u]=vec4u(r2.spec,r3.spec);
+    }
 }
