@@ -223,6 +223,7 @@ fn build_shell_bind_group(
     material: &MaterialBuffers,
     sh_coeffs_buf: &wgpu::Buffer,
     aux_data_buf: Option<&wgpu::Buffer>,
+    energy_radiance: Option<&wgpu::Buffer>,
 ) -> wgpu::BindGroup {
     let stub;
     let aux = match aux_data_buf {
@@ -237,15 +238,28 @@ fn build_shell_bind_group(
             &stub
         }
     };
-    rmesh_render::create_shell_bind_group(
-        device,
-        pipeline,
-        shell,
-        buffers,
-        material,
-        sh_coeffs_buf,
-        aux,
-    )
+    if let Some(radiance) = energy_radiance {
+        rmesh_render::create_energy_shell_bind_group(
+            device,
+            pipeline,
+            shell,
+            buffers,
+            radiance,
+            material,
+            sh_coeffs_buf,
+            aux,
+        )
+    } else {
+        rmesh_render::create_shell_bind_group(
+            device,
+            pipeline,
+            shell,
+            buffers,
+            material,
+            sh_coeffs_buf,
+            aux,
+        )
+    }
 }
 
 impl App {
@@ -491,7 +505,8 @@ impl App {
 
                 let mut required_features =
                     wgpu::Features::SHADER_FLOAT32_ATOMIC | wgpu::Features::TIMESTAMP_QUERY;
-                required_features |= adapter_features & wgpu::Features::FLOAT32_FILTERABLE;
+                required_features |= adapter_features
+                    & (wgpu::Features::FLOAT32_FILTERABLE | wgpu::Features::SHADER_F16);
                 if subgroup_supported {
                     required_features |= wgpu::Features::SUBGROUP;
                 }
@@ -500,10 +515,11 @@ impl App {
                 }
                 // Encoder-level timestamps let the postprocess profiler bracket
                 // each fullscreen pass without threading timestamp_writes
-                // through every record_* helper. Optional — the profiler
-                // degrades to "unavailable" when the backend lacks it.
-                let encoder_ts =
-                    adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+                // through every record_* helper. Disabled on Metal: calling
+                // encoder.write_timestamp around compute+render shell passes
+                // breaks subsequent compute dispatch execution on wgpu-metal.
+                let encoder_ts = _backend != wgpu::Backend::Metal
+                    && adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
                 if encoder_ts {
                     required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
                 }
@@ -632,6 +648,8 @@ impl App {
         let sh_degree = 0;
         let light_bake = light_bake::LightBake::new(&device, &queue, &self.scene_data, &self.sh_coeffs, self.pbr_data.as_ref(), &buffers);
         light_bake.configure_interval(&device, &mut compute_interval_pipelines);
+        self.shell_system
+            .seed_adjacency(&self.scene_data, light_bake.adjacency().to_vec());
 
         let aux_data_buf: Option<wgpu::Buffer> = None;
 
@@ -671,12 +689,21 @@ impl App {
         // groups sample the pyramid, so it has to exist first.
         let primitive_targets =
             PrimitiveTargets::new(&device, size.width.max(1), size.height.max(1));
-        let shell_pipeline = rmesh_render::ShellPipeline::new(
-            &device,
-            gbuffer_formats,
-            color_format, // DSM moment target — deliberately independent of the G-buffer
-            wgpu::TextureFormat::Depth32Float,
-        );
+        let shell_pipeline = if light_bake.uses_energy() {
+            rmesh_render::ShellPipeline::new_energy(
+                &device,
+                gbuffer_formats,
+                color_format,
+                wgpu::TextureFormat::Depth32Float,
+            )
+        } else {
+            rmesh_render::ShellPipeline::new(
+                &device,
+                gbuffer_formats,
+                color_format, // DSM moment target — deliberately independent of the G-buffer
+                wgpu::TextureFormat::Depth32Float,
+            )
+        };
         let shell_buffers = rmesh_render::ShellBuffers::new(&device);
         let shell_bg = build_shell_bind_group(
             &device,
@@ -686,6 +713,7 @@ impl App {
             &material,
             &sh_coeffs_buf,
             aux_data_buf.as_ref(),
+            light_bake.energy_radiance_buffer(),
         );
         let overdraw_pipelines =
             rmesh_render::OverdrawPipelines::new(&device, surface_config.format);
@@ -1178,6 +1206,8 @@ impl App {
             gpu.sh_degree = 0;
             gpu.light_bake = light_bake::LightBake::new(&gpu.device, &gpu.queue, &self.scene_data, &self.sh_coeffs, self.pbr_data.as_ref(), &gpu.buffers);
             gpu.light_bake.configure_interval(&gpu.device, &mut gpu.compute_interval_pipelines);
+            self.shell_system
+                .seed_adjacency(&self.scene_data, gpu.light_bake.adjacency().to_vec());
 
             // Recreate sort state for new tet count
             let n_pow2 = gpu.tet_count.next_power_of_two();
@@ -1191,6 +1221,23 @@ impl App {
             // Recreate bind groups
             // New scene: drop the old shell (its face ids index the previous
             // tet array) and rebind against the new buffers.
+            let gbuffer_formats = gpu.targets.formats;
+            let color_format = gbuffer_formats.color;
+            gpu.shell_pipeline = if gpu.light_bake.uses_energy() {
+                rmesh_render::ShellPipeline::new_energy(
+                    &gpu.device,
+                    gbuffer_formats,
+                    color_format,
+                    wgpu::TextureFormat::Depth32Float,
+                )
+            } else {
+                rmesh_render::ShellPipeline::new(
+                    &gpu.device,
+                    gbuffer_formats,
+                    color_format,
+                    wgpu::TextureFormat::Depth32Float,
+                )
+            };
             gpu.shell_buffers = rmesh_render::ShellBuffers::new(&gpu.device);
             gpu.shell_bg = build_shell_bind_group(
                 &gpu.device,
@@ -1200,6 +1247,7 @@ impl App {
                 &gpu.material_buffers,
                 &gpu.sh_coeffs_buf,
                 gpu.aux_data_buf.as_ref(),
+                gpu.light_bake.energy_radiance_buffer(),
             );
 
             gpu.compute_bg = create_compute_bind_group(
@@ -1777,7 +1825,12 @@ impl ApplicationHandler for App {
 
         // Cache the flare collision mesh on load so the BVH is ready before the
         // first flare is fired or the collision mesh is toggled on.
-        self.flare_system.rebuild_collision_mesh(&self.scene_data);
+        if let Some(gpu) = &self.gpu {
+            self.flare_system
+                .rebuild_collision_mesh_with_adj(&self.scene_data, gpu.light_bake.adjacency());
+        } else {
+            self.flare_system.rebuild_collision_mesh(&self.scene_data);
+        }
 
         log::info!(
             "Viewer initialized: {} tets, {} vertices (SH degree {})",

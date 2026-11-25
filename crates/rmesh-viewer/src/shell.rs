@@ -289,6 +289,38 @@ impl ShellSystem {
         self.dirty = true;
     }
 
+    /// Seed precomputed tet adjacency from `LightBake` so the shell and
+    /// importance cull skip a duplicate `compute_tet_neighbors` pass.
+    pub fn seed_adjacency(&mut self, scene_data: &rmesh_data::SceneData, neighbors: Vec<i32>) {
+        if self.cache.is_some() || scene_data.tet_count == 0 {
+            return;
+        }
+        let tet_count = scene_data.tet_count as usize;
+        let t = std::time::Instant::now();
+        let alphas = tet_alphas(
+            &scene_data.vertices,
+            &scene_data.indices,
+            &scene_data.densities,
+            tet_count,
+        );
+        let max_od = crate::importance::tet_max_od(
+            &scene_data.vertices,
+            &scene_data.indices,
+            &scene_data.densities,
+            tet_count,
+        );
+        log::info!(
+            "[shell] built per-tet opacity (reusing adjacency) for {} tets in {:.2}s",
+            tet_count,
+            t.elapsed().as_secs_f64()
+        );
+        self.cache = Some(Arc::new(SceneCache {
+            neighbors,
+            alphas,
+            max_od,
+        }));
+    }
+
     /// Forget the current shell — used when a new scene invalidates the tet ids.
     pub fn reset(&mut self) {
         self.faces.clear();

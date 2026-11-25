@@ -6,6 +6,7 @@ use wgpu::util::DeviceExt;
 const PROBE_SIZE: u32 = 64;
 const PROBE_LEVELS: u32 = 7;
 const PROBE_COUNT: u32 = 5;
+const PROBE_HIT_CAP: u32 = 96;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -23,11 +24,15 @@ struct Pass {
     dispatch: [u32; 3],
 }
 impl Pass {
+    #[cfg(test)]
     fn record(&self, encoder: &mut wgpu::CommandEncoder) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("vertex probe lighting"),
             ..Default::default()
         });
+        self.dispatch_into(&mut pass);
+    }
+    fn dispatch_into<'a>(&'a self, pass: &mut wgpu::ComputePass<'a>) {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.group, &[]);
         pass.dispatch_workgroups(self.dispatch[0], self.dispatch[1], self.dispatch[2]);
@@ -69,7 +74,10 @@ fn make_pass(
         layout: None,
         module: &shader,
         entry_point: Some(entry),
-        compilation_options: Default::default(),
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     });
     let entries: Vec<_> = resources
@@ -91,13 +99,24 @@ fn make_pass(
     }
 }
 
-fn point_in_cell(scene: &SceneData, t: usize, p: Vec3) -> bool {
-    let ids = &scene.indices[t * 4..t * 4 + 4];
-    let q = |i| Vec3::from_slice(&scene.vertices[3 * ids[i] as usize..3 * ids[i] as usize + 3]);
+fn point_in_tet(vertices: &[f32], indices: &[u32], t: usize, p: Vec3) -> bool {
+    let ids = &indices[t * 4..t * 4 + 4];
+    let q = |i| Vec3::from_slice(&vertices[3 * ids[i] as usize..3 * ids[i] as usize + 3]);
     let a = q(0);
-    let b = q(1) - a;
-    let c = q(2) - a;
-    let d = q(3) - a;
+    let p1 = q(1);
+    let p2 = q(2);
+    let p3 = q(3);
+    let lo = a.min(p1).min(p2).min(p3);
+    let hi = a.max(p1).max(p2).max(p3);
+    if p.x < lo.x - 1e-5 || p.x > hi.x + 1e-5
+        || p.y < lo.y - 1e-5 || p.y > hi.y + 1e-5
+        || p.z < lo.z - 1e-5 || p.z > hi.z + 1e-5
+    {
+        return false;
+    }
+    let b = p1 - a;
+    let c = p2 - a;
+    let d = p3 - a;
     let det = b.dot(c.cross(d));
     if det.abs() < 1e-25 {
         return false;
@@ -105,6 +124,9 @@ fn point_in_cell(scene: &SceneData, t: usize, p: Vec3) -> bool {
     let v = p - a;
     let w = Vec3::new(v.dot(c.cross(d)), v.dot(d.cross(b)), v.dot(b.cross(c))) / det;
     w.min_element() >= -1e-5 && w.element_sum() <= 1.00001
+}
+fn point_in_cell(scene: &SceneData, t: usize, p: Vec3) -> bool {
+    point_in_tet(&scene.vertices, &scene.indices, t, p)
 }
 /// One exported camera plus four local offsets. Avoid dense cells and use dense
 /// scene bounds rather than the potentially enormous empty background tets.
@@ -179,15 +201,17 @@ fn probe_positions(scene: &SceneData, lo: Vec3, hi: Vec3) -> ([Vec3; 5], f32) {
 }
 
 pub struct EnergyForward {
-    layout: wgpu::BindGroupLayout,
-    group: wgpu::BindGroup,
     frame: wgpu::Buffer,
     frame_data: Frame,
+    cell_seen: wgpu::Buffer,
+    prep_lights: Pass,
     diffuse: Pass,
+    capture_cache: Pass,
     capture: Pass,
     visibility: Pass,
     visibility_ready: bool,
     filters: Vec<Pass>,
+    prep_view: Pass,
     shade: Pass,
     last: Option<([f32; 3], u64)>,
     // Keep available for GPU regression readback.
@@ -208,13 +232,46 @@ impl EnergyForward {
         snapshot: &wgpu::Buffer,
         neighbors: &wgpu::Buffer,
         shadow_geometry: &wgpu::Buffer,
+        vertex_meta: &wgpu::Buffer,
+        trace_indices_buf: &wgpu::Buffer,
+        trace_indices_cpu: &[u32],
         _adjacency: &[i32],
     ) -> Self {
-        let mut cell_materials = Vec::<f32>::with_capacity(scene.tet_count as usize * 8);
-        for (i, m) in pbr.energy_material.chunks_exact(5).enumerate() {
-            cell_materials.extend_from_slice(&pbr.albedo[3 * i..3 * i + 3]);
-            cell_materials.extend_from_slice(m);
-        }
+        let pack2 = |a: f32, b: f32| -> u32 {
+            let qa = (a.clamp(0.0, 1.0) * 65535.0 + 0.5) as u32;
+            let qb = (b.clamp(0.0, 1.0) * 65535.0 + 0.5) as u32;
+            qa | (qb << 16)
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let cell_materials: Vec<[u32; 4]> = {
+            use rayon::prelude::*;
+            (0..scene.tet_count as usize)
+                .into_par_iter()
+                .map(|i| {
+                    let a = &pbr.albedo[3 * i..3 * i + 3];
+                    let m = &pbr.energy_material[5 * i..5 * i + 5];
+                    [
+                        pack2(a[0], a[1]),
+                        pack2(a[2], m[0]),
+                        pack2(m[1], m[2]),
+                        pack2(m[3], m[4]),
+                    ]
+                })
+                .collect()
+        };
+        #[cfg(target_arch = "wasm32")]
+        let cell_materials: Vec<[u32; 4]> = (0..scene.tet_count as usize)
+            .map(|i| {
+                let a = &pbr.albedo[3 * i..3 * i + 3];
+                let m = &pbr.energy_material[5 * i..5 * i + 5];
+                [
+                    pack2(a[0], a[1]),
+                    pack2(a[2], m[0]),
+                    pack2(m[1], m[2]),
+                    pack2(m[3], m[4]),
+                ]
+            })
+            .collect();
         let cell_materials = buffer(
             device,
             "cell diffuse materials",
@@ -224,7 +281,7 @@ impl EnergyForward {
         let diffuse = storage(
             device,
             "baked cell diffuse/material",
-            scene.tet_count as u64 * 32,
+            scene.tet_count as u64 * 8,
         );
         let radiance = storage(
             device,
@@ -258,21 +315,19 @@ impl EnergyForward {
             .ok().map(|v| v.parse::<f32>().expect("invalid probe falloff distance"))
             .unwrap_or(1.0);
         assert!(falloff_distance.is_finite() && falloff_distance >= 0.0);
+        let trace_tet_count = trace_indices_cpu.len() / 4;
+        let probe_cells = probes.map(|p| {
+            (0..trace_tet_count)
+                .find(|&t| point_in_tet(&scene.vertices, trace_indices_cpu, t, p))
+                .map_or(u32::MAX, |t| t as u32)
+        });
         let frame_data = Frame {
             components,
-            probes: probes.map(|p| {
-                [
-                    p.x,
-                    p.y,
-                    p.z,
-                    f32::from_bits(
-                        (0..scene.tet_count as usize)
-                            .find(|&t| point_in_cell(scene, t, p))
-                            .map_or(u32::MAX, |t| t as u32),
-                    ),
-                ]
+            probes: std::array::from_fn(|k| {
+                let p = probes[k];
+                [p.x, p.y, p.z, f32::from_bits(probe_cells[k])]
             }),
-            influence: [radius, falloff_distance, 0., 0.],
+            influence: [radius, falloff_distance, PROBE_SIZE as f32, 0.],
             eye: [
                 0.,
                 0.,
@@ -284,9 +339,7 @@ impl EnergyForward {
                 scene.vertex_count,
                 scene.tet_count,
                 PROBE_LEVELS,
-                (0..scene.tet_count as usize)
-                    .find(|&t| point_in_cell(scene, t, probe))
-                    .map_or(u32::MAX, |t| t as u32),
+                probe_cells[0],
             ],
         };
         let frame = buffer(
@@ -338,63 +391,128 @@ impl EnergyForward {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
+        let filtered_lut = device.features().contains(wgpu::Features::FLOAT32_FILTERABLE);
+        let energy_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
         let source = format!(
-            "{}\n{}",
-            crate::energy::WGSL,
+            "{}\n{}\n{}",
+            crate::energy::shader_source(filtered_lut),
+            if filtered_lut { "@group(0) @binding(14) var energy_sampler:sampler;" } else { "" },
             include_str!("wgsl/energy_vertex.wgsl")
         );
         let groups = scene.vertex_count.div_ceil(64);
-        let dispatch = [groups.min(65535), groups.div_ceil(65535), 1];
-        let diffuse_pass = make_pass(
+        let vert_dispatch = [groups.min(65535), groups.div_ceil(65535), 1];
+        let dispatch = [groups.min(65535), groups.div_ceil(65535), PROBE_COUNT];
+        let tet_groups = scene.tet_count.div_ceil(64);
+        let tet_dispatch = [tet_groups.min(65535), tet_groups.div_ceil(65535), 1];
+
+        let vertex_light = storage(
+            device,
+            "per-vertex light cache",
+            scene.vertex_count as u64 * 16,
+        );
+        let vertex_view = storage(
+            device,
+            "per-vertex view/light cache",
+            scene.vertex_count as u64 * 32,
+        );
+        let vertex_probe = storage(
+            device,
+            "per-vertex blended probe mips (RGB9E5)",
+            scene.vertex_count as u64 * 32,
+        );
+        let probe_hits = storage(
+            device,
+            "cached probe ray segments",
+            (PROBE_SIZE as u64)
+                * (PROBE_SIZE as u64)
+                * 6
+                * (PROBE_COUNT as u64)
+                * (PROBE_HIT_CAP as u64)
+                * 8,
+        );
+        let cell_seen = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("probe cell seen bitset"),
+            size: (scene.tet_count.div_ceil(32) as u64 * 4).max(16),
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let prep_lights = make_pass(
             device,
             &source,
-            "bake_diffuse",
+            "prepare_vertex_lights",
             &[
                 (0, frame.as_entire_binding()),
                 (1, buffers.vertices.as_entire_binding()),
                 (2, buffers.vertex_normals.as_entire_binding()),
                 (4, transport.as_entire_binding()),
                 (5, snapshot.as_entire_binding()),
-                (6, diffuse.as_entire_binding()),
-                (8, wgpu::BindingResource::TextureView(&lut)),
-                (11, cell_materials.as_entire_binding()),
-                (12, buffers.indices.as_entire_binding()),
+                (16, vertex_light.as_entire_binding()),
             ],
-            [
-                scene.tet_count.div_ceil(64).min(65535),
-                scene.tet_count.div_ceil(64).div_ceil(65535),
-                1,
-            ],
+            vert_dispatch,
         );
+        let mut diffuse_res: Vec<(u32, wgpu::BindingResource<'_>)> = vec![
+            (0, frame.as_entire_binding()),
+            (1, buffers.vertices.as_entire_binding()),
+            (2, buffers.vertex_normals.as_entire_binding()),
+            (4, transport.as_entire_binding()),
+            (5, snapshot.as_entire_binding()),
+            (6, diffuse.as_entire_binding()),
+            (8, wgpu::BindingResource::TextureView(&lut)),
+            (11, cell_materials.as_entire_binding()),
+            (12, buffers.indices.as_entire_binding()),
+            (15, cell_seen.as_entire_binding()),
+            (21, vertex_light.as_entire_binding()),
+        ];
+        if filtered_lut {
+            diffuse_res.push((14, wgpu::BindingResource::Sampler(&energy_sampler)));
+        }
+        let diffuse_pass = make_pass(device, &source, "bake_diffuse", &diffuse_res, tet_dispatch);
         let weights = storage(
             device,
             "cached probe blend weights",
             scene.vertex_count as u64 * PROBE_COUNT as u64 * 4,
         );
-        let shade = make_pass(
+        let prep_view = make_pass(
             device,
             &source,
-            "shade_corners",
+            "prepare_vertex_view",
             &[
                 (0, frame.as_entire_binding()),
                 (1, buffers.vertices.as_entire_binding()),
                 (2, buffers.vertex_normals.as_entire_binding()),
                 (4, transport.as_entire_binding()),
                 (5, snapshot.as_entire_binding()),
-                (7, radiance.as_entire_binding()),
-                (8, wgpu::BindingResource::TextureView(&lut)),
                 (9, wgpu::BindingResource::TextureView(&filtered_cube)),
                 (10, wgpu::BindingResource::Sampler(&sampler)),
                 (13, weights.as_entire_binding()),
-                (11, cell_materials.as_entire_binding()),
-                (12, buffers.indices.as_entire_binding()),
+                (17, vertex_view.as_entire_binding()),
+                (19, vertex_probe.as_entire_binding()),
+                (21, vertex_light.as_entire_binding()),
             ],
-            [
-                scene.tet_count.div_ceil(64).min(65535),
-                scene.tet_count.div_ceil(64).div_ceil(65535),
-                1,
-            ],
+            vert_dispatch,
         );
+        let mut shade_res: Vec<(u32, wgpu::BindingResource<'_>)> = vec![
+            (0, frame.as_entire_binding()),
+            (1, buffers.vertices.as_entire_binding()),
+            (2, buffers.vertex_normals.as_entire_binding()),
+            (4, transport.as_entire_binding()),
+            (5, snapshot.as_entire_binding()),
+            (7, radiance.as_entire_binding()),
+            (8, wgpu::BindingResource::TextureView(&lut)),
+            (11, cell_materials.as_entire_binding()),
+            (12, buffers.indices.as_entire_binding()),
+            (18, vertex_view.as_entire_binding()),
+            (20, vertex_probe.as_entire_binding()),
+        ];
+        if filtered_lut {
+            shade_res.push((14, wgpu::BindingResource::Sampler(&energy_sampler)));
+        }
+        let shade = make_pass(device, &source, "shade_corners", &shade_res, tet_dispatch);
         let visibility = include_str!("wgsl/shadow_visibility.wgsl").replace(
             "fn normal(i:u32)->vec3f { return vec3f(normals[3*i],normals[3*i+1],normals[3*i+2]); }",
             "",
@@ -405,6 +523,27 @@ impl EnergyForward {
             visibility,
             include_str!("wgsl/probe_capture.wgsl")
         );
+        let capture_dispatch = [
+            PROBE_SIZE.div_ceil(8),
+            PROBE_SIZE.div_ceil(8),
+            6 * PROBE_COUNT,
+        ];
+        let capture_cache = make_pass(
+            device,
+            &source,
+            "capture_cache",
+            &[
+                (0, frame.as_entire_binding()),
+                (1, buffers.vertices.as_entire_binding()),
+                (2, trace_indices_buf.as_entire_binding()),
+                (3, buffers.densities.as_entire_binding()),
+                (4, neighbors.as_entire_binding()),
+                (6, shadow_geometry.as_entire_binding()),
+                (10, probe_hits.as_entire_binding()),
+                (12, cell_seen.as_entire_binding()),
+            ],
+            capture_dispatch,
+        );
         let capture = make_pass(
             device,
             &source,
@@ -412,18 +551,15 @@ impl EnergyForward {
             &[
                 (0, frame.as_entire_binding()),
                 (1, buffers.vertices.as_entire_binding()),
-                (2, buffers.indices.as_entire_binding()),
+                (2, trace_indices_buf.as_entire_binding()),
                 (3, buffers.densities.as_entire_binding()),
                 (4, neighbors.as_entire_binding()),
                 (5, diffuse.as_entire_binding()),
                 (6, shadow_geometry.as_entire_binding()),
                 (7, wgpu::BindingResource::TextureView(&raw_output)),
+                (11, probe_hits.as_entire_binding()),
             ],
-            [
-                PROBE_SIZE.div_ceil(8),
-                PROBE_SIZE.div_ceil(8),
-                6 * PROBE_COUNT,
-            ],
+            capture_dispatch,
         );
         let visibility_pass = make_pass(
             device,
@@ -432,11 +568,12 @@ impl EnergyForward {
             &[
                 (0, frame.as_entire_binding()),
                 (1, buffers.vertices.as_entire_binding()),
-                (2, buffers.indices.as_entire_binding()),
+                (2, trace_indices_buf.as_entire_binding()),
                 (3, buffers.densities.as_entire_binding()),
                 (4, neighbors.as_entire_binding()),
                 (6, shadow_geometry.as_entire_binding()),
                 (8, weights.as_entire_binding()),
+                (9, vertex_meta.as_entire_binding()),
             ],
             dispatch,
         );
@@ -469,55 +606,18 @@ impl EnergyForward {
                 )
             })
             .collect();
-        let entries: Vec<_> = [0, 1, 3]
-            .into_iter()
-            .map(|binding| wgpu::BindGroupLayoutEntry {
-                binding,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: if binding == 3 {
-                        wgpu::BufferBindingType::Uniform
-                    } else {
-                        wgpu::BufferBindingType::Storage { read_only: true }
-                    },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            })
-            .collect();
-        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("interpolated vertex radiance"),
-            entries: &entries,
-        });
-        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("interpolated vertex radiance"),
-            layout: &layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffers.vertices.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: radiance.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: frame.as_entire_binding(),
-                },
-            ],
-        });
         Self {
-            layout,
-            group,
             frame,
             frame_data,
+            cell_seen,
+            prep_lights,
             diffuse: diffuse_pass,
+            capture_cache,
             capture,
             visibility: visibility_pass,
             visibility_ready: false,
             filters,
+            prep_view,
             shade,
             last: None,
             radiance,
@@ -534,12 +634,10 @@ impl EnergyForward {
         device: &wgpu::Device,
         pipelines: &mut rmesh_render::ComputeIntervalPipelines,
     ) {
-        pipelines.set_point_samples(device, true);
-        pipelines.set_color_shader(
+        pipelines.set_energy_interval(
             device,
-            &self.layout,
+            &self.radiance,
             include_str!("wgsl/energy_interval.wgsl"),
-            self.group.clone(),
         );
     }
     pub fn record(
@@ -554,18 +652,32 @@ impl EnergyForward {
         }
         self.frame_data.eye[..3].copy_from_slice(&eye);
         queue.write_buffer(&self.frame, 0, bytemuck::bytes_of(&self.frame_data));
-        if !self.visibility_ready {
-            self.visibility.record(encoder);
-            self.visibility_ready = true;
+        let need_vis = !self.visibility_ready;
+        let need_gen = self.last.is_none_or(|(_, g)| g != generation);
+        if need_vis {
+            encoder.clear_buffer(&self.cell_seen, 0, None);
         }
-        if self.last.is_none_or(|(_, g)| g != generation) {
-            self.diffuse.record(encoder);
-            self.capture.record(encoder);
-            for filter in &self.filters {
-                filter.record(encoder);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("vertex probe lighting"),
+                ..Default::default()
+            });
+            if need_vis {
+                self.visibility.dispatch_into(&mut pass);
+                self.capture_cache.dispatch_into(&mut pass);
+                self.visibility_ready = true;
             }
+            if need_gen {
+                self.prep_lights.dispatch_into(&mut pass);
+                self.diffuse.dispatch_into(&mut pass);
+                self.capture.dispatch_into(&mut pass);
+                for filter in &self.filters {
+                    filter.dispatch_into(&mut pass);
+                }
+            }
+            self.prep_view.dispatch_into(&mut pass);
+            self.shade.dispatch_into(&mut pass);
         }
-        self.shade.record(encoder);
         self.last = Some((eye, generation));
     }
     pub fn invalidate(&mut self) {
@@ -600,6 +712,9 @@ mod tests {
         let mut packed = vec![bvh.nodes.len() as u32, 0, 0, 0];
         packed.extend_from_slice(bytemuck::cast_slice(&bvh.nodes));
         packed.extend_from_slice(&bvh.boundary_faces);
+        while packed.len() % 4 != 0 {
+            packed.push(0);
+        }
         let neighbors = buffer(
             &device,
             "neighbors",
@@ -629,15 +744,25 @@ mod tests {
                 .collect(),
             geom_normals: vec![],
             render_min_t: None,
+            empty_indices: vec![],
             env_feature: vec![],
             vertex_normals: vec![],
             tone_curve: vec![],
             metallic: vec![],
             f0_dielectric: vec![],
         };
+        let meta: Vec<[u32; 4]> = (0..scene.vertex_count)
+            .map(|i| [if i < 4 { 0 } else { u32::MAX }, 0, i, i])
+            .collect();
+        let vertex_meta = buffer(
+            &device,
+            "vertex_meta",
+            bytemuck::cast_slice(&meta),
+            wgpu::BufferUsages::STORAGE,
+        );
         let mut forward = EnergyForward::new(
             &device, &queue, &scene, &pbr, &buffers, &transport, &snapshot, &neighbors, &geometry,
-            &adjacency,
+            &vertex_meta, &buffers.indices, &scene.indices, &adjacency,
         );
         forward.frame_data.probes = [[-2., 0., 0., f32::from_bits(u32::MAX)]; 5];
         forward.frame_data.influence[0] = 10.;

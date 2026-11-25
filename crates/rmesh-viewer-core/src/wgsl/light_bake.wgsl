@@ -26,7 +26,8 @@ fn bake(@builtin(global_invocation_id) id:vec3u) {
     let p=mix(vertex(i),center,0.0001);
     if(params.control.z==1u){
         // No material response, intensity, or distance attenuation in this cache.
-        for(var block=0u;block<4u;block++){
+        let blocks=(params.lights+3u)>>2u;
+        for(var block=0u;block<blocks;block++){
             var values=vec4f(0.0);
             for(var lane=0u;lane<4u;lane++){
                 let li=block*4u+lane;

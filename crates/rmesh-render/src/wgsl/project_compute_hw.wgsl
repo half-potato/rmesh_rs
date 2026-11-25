@@ -132,6 +132,13 @@ fn shell_occluded(min_x: f32, max_x: f32, min_y: f32, max_y: f32, near_z: f32) -
     return near_z > bound + uniforms.shell_cull_bias;
 }
 
+fn morton4(x: u32) -> u32 {
+    var v = x & 15u;
+    v = (v | (v << 2u)) & 0x33u;
+    v = (v | (v << 1u)) & 0x55u;
+    return v;
+}
+
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgroups) num_workgroups: vec3<u32>) {
     let tet_id = global_id.x + global_id.y * num_workgroups.x * 64u;
@@ -167,7 +174,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let any_behind = (p0.w <= 0.0) || (p1.w <= 0.0) || (p2.w <= 0.0) || (p3.w <= 0.0);
 
     var visible = true;
-    if (all_behind) {
+    var tile_code = 0u;
+    if (all_behind || (any_behind && (uniforms.shell_cull_flags & 16u) != 0u)) {
         visible = false;
     } else if (!any_behind) {
         let min_x = min(min(p0.x, p1.x), min(p2.x, p3.x));
@@ -191,6 +199,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         if (visible && shell_occluded(min_x, max_x, min_y, max_y, min_z)) {
             visible = false;
         }
+        let cx_ndc = clamp((min_x + max_x) * 0.25 + 0.5, 0.0, 0.9999);
+        let cy_ndc = clamp((min_y + max_y) * 0.25 + 0.5, 0.0, 0.9999);
+        tile_code = morton4(u32(cx_ndc * 16.0)) | (morton4(u32(cy_ndc * 16.0)) << 1u);
     }
 
     if (!visible) {
@@ -221,6 +232,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
     let depth_raw = dot(cam - v0, cam + v0 - 2.0 * center);
     let depth = clamp(depth_raw, -1e20, 1e20);
     let depth_bits = bitcast<u32>(depth);
+    // Monotonic descending IEEE-754 key (handles negative power distance too).
+    let desc = ~(depth_bits ^ select(0x80000000u, 0xFFFFFFFFu, (depth_bits & 0x80000000u) != 0u));
 
     let vis_idx = atomicAdd(&indirect_args.instance_count, 1u);
     if ((uniforms.shell_cull_flags & 4u) != 0u) {
@@ -228,12 +241,21 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>, @builtin(num_workgr
         // tile bookkeeping or its extra storage bindings.
         let t = clamp(sqrt(max(depth_raw, 0.0)) / uniforms.far_plane, 0.0, 1.0);
         sort_keys[vis_idx] = 65535u - u32(t * 65535.0);
+    } else if ((uniforms.shell_cull_flags & 32u) != 0u) {
+        // Tile-coherent 32-bit key: top 16 bits = bf16 depth slab (~0.39% dist),
+        // middle 8 bits = 2D Morton screen tile (16x16), low 8 bits = fine depth
+        // (24-bit exact float ordering within every screen tile).
+        sort_keys[vis_idx] = (desc & 0xFFFF0000u) | (tile_code << 8u) | ((desc >> 8u) & 0xFFu);
     } else {
-        sort_keys[vis_idx] = ~depth_bits;
+        sort_keys[vis_idx] = desc;
     }
     sort_values[vis_idx] = tet_id;
 
     // --- 4. Color evaluation (only for visible tets) ---
+    // Energy mode reads cell-corner radiance directly and skips flat colors.
+    if ((uniforms.shell_cull_flags & 16u) != 0u) {
+        return;
+    }
     // sh_degree >= 0 all need SH eval (degree 0 = DC only). Else branch is training-only.
     if (arrayLength(&sh_coeffs) > 1u) {
         let centroid = (v0 + v1 + v2 + v3) * 0.25;

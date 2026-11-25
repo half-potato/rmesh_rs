@@ -15,7 +15,7 @@ const TIME_SCALE: f32 = 0.1; // slow motion
 const MAX_LIFETIME: f32 = 30.0;
 const FADE_DURATION: f32 = 5.0;
 const FLARE_COLOR: [f32; 3] = [1.0, 0.85, 0.5];
-const FLARE_INTENSITY: f32 = 2.0;
+const FLARE_INTENSITY: f32 = 0.4;
 const FLARE_RADIUS: f32 = 0.25;
 /// The model is ~17 units tall along its local axis.
 const FLARE_MODEL_HEIGHT: f32 = 17.0;
@@ -89,7 +89,13 @@ pub fn unpack_face(packed: u32) -> (usize, usize) {
 /// The result is in [0, 1] and means the same thing in every scene, which is
 /// what makes a shared default threshold possible at all.
 pub fn tet_alphas(verts: &[f32], idxs: &[u32], densities: &[f32], tet_count: usize) -> Vec<f32> {
-    (0..tet_count)
+    #[cfg(not(target_arch = "wasm32"))]
+    use rayon::prelude::*;
+    #[cfg(not(target_arch = "wasm32"))]
+    let iter = (0..tet_count).into_par_iter();
+    #[cfg(target_arch = "wasm32")]
+    let iter = 0..tet_count;
+    iter
         .map(|t| {
             let p = |k: usize| v3_from(verts, idxs[t * 4 + k] as usize);
             let (a, b, c, d) = (p(0), p(1), p(2), p(3));
@@ -227,6 +233,23 @@ impl CollisionMesh {
         )
     }
 
+    /// Extract the boundary surface of the dense region and build a BVH,
+    /// reusing a precomputed tet adjacency.
+    pub fn build_with_adj(
+        scene_data: &rmesh_data::SceneData,
+        neighbors: &[i32],
+        threshold: f32,
+    ) -> Self {
+        let boundary = extract_boundary_faces_adj(
+            neighbors,
+            &scene_data.densities,
+            scene_data.tet_count as usize,
+            threshold,
+            0,
+        );
+        Self::from_boundary(&scene_data.vertices, &scene_data.indices, &boundary, threshold)
+    }
+
     /// Same as [`build`] but takes the raw slices directly — used by the
     /// async background rebuild path which moves owned `Vec`s into a thread.
     pub fn build_from_slices(
@@ -237,11 +260,15 @@ impl CollisionMesh {
         threshold: f32,
     ) -> Self {
         let boundary = extract_boundary_faces(idxs, densities, tet_count, threshold, 0);
+        Self::from_boundary(verts, idxs, &boundary, threshold)
+    }
+
+    fn from_boundary(verts: &[f32], idxs: &[u32], boundary: &[u32], threshold: f32) -> Self {
 
         let mut triangles = Vec::with_capacity(boundary.len());
         let mut normals = Vec::with_capacity(boundary.len());
 
-        for &packed in &boundary {
+        for &packed in boundary {
             let (t, fi) = unpack_face(packed);
             let ti = [
                 idxs[t * 4],
@@ -563,6 +590,7 @@ struct Flare {
     last_dir: Vec3,
     lifetime: f32,
     stuck: bool,
+    base_intensity: f32,
     /// Indices into the App's primitives vec (one per mesh in the model).
     primitive_indices: Vec<usize>,
 }
@@ -573,6 +601,7 @@ struct Flare {
 
 pub struct FlareSystem {
     flares: Vec<Flare>,
+    pub intensity: f32,
     pub density_threshold: f32,
     pub show_collision_mesh: bool,
     collision_mesh: Option<CollisionMesh>,
@@ -600,6 +629,7 @@ impl Default for FlareSystem {
     fn default() -> Self {
         Self {
             flares: Vec::new(),
+            intensity: FLARE_INTENSITY,
             density_threshold: 0.05,
             show_collision_mesh: false,
             collision_mesh: None,
@@ -633,6 +663,7 @@ impl FlareSystem {
         };
         let mut indices = Vec::with_capacity(mesh_count);
 
+        let base_intensity = self.intensity.max(0.0);
         for mesh_i in 0..mesh_count {
             let name = format!("Flare.{:03}.{}", flare_id, mesh_i);
             let kind = if self.has_flare_model {
@@ -649,7 +680,7 @@ impl FlareSystem {
                 FLARE_COLOR[0],
                 FLARE_COLOR[1],
                 FLARE_COLOR[2],
-                FLARE_INTENSITY,
+                base_intensity,
             ]);
 
             if mesh_i < self.flare_material_indices.len() {
@@ -673,7 +704,7 @@ impl FlareSystem {
                 FLARE_COLOR[0],
                 FLARE_COLOR[1],
                 FLARE_COLOR[2],
-                FLARE_INTENSITY,
+                base_intensity,
             ]);
             indices.push(primitives.len());
             primitives.push(light);
@@ -685,6 +716,7 @@ impl FlareSystem {
             last_dir: camera_forward,
             lifetime: MAX_LIFETIME,
             stuck: false,
+            base_intensity,
             primitive_indices: indices,
         });
     }
@@ -697,6 +729,21 @@ impl FlareSystem {
         self.collision_mesh = None;
         self.last_built_threshold = -1.0;
         self.ensure_collision_mesh(scene_data);
+    }
+
+    /// Same as [`rebuild_collision_mesh`], reusing a precomputed tet adjacency
+    /// so startup does not rebuild the adjacency map twice.
+    pub fn rebuild_collision_mesh_with_adj(
+        &mut self,
+        scene_data: &rmesh_data::SceneData,
+        neighbors: &[i32],
+    ) {
+        self.collision_mesh = Some(CollisionMesh::build_with_adj(
+            scene_data,
+            neighbors,
+            self.density_threshold,
+        ));
+        self.last_built_threshold = self.density_threshold;
     }
 
     /// Kick off a background BVH rebuild from the current scene data. Returns
@@ -839,7 +886,7 @@ impl FlareSystem {
             } else {
                 1.0
             };
-            let intensity = FLARE_INTENSITY * fade;
+            let intensity = flare.base_intensity * fade;
             let rotation = dir_to_rotation(flare.last_dir);
 
             for &prim_idx in &flare.primitive_indices {
@@ -935,6 +982,34 @@ impl FlareSystem {
 
     pub fn flare_count(&self) -> usize {
         self.flares.len()
+    }
+
+    pub fn is_flare_primitive(&self, index: usize) -> bool {
+        self.flares.iter().any(|f| f.primitive_indices.contains(&index))
+    }
+
+    pub fn set_intensity(&mut self, intensity: f32) {
+        let clamped = intensity.max(0.0);
+        self.intensity = clamped;
+        for flare in &mut self.flares {
+            flare.base_intensity = clamped;
+        }
+    }
+
+    pub fn set_primitive_intensity(&mut self, index: usize, intensity: f32) {
+        let clamped = intensity.max(0.0);
+        if let Some(flare) = self
+            .flares
+            .iter_mut()
+            .find(|f| f.primitive_indices.contains(&index))
+        {
+            let fade = if flare.lifetime < FADE_DURATION {
+                (flare.lifetime / FADE_DURATION).max(0.0)
+            } else {
+                1.0
+            };
+            flare.base_intensity = if fade > 1e-6 { clamped / fade } else { clamped };
+        }
     }
 
     /// Get debug vertices for the collision mesh (if built).
@@ -1083,6 +1158,49 @@ mod tests {
             system.clear(&mut primitives);
             assert!(primitives.is_empty());
         }
+    }
+
+    #[test]
+    fn torch_intensity_defaults_in_low_range_and_persists_across_ticks() {
+        let scene = rmesh_util::test_util::build_test_scene(
+            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            vec![0, 1, 2, 3],
+            vec![0.0],
+            vec![0.0; 3],
+        );
+        let mut system = FlareSystem::default();
+        system.has_flare_model = true;
+        system.flare_mesh_count = 2;
+        assert!(
+            (0.1..=1.0).contains(&system.intensity),
+            "default torch intensity {} should be in 0.1..=1.0",
+            system.intensity
+        );
+
+        let mut primitives = vec![Primitive::new(PrimitiveKind::PointLight, "Scene light")];
+        let mut id = 0;
+        system.shoot(Vec3::splat(10.0), Vec3::X, &mut primitives, &mut id);
+
+        assert!(!system.is_flare_primitive(0));
+        let light_idx = primitives
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(_, p)| p.kind == PrimitiveKind::PointLight)
+            .unwrap()
+            .0;
+        assert!(system.is_flare_primitive(light_idx));
+        assert!((primitives[light_idx].color.unwrap()[3] - system.intensity).abs() < 1e-6);
+
+        // Editing the individual flare light's intensity must survive tick().
+        system.set_primitive_intensity(light_idx, 0.25);
+        system.tick(0.1, &mut primitives, &scene);
+        assert!((primitives[light_idx].color.unwrap()[3] - 0.25).abs() < 1e-6);
+
+        // Updating the system intensity updates active flares as well.
+        system.set_intensity(0.8);
+        system.tick(0.1, &mut primitives, &scene);
+        assert!((primitives[light_idx].color.unwrap()[3] - 0.8).abs() < 1e-6);
     }
 
     /// Two tets sharing the face (v0, v1, v2). Vertices are shared by index so

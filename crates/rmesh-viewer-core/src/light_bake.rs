@@ -63,6 +63,9 @@ pub struct DiffuseBake {
     published_snapshot: wgpu::Buffer,
     neighbors: wgpu::Buffer,
     shadow_geometry: wgpu::Buffer,
+    vertex_meta: wgpu::Buffer,
+    bake_indices_buf: Option<wgpu::Buffer>,
+    bake_indices_cpu: Vec<u32>,
     adjacency: Vec<i32>,
     energy: bool,
     cached: Vec<Light>,
@@ -108,8 +111,33 @@ impl DiffuseBake {
     ) -> Self {
         let now = web_time::Instant::now();
         let energy = pbr.is_some_and(|p| !p.energy_material.is_empty());
-        let adjacency =
-            rmesh_raytrace::compute_tet_neighbors(&scene.indices, scene.tet_count as usize);
+        let empty_indices = pbr.map_or(&[][..], |p| p.empty_indices.as_slice());
+        let active_tets = scene.tet_count as usize;
+        let has_empty = !empty_indices.is_empty();
+        let bake_indices_cpu: Vec<u32> = if has_empty {
+            let mut v = Vec::with_capacity(scene.indices.len() + empty_indices.len());
+            v.extend_from_slice(&scene.indices);
+            v.extend_from_slice(empty_indices);
+            v
+        } else {
+            Vec::new()
+        };
+        let trace_indices: &[u32] = if has_empty {
+            &bake_indices_cpu
+        } else {
+            &scene.indices
+        };
+        let trace_tets = trace_indices.len() / 4;
+        let trace_adjacency = rmesh_raytrace::compute_tet_neighbors(trace_indices, trace_tets);
+        let adjacency: Vec<i32> = if has_empty {
+            let active_i32 = active_tets as i32;
+            trace_adjacency[..active_tets * 4]
+                .iter()
+                .map(|&nb| if nb < active_i32 { nb } else { -1 })
+                .collect()
+        } else {
+            trace_adjacency.clone()
+        };
         let nc = ((sh.degree + 1) * (sh.degree + 1)) as usize;
         let material: Vec<[f32; 4]> = (0..scene.tet_count as usize)
             .map(|i| {
@@ -141,17 +169,30 @@ impl DiffuseBake {
             })
             .collect();
         let mut anchor = vec![u32::MAX; scene.vertex_count as usize];
+        let mut anchor_density = vec![f32::INFINITY; scene.vertex_count as usize];
         let mut roughness = vec![[0.0f32; 2]; scene.vertex_count as usize];
         for (t, ids) in scene.indices.chunks_exact(4).enumerate() {
+            let d = scene.densities[t];
             for &v in ids {
                 let idx = v as usize;
-                if anchor[idx] == u32::MAX
-                    || scene.densities[t] < scene.densities[anchor[idx] as usize]
-                {
+                if d < anchor_density[idx] {
                     anchor[idx] = t as u32;
+                    anchor_density[idx] = d;
                 }
                 roughness[idx][0] += material[t][3];
                 roughness[idx][1] += 1.0;
+            }
+        }
+        // Empty tets have density 0 and complete the Delaunay hull. Using them
+        // as anchors starts surface shadow rays directly inside empty space.
+        for (e, ids) in empty_indices.chunks_exact(4).enumerate() {
+            let t = (active_tets + e) as u32;
+            for &v in ids {
+                let idx = v as usize;
+                if 0.0 < anchor_density[idx] {
+                    anchor[idx] = t;
+                    anchor_density[idx] = 0.0;
+                }
             }
         }
         // Morton order groups nearby shadow rays in each GPU workgroup. Keep
@@ -199,14 +240,24 @@ impl DiffuseBake {
         };
         // Re-entry from empty space only needs exposed faces, not every
         // internal face in the tetrahedralization.
-        let bvh = rmesh_raytrace::build_boundary_bvh_sah(&scene.vertices, &scene.indices, &adjacency, scene.tet_count as usize);
+        let bvh = rmesh_raytrace::build_boundary_bvh_sah(&scene.vertices, trace_indices, &trace_adjacency, trace_tets);
+        log::info!(
+            "Light bake BVH: {} boundary faces, {} nodes (trace_tets={})",
+            bvh.boundary_faces.len(),
+            bvh.nodes.len(),
+            trace_tets
+        );
         let mut packed = vec![bvh.nodes.len() as u32, 0, 0, 0];
         packed.extend_from_slice(bytemuck::cast_slice(&bvh.nodes));
         packed.extend_from_slice(&bvh.boundary_faces);
+        while packed.len() % 4 != 0 {
+            packed.push(0);
+        }
         let shadow_geometry = upload("bake_shadow_geometry", bytemuck::cast_slice(&packed));
         let shadow_epsilon = ((glam::Vec3::from_array(hi)-glam::Vec3::from_array(lo)).length()*1e-7).max(1e-7);
         let vertex_meta = upload("bake_vertex_meta", bytemuck::cast_slice(&meta));
-        let neighbors = upload("bake_neighbors", bytemuck::cast_slice(&adjacency));
+        let neighbors = upload("bake_neighbors", bytemuck::cast_slice(&trace_adjacency));
+        let bake_indices_buf = has_empty.then(|| upload("bake_indices", bytemuck::cast_slice(trace_indices)));
         let albedo = upload("bake_albedo", if energy { bytemuck::bytes_of(&[0f32;4]) } else { bytemuck::cast_slice(&material) });
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bake_params"),
@@ -283,10 +334,11 @@ impl DiffuseBake {
                 compilation_options: Default::default(),
                 cache: None,
             });
+            let trace_indices_ref = bake_indices_buf.as_ref().unwrap_or(&buffers.indices);
             let resources = [
                 &params,
                 &buffers.vertices,
-                &buffers.indices,
+                if entry == "bake" { trace_indices_ref } else { &buffers.indices },
                 &buffers.densities,
                 &neighbors,
                 &albedo,
@@ -324,7 +376,7 @@ impl DiffuseBake {
             params,
             pending,
             _irradiance: irradiance,
-            published_transport, published_snapshot, neighbors, shadow_geometry, adjacency, energy,
+            published_transport, published_snapshot, neighbors, shadow_geometry, vertex_meta, bake_indices_buf, bake_indices_cpu, adjacency, energy,
             cached: Vec::new(),
             offset: 0,
             count: scene.vertex_count,
@@ -479,7 +531,7 @@ mod tests {
         let scene=build_test_scene(vec![-1.,-1.,0., 1.,-1.,0., 0.,1.,0., 0.,0.,1.],vec![0,1,2,3],vec![0.],vec![0.;3]);
         let pbr=PbrData {roughness:vec![0.3],albedo:vec![0.5;3],energy_material:vec![0.3,0.4,0.4,0.4,0.0],
             energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-            geom_normals:vec![0.,0.,-1.].repeat(4),render_min_t:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+            geom_normals:vec![0.,0.,-1.].repeat(4),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
         let buffers=SceneBuffers::upload(&device,&queue,&scene);
         let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
         let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;3]},Some(&pbr),&buffers);
@@ -515,7 +567,7 @@ mod tests {
             let pbr=PbrData {roughness:vec![0.5;2],albedo:vec![1.;6],
                 energy_material:vec![0.5,0.04,0.04,0.04,0., 0.5,neighbor_f0,neighbor_f0,neighbor_f0,0.],
                 energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-                geom_normals:vec![0.,0.,normal_z].repeat(5),render_min_t:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+                geom_normals:vec![0.,0.,normal_z].repeat(5),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
             let buffers=SceneBuffers::upload(&device,&queue,&scene);
             let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
             let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;6]},Some(&pbr),&buffers);
@@ -539,7 +591,7 @@ mod tests {
         let scene=build_test_scene(vec![0.,0.,0., 1.,0.,0., 0.,1.,0., 0.,0.,1.],vec![0,1,2,3],vec![0.],vec![0.;3]);
         let pbr=PbrData {roughness:vec![0.04],albedo:vec![0.5;3],energy_material:vec![0.04,0.1,0.3,0.7,0.8],
             energy_lut:crate::energy::LUT.chunks_exact(4).map(bytemuck::pod_read_unaligned).collect(),
-            geom_normals:vec![0.,0.,1.].repeat(4),render_min_t:None,env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
+            geom_normals:vec![0.,0.,1.].repeat(4),render_min_t:None,empty_indices:vec![],env_feature:vec![],vertex_normals:vec![],tone_curve:vec![],metallic:vec![],f0_dielectric:vec![]};
         let buffers=SceneBuffers::upload(&device,&queue,&scene);
         let (material,_)=upload_material(&device,&queue,&scene,Some(&pbr),&buffers);
         let mut bake=LightBake::new(&device,&queue,&scene,&ShCoeffs{degree:0,coeffs:vec![0.;3]},Some(&pbr),&buffers);
@@ -793,14 +845,22 @@ impl LightBake {
         sh: &ShCoeffs, pbr: Option<&PbrData>, buffers: &SceneBuffers) -> Self {
         let inner=DiffuseBake::new(device,scene,sh,pbr,buffers);
         let forward=pbr.filter(|p|!p.energy_material.is_empty()).map(|p|
-            crate::energy_forward::EnergyForward::new(device,queue,scene,p,buffers,&inner.published_transport,&inner.published_snapshot,&inner.neighbors,&inner.shadow_geometry,&inner.adjacency));
+            crate::energy_forward::EnergyForward::new(
+                device,queue,scene,p,buffers,
+                &inner.published_transport,&inner.published_snapshot,
+                &inner.neighbors,&inner.shadow_geometry,&inner.vertex_meta,
+                inner.bake_indices_buf.as_ref().unwrap_or(&buffers.indices),
+                if inner.bake_indices_cpu.is_empty() { &scene.indices } else { &inner.bake_indices_cpu },
+                &inner.adjacency,
+            ));
         Self {inner,forward,generation:0}
     }
+    pub fn adjacency(&self) -> &[i32] { &self.inner.adjacency }
+    pub fn energy_radiance_buffer(&self) -> Option<&wgpu::Buffer> { self.forward.as_ref().map(|f| &f.radiance) }
     pub fn configure_interval(&self, device: &wgpu::Device,
         pipelines: &mut rmesh_render::ComputeIntervalPipelines) {
         if let Some(forward)=&self.forward {forward.configure(device,pipelines);return;}
-        pipelines.color_only_override = None;
-        pipelines.set_point_samples(device, false);
+        pipelines.clear_energy_interval(device);
     }
     /// Raw diffuse reflection cubemap array: six faces per probe (+X,-X,+Y,-Y,+Z,-Z).
     pub fn reflection_probe_positions(&self) -> Option<[[f32;3];5]> { self.forward.as_ref().map(|f| f.probe_positions()) }

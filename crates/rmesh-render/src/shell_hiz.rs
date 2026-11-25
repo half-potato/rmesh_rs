@@ -4,26 +4,40 @@
 //! where the win is — the sort is the single largest slice of the interval
 //! frame, and a fragment-level depth test does nothing to shrink it.
 //!
+//! Built with multi-mip compute passes (up to 4 mip levels per dispatch, staying
+//! within WebGPU's 4-storage-texture limit) instead of one render pass per mip.
+//!
 //! The reduction is `max`, not `min`: culling is only safe when a tet's nearest
 //! point is behind the *farthest* occluder anywhere in its screen footprint.
 //! Cleared texels stay at 1.0 and max() to 1.0, so any footprint touching
 //! background culls nothing.
-//!
-//! This is a deliberate near-duplicate of `rmesh-postprocess`'s Hi-Z. That one
-//! is built after the volume pass (and linearizes to view-space Z for SSGI/SSR),
-//! so it is both a frame late and the wrong reduction for this use. Crate order
-//! also forbids depending on it from here.
+
+use wgpu::util::DeviceExt;
 
 static SHELL_HIZ_WGSL: rmesh_util::HotShader = rmesh_util::hot_shader!("wgsl/shell_hiz_max.wgsl");
 
 pub struct ShellHiZPipelines {
-    pub init_pipeline: wgpu::RenderPipeline,
-    pub downsample_pipeline: wgpu::RenderPipeline,
+    pub init_pipeline: wgpu::ComputePipeline,
+    pub downsample_pipeline: wgpu::ComputePipeline,
+    pub tail_pipeline: wgpu::ComputePipeline,
     pub init_bgl: wgpu::BindGroupLayout,
     pub downsample_bgl: wgpu::BindGroupLayout,
 }
 
 const HIZ_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
+
+fn storage_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::StorageTexture {
+            access: wgpu::StorageTextureAccess::WriteOnly,
+            format: HIZ_FORMAT,
+            view_dimension: wgpu::TextureViewDimension::D2,
+        },
+        count: None,
+    }
+}
 
 impl ShellHiZPipelines {
     pub fn new(device: &wgpu::Device) -> Self {
@@ -32,32 +46,57 @@ impl ShellHiZPipelines {
             source: wgpu::ShaderSource::Wgsl(SHELL_HIZ_WGSL.as_str().into()),
         });
 
+        let uniform_entry = wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+
         let init_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shell_hiz_init_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Depth,
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                uniform_entry,
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                storage_tex_entry(2),
+                storage_tex_entry(3),
+                storage_tex_entry(4),
+                storage_tex_entry(5),
+            ],
         });
 
         let downsample_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shell_hiz_downsample_bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
+            entries: &[
+                uniform_entry,
+                storage_tex_entry(2),
+                storage_tex_entry(3),
+                storage_tex_entry(4),
+                storage_tex_entry(5),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+            ],
         });
 
         let make = |label: &str, bgl: &wgpu::BindGroupLayout, entry: &str| {
@@ -66,40 +105,41 @@ impl ShellHiZPipelines {
                 bind_group_layouts: &[bgl],
                 immediate_size: 0,
             });
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
+                module: &shader,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
                 },
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some(entry),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: HIZ_FORMAT,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
                 cache: None,
             })
         };
 
         Self {
-            init_pipeline: make("shell_hiz_init", &init_bgl, "fs_init"),
-            downsample_pipeline: make("shell_hiz_downsample", &downsample_bgl, "fs_downsample"),
+            init_pipeline: make("shell_hiz_init", &init_bgl, "cs_init"),
+            downsample_pipeline: make("shell_hiz_downsample", &downsample_bgl, "cs_downsample"),
+            tail_pipeline: make("shell_hiz_tail", &downsample_bgl, "cs_tail"),
             init_bgl,
             downsample_bgl,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HiZPassKind {
+    Init,
+    Downsample,
+    Tail,
+}
+
+struct HiZPass {
+    kind: HiZPassKind,
+    bg: wgpu::BindGroup,
+    dispatch: [u32; 3],
+    _params: wgpu::Buffer,
 }
 
 /// The pyramid itself, plus the bind groups that build it.
@@ -110,12 +150,15 @@ pub struct ShellHiZ {
     pub texture: wgpu::Texture,
     /// All-mips view. This is what `project_compute*` samples.
     pub full_view: wgpu::TextureView,
-    mip_views: Vec<wgpu::TextureView>,
-    init_bg: wgpu::BindGroup,
-    downsample_bgs: Vec<wgpu::BindGroup>,
+    _dummy_out: wgpu::Texture,
+    passes: Vec<HiZPass>,
     pub width: u32,
     pub height: u32,
     pub mip_count: u32,
+}
+
+fn mip_dim(base: u32, mip: u32) -> u32 {
+    (base >> mip).max(1)
 }
 
 impl ShellHiZ {
@@ -141,7 +184,7 @@ impl ShellHiZ {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: HIZ_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
 
@@ -161,35 +204,171 @@ impl ShellHiZ {
             })
             .collect();
 
-        let init_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("shell_hiz_init_bg"),
-            layout: &pipelines.init_bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(depth_view),
-            }],
+        // 1x1 dummy storage texture for unused output slots when a pass writes < 4 mips.
+        let dummy_out = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("shell_hiz_dummy_out"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: HIZ_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
         });
+        let dummy_out_view = dummy_out.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // downsample_bgs[i] reads mip i; the pass writes mip i+1.
-        let downsample_bgs: Vec<_> = (0..mip_count.saturating_sub(1))
-            .map(|mip| {
-                device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("shell_hiz_downsample_bg"),
-                    layout: &pipelines.downsample_bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&mip_views[mip as usize]),
-                    }],
-                })
+        let make_params = |src_w: u32, src_h: u32, levels: u32| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("shell_hiz_params"),
+                contents: bytemuck::cast_slice(&[src_w, src_h, levels, 0u32]),
+                usage: wgpu::BufferUsages::UNIFORM,
             })
-            .collect();
+        };
+
+        let mut passes = Vec::new();
+
+        // Pass 1: copy src_depth -> mip 0 and fuse up to 3 reductions while parent dims are even.
+        let mut init_levels = 1u32;
+        while init_levels < 4 && init_levels < mip_count {
+            let pw = mip_dim(width, init_levels - 1);
+            let ph = mip_dim(height, init_levels - 1);
+            if pw % 2 == 0 && ph % 2 == 0 {
+                init_levels += 1;
+            } else {
+                break;
+            }
+        }
+        let out_view = |mip: u32, count: u32| -> &wgpu::TextureView {
+            if mip < count {
+                &mip_views[mip as usize]
+            } else {
+                &dummy_out_view
+            }
+        };
+        {
+            let params_buf = make_params(width, height, init_levels);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shell_hiz_init_bg"),
+                layout: &pipelines.init_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(out_view(0, init_levels)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(out_view(1, init_levels)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(out_view(2, init_levels)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(out_view(3, init_levels)),
+                    },
+                ],
+            });
+            passes.push(HiZPass {
+                kind: HiZPassKind::Init,
+                bg,
+                dispatch: [width.div_ceil(16), height.div_ceil(16), 1],
+                _params: params_buf,
+            });
+        }
+
+        // Subsequent passes: reduce from `cur - 1` into `cur..cur+levels`.
+        let mut cur = init_levels;
+        while cur < mip_count {
+            let src_mip = cur - 1;
+            let sw = mip_dim(width, src_mip);
+            let sh = mip_dim(height, src_mip);
+            let d0w = mip_dim(width, cur);
+            let d0h = mip_dim(height, cur);
+            let remaining = mip_count - cur;
+
+            // Small mips fit in one 12 KB workgroup (tail_a[2048], tail_b[1024]),
+            // handling arbitrary odd borders across up to 4 levels in 1 workgroup.
+            let (kind, levels, dispatch) = if d0w * d0h <= 2048 && (d0w / 2).max(1) * (d0h / 2).max(1) <= 1024 {
+                (HiZPassKind::Tail, remaining.min(4), [1, 1, 1])
+            } else {
+                let mut k = 1u32;
+                if sw % 2 == 0 && sh % 2 == 0 {
+                    while k < 4 && k < remaining {
+                        let pw = mip_dim(width, cur + k - 1);
+                        let ph = mip_dim(height, cur + k - 1);
+                        if pw % 2 == 0 && ph % 2 == 0 {
+                            k += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                (
+                    HiZPassKind::Downsample,
+                    k,
+                    [d0w.div_ceil(8), d0h.div_ceil(8), 1],
+                )
+            };
+
+            let end_mip = cur + levels;
+            let params_buf = make_params(sw, sh, levels);
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("shell_hiz_downsample_bg"),
+                layout: &pipelines.downsample_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(out_view(cur, end_mip)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::TextureView(out_view(cur + 1, end_mip)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: wgpu::BindingResource::TextureView(out_view(cur + 2, end_mip)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: wgpu::BindingResource::TextureView(out_view(cur + 3, end_mip)),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: wgpu::BindingResource::TextureView(&mip_views[src_mip as usize]),
+                    },
+                ],
+            });
+            passes.push(HiZPass {
+                kind,
+                bg,
+                dispatch,
+                _params: params_buf,
+            });
+            cur = end_mip;
+        }
 
         Self {
             texture,
             full_view,
-            mip_views,
-            init_bg,
-            downsample_bgs,
+            _dummy_out: dummy_out,
+            passes,
             width,
             height,
             mip_count,
@@ -251,47 +430,18 @@ pub fn record_shell_hiz(
     pipelines: &ShellHiZPipelines,
     hiz: &ShellHiZ,
 ) {
-    // Clearing to 1.0 (the far plane) means any texel a pass fails to write
-    // culls nothing.
-    let clear = wgpu::Operations {
-        load: wgpu::LoadOp::Clear(wgpu::Color {
-            r: 1.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.0,
-        }),
-        store: wgpu::StoreOp::Store,
-    };
-
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shell_hiz_init"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &hiz.mip_views[0],
-                resolve_target: None,
-                ops: clear,
-                depth_slice: None,
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&pipelines.init_pipeline);
-        pass.set_bind_group(0, &hiz.init_bg, &[]);
-        pass.draw(0..3, 0..1);
-    }
-
-    for (i, bg) in hiz.downsample_bgs.iter().enumerate() {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("shell_hiz_downsample"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &hiz.mip_views[i + 1],
-                resolve_target: None,
-                ops: clear,
-                depth_slice: None,
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(&pipelines.downsample_pipeline);
-        pass.set_bind_group(0, bg, &[]);
-        pass.draw(0..3, 0..1);
+    let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: Some("shell_hiz"),
+        timestamp_writes: None,
+    });
+    for p in &hiz.passes {
+        let pipeline = match p.kind {
+            HiZPassKind::Init => &pipelines.init_pipeline,
+            HiZPassKind::Downsample => &pipelines.downsample_pipeline,
+            HiZPassKind::Tail => &pipelines.tail_pipeline,
+        };
+        cpass.set_pipeline(pipeline);
+        cpass.set_bind_group(0, &p.bg, &[]);
+        cpass.dispatch_workgroups(p.dispatch[0], p.dispatch[1], p.dispatch[2]);
     }
 }

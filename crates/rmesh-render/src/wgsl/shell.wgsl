@@ -203,7 +203,7 @@ struct VsOut {
     /// feeding it to the deferred pass as albedo double-counts lighting and
     /// blows the shell out to white — so `fs_main` prefers `aux_data` when it
     /// exists, exactly as `interval_fragment.wgsl` does.
-    @location(0) @interpolate(flat) sh_color: vec3<f32>,
+    @location(0) sh_color: vec3<f32>,
     @location(1) view_depth: f32,
     /// Interpolated learned vertex normal. These are gradient-like (they point
     /// *into* the density, same as the volume path's `field_gradient`), so the
@@ -278,8 +278,9 @@ fn shell_vertex(vid: u32) -> VsOut {
 
     var p = pa;
     var vn_idx = ia;
-    if (corner == 1u) { p = pb; vn_idx = ib; }
-    else if (corner == 2u) { p = pc; vn_idx = ic; }
+    var face_corner = face.x;
+    if (corner == 1u) { p = pb; vn_idx = ib; face_corner = face.y; }
+    else if (corner == 2u) { p = pc; vn_idx = ic; face_corner = face.z; }
 
     let vp = mat4x4<f32>(view.vp_col0, view.vp_col1, view.vp_col2, view.vp_col3);
     let clip = vp * vec4<f32>(p, 1.0);
@@ -405,12 +406,79 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 struct PreparedVertex { position: vec4f, color: vec4f }
 @group(1) @binding(0) var<storage, read_write> prepared_vertices: array<PreparedVertex>;
 
+fn eval_corner_color(tet_id: u32, face_corner: u32, dir: vec3<f32>, at: vec3<f32>, centroid: vec3<f32>) -> vec3<f32> {
+    return eval_sh_color(tet_id, dir, at, centroid);
+}
+
 @compute @workgroup_size(64)
 fn prepare_color(@builtin(global_invocation_id) id: vec3u) {
-    let vid = id.x + id.y * 65535u * 64u;
-    if (vid >= u32(view.params.x) * 3u) { return; }
-    let vertex = shell_vertex(vid);
-    prepared_vertices[vid] = PreparedVertex(vertex.pos, vec4f(vertex.sh_color, 1.0));
+    let tri = id.x + id.y * 65535u * 64u;
+    if (tri >= u32(view.params.x)) { return; }
+    let out_base = tri * 3u;
+    let degen = PreparedVertex(vec4f(0.0, 0.0, 0.0, 1.0), vec4f(0.0));
+
+    let packed = shell_faces[tri];
+    let tet_id = packed >> 2u;
+    let face = TET_FACES[packed & 3u];
+
+    let base = tet_id * 4u;
+    let pa = load_vertex(indices[base + face.x]);
+    let pb = load_vertex(indices[base + face.y]);
+    let pc = load_vertex(indices[base + face.z]);
+    let popp = load_vertex(indices[base + face.w]);
+
+    let n_raw = cross(pb - pa, pc - pa);
+    let n_len = length(n_raw);
+    if (n_len < 1e-12) {
+        prepared_vertices[out_base] = degen;
+        prepared_vertices[out_base + 1u] = degen;
+        prepared_vertices[out_base + 2u] = degen;
+        return;
+    }
+
+    let center = (pa + pb + pc) * (1.0 / 3.0);
+    var outward = n_raw / n_len;
+    if (dot(outward, center - popp) < 0.0) {
+        outward = -outward;
+    }
+    let facing = dot(outward, center - view.eye.xyz);
+    let want_entry = view.params.w > 0.5;
+    if (select(facing <= 0.0, facing >= 0.0, want_entry)) {
+        prepared_vertices[out_base] = degen;
+        prepared_vertices[out_base + 1u] = degen;
+        prepared_vertices[out_base + 2u] = degen;
+        return;
+    }
+
+    let vp = mat4x4<f32>(view.vp_col0, view.vp_col1, view.vp_col2, view.vp_col3);
+    let ca = vp * vec4<f32>(pa, 1.0);
+    let cb = vp * vec4<f32>(pb, 1.0);
+    let cc = vp * vec4<f32>(pc, 1.0);
+
+    // Quick behind-camera / off-frustum reject (all 3 verts outside same clip plane).
+    if ((ca.w <= 0.0 && cb.w <= 0.0 && cc.w <= 0.0)
+        || (ca.x < -ca.w && cb.x < -cb.w && cc.x < -cc.w)
+        || (ca.x > ca.w && cb.x > cb.w && cc.x > cc.w)
+        || (ca.y < -ca.w && cb.y < -cb.w && cc.y < -cc.w)
+        || (ca.y > ca.w && cb.y > cb.w && cc.y > cc.w)
+        || (ca.z > ca.w && cb.z > cb.w && cc.z > cc.w)) {
+        prepared_vertices[out_base] = degen;
+        prepared_vertices[out_base + 1u] = degen;
+        prepared_vertices[out_base + 2u] = degen;
+        return;
+    }
+
+    let raw_dir = center - view.eye.xyz;
+    let dir_len = length(raw_dir);
+    let dir = select(vec3<f32>(0.0), raw_dir / dir_len, dir_len > 0.0);
+    let centroid = (pa + pb + pc + popp) * 0.25;
+
+    let col_a = eval_corner_color(tet_id, face.x, dir, center, centroid);
+    let col_b = eval_corner_color(tet_id, face.y, dir, center, centroid);
+    let col_c = eval_corner_color(tet_id, face.z, dir, center, centroid);
+    prepared_vertices[out_base] = PreparedVertex(ca, vec4f(col_a, 1.0));
+    prepared_vertices[out_base + 1u] = PreparedVertex(cb, vec4f(col_b, 1.0));
+    prepared_vertices[out_base + 2u] = PreparedVertex(cc, vec4f(col_c, 1.0));
 }
 
 @vertex

@@ -211,8 +211,15 @@ impl ShellBuffers {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellMode {
+    Sh,
+    Baked,
+    Energy,
+}
+
 pub struct ShellPipeline {
-    baked: bool,
+    mode: ShellMode,
     prepare_color: Option<wgpu::ComputePipeline>,
     pub color_pipeline: wgpu::RenderPipeline,
     pub mrt_pipeline: wgpu::RenderPipeline,
@@ -232,23 +239,45 @@ impl ShellPipeline {
         dsm_format: wgpu::TextureFormat,
         depth_format: wgpu::TextureFormat,
     ) -> Self {
-        Self::new_internal(device, formats, dsm_format, depth_format, false)
+        Self::new_internal(device, formats, dsm_format, depth_format, ShellMode::Sh)
     }
     pub fn new_baked(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats,
         dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat) -> Self {
-        Self::new_internal(device, formats, dsm_format, depth_format, true)
+        Self::new_internal(device, formats, dsm_format, depth_format, ShellMode::Baked)
+    }
+    /// Density shell shading from packed cell-corner energy radiance (4 corners per tet).
+    pub fn new_energy(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats,
+        dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat) -> Self {
+        Self::new_internal(device, formats, dsm_format, depth_format, ShellMode::Energy)
     }
     fn new_internal(device: &wgpu::Device, formats: rmesh_util::shared::GBufferFormats,
-        dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, baked: bool) -> Self {
+        dsm_format: wgpu::TextureFormat, depth_format: wgpu::TextureFormat, mode: ShellMode) -> Self {
+        let omit_sh = mode != ShellMode::Sh;
         let mut source=SHELL_WGSL.to_string();
-        if baked {
+        if omit_sh {
             source=source.lines().filter(|l| !l.contains("@binding(6)") && !l.contains("@binding(7)")).collect::<Vec<_>>().join("\n");
             let start=source.find("fn read_sh_f16").unwrap();
             let end=source[start..].find("fn load_vertex").unwrap()+start;
             source.replace_range(start..end, "");
             let start=source.find("fn eval_sh_color").unwrap();
             let end=source[start..].find("struct VsOut").unwrap()+start;
-            source.replace_range(start..end, "fn eval_sh_color(tet_id:u32, dir:vec3<f32>, at:vec3<f32>, centroid:vec3<f32>) -> vec3<f32> { return vec3<f32>(base_colors_buf[tet_id*3u],base_colors_buf[tet_id*3u+1u],base_colors_buf[tet_id*3u+2u]); }\n");
+            if mode == ShellMode::Energy {
+                source.replace_range(start..end, "fn eval_energy_corner(tet_id:u32, face_corner:u32) -> vec3<f32> { let b = tet_id * 4u; let p = base_colors_buf[b + face_corner]; let c = vec3<f32>(unpack2x16float(p.x), unpack2x16float(p.y).x); if (c.x + c.y + c.z > 0.0) { return c; } var sum = vec3<f32>(0.0); var n = 0.0; for (var k = 0u; k < 4u; k++) { let q = base_colors_buf[b + k]; let ck = vec3<f32>(unpack2x16float(q.x), unpack2x16float(q.y).x); if (ck.x + ck.y + ck.z > 0.0) { sum += ck; n += 1.0; } } return select(vec3<f32>(0.0), sum / n, n > 0.0); }\n");
+                source = source.replace(
+                    "@group(0) @binding(9) var<storage, read> base_colors_buf: array<f32>;",
+                    "@group(0) @binding(9) var<storage, read> base_colors_buf: array<vec2<u32>>;",
+                );
+                source = source.replace(
+                    "out.sh_color = eval_sh_color(tet_id, dir, center, centroid);",
+                    "out.sh_color = eval_energy_corner(tet_id, face_corner);",
+                );
+                source = source.replace(
+                    "return eval_sh_color(tet_id, dir, at, centroid);",
+                    "return eval_energy_corner(tet_id, face_corner);",
+                );
+            } else {
+                source.replace_range(start..end, "fn eval_sh_color(tet_id:u32, dir:vec3<f32>, at:vec3<f32>, centroid:vec3<f32>) -> vec3<f32> { return vec3<f32>(base_colors_buf[tet_id*3u],base_colors_buf[tet_id*3u+1u],base_colors_buf[tet_id*3u+2u]); }\n");
+            }
         }
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shell.wgsl"),
@@ -270,7 +299,7 @@ impl ShellPipeline {
             count: None,
         }];
         for binding in 1..=9u32 {
-            if baked && [6,7].contains(&binding) { continue; }
+            if omit_sh && [6,7].contains(&binding) { continue; }
             entries.push(wgpu::BindGroupLayoutEntry {
                 binding,
                 visibility: wgpu::ShaderStages::VERTEX
@@ -479,7 +508,7 @@ impl ShellPipeline {
         });
 
         Self {
-            baked,
+            mode,
             prepare_color,
             color_pipeline,
             mrt_pipeline,
@@ -493,7 +522,7 @@ impl ShellPipeline {
 ///
 /// Bindings: 0 = shell view (uniform), 1 = uniforms, 2 = vertices, 3 = indices,
 /// 4 = shell faces, 5 = vertex normals, 6 = sh coeffs, 7 = color grads,
-/// 8 = aux data, 9 = base colors.
+/// 8 = aux data, 9 = base colors (or packed corner radiance in energy mode).
 #[allow(clippy::too_many_arguments)]
 pub fn create_shell_bind_group(
     device: &wgpu::Device,
@@ -504,7 +533,54 @@ pub fn create_shell_bind_group(
     sh_coeffs: &wgpu::Buffer,
     aux_data: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
+    create_shell_bind_group_with_colors(
+        device,
+        pipeline,
+        shell,
+        buffers,
+        &material.base_colors,
+        &material.color_grads,
+        sh_coeffs,
+        aux_data,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_energy_shell_bind_group(
+    device: &wgpu::Device,
+    pipeline: &ShellPipeline,
+    shell: &ShellBuffers,
+    buffers: &rmesh_data::SceneBuffers,
+    corner_radiance: &wgpu::Buffer,
+    material: &rmesh_data::MaterialBuffers,
+    sh_coeffs: &wgpu::Buffer,
+    aux_data: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    create_shell_bind_group_with_colors(
+        device,
+        pipeline,
+        shell,
+        buffers,
+        corner_radiance,
+        &material.color_grads,
+        sh_coeffs,
+        aux_data,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_shell_bind_group_with_colors(
+    device: &wgpu::Device,
+    pipeline: &ShellPipeline,
+    shell: &ShellBuffers,
+    buffers: &rmesh_data::SceneBuffers,
+    base_colors: &wgpu::Buffer,
+    color_grads: &wgpu::Buffer,
+    sh_coeffs: &wgpu::Buffer,
+    aux_data: &wgpu::Buffer,
+) -> wgpu::BindGroup {
     use rmesh_util::gpu_helpers::buf_entry;
+    let omit_sh = pipeline.mode != ShellMode::Sh;
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shell_bg"),
         layout: &pipeline.bg_layout,
@@ -519,10 +595,10 @@ pub fn create_shell_bind_group(
             buf_entry(4, &shell.faces),
             buf_entry(5, &buffers.vertex_normals),
             buf_entry(6, sh_coeffs),
-            buf_entry(7, &material.color_grads),
+            buf_entry(7, color_grads),
             buf_entry(8, aux_data),
-            buf_entry(9, &material.base_colors),
-        ].into_iter().filter(|e| !pipeline.baked || ![6,7].contains(&e.binding)).collect::<Vec<_>>(),
+            buf_entry(9, base_colors),
+        ].into_iter().filter(|e| !omit_sh || ![6,7].contains(&e.binding)).collect::<Vec<_>>(),
     })
 }
 
@@ -610,7 +686,7 @@ pub fn record_shell_color_pass(
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_bind_group(1, &shell.prepared_bg, &[]);
-        let groups = shell.vertex_count().div_ceil(64);
+        let groups = shell.face_count.div_ceil(64);
         pass.dispatch_workgroups(groups.min(65535), groups.div_ceil(65535), 1);
     }
 

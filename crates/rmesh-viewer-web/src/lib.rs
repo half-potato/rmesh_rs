@@ -117,6 +117,7 @@ pub struct WebViewer {
     staging_belt: wgpu::util::StagingBelt,
     blit_pipeline: BlitPipeline,
     shell_pipeline: rmesh_render::ShellPipeline,
+    energy_shell_pipeline: rmesh_render::ShellPipeline,
     shell_enabled: bool,
     importance_enabled: bool,
     importance_threshold: f32,
@@ -299,6 +300,12 @@ impl WebViewer {
                 wgpu::TextureFormat::Rgba16Float,
                 wgpu::TextureFormat::Depth32Float,
             ),
+            energy_shell_pipeline: rmesh_render::ShellPipeline::new_energy(
+                &device,
+                formats,
+                wgpu::TextureFormat::Rgba16Float,
+                wgpu::TextureFormat::Depth32Float,
+            ),
             shell_enabled: true,
             importance_enabled: true,
             importance_threshold: 0.01,
@@ -393,9 +400,8 @@ impl WebViewer {
     /// Render one frame. JS calls this from `requestAnimationFrame`.
     pub fn render(&mut self) -> Result<(), JsValue> {
         self.poll_vertex_grab()?;
-        let shell_enabled = self.show_scene && self.shell_enabled && self.vertex_grab.is_none()
-            && !self.scene.as_ref().is_some_and(|s|s.light_bake.uses_energy());
-        if self.scene.as_ref().is_some_and(|s|s.light_bake.uses_energy()) {self.render_mode=WebRenderMode::Interval;self.shell_only=false;}
+        let shell_enabled = self.show_scene && self.shell_enabled && self.vertex_grab.is_none();
+        if self.scene.as_ref().is_some_and(|s|s.light_bake.uses_energy()) {self.render_mode=WebRenderMode::Interval;}
         // Mutable borrow — CPU sort mutates `scene.cpu_sorter`.
         let scene = match self.scene.as_mut() {
             Some(s) => s,
@@ -483,7 +489,9 @@ impl WebViewer {
             shell_cull_flags: u32::from(
                 shell_enabled && self.shell_cull && self.use_gpu_sort && scene.shell.face_count > 0,
             ) | if self.vertex_grab.is_some() { 2 } else { 0 }
-                | if self.use_gpu_sort && self.sort_bits == 16 { 4 } else { 0 },
+                | if self.use_gpu_sort && self.sort_bits == 16 { 4 } else { 0 }
+                | if scene.light_bake.uses_energy() { 16 } else { 0 }
+                | if shell_enabled || self.importance_enabled { 32 } else { 0 },
         };
 
         self.queue
@@ -596,9 +604,14 @@ impl WebViewer {
                 vp.to_cols_array_2d(),
                 self.camera.position.to_array(),
             );
+            let shell_pipe = if scene.light_bake.uses_energy() {
+                &self.energy_shell_pipeline
+            } else {
+                &self.shell_pipeline
+            };
             rmesh_render::record_shell_color_pass(
                 &mut encoder2,
-                &self.shell_pipeline,
+                shell_pipe,
                 &scene.shell_bg,
                 &scene.shell,
                 &self.targets.color_view,
@@ -1543,15 +1556,28 @@ impl WebViewer {
                     contents: bytemuck::bytes_of(&0u32),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
-            scene.shell_bg = rmesh_render::create_shell_bind_group(
-                &self.device,
-                &self.shell_pipeline,
-                &scene.shell,
-                &scene.buffers,
-                &scene.material,
-                &scene.sh_coeffs_buf,
-                &aux,
-            );
+            scene.shell_bg = if let Some(radiance) = scene.light_bake.energy_radiance_buffer() {
+                rmesh_render::create_energy_shell_bind_group(
+                    &self.device,
+                    &self.energy_shell_pipeline,
+                    &scene.shell,
+                    &scene.buffers,
+                    radiance,
+                    &scene.material,
+                    &scene.sh_coeffs_buf,
+                    &aux,
+                )
+            } else {
+                rmesh_render::create_shell_bind_group(
+                    &self.device,
+                    &self.shell_pipeline,
+                    &scene.shell,
+                    &scene.buffers,
+                    &scene.material,
+                    &scene.sh_coeffs_buf,
+                    &aux,
+                )
+            };
             scene.importance_kept = scene.importance_mask.iter().map(|v| v.count_ones()).sum();
             scene.opacity = opacity;
             scene.max_od = max_od;
@@ -1587,15 +1613,28 @@ impl WebViewer {
                     contents: bytemuck::bytes_of(&0u32),
                     usage: wgpu::BufferUsages::STORAGE,
                 });
-            scene.shell_bg = rmesh_render::create_shell_bind_group(
-                &self.device,
-                &self.shell_pipeline,
-                &scene.shell,
-                &scene.buffers,
-                &scene.material,
-                &scene.sh_coeffs_buf,
-                &aux,
-            );
+            scene.shell_bg = if let Some(radiance) = scene.light_bake.energy_radiance_buffer() {
+                rmesh_render::create_energy_shell_bind_group(
+                    &self.device,
+                    &self.energy_shell_pipeline,
+                    &scene.shell,
+                    &scene.buffers,
+                    radiance,
+                    &scene.material,
+                    &scene.sh_coeffs_buf,
+                    &aux,
+                )
+            } else {
+                rmesh_render::create_shell_bind_group(
+                    &self.device,
+                    &self.shell_pipeline,
+                    &scene.shell,
+                    &scene.buffers,
+                    &scene.material,
+                    &scene.sh_coeffs_buf,
+                    &aux,
+                )
+            };
         }
     }
 
@@ -1723,8 +1762,7 @@ impl WebViewer {
             &scene_data.densities,
             tet_count as usize,
         );
-        let neighbors =
-            rmesh_raytrace::compute_tet_neighbors(&scene_data.indices, tet_count as usize);
+        let neighbors = light_bake.adjacency().to_vec();
         let max_od = rmesh_viewer_core::importance::tet_max_od(
             &scene_data.vertices,
             &scene_data.indices,
@@ -1767,15 +1805,28 @@ impl WebViewer {
                 contents: bytemuck::bytes_of(&0u32),
                 usage: wgpu::BufferUsages::STORAGE,
             });
-        let shell_bg = rmesh_render::create_shell_bind_group(
-            &self.device,
-            &self.shell_pipeline,
-            &shell,
-            &buffers,
-            &material,
-            &sh_coeffs_buf,
-            &aux_stub,
-        );
+        let shell_bg = if let Some(radiance) = light_bake.energy_radiance_buffer() {
+            rmesh_render::create_energy_shell_bind_group(
+                &self.device,
+                &self.energy_shell_pipeline,
+                &shell,
+                &buffers,
+                radiance,
+                &material,
+                &sh_coeffs_buf,
+                &aux_stub,
+            )
+        } else {
+            rmesh_render::create_shell_bind_group(
+                &self.device,
+                &self.shell_pipeline,
+                &shell,
+                &buffers,
+                &material,
+                &sh_coeffs_buf,
+                &aux_stub,
+            )
+        };
 
         // The unused tile-projection fallback gets a far-plane stub; the active
         // HW projection below samples the live shell pyramid.

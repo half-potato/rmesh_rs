@@ -1,11 +1,12 @@
 // DeviceRadixSort — Scan kernel (WGE16 path only)
 // Ported from b0nes164/GPUSorting (MIT, Thomas Smith 2024)
 //
-// Each workgroup scans one digit's partition-level counts in b_passHist.
-// Dispatched with RADIX (256) workgroups.
+// Scans only [0, effectiveTB) per digit (using config.threadBlocks as row stride),
+// eliminating both passHist clearing and dead-partition scans.
 
 const SCAN_DIM: u32 = 128u;
 const RADIX: u32 = 256u;
+const PART_SIZE: u32 = 2048u;
 
 struct Config {
     numKeys: u32,
@@ -18,8 +19,6 @@ struct Config {
 @group(0) @binding(1) var<storage, read_write> b_passHist: array<u32>;
 
 var<workgroup> g_scan: array<u32, 128>;
-var<private> subgroup_size_p: u32;
-var<private> subgroup_invocation_id_p: u32;
 
 @compute
 @workgroup_size(128, 1, 1)
@@ -29,17 +28,20 @@ fn main(
     @builtin(subgroup_size) sg_size: u32,
     @builtin(subgroup_invocation_id) sg_id: u32,
 ) {
-    subgroup_size_p = sg_size;
-    subgroup_invocation_id_p = sg_id;
     let gtid = local_id.x;
     let gid = wid.x; // one workgroup per digit (0..255)
 
-    let laneCount = subgroup_size_p;
+    let effectiveTB = min((config.numKeys + PART_SIZE - 1u) / PART_SIZE, config.threadBlocks);
+    if effectiveTB == 0u {
+        return;
+    }
+
+    let laneCount = sg_size;
     let laneMask = laneCount - 1u;
-    let circularLaneShift = (subgroup_invocation_id_p + 1u) & laneMask;
+    let circularLaneShift = (sg_id + 1u) & laneMask;
 
     var reduction = 0u;
-    let partitionsEnd = (config.threadBlocks / SCAN_DIM) * SCAN_DIM;
+    let partitionsEnd = (effectiveTB / SCAN_DIM) * SCAN_DIM;
     let deviceOffset = gid * config.threadBlocks;
 
     // Full partitions
@@ -56,7 +58,7 @@ fn main(
 
         let i = k + gtid;
         let index = circularLaneShift + (i & ~laneMask);
-        let val = select(g_scan[gtid], 0u, subgroup_invocation_id_p == laneMask);
+        let val = select(g_scan[gtid], 0u, sg_id == laneMask);
         var prev = 0u;
         if gtid >= laneCount {
             prev = subgroupShuffle(g_scan[gtid - 1u], 0u);
@@ -68,11 +70,10 @@ fn main(
     }
 
     // Partial partition (remainder)
-    let remainder = config.threadBlocks - partitionsEnd;
+    let remainder = effectiveTB - partitionsEnd;
     if remainder > 0u {
-        let i_local = gtid;
-        if i_local < remainder {
-            g_scan[gtid] = b_passHist[partitionsEnd + i_local + deviceOffset];
+        if gtid < remainder {
+            g_scan[gtid] = b_passHist[partitionsEnd + gtid + deviceOffset];
         } else {
             g_scan[gtid] = 0u;
         }
@@ -87,8 +88,8 @@ fn main(
 
         let i = partitionsEnd + gtid;
         let index = circularLaneShift + (i & ~laneMask);
-        if index < config.threadBlocks {
-            let val = select(g_scan[gtid], 0u, subgroup_invocation_id_p == laneMask);
+        if index < effectiveTB {
+            let val = select(g_scan[gtid], 0u, sg_id == laneMask);
             var prev = 0u;
             if gtid >= laneCount {
                 prev = subgroupShuffle(g_scan[(gtid & ~laneMask) - 1u], 0u);

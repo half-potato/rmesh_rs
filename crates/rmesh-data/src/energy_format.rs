@@ -9,6 +9,7 @@ pub struct EnergyData {
     pub geom_normals: Vec<f32>,
     pub lut: Vec<f32>,
     pub min_t: f32,
+    pub empty_indices: Vec<u32>,
 }
 struct Section<'a> {
     dtype: u32,
@@ -177,12 +178,31 @@ pub fn parse(data: &[u8], offset: usize, nv: usize, nt: usize) -> Result<Option<
             retro[i],
         ]);
     }
+    let empty_indices = if let Some(s) = sections.get("empty_indices") {
+        ensure!(
+            s.dtype == 3 && s.shape.len() == 2 && s.shape[1] == 4,
+            "Invalid dtype/shape for empty_indices"
+        );
+        let idx: Vec<u32> = s
+            .bytes
+            .chunks_exact(4)
+            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        ensure!(
+            idx.iter().all(|&i| (i as usize) < nv),
+            "Invalid vertex index in empty_indices"
+        );
+        idx
+    } else {
+        Vec::new()
+    };
     Ok(Some(EnergyData {
         density,
         material,
         geom_normals,
         lut,
         min_t: near[1],
+        empty_indices,
     }))
 }
 

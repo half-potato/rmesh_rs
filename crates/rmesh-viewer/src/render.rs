@@ -225,10 +225,11 @@ impl App {
                 let px = (gpu.surface_config.width as f64) * (gpu.surface_config.height as f64);
                 let frags = gpu.frag_invocations as f64;
                 log::info!(
-                    "[pp {}x{} fps={:.1}] frags={:.1}M ({:.1}/px, {:.1} Gfrag/s) | geom {:.2}ms (proj {:.2} sort {:.2} gen {:.2} raster {:.2}) | chain {:.3}ms = {}",
+                    "[pp {}x{} fps={:.1}] vis={} frags={:.1}M ({:.1}/px, {:.1} Gfrag/s) | geom {:.2}ms (proj {:.2} sort {:.2} gen {:.2} raster {:.2}) | chain {:.3}ms = {}",
                     gpu.surface_config.width,
                     gpu.surface_config.height,
                     fps,
+                    gpu.visible_instance_count,
                     frags / 1.0e6,
                     frags / px.max(1.0),
                     frags / (t.render_ms.max(1.0e-6) as f64 * 1.0e-3) / 1.0e9,
@@ -362,7 +363,10 @@ impl App {
             // (the egui frame runs after this upload). Harmless either way: the
             // pyramid is cleared to the far plane, so a stale-but-set flag finds
             // no occluder rather than an invalid one.
-            shell_cull_flags: u32::from(self.shell_system.cull_active() && !gpu.light_bake.uses_energy()),
+            shell_cull_flags: u32::from(self.shell_system.cull_active())
+                | if matches!(self.sort_mode, SortMode::Gpu16) { 4 } else { 0 }
+                | if gpu.light_bake.uses_energy() { 16 } else { 0 }
+                | if self.shell_system.enabled || self.shell_system.importance_enabled { 32 } else { 0 },
         };
 
         gpu.queue
@@ -415,6 +419,7 @@ impl App {
         let mut add_shadow_test_scene = false;
         let mut shoot_flare = false;
         let mut clear_flares = false;
+        let mut flare_intensity = self.flare_system.intensity;
         let mut density_threshold = self.flare_system.density_threshold;
         let mut show_collision_mesh = self.flare_system.show_collision_mesh;
         let mut shell_enabled = self.shell_system.enabled;
@@ -435,7 +440,10 @@ impl App {
         let bake_was_ready = gpu.light_bake.ready();
         let mut light_edits: Vec<_> = self.primitives.iter().enumerate()
             .filter(|(_, p)| matches!(p.kind, PrimitiveKind::PointLight | PrimitiveKind::SpotLight))
-            .map(|(i, p)| (i, p.transform.position, p.color.unwrap_or([1.0, 1.0, 1.0, 3.0])))
+            .map(|(i, p)| {
+                let color = p.color.unwrap_or([1.0, 1.0, 1.0, 3.0]);
+                (i, self.flare_system.is_flare_primitive(i), p.transform.position, color, color[3])
+            })
             .collect();
         let primitives_ref = &self.primitives;
         let mut quality_pick: Option<crate::QualityPreset> = None;
@@ -520,7 +528,7 @@ impl App {
                         ui.checkbox(&mut show_collision_mesh, format!("Show Collision Mesh ({})", collision_tri_count));
                         ui.separator();
                         ui.label("Density Shell");
-                        ui.add_enabled(!gpu.light_bake.uses_energy(), egui::Checkbox::new(&mut shell_enabled, "Enable Shell"));
+                        ui.checkbox(&mut shell_enabled, "Enable Shell");
                         ui.add_enabled_ui(shell_enabled, |ui| {
                             // An opacity in [0, 1] -- the alpha one tet
                             // contributes to a crossing ray -- so the range is
@@ -684,11 +692,12 @@ impl App {
                             clear_flares = true;
                         }
                 });
+                ui.add(egui::Slider::new(&mut flare_intensity, 0.1..=1.0).text("Torch Intensity"));
                 ui.separator();
                 ui.heading("Lighting");
                 if gpu.light_bake.ready() { ui.label("Baked · ambient off"); }
                 else { ui.add(egui::ProgressBar::new(gpu.light_bake.progress()).text("Baking lighting")); }
-                for (i, position, color) in &mut light_edits {
+                for (i, is_flare, position, color, _) in &mut light_edits {
                     ui.label(&primitives_ref[*i].name);
                     ui.horizontal(|ui| {
                         for (label, value) in [("X", &mut position.x), ("Y", &mut position.y), ("Z", &mut position.z)] {
@@ -698,7 +707,16 @@ impl App {
                     let mut rgb = [color[0], color[1], color[2]];
                     ui.color_edit_button_rgb(&mut rgb);
                     color[..3].copy_from_slice(&rgb);
-                    ui.add(egui::Slider::new(&mut color[3], 0.0..=100.0).text("Intensity"));
+                    if *is_flare {
+                        ui.add(egui::Slider::new(&mut color[3], 0.0..=1.0).text("Intensity"));
+                    } else {
+                        ui.add(
+                            egui::Slider::new(&mut color[3], 0.0..=100.0)
+                                .logarithmic(true)
+                                .smallest_positive(0.01)
+                                .text("Intensity"),
+                        );
+                    }
                 }
                 ui.separator();
                 for (i, prim) in primitives_ref.iter().enumerate() {
@@ -889,13 +907,19 @@ impl App {
         self.render_mode = render_mode;
         self.use_mesh_shader = use_mesh_shader;
         self.show_primitives = show_primitives;
-        for (i, position, color) in light_edits {
+        for (i, is_flare, position, color, orig_intensity) in light_edits {
             self.primitives[i].transform.position = position;
             self.primitives[i].color = Some(color);
+            if is_flare && (color[3] - orig_intensity).abs() > 1e-6 {
+                self.flare_system.set_primitive_intensity(i, color[3]);
+            }
         }
         self.show_scene = show_scene;
         self.sort_mode = sort_mode;
         self.pbd_radius = pbd_radius;
+        if (flare_intensity - self.flare_system.intensity).abs() > 1e-6 {
+            self.flare_system.set_intensity(flare_intensity);
+        }
         self.flare_system.density_threshold = density_threshold;
         self.flare_system.show_collision_mesh = show_collision_mesh;
 
@@ -924,8 +948,6 @@ impl App {
         if gpu.light_bake.uses_energy() {
             self.render_mode = RenderMode::IntervalShader;
             self.use_mesh_shader = false;
-            self.shell_system.enabled = false;
-            self.shell_system.show_only = false;
         }
 
         // Density shell: kick off a background extraction if the threshold moved,
@@ -946,6 +968,7 @@ impl App {
                 &gpu.material_buffers,
                 &gpu.sh_coeffs_buf,
                 gpu.aux_data_buf.as_ref(),
+                gpu.light_bake.energy_radiance_buffer(),
             );
             gpu.shell_bg = bg;
         }

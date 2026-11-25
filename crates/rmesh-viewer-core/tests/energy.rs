@@ -161,6 +161,7 @@ fn disconnected_occluder_blocks_diffuse_baker() {
                 .collect(),
             geom_normals: vec![0., 0., -1.].repeat(8),
             render_min_t: None,
+            empty_indices: vec![],
             roughness: vec![0.4; 2],
             env_feature: vec![],
             vertex_normals: vec![0., 0., -1.].repeat(8),

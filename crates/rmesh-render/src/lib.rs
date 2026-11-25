@@ -43,8 +43,8 @@ pub mod shell;
 pub mod shell_hiz;
 
 pub use shell::{
-    create_shell_bind_group, record_shell_color_pass, record_shell_dsm_pass, record_shell_pass,
-    ShellBuffers, ShellFace, ShellPipeline, ShellView,
+    create_energy_shell_bind_group, create_shell_bind_group, record_shell_color_pass,
+    record_shell_dsm_pass, record_shell_pass, ShellBuffers, ShellFace, ShellPipeline, ShellView,
 };
 pub use overdraw::{
     record_overdraw_count, record_overdraw_viz, OverdrawPipelines, OverdrawTarget, OverdrawView,
@@ -77,6 +77,8 @@ static INTERVAL_FRAGMENT_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_fragment.wgsl");
 static INTERVAL_COMPUTE_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_compute.wgsl");
+static INTERVAL_COMPUTE_ENERGY_WGSL: rmesh_util::HotShader =
+    rmesh_util::hot_shader!("wgsl/interval_compute_energy.wgsl");
 static INTERVAL_VERTEX_WGSL: rmesh_util::HotShader =
     rmesh_util::hot_shader!("wgsl/interval_vertex.wgsl");
 static INTERVAL_INDIRECT_CONVERT_WGSL: rmesh_util::HotShader =
@@ -1097,7 +1099,9 @@ impl IntervalPipelines {
 pub struct ComputeIntervalPipelines {
     baked: bool,
     color_format: wgpu::TextureFormat,
-    pub color_only_override: Option<(wgpu::RenderPipeline, wgpu::BindGroup)>,
+    pub color_only_override: Option<(wgpu::RenderPipeline, Option<wgpu::BindGroup>)>,
+    pub overdraw_override: Option<wgpu::RenderPipeline>,
+    energy_radiance: Option<wgpu::Buffer>,
     gen_source: String,
     pub gen_pipeline: wgpu::ComputePipeline,
     pub gen_bg_layout: wgpu::BindGroupLayout,
@@ -1442,6 +1446,8 @@ impl ComputeIntervalPipelines {
         Self {
             baked,
             color_only_override: None,
+            overdraw_override: None,
+            energy_radiance: None,
             color_format: formats.color,
             gen_source: source,
             gen_pipeline,
@@ -2327,6 +2333,10 @@ pub fn create_compute_interval_gen_bind_group_with_sort_values(
     material: &MaterialBuffers,
     sort_values: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
+    let colors_buf = pipelines
+        .energy_radiance
+        .as_ref()
+        .unwrap_or(&material.colors);
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("compute_interval_gen_bg_sort_b"),
         layout: &pipelines.gen_bg_layout,
@@ -2334,7 +2344,7 @@ pub fn create_compute_interval_gen_bind_group_with_sort_values(
             buf_entry(0, &buffers.uniforms),
             buf_entry(1, &buffers.vertices),
             buf_entry(2, &buffers.indices),
-            buf_entry(3, &material.colors),
+            buf_entry(3, colors_buf),
             buf_entry(4, &buffers.densities),
             buf_entry(5, &material.color_grads),
             buf_entry(6, sort_values),
@@ -3346,13 +3356,13 @@ pub fn record_compute_interval_project(
             end_of_pass_write_index: Some(1),
         }),
     });
-    if use_16bit_sort {
+    if let Some(hw_bg) = hw_compute_bg {
+        cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
+        cpass.set_bind_group(0, &hw_bg.bg, &[]);
+    } else if use_16bit_sort {
         cpass.set_pipeline(fwd_pipelines.compute_pipeline_16bit.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
         cpass.set_bind_group(1, &compute_bg.bg1, &[]);
-    } else if let Some(hw_bg) = hw_compute_bg {
-        cpass.set_pipeline(&fwd_pipelines.hw_compute_pipeline);
-        cpass.set_bind_group(0, &hw_bg.bg, &[]);
     } else {
         cpass.set_pipeline(fwd_pipelines.compute_pipeline.as_ref().expect("tile projection requires 15 storage buffers"));
         cpass.set_bind_group(0, &compute_bg.bg0, &[]);
@@ -3514,7 +3524,7 @@ fn record_compute_interval_after_sort_impl(
             timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
                 query_set: qs,
                 beginning_of_pass_write_index: Some(2),
-                end_of_pass_write_index: Some(3),
+                end_of_pass_write_index: None,
             }),
         });
         cpass.set_pipeline(&ci_pipelines.indirect_convert_pipeline);
@@ -3526,7 +3536,11 @@ fn record_compute_interval_after_sort_impl(
     {
         let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("compute_interval_gen"),
-            timestamp_writes: None,
+            timestamp_writes: profiler.map(|qs| wgpu::ComputePassTimestampWrites {
+                query_set: qs,
+                beginning_of_pass_write_index: None,
+                end_of_pass_write_index: Some(3),
+            }),
         });
         cpass.set_pipeline(&ci_pipelines.gen_pipeline);
         cpass.set_bind_group(0, gen_bg, &[]);
@@ -3619,7 +3633,9 @@ fn record_compute_interval_after_sort_impl(
         } else {
             if let Some((pipeline, bg)) = &ci_pipelines.color_only_override {
                 rpass.set_pipeline(pipeline);
-                rpass.set_bind_group(1, bg, &[]);
+                if let Some(bg) = bg {
+                    rpass.set_bind_group(1, bg, &[]);
+                }
             } else { rpass.set_pipeline(&ci_pipelines.render_pipeline_color_only); }
         }
         rpass.set_bind_group(0, ci_render_bg, &[]);
@@ -4070,6 +4086,143 @@ impl ComputeIntervalPipelines {
             entry_point: Some("main"), compilation_options: Default::default(), cache: None,
         });
     }
+    /// Install pre-interpolated energy interval shading: interval_compute_energy
+    /// writes perspective-weighted cell-corner radiance (C / z_view) into the
+    /// vertex slots so the fragment shader integrates with zero storage reads.
+    pub fn set_energy_interval(
+        &mut self,
+        device: &wgpu::Device,
+        corner_radiance: &wgpu::Buffer,
+        render_source: &str,
+    ) {
+        self.energy_radiance = Some(corner_radiance.clone());
+        let gen_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("interval energy gen"),
+            bind_group_layouts: &[&self.gen_bg_layout],
+            immediate_size: 0,
+        });
+        let gen_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("interval_compute_energy.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(INTERVAL_COMPUTE_ENERGY_WGSL.as_str().into()),
+        });
+        self.gen_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("interval energy gen"),
+            layout: Some(&gen_layout),
+            module: &gen_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let use_f16 = device.features().contains(wgpu::Features::SHADER_F16);
+        let full_source = if use_f16 {
+            format!("enable f16;\nalias ScalarF = f16;\nalias Color3 = vec3<f16>;\n{render_source}")
+        } else {
+            format!("alias ScalarF = f32;\nalias Color3 = vec3<f32>;\n{render_source}")
+        };
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("energy_interval.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(full_source.into()),
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("energy interval"),
+            bind_group_layouts: &[&self.render_bg_layout],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("energy interval"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_energy"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("main_color_only"),
+                targets: &[
+                    Some(wgpu::ColorTargetState {
+                        format: self.color_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    None,
+                    None,
+                    None,
+                ],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        let overdraw = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("energy interval overdraw"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_energy"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: false,
+                depth_compare: wgpu::CompareFunction::LessEqual,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_overdraw"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: crate::overdraw::OVERDRAW_FORMAT,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.color_only_override = Some((pipeline, None));
+        self.overdraw_override = Some(overdraw);
+    }
+    pub fn clear_energy_interval(&mut self, device: &wgpu::Device) {
+        self.energy_radiance = None;
+        self.color_only_override = None;
+        self.overdraw_override = None;
+        self.set_point_samples(device, false);
+    }
     pub fn set_color_shader(&mut self, device: &wgpu::Device, extra: &wgpu::BindGroupLayout,
                             source: &str, bg: wgpu::BindGroup) {
         let vertex=device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("energy interval vertex"),source:wgpu::ShaderSource::Wgsl(INTERVAL_VERTEX_WGSL.as_str().into())});
@@ -4085,6 +4238,6 @@ impl ComputeIntervalPipelines {
             fragment:Some(wgpu::FragmentState {module:&fragment,entry_point:Some("main_color_only"),targets:&[Some(wgpu::ColorTargetState {format:self.color_format,blend:Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),write_mask:wgpu::ColorWrites::ALL}),None,None,None],compilation_options:Default::default()}),
             multiview_mask:None,cache:None,
         });
-        self.color_only_override=Some((pipeline,bg));
+        self.color_only_override=Some((pipeline,Some(bg)));
     }
 }

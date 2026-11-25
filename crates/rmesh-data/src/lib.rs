@@ -182,6 +182,9 @@ pub struct PbrData {
     pub energy_lut: Vec<f32>,
     pub geom_normals: Vec<f32>,
     pub render_min_t: Option<f32>,
+    /// Optional zero-density tetrahedra [E × 4] completing the Delaunay hull for
+    /// cavity-free adjacency traversal during light baking and probe capture.
+    pub empty_indices: Vec<u32>,
     /// Per-tet roughness [M] f32 (pre-activated sigmoid).
     pub roughness: Vec<f32>,
     /// Per-tet specular features [M × 4] f32 (pre-activated tanh).
@@ -522,6 +525,7 @@ fn parse_rmesh(data: &[u8]) -> Result<(SceneData, ShCoeffs, Option<PbrData>)> {
         pbr.energy_lut = energy.lut;
         pbr.geom_normals = energy.geom_normals;
         pbr.render_min_t = Some(energy.min_t);
+        pbr.empty_indices = energy.empty_indices;
         // Existing runtime APIs expect vertex_normals. Both names refer to
         // geometric normals for compact energy assets; only one is serialized.
         if compact { pbr.vertex_normals = pbr.geom_normals.clone(); }
@@ -725,6 +729,7 @@ fn parse_tagged_extensions(
             energy_lut: Vec::new(),
             geom_normals: Vec::new(),
             render_min_t: None,
+            empty_indices: Vec::new(),
             roughness,
             env_feature,
             albedo,

@@ -252,7 +252,12 @@ pub fn record_overdraw_count(
         1.0,
     );
     rpass.set_scissor_rect(0, 0, targets.width, targets.height);
-    rpass.set_pipeline(&ci_pipelines.overdraw_pipeline);
+    rpass.set_pipeline(
+        ci_pipelines
+            .overdraw_override
+            .as_ref()
+            .unwrap_or(&ci_pipelines.overdraw_pipeline),
+    );
     rpass.set_bind_group(0, ci_render_bg, &[]);
     rpass.set_index_buffer(
         buffers.interval_fan_index_buf.slice(..),
